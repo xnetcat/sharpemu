@@ -138,12 +138,23 @@ public static class KernelMemoryCompatExports
         public uint Type;
     }
 
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern nuint VirtualQuery(nint lpAddress, out MemoryBasicInformation lpBuffer, nuint dwLength);
+    private static unsafe nuint VirtualQuery(nint lpAddress, out MemoryBasicInformation lpBuffer, nuint dwLength)
+    {
+        _ = dwLength;
+        var result = HostMemory.Query((void*)lpAddress, out var info);
+        lpBuffer = default;
+        lpBuffer.BaseAddress = (nint)info.BaseAddress;
+        lpBuffer.AllocationBase = (nint)info.AllocationBase;
+        lpBuffer.AllocationProtect = info.AllocationProtect;
+        lpBuffer.RegionSize = (nuint)info.RegionSize;
+        lpBuffer.State = info.State;
+        lpBuffer.Protect = info.Protect;
+        lpBuffer.Type = info.Type;
+        return result;
+    }
 
-    [DllImport("kernel32.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool VirtualProtect(nint lpAddress, nuint dwSize, uint flNewProtect, out uint lpflOldProtect);
+    private static unsafe bool VirtualProtect(nint lpAddress, nuint dwSize, uint flNewProtect, out uint lpflOldProtect) =>
+        HostMemory.Protect((void*)lpAddress, dwSize, flNewProtect, out lpflOldProtect);
 
     private sealed class OpenDirectory
     {
