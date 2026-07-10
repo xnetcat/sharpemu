@@ -7,7 +7,7 @@ using System.Runtime.InteropServices;
 
 namespace SharpEmu.Libs.Audio;
 
-internal sealed class WinMmAudioPort : IDisposable
+internal sealed class WinMmAudioPort : IHostAudioPort
 {
     private const uint WaveMapper = uint.MaxValue;
     private const uint CallbackEvent = 0x0005_0000;
@@ -82,7 +82,7 @@ internal sealed class WinMmAudioPort : IDisposable
             var output = ArrayPool<byte>.Shared.Rent(outputLength);
             try
             {
-                ConvertToStereoPcm16(
+                AudioSampleConverter.ConvertToStereoPcm16(
                     source,
                     output.AsSpan(0, outputLength),
                     checked((int)frames),
@@ -209,44 +209,6 @@ internal sealed class WinMmAudioPort : IDisposable
         _queuedPcmBytes -= buffer.Length;
         Marshal.FreeHGlobal(buffer.Header);
         Marshal.FreeHGlobal(buffer.Data);
-    }
-
-    private static void ConvertToStereoPcm16(
-        ReadOnlySpan<byte> source,
-        Span<byte> destination,
-        int frames,
-        int channels,
-        int bytesPerSample,
-        bool isFloat)
-    {
-        var sourceFrameSize = checked(channels * bytesPerSample);
-        for (var frame = 0; frame < frames; frame++)
-        {
-            var sourceFrame = source.Slice(frame * sourceFrameSize, sourceFrameSize);
-            var left = ReadSample(sourceFrame, 0, bytesPerSample, isFloat);
-            var right = channels == 1
-                ? left
-                : ReadSample(sourceFrame, 1, bytesPerSample, isFloat);
-            BinaryPrimitives.WriteInt16LittleEndian(destination[(frame * 4)..], left);
-            BinaryPrimitives.WriteInt16LittleEndian(destination[((frame * 4) + 2)..], right);
-        }
-    }
-
-    private static short ReadSample(
-        ReadOnlySpan<byte> frame,
-        int channel,
-        int bytesPerSample,
-        bool isFloat)
-    {
-        var sample = frame.Slice(channel * bytesPerSample, bytesPerSample);
-        if (!isFloat)
-        {
-            return BinaryPrimitives.ReadInt16LittleEndian(sample);
-        }
-
-        var bits = BinaryPrimitives.ReadInt32LittleEndian(sample);
-        var value = Math.Clamp(BitConverter.Int32BitsToSingle(bits), -1.0f, 1.0f);
-        return checked((short)MathF.Round(value * short.MaxValue));
     }
 
     private readonly record struct NativeBuffer(IntPtr Data, IntPtr Header, int Length);
