@@ -8,6 +8,7 @@ SPDX-License-Identifier: GPL-2.0-or-later
   </PropertyGroup>
   <ItemGroup>
     <PackageVersion Include="Iced" Version="1.21.0" />
+    <PackageVersion Include="Silk.NET.Input" Version="2.23.0" />
     <PackageVersion Include="Silk.NET.Vulkan" Version="2.23.0" />
     <PackageVersion Include="Silk.NET.Vulkan.Extensions.EXT" Version="2.23.0" />
     <PackageVersion Include="Silk.NET.Vulkan.Extensions.KHR" Version="2.23.0" />

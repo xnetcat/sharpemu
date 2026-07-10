@@ -216,11 +216,44 @@ public static class PadExports
     [DllImport("user32.dll")]
     private static extern uint GetWindowThreadProcessId(nint hWnd, out uint processId);
 
-    private static bool IsKeyDown(int vk) =>
-        (GetAsyncKeyState(vk) & 0x8000) != 0;
+    private static bool IsKeyDown(int vk)
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return TryMapVirtualKey(vk, out var key) && HostWindowInput.IsKeyDown(key);
+        }
+
+        return (GetAsyncKeyState(vk) & 0x8000) != 0;
+    }
+
+    private static bool TryMapVirtualKey(int vk, out Silk.NET.Input.Key key)
+    {
+        key = vk switch
+        {
+            0x08 => Silk.NET.Input.Key.Backspace,
+            0x09 => Silk.NET.Input.Key.Tab,
+            0x0D => Silk.NET.Input.Key.Enter,
+            0x1B => Silk.NET.Input.Key.Escape,
+            0x25 => Silk.NET.Input.Key.Left,
+            0x26 => Silk.NET.Input.Key.Up,
+            0x27 => Silk.NET.Input.Key.Right,
+            0x28 => Silk.NET.Input.Key.Down,
+            >= 0x41 and <= 0x5A => Silk.NET.Input.Key.A + (vk - 0x41),
+            _ => Silk.NET.Input.Key.Unknown,
+        };
+        return key != Silk.NET.Input.Key.Unknown;
+    }
 
     private static bool IsEmulatorWindowFocused()
     {
+        if (!OperatingSystem.IsWindows())
+        {
+            // user32 is Windows-only; accept keyboard input whenever the
+            // presenter window's keyboard is attached (GLFW only delivers
+            // key events to the focused window anyway).
+            return HostWindowInput.IsConnected;
+        }
+
         var foregroundWindow = GetForegroundWindow();
         if (foregroundWindow == 0)
         {

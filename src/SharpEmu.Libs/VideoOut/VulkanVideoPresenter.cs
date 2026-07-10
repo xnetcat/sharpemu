@@ -4,7 +4,9 @@
 using Silk.NET.Core;
 using Silk.NET.Core.Native;
 using Silk.NET.Maths;
+using SharpEmu.HLE;
 using SharpEmu.Libs.Agc;
+using Silk.NET.Input;
 using Silk.NET.Vulkan;
 using Silk.NET.Vulkan.Extensions.KHR;
 using Silk.NET.Vulkan.Extensions.EXT;
@@ -176,7 +178,10 @@ internal static unsafe class VulkanVideoPresenter
     private static uint _windowWidth;
     private static uint _windowHeight;
     private static bool _closed;
+    private static bool _presenterCloseRequested;
     private const string DebugUtilsExtensionName = "VK_EXT_debug_utils";
+    private const string PortabilityEnumerationExtensionName = "VK_KHR_portability_enumeration";
+    private const string PortabilitySubsetExtensionName = "VK_KHR_portability_subset";
     private static bool _splashHidden;
     private static long _enqueuedGuestWorkSequence;
     private static long _completedGuestWorkSequence;
@@ -238,12 +243,7 @@ internal static unsafe class VulkanVideoPresenter
                     TranslatedDraw: null,
                     RequiredGuestWorkSequence: _enqueuedGuestWorkSequence,
                     IsSplash: false);
-            _thread = new Thread(Run)
-            {
-                IsBackground = true,
-                Name = "SharpEmu Vulkan VideoOut",
-            };
-            _thread.Start();
+            StartPresenterLocked();
         }
     }
 
@@ -302,12 +302,7 @@ internal static unsafe class VulkanVideoPresenter
 
             _windowWidth = width;
             _windowHeight = height;
-            _thread = new Thread(Run)
-            {
-                IsBackground = true,
-                Name = "SharpEmu Vulkan VideoOut",
-            };
-            _thread.Start();
+            StartPresenterLocked();
         }
     }
 
@@ -346,12 +341,7 @@ internal static unsafe class VulkanVideoPresenter
 
             _windowWidth = width;
             _windowHeight = height;
-            _thread = new Thread(Run)
-            {
-                IsBackground = true,
-                Name = "SharpEmu Vulkan VideoOut",
-            };
-            _thread.Start();
+            StartPresenterLocked();
         }
     }
 
@@ -410,12 +400,7 @@ internal static unsafe class VulkanVideoPresenter
 
             _windowWidth = width;
             _windowHeight = height;
-            _thread = new Thread(Run)
-            {
-                IsBackground = true,
-                Name = "SharpEmu Vulkan VideoOut",
-            };
-            _thread.Start();
+            StartPresenterLocked();
         }
     }
 
@@ -736,6 +721,37 @@ internal static unsafe class VulkanVideoPresenter
         return pixels;
     }
 
+    private static void StartPresenterLocked()
+    {
+        if (HostMainThread.IsAvailable)
+        {
+            // AppKit (and therefore GLFW) traps when touched off the process
+            // main thread on macOS, so hand the whole window loop to the
+            // main-thread pump the CLI parked for us. _thread only marks the
+            // presenter as running; Run() clears it on exit either way.
+            _thread = Thread.CurrentThread;
+            HostMainThread.SetShutdownRequestHandler(RequestClose);
+            HostMainThread.Post(Run);
+            return;
+        }
+
+        _thread = new Thread(Run)
+        {
+            IsBackground = true,
+            Name = "SharpEmu Vulkan VideoOut",
+        };
+        _thread.Start();
+    }
+
+    /// <summary>
+    /// Asks a running presenter to close its window; used at emulator
+    /// shutdown so a main-thread-hosted window loop returns to the pump.
+    /// </summary>
+    public static void RequestClose()
+    {
+        Volatile.Write(ref _presenterCloseRequested, true);
+    }
+
     private static void Run()
     {
         uint width;
@@ -1052,6 +1068,19 @@ internal static unsafe class VulkanVideoPresenter
 
         private void Initialize()
         {
+            if (!OperatingSystem.IsWindows())
+            {
+                try
+                {
+                    Pad.HostWindowInput.Attach(_window.CreateInput());
+                    Console.Error.WriteLine("[LOADER][INFO] Window keyboard input attached for pad emulation.");
+                }
+                catch (Exception exception)
+                {
+                    Console.Error.WriteLine($"[LOADER][WARN] Window keyboard input unavailable: {exception.Message}");
+                }
+            }
+
             WaitForRenderDocAttachIfRequested();
             _vk = Vk.GetApi();
             CreateInstance();
@@ -1263,8 +1292,10 @@ internal static unsafe class VulkanVideoPresenter
 
                 var extensions = _window.VkSurface!.GetRequiredExtensions(out var extensionCount);
                 byte* debugUtilsExtension = null;
+                byte* portabilityExtension = null;
+                var instanceCreateFlags = InstanceCreateFlags.None;
                 var enabledExtensionCount = (int)extensionCount;
-                var enabledExtensions = stackalloc byte*[(int)extensionCount + 1];
+                var enabledExtensions = stackalloc byte*[(int)extensionCount + 2];
                 for (var index = 0; index < (int)extensionCount; index++)
                 {
                     enabledExtensions[index] = extensions[index];
@@ -1274,6 +1305,15 @@ internal static unsafe class VulkanVideoPresenter
                 {
                     debugUtilsExtension = (byte*)SilkMarshal.StringToPtr(DebugUtilsExtensionName);
                     enabledExtensions[enabledExtensionCount++] = debugUtilsExtension;
+                }
+
+                if (IsInstanceExtensionAvailable(PortabilityEnumerationExtensionName))
+                {
+                    // MoltenVK is a portability (non-conformant) implementation;
+                    // without this flag + extension the loader hides it.
+                    portabilityExtension = (byte*)SilkMarshal.StringToPtr(PortabilityEnumerationExtensionName);
+                    enabledExtensions[enabledExtensionCount++] = portabilityExtension;
+                    instanceCreateFlags |= InstanceCreateFlags.EnumeratePortabilityBitKhr;
                 }
 
                 if (enableValidation && IsInstanceLayerAvailable("VK_LAYER_KHRONOS_validation"))
@@ -1294,6 +1334,7 @@ internal static unsafe class VulkanVideoPresenter
                 var createInfo = new InstanceCreateInfo
                 {
                     SType = StructureType.InstanceCreateInfo,
+                    Flags = instanceCreateFlags,
                     PApplicationInfo = &applicationInfo,
                     EnabledExtensionCount = (uint)enabledExtensionCount,
                     PpEnabledExtensionNames = enabledExtensions,
@@ -1322,6 +1363,10 @@ internal static unsafe class VulkanVideoPresenter
                     {
                         SilkMarshal.Free((nint)debugUtilsExtension);
                     }
+                    if (portabilityExtension is not null)
+                    {
+                        SilkMarshal.Free((nint)portabilityExtension);
+                    }
                 }
             }
             finally
@@ -1332,6 +1377,40 @@ internal static unsafe class VulkanVideoPresenter
                     SilkMarshal.Free((nint)validationLayerName);
                 }
             }
+        }
+
+        private bool IsDeviceExtensionAvailable(string extensionName)
+        {
+            uint extensionCount = 0;
+            if (_vk.EnumerateDeviceExtensionProperties(_physicalDevice, (byte*)null, &extensionCount, null) != Result.Success ||
+                extensionCount == 0)
+            {
+                return false;
+            }
+
+            var properties = new ExtensionProperties[extensionCount];
+            fixed (ExtensionProperties* propertyPointer = properties)
+            {
+                if (_vk.EnumerateDeviceExtensionProperties(
+                        _physicalDevice,
+                        (byte*)null,
+                        &extensionCount,
+                        propertyPointer) != Result.Success)
+                {
+                    return false;
+                }
+
+                var expected = Encoding.UTF8.GetBytes(extensionName);
+                for (var index = 0; index < extensionCount; index++)
+                {
+                    if (Utf8NullTerminatedEquals(propertyPointer[index].ExtensionName, expected))
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            return false;
         }
 
         private bool IsInstanceLayerAvailable(string layerName)
@@ -1520,6 +1599,7 @@ internal static unsafe class VulkanVideoPresenter
             };
             _vk.GetPhysicalDeviceFeatures2(_physicalDevice, &featuresQuery);
             var supportsMaintenance8 = maintenance8Features.Maintenance8;
+            var supportsRobustBufferAccess2 = robustness2Features.RobustBufferAccess2;
             var supportsRobustImageAccess2 = robustness2Features.RobustImageAccess2;
             var supportsNullDescriptor = robustness2Features.NullDescriptor;
             var supportsRobustness2 = supportsRobustImageAccess2 || supportsNullDescriptor;
@@ -1540,9 +1620,10 @@ internal static unsafe class VulkanVideoPresenter
             var swapchainExtension = (byte*)SilkMarshal.StringToPtr("VK_KHR_swapchain");
             var maintenance8Extension = (byte*)SilkMarshal.StringToPtr("VK_KHR_maintenance8");
             var robustness2Extension = (byte*)SilkMarshal.StringToPtr("VK_EXT_robustness2");
+            var portabilitySubsetExtension = (byte*)SilkMarshal.StringToPtr(PortabilitySubsetExtensionName);
             try
             {
-                var extensions = stackalloc byte*[3];
+                var extensions = stackalloc byte*[4];
                 var extensionCount = 0u;
                 extensions[extensionCount++] = swapchainExtension;
                 if (supportsMaintenance8)
@@ -1555,10 +1636,17 @@ internal static unsafe class VulkanVideoPresenter
                     extensions[extensionCount++] = robustness2Extension;
                 }
 
+                if (IsDeviceExtensionAvailable(PortabilitySubsetExtensionName))
+                {
+                    // The spec requires enabling this when the (MoltenVK)
+                    // device advertises it.
+                    extensions[extensionCount++] = portabilitySubsetExtension;
+                }
+
                 maintenance8Features.Maintenance8 = supportsMaintenance8;
                 maintenance8Features.PNext = null;
                 robustness2Features.RobustBufferAccess2 =
-                    supportsRobustImageAccess2 && supportedFeatures.RobustBufferAccess;
+                    supportsRobustBufferAccess2 && supportedFeatures.RobustBufferAccess;
                 robustness2Features.RobustImageAccess2 = supportsRobustImageAccess2;
                 robustness2Features.NullDescriptor = supportsNullDescriptor;
                 robustness2Features.PNext = supportsMaintenance8 ? &maintenance8Features : null;
@@ -1587,6 +1675,7 @@ internal static unsafe class VulkanVideoPresenter
                 SilkMarshal.Free((nint)swapchainExtension);
                 SilkMarshal.Free((nint)maintenance8Extension);
                 SilkMarshal.Free((nint)robustness2Extension);
+                SilkMarshal.Free((nint)portabilitySubsetExtension);
             }
 
             _vk.GetDeviceQueue(_device, _queueFamilyIndex, 0, out _queue);
@@ -4827,6 +4916,12 @@ internal static unsafe class VulkanVideoPresenter
 
         private void Render(double _)
         {
+            if (Volatile.Read(ref _presenterCloseRequested))
+            {
+                _window.Close();
+                return;
+            }
+
             if (!_vulkanReady)
             {
                 return;
