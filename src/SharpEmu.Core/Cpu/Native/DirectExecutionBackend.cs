@@ -4436,6 +4436,13 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	public unsafe void Dispose()
 	{
+		if (ReferenceEquals(_posixSignalBackend, this))
+		{
+			// The signal handlers stay installed (they chain to the previous
+			// action when no backend is active), but must stop dispatching
+			// into a disposed backend.
+			_posixSignalBackend = null;
+		}
 		ClearImportHandlerTrampolines();
 		_importEntries = Array.Empty<ImportStubEntry>();
 		_runtimeSymbolsByName.Clear();
