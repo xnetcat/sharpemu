@@ -39,6 +39,10 @@ public static class VideoOutExports
     private const ulong SceVideoOutPixelFormatA2R10G10B10Srgb = 0x88000000;
     private const ulong SceVideoOutPixelFormatA2R10G10B10Bt2020Pq = 0x88740000;
     private const ulong SceVideoOutInternalEventFlip = 0x6;
+    // Distinct internal ident for vblank events. Games interpret events through
+    // sceVideoOutGetEventId (mapped below), so the exact value is internal; only
+    // its distinctness from the flip ident matters for GetEventId/GetEventData.
+    private const ulong SceVideoOutInternalEventVblank = 0x40;
     private const short OrbisKernelEventFilterVideoOut = -13;
 
     private static readonly object _stateGate = new();
@@ -100,6 +104,7 @@ public static class VideoOutExports
         public VideoOutBufferGroup?[] Groups { get; } = new VideoOutBufferGroup?[MaxDisplayBufferGroups];
         public VideoOutBufferSlot[] BufferSlots { get; } = CreateBufferSlots();
         public List<FlipEventRegistration> FlipEvents { get; } = new();
+        public List<FlipEventRegistration> VblankEvents { get; } = new();
         public long LastVblankTimestamp;
     }
 
@@ -376,6 +381,69 @@ public static class VideoOutExports
     }
 
     [SysAbiExport(
+        Nid = "Xru92wHJRmg",
+        ExportName = "sceVideoOutAddVblankEvent",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceVideoOut")]
+    public static int VideoOutAddVblankEvent(CpuContext ctx)
+    {
+        var equeue = ctx[CpuRegister.Rdi];
+        var handle = unchecked((int)ctx[CpuRegister.Rsi]);
+        var userData = ctx[CpuRegister.Rdx];
+        if (!TryGetPort(handle, out var port))
+        {
+            return OrbisVideoOutErrorInvalidHandle;
+        }
+
+        if (!KernelEventQueueCompatExports.IsValidEqueue(equeue))
+        {
+            return OrbisVideoOutErrorInvalidEventQueue;
+        }
+
+        lock (_stateGate)
+        {
+            var existingIndex = port.VblankEvents.FindIndex(registration => registration.Equeue == equeue);
+            if (existingIndex >= 0)
+            {
+                port.VblankEvents[existingIndex] = new FlipEventRegistration(equeue, userData);
+            }
+            else
+            {
+                port.VblankEvents.Add(new FlipEventRegistration(equeue, userData));
+            }
+        }
+
+        // A guest that parks its main/render loop on a vblank event needs a
+        // steady tick to advance; start the emulated vblank cadence on demand.
+        StartVblankThreadOnce();
+        TraceVideoOut($"videoout.add_vblank_event eq=0x{equeue:X16} handle={handle} udata=0x{userData:X16}");
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "oNOQn3knW6s",
+        ExportName = "sceVideoOutDeleteVblankEvent",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceVideoOut")]
+    public static int VideoOutDeleteVblankEvent(CpuContext ctx)
+    {
+        var equeue = ctx[CpuRegister.Rdi];
+        var handle = unchecked((int)ctx[CpuRegister.Rsi]);
+        if (!TryGetPort(handle, out var port))
+        {
+            return OrbisVideoOutErrorInvalidHandle;
+        }
+
+        lock (_stateGate)
+        {
+            port.VblankEvents.RemoveAll(registration => registration.Equeue == equeue);
+        }
+
+        TraceVideoOut($"videoout.delete_vblank_event eq=0x{equeue:X16} handle={handle}");
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
         Nid = "U46NwOiJpys",
         ExportName = "sceVideoOutSubmitFlip",
         Target = Generation.Gen4 | Generation.Gen5,
@@ -425,12 +493,23 @@ public static class VideoOutExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
-        if (filter != OrbisKernelEventFilterVideoOut || ident != SceVideoOutInternalEventFlip)
+        if (filter != OrbisKernelEventFilterVideoOut)
         {
             return OrbisVideoOutErrorInvalidEvent;
         }
 
-        return 0;
+        // sceVideoOutGetEventId reports the event kind: 0 = flip, 1 = vblank.
+        if (ident == SceVideoOutInternalEventFlip)
+        {
+            return 0;
+        }
+
+        if (ident == SceVideoOutInternalEventVblank)
+        {
+            return 1;
+        }
+
+        return OrbisVideoOutErrorInvalidEvent;
     }
 
     [SysAbiExport(
@@ -454,7 +533,8 @@ public static class VideoOutExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
-        if (filter != OrbisKernelEventFilterVideoOut || ident != SceVideoOutInternalEventFlip)
+        if (filter != OrbisKernelEventFilterVideoOut ||
+            (ident != SceVideoOutInternalEventFlip && ident != SceVideoOutInternalEventVblank))
         {
             return OrbisVideoOutErrorInvalidEvent;
         }
@@ -885,6 +965,88 @@ public static class VideoOutExports
         "1",
         StringComparison.Ordinal);
     private static long _lastFlipPacingTimestamp;
+
+    private static Thread? _vblankThread;
+    private static readonly object _vblankThreadGate = new();
+
+    /// <summary>
+    /// Starts the emulated vblank tick once a guest registers interest in vblank
+    /// events. The tick fires the registered vblank events on their event queues
+    /// at the display refresh cadence so guests that park their main/render loop
+    /// on a vblank equeue keep advancing.
+    /// </summary>
+    private static void StartVblankThreadOnce()
+    {
+        if (Volatile.Read(ref _vblankThread) is not null)
+        {
+            return;
+        }
+
+        lock (_vblankThreadGate)
+        {
+            if (_vblankThread is not null)
+            {
+                return;
+            }
+
+            var thread = new Thread(VblankTickLoop)
+            {
+                IsBackground = true,
+                Name = "SharpEmu-Vblank",
+            };
+            _vblankThread = thread;
+            thread.Start();
+        }
+    }
+
+    private static void VblankTickLoop()
+    {
+        var pending = new List<(ulong Equeue, ulong DataHint, ulong UserData)>();
+        var next = Stopwatch.GetTimestamp();
+        while (true)
+        {
+            uint refresh = 60;
+            pending.Clear();
+            lock (_stateGate)
+            {
+                foreach (var port in _ports.Values)
+                {
+                    if (port.VblankEvents.Count == 0)
+                    {
+                        continue;
+                    }
+
+                    refresh = port.RefreshRate == 0 ? 60 : port.RefreshRate;
+                    port.VblankCount++;
+                    var dataHint = (port.VblankCount & 0x0000_FFFF_FFFF_FFFFUL) << 16;
+                    foreach (var registration in port.VblankEvents)
+                    {
+                        pending.Add((registration.Equeue, dataHint, registration.UserData));
+                    }
+                }
+            }
+
+            foreach (var (equeue, dataHint, userData) in pending)
+            {
+                _ = KernelEventQueueCompatExports.TriggerDisplayEvent(
+                    equeue,
+                    SceVideoOutInternalEventVblank,
+                    OrbisKernelEventFilterVideoOut,
+                    dataHint,
+                    userData);
+            }
+
+            var interval = Stopwatch.Frequency / Math.Max(1, (long)refresh);
+            next += interval;
+            var now = Stopwatch.GetTimestamp();
+            if (next < now)
+            {
+                next = now;
+            }
+
+            HostTiming.SleepUntil(next);
+        }
+    }
 
     /// <summary>
     /// Emulates the display vblank cadence: hardware completes flips at the
