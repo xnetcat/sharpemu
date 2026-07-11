@@ -100,6 +100,7 @@ public static class VideoOutExports
         public VideoOutBufferGroup?[] Groups { get; } = new VideoOutBufferGroup?[MaxDisplayBufferGroups];
         public VideoOutBufferSlot[] BufferSlots { get; } = CreateBufferSlots();
         public List<FlipEventRegistration> FlipEvents { get; } = new();
+        public long LastVblankTimestamp;
     }
 
     private sealed class VideoOutBufferGroup
@@ -311,7 +312,24 @@ public static class VideoOutExports
             return OrbisVideoOutErrorInvalidHandle;
         }
 
-        Thread.Sleep(1);
+        // Wait to the next boundary of the emulated display refresh rather
+        // than a raw Thread.Sleep(1): coarse sleeps overshoot to the
+        // scheduler quantum, which mis-paces games that spin on vblank. A
+        // caller that arrives past the boundary already missed the vblank:
+        // report it immediately instead of charging a full extra interval.
+        var intervalTicks = Stopwatch.Frequency / Math.Max(1, (long)port.RefreshRate);
+        var now = Stopwatch.GetTimestamp();
+        var last = Interlocked.Read(ref port.LastVblankTimestamp);
+        var target = last + intervalTicks;
+        if (target <= now || target > now + intervalTicks)
+        {
+            Interlocked.CompareExchange(ref port.LastVblankTimestamp, now, last);
+        }
+        else
+        {
+            HostTiming.SleepUntil(target);
+            Interlocked.CompareExchange(ref port.LastVblankTimestamp, target, last);
+        }
         lock (_stateGate)
         {
             port.VblankCount++;
@@ -791,6 +809,7 @@ public static class VideoOutExports
         }
 
         PaceFlip(port.FlipRate);
+        PerfOverlay.RecordSubmit();
 
         if (submitGpuImage &&
             bufferIndex >= 0 &&
@@ -803,10 +822,7 @@ public static class VideoOutExports
                 displayBuffer.PitchInPixel);
         }
 
-        if (string.Equals(
-                Environment.GetEnvironmentVariable("SHARPEMU_DUMP_VIDEOOUT"),
-                "1",
-                StringComparison.Ordinal))
+        if (_dumpVideoOut)
         {
             _ = TryDumpFrame(ctx, port, bufferIndex, flipMode, flipArg);
         }
@@ -901,9 +917,11 @@ public static class VideoOutExports
         }
 
         var waitMilliseconds = (target - now) * 1000 / Stopwatch.Frequency;
-        if (waitMilliseconds is > 0 and < 100)
+        if (waitMilliseconds is >= 0 and < 100)
         {
-            Thread.Sleep((int)waitMilliseconds);
+            // Precise wait: Thread.Sleep alone overshoots by a scheduler
+            // quantum, which caps the flip rate below the target cadence.
+            HostTiming.SleepUntil(target);
         }
 
         Interlocked.CompareExchange(ref _lastFlipPacingTimestamp, target, last);
@@ -1366,9 +1384,18 @@ public static class VideoOutExports
         return true;
     }
 
+    private static readonly bool _traceVideoOut = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_LOG_VIDEOOUT"),
+        "1",
+        StringComparison.Ordinal);
+    private static readonly bool _dumpVideoOut = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_DUMP_VIDEOOUT"),
+        "1",
+        StringComparison.Ordinal);
+
     private static void TraceVideoOut(string message)
     {
-        if (!string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_VIDEOOUT"), "1", StringComparison.Ordinal))
+        if (!_traceVideoOut)
         {
             return;
         }

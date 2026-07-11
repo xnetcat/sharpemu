@@ -73,8 +73,10 @@ internal static class Gen5ShaderScalarEvaluator
         var globalMemoryBindings = new List<Gen5GlobalMemoryBinding>();
         var globalMemoryByAddress = new Dictionary<(uint ScalarAddress, ulong BaseAddress), Gen5GlobalMemoryBinding>();
         var vertexInputBindings = new List<Gen5VertexInputBinding>();
-        var runtimeScalarRegisters = CollectRuntimeScalarRegisters(state.Program);
-        var scalarRegisterSnapshots = new Dictionary<uint, IReadOnlyList<uint>>();
+        // Shared, cached, read-only: computed once per decoded program. The
+        // set already includes every instruction's destination registers, so
+        // the per-load additions the loop used to make are redundant.
+        var runtimeScalarRegisters = state.Program.RuntimeScalarRegisters;
         var scalarConditionCode = false;
         uint? skipUntilPc = null;
 
@@ -89,8 +91,6 @@ internal static class Gen5ShaderScalarEvaluator
 
                 skipUntilPc = null;
             }
-
-            scalarRegisterSnapshots[instruction.Pc] = (uint[])scalarRegisters.Clone();
 
             if (instruction.Opcode == "SEndpgm")
             {
@@ -160,14 +160,9 @@ internal static class Gen5ShaderScalarEvaluator
 
             if (instruction.Control is Gen5ScalarMemoryControl scalarMemory)
             {
-                foreach (var destination in instruction.Destinations)
-                {
-                    if (destination.Kind == Gen5OperandKind.ScalarRegister && destination.Value < ScalarRegisterCount)
-                    {
-                        runtimeScalarRegisters.Add(destination.Value);
-                    }
-                }
-
+                // Destinations are already in the cached runtimeScalarRegisters
+                // set (it scans every instruction's destinations), so no
+                // per-load mutation is needed here.
                 if (!TryExecuteScalarLoad(ctx, state, instruction, scalarMemory, scalarRegisters, globalMemoryBindings, globalMemoryByAddress, runtimeScalarRegisters, out error))
                 {
                     return false;
@@ -204,8 +199,7 @@ internal static class Gen5ShaderScalarEvaluator
                 }
                 else
                 {
-                    byte[] data;
-                    if (!TryReadGlobalMemory(ctx, baseAddress, out data))
+                    if (!TryReadGlobalMemory(ctx, baseAddress, out var data, out var dataLength))
                     {
                         error =
                             $"global-memory-read-failed pc=0x{instruction.Pc:X} " +
@@ -217,7 +211,9 @@ internal static class Gen5ShaderScalarEvaluator
                         globalMemory.ScalarAddress,
                         baseAddress,
                         new List<uint> { instruction.Pc },
-                        data);
+                        data,
+                        dataLength,
+                        DataPooled: true);
                     globalMemoryByAddress.Add(key, binding);
                     globalMemoryBindings.Add(binding);
                 }
@@ -260,7 +256,8 @@ internal static class Gen5ShaderScalarEvaluator
                             ctx,
                             bufferDescriptor.BaseAddress,
                             bufferDescriptor.SizeBytes,
-                            out var vertexData))
+                            out var vertexData,
+                            out var vertexDataLength))
                     {
                         error =
                             $"vertex-buffer-read-failed pc=0x{instruction.Pc:X} " +
@@ -275,6 +272,7 @@ internal static class Gen5ShaderScalarEvaluator
                             bufferMemory,
                             bufferDescriptor,
                             vertexData,
+                            vertexDataLength,
                             (uint)vertexInputBindings.Count,
                             scalarRegisters,
                             out var vertexInputBinding))
@@ -303,7 +301,8 @@ internal static class Gen5ShaderScalarEvaluator
                             ctx,
                             bufferDescriptor.BaseAddress,
                             bufferDescriptor.SizeBytes,
-                            out var data))
+                            out var data,
+                            out var dataLength))
                     {
                         var descriptorWords = string.Join(
                             ':',
@@ -322,7 +321,9 @@ internal static class Gen5ShaderScalarEvaluator
                         bufferMemory.ScalarResource,
                         bufferDescriptor.BaseAddress,
                         new List<uint> { instruction.Pc },
-                        data);
+                        data,
+                        dataLength,
+                        DataPooled: true);
                     globalMemoryByAddress.Add(key, binding);
                     globalMemoryBindings.Add(binding);
                 }
@@ -376,7 +377,6 @@ internal static class Gen5ShaderScalarEvaluator
         evaluation = new Gen5ShaderEvaluation(
             initialScalarRegisters,
             scalarRegisters,
-            scalarRegisterSnapshots,
             resolved,
             globalMemoryBindings,
             state.ComputeSystemRegisters,
@@ -390,6 +390,7 @@ internal static class Gen5ShaderScalarEvaluator
         Gen5BufferMemoryControl control,
         BufferDescriptor descriptor,
         byte[] data,
+        int dataLength,
         uint location,
         uint[] scalarRegisters,
         out Gen5VertexInputBinding binding)
@@ -399,10 +400,10 @@ internal static class Gen5ShaderScalarEvaluator
             instruction.Sources.Count <= 2 ||
             !TryEvaluateScalarOperand(instruction.Sources[2], scalarRegisters, out var scalarOffset))
         {
+            System.Buffers.ArrayPool<byte>.Shared.Return(data);
             return false;
         }
 
-        var bindingData = data;
         var bindingStride = descriptor.Stride;
         var bindingOffset = unchecked((uint)control.OffsetBytes + scalarOffset);
         var bindingDataFormat = descriptor.DataFormat;
@@ -416,7 +417,9 @@ internal static class Gen5ShaderScalarEvaluator
             descriptor.BaseAddress,
             bindingStride,
             bindingOffset,
-            bindingData);
+            data,
+            dataLength,
+            DataPooled: true);
         return true;
     }
 
@@ -431,33 +434,6 @@ internal static class Gen5ShaderScalarEvaluator
         descriptor.Stride != 0 &&
         (instruction.Opcode.StartsWith("BufferLoadFormat", StringComparison.Ordinal) ||
          instruction.Opcode.StartsWith("TBufferLoadFormat", StringComparison.Ordinal));
-
-    private static HashSet<uint> CollectRuntimeScalarRegisters(Gen5ShaderProgram program)
-    {
-        var registers = new HashSet<uint>();
-        foreach (var instruction in program.Instructions)
-        {
-            foreach (var operand in instruction.Sources.Concat(instruction.Destinations))
-            {
-                if (operand.Kind == Gen5OperandKind.ScalarRegister &&
-                    operand.Value < ScalarRegisterCount)
-                {
-                    registers.Add(operand.Value);
-                }
-            }
-
-            if (instruction.Control is Gen5ScalarMemoryControl
-                {
-                    DynamicOffsetRegister: { } offsetRegister,
-                } &&
-                offsetRegister < ScalarRegisterCount)
-            {
-                registers.Add(offsetRegister);
-            }
-        }
-
-        return registers;
-    }
 
     private static bool TryGetSoppBranchTargetPc(
         Gen5ShaderInstruction instruction,
@@ -534,21 +510,30 @@ internal static class Gen5ShaderScalarEvaluator
         return false;
     }
 
+    // Both readers rent from ArrayPool: these run per bound buffer per draw,
+    // and fresh multi-megabyte allocations here kept the background GC busy
+    // full-time. The rented array (possibly oversized) is handed to the
+    // presenter, which returns it to the pool after the host-buffer upload.
     private static bool TryReadGlobalMemory(
         CpuContext ctx,
         ulong baseAddress,
-        out byte[] data)
+        out byte[] data,
+        out int dataLength)
     {
+        var rented = System.Buffers.ArrayPool<byte>.Shared.Rent((int)MaxGlobalMemoryBindingBytes);
         for (var size = MaxGlobalMemoryBindingBytes; size >= 4096; size >>= 1)
         {
-            data = GC.AllocateUninitializedArray<byte>(size);
-            if (ctx.Memory.TryRead(baseAddress, data))
+            if (ctx.Memory.TryRead(baseAddress, rented.AsSpan(0, size)))
             {
+                data = rented;
+                dataLength = size;
                 return true;
             }
         }
 
+        System.Buffers.ArrayPool<byte>.Shared.Return(rented);
         data = [];
+        dataLength = 0;
         return false;
     }
 
@@ -556,28 +541,32 @@ internal static class Gen5ShaderScalarEvaluator
         CpuContext ctx,
         ulong baseAddress,
         ulong sizeBytes,
-        out byte[] data)
+        out byte[] data,
+        out int dataLength)
     {
+        data = [];
+        dataLength = 0;
         if (sizeBytes == 0)
         {
-            data = [];
             return false;
         }
 
         var cappedSize = Math.Min(sizeBytes, MaxGlobalMemoryBindingBytes);
         if (cappedSize > int.MaxValue)
         {
-            data = [];
             return false;
         }
 
+        var rented = System.Buffers.ArrayPool<byte>.Shared.Rent((int)cappedSize);
         var candidateSize = (int)cappedSize;
         while (candidateSize >= sizeof(uint))
         {
-            data = GC.AllocateUninitializedArray<byte>(candidateSize);
-            if (ctx.Memory.TryRead(baseAddress, data) ||
-                KernelMemoryCompatExports.TryReadTrackedLibcHeap(baseAddress, data))
+            var span = rented.AsSpan(0, candidateSize);
+            if (ctx.Memory.TryRead(baseAddress, span) ||
+                KernelMemoryCompatExports.TryReadTrackedLibcHeap(baseAddress, span))
             {
+                data = rented;
+                dataLength = candidateSize;
                 return true;
             }
 
@@ -589,7 +578,7 @@ internal static class Gen5ShaderScalarEvaluator
             candidateSize = Math.Max(candidateSize / 2, sizeof(uint));
         }
 
-        data = [];
+        System.Buffers.ArrayPool<byte>.Shared.Return(rented);
         return false;
     }
 
@@ -1258,7 +1247,7 @@ internal static class Gen5ShaderScalarEvaluator
         uint[] scalarRegisters,
         List<Gen5GlobalMemoryBinding> globalMemoryBindings,
         Dictionary<(uint ScalarAddress, ulong BaseAddress), Gen5GlobalMemoryBinding> globalMemoryByAddress,
-        HashSet<uint> runtimeScalarRegisters,
+        IReadOnlySet<uint> runtimeScalarRegisters,
         out string error)
     {
         error = string.Empty;
@@ -1317,8 +1306,19 @@ internal static class Gen5ShaderScalarEvaluator
             }
             else
             {
-                TryReadGlobalMemory(ctx, bufferDescriptor.BaseAddress, bufferDescriptor.SizeBytes, out var data);
-                var binding = new Gen5GlobalMemoryBinding(scalarBase.Value, bufferDescriptor.BaseAddress, new List<uint> { instruction.Pc }, data);
+                var pooled = TryReadGlobalMemory(
+                    ctx,
+                    bufferDescriptor.BaseAddress,
+                    bufferDescriptor.SizeBytes,
+                    out var data,
+                    out var dataLength);
+                var binding = new Gen5GlobalMemoryBinding(
+                    scalarBase.Value,
+                    bufferDescriptor.BaseAddress,
+                    new List<uint> { instruction.Pc },
+                    data,
+                    dataLength,
+                    DataPooled: pooled);
                 globalMemoryByAddress.Add(key, binding);
                 globalMemoryBindings.Add(binding);
             }
@@ -1344,20 +1344,19 @@ internal static class Gen5ShaderScalarEvaluator
                 requiredBytes = Math.Min(
                     (requiredBytes + 4095UL) & ~4095UL,
                     MaxGlobalMemoryBindingBytes);
-                if (!TryReadGlobalMemory(
-                        ctx,
-                        baseAddress,
-                        requiredBytes,
-                        out var data))
-                {
-                    data = [];
-                }
-
+                var pooled = TryReadGlobalMemory(
+                    ctx,
+                    baseAddress,
+                    requiredBytes,
+                    out var data,
+                    out var dataLength);
                 var binding = new Gen5GlobalMemoryBinding(
                     scalarBase.Value,
                     baseAddress,
                     new List<uint> { instruction.Pc },
-                    data);
+                    data,
+                    dataLength,
+                    DataPooled: pooled);
                 globalMemoryByAddress.Add(key, binding);
                 globalMemoryBindings.Add(binding);
             }

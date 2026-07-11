@@ -266,11 +266,16 @@ internal sealed record Gen5ImageBinding(
     IReadOnlyList<uint> SamplerDescriptor,
     uint? MipLevel);
 
+// Data arrays may be rented from ArrayPool (oversized): always slice with
+// DataLength, never Data.Length. Ownership transfers to the presenter, which
+// returns pooled arrays after uploading them into host-visible buffers.
 internal sealed record Gen5GlobalMemoryBinding(
     uint ScalarAddress,
     ulong BaseAddress,
     IReadOnlyList<uint> InstructionPcs,
-    byte[] Data);
+    byte[] Data,
+    int DataLength,
+    bool DataPooled);
 
 internal sealed record Gen5VertexInputBinding(
     uint Pc,
@@ -281,12 +286,13 @@ internal sealed record Gen5VertexInputBinding(
     ulong BaseAddress,
     uint Stride,
     uint OffsetBytes,
-    byte[] Data);
+    byte[] Data,
+    int DataLength,
+    bool DataPooled);
 
 internal sealed record Gen5ShaderEvaluation(
     IReadOnlyList<uint> InitialScalarRegisters,
     IReadOnlyList<uint> ScalarRegisters,
-    IReadOnlyDictionary<uint, IReadOnlyList<uint>> ScalarRegistersByPc,
     IReadOnlyList<Gen5ImageBinding> ImageBindings,
     IReadOnlyList<Gen5GlobalMemoryBinding> GlobalMemoryBindings,
     Gen5ComputeSystemRegisters? ComputeSystemRegisters = null,
@@ -306,8 +312,58 @@ internal sealed record Gen5ShaderProgram(
     ulong Address,
     IReadOnlyList<Gen5ShaderInstruction> Instructions)
 {
+    private const int ScalarRegisterCount = 256;
+    private IReadOnlySet<uint>? _runtimeScalarRegisters;
+
     public IEnumerable<Gen5ImageControl> ImageResources =>
         Instructions
             .Select(instruction => instruction.Control)
             .OfType<Gen5ImageControl>();
+
+    /// <summary>
+    /// The set of scalar registers the program reads or writes as runtime
+    /// values. It depends only on the (cached) decoded program, so it is
+    /// computed once and shared read-only across every draw that uses this
+    /// shader — the evaluator previously rebuilt this HashSet by scanning
+    /// every instruction on every draw, one of the largest per-draw
+    /// allocation and CPU sources.
+    /// </summary>
+    public IReadOnlySet<uint> RuntimeScalarRegisters =>
+        _runtimeScalarRegisters ??= ComputeRuntimeScalarRegisters();
+
+    private IReadOnlySet<uint> ComputeRuntimeScalarRegisters()
+    {
+        var registers = new HashSet<uint>();
+        foreach (var instruction in Instructions)
+        {
+            foreach (var operand in instruction.Sources)
+            {
+                if (operand.Kind == Gen5OperandKind.ScalarRegister &&
+                    operand.Value < ScalarRegisterCount)
+                {
+                    registers.Add(operand.Value);
+                }
+            }
+
+            foreach (var operand in instruction.Destinations)
+            {
+                if (operand.Kind == Gen5OperandKind.ScalarRegister &&
+                    operand.Value < ScalarRegisterCount)
+                {
+                    registers.Add(operand.Value);
+                }
+            }
+
+            if (instruction.Control is Gen5ScalarMemoryControl
+                {
+                    DynamicOffsetRegister: { } offsetRegister,
+                } &&
+                offsetRegister < ScalarRegisterCount)
+            {
+                registers.Add(offsetRegister);
+            }
+        }
+
+        return registers;
+    }
 }

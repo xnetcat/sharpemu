@@ -133,6 +133,25 @@ public static unsafe class GuestImageWriteTracker
         }
     }
 
+    /// <summary>
+    /// Non-consuming variant of <see cref="ConsumeDirty"/>: reports whether
+    /// the range has been written since it was last re-armed, leaving the
+    /// flag for the owner that evicts and re-uploads.
+    /// </summary>
+    public static bool PeekDirty(ulong address)
+    {
+        if (!_enabled)
+        {
+            return false;
+        }
+
+        lock (_gate)
+        {
+            return _rangesByAddress.TryGetValue(address, out var range) &&
+                Volatile.Read(ref range.Dirty) != 0;
+        }
+    }
+
     public static void Rearm(ulong address)
     {
         if (!_enabled)
