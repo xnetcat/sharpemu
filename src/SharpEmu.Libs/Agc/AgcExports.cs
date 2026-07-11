@@ -2021,6 +2021,7 @@ public static class AgcExports
         lock (gpuState.Gate)
         {
             ParseSubmittedDcb(ctx, gpuState, gpuState.Graphics, commandAddress, dwordCount, tracePackets);
+            DrainResumableDcbs(ctx, gpuState, tracePackets);
         }
 
         ctx[CpuRegister.Rax] = 0;
@@ -2070,6 +2071,7 @@ public static class AgcExports
             }
 
             ParseSubmittedDcb(ctx, gpuState, queueState, commandAddress, dwordCount, tracePackets);
+            DrainResumableDcbs(ctx, gpuState, tracePackets);
         }
 
         ctx[CpuRegister.Rax] = 0;
@@ -2370,12 +2372,23 @@ public static class AgcExports
                 register is RWaitMem32 or RWaitMem64 &&
                 length >= (register == RWaitMem32 ? 6u : 9u))
             {
-                ObserveSubmittedWaitRegMem(ctx, currentAddress, register == RWaitMem64, tracePackets);
+                if (HandleSubmittedWaitRegMem(
+                        ctx, state, commandAddress, currentAddress, offset, length,
+                        dwordCount, is64Bit: register == RWaitMem64, isStandard: false,
+                        tracePackets))
+                {
+                    return; // DCB suspended until the awaited label is written
+                }
             }
 
             if (op == ItWaitRegMem && length >= 7)
             {
-                ObserveSubmittedStandardWaitRegMem(ctx, currentAddress, tracePackets);
+                if (HandleSubmittedWaitRegMem(
+                        ctx, state, commandAddress, currentAddress, offset, length,
+                        dwordCount, is64Bit: false, isStandard: true, tracePackets))
+                {
+                    return; // DCB suspended until the awaited label is written
+                }
             }
 
             if (TryReadSubmittedDrawCount(
@@ -2840,96 +2853,208 @@ public static class AgcExports
         }
     }
 
-    private static void ObserveSubmittedWaitRegMem(
+    // SHARPEMU_GPU_WAIT_MODE=force reverts to the legacy behaviour of faking a
+    // satisfying value at parse time. Default (suspend) properly suspends the
+    // DCB on an unmet WAIT_REG_MEM and resumes it once the awaited completion
+    // label is genuinely written by a later submit — preserving cross-submit
+    // ordering so the work after a wait (e.g. the final composite) does not run
+    // ahead of the compute it samples.
+    private static readonly bool _gpuWaitSuspendEnabled = !string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_GPU_WAIT_MODE"),
+        "force",
+        StringComparison.OrdinalIgnoreCase);
+
+    // Safety valve: a completion label the guest expects but that we never
+    // write (work we do not model) would otherwise suspend its DCB forever.
+    // Force-satisfy + resume waiters older than this. SHARPEMU_GPU_WAIT_FALLBACK_MS
+    // overrides (0 disables the valve); default 3s.
+    private static readonly long _gpuWaitStaleTicks =
+        (long.TryParse(
+             Environment.GetEnvironmentVariable("SHARPEMU_GPU_WAIT_FALLBACK_MS"),
+             out var fallbackMs) && fallbackMs >= 0
+            ? fallbackMs
+            : 3000L) * System.Diagnostics.Stopwatch.Frequency / 1000L;
+
+    // Reads the WAIT_REG_MEM watched address, reference, mask, and 3-bit compare
+    // function for both the AGC NOP-encapsulated (RWaitMem32/64) and the standard
+    // ItWaitRegMem packet layouts.
+    private static bool TryParseSubmittedWait(
         CpuContext ctx,
         ulong packetAddress,
         bool is64Bit,
-        bool tracePacket)
+        bool isStandard,
+        out ulong waitAddress,
+        out ulong reference,
+        out ulong mask,
+        out uint compareFunction)
     {
-        if (!TryReadUInt64(ctx, packetAddress + 4, out var address) ||
-            !TryReadUInt32(ctx, packetAddress + (is64Bit ? 28u : 16u), out var control))
+        waitAddress = 0;
+        reference = 0;
+        mask = 0;
+        compareFunction = 0;
+        if (isStandard)
         {
-            return;
+            if (!TryReadUInt32(ctx, packetAddress + 4, out var stdControl) ||
+                !TryReadUInt64(ctx, packetAddress + 8, out waitAddress) ||
+                !TryReadUInt32(ctx, packetAddress + 16, out var stdRef) ||
+                !TryReadUInt32(ctx, packetAddress + 20, out var stdMask))
+            {
+                return false;
+            }
+
+            compareFunction = stdControl & 0x7u;
+            reference = stdRef;
+            mask = stdMask;
+            return true;
         }
 
-        ulong mask;
-        ulong reference;
-        ulong value;
+        if (!TryReadUInt64(ctx, packetAddress + 4, out waitAddress) ||
+            !TryReadUInt32(ctx, packetAddress + (is64Bit ? 28u : 16u), out var control))
+        {
+            return false;
+        }
+
+        compareFunction = control & 0x7u;
         if (is64Bit)
         {
-            if (!TryReadUInt64(ctx, packetAddress + 12, out mask) ||
-                !TryReadUInt64(ctx, packetAddress + 20, out reference) ||
-                !TryReadUInt64(ctx, address, out value))
-            {
-                return;
-            }
+            return TryReadUInt64(ctx, packetAddress + 12, out mask) &&
+                   TryReadUInt64(ctx, packetAddress + 20, out reference);
+        }
+
+        if (!TryReadUInt32(ctx, packetAddress + 12, out var mask32) ||
+            !TryReadUInt32(ctx, packetAddress + 20, out var reference32))
+        {
+            return false;
+        }
+
+        mask = mask32;
+        reference = reference32;
+        return true;
+    }
+
+    // Returns true when the DCB should suspend parsing at this wait (its
+    // continuation was registered into GpuWaitRegistry); false to keep parsing
+    // (already satisfied, unreadable, or legacy force-satisfy mode).
+    private static bool HandleSubmittedWaitRegMem(
+        CpuContext ctx,
+        SubmittedDcbState state,
+        ulong commandAddress,
+        ulong packetAddress,
+        uint offset,
+        uint length,
+        uint dwordCount,
+        bool is64Bit,
+        bool isStandard,
+        bool tracePacket)
+    {
+        if (!TryParseSubmittedWait(
+                ctx, packetAddress, is64Bit, isStandard,
+                out var waitAddress, out var reference, out var mask, out var compareFunction))
+        {
+            return false;
+        }
+
+        ulong currentValue = 0;
+        bool hasCurrent;
+        if (is64Bit)
+        {
+            hasCurrent = TryReadUInt64(ctx, waitAddress, out currentValue);
+        }
+        else if (TryReadUInt32(ctx, waitAddress, out var current32))
+        {
+            currentValue = current32;
+            hasCurrent = true;
         }
         else
         {
-            if (!TryReadUInt32(ctx, packetAddress + 12, out var mask32) ||
-                !TryReadUInt32(ctx, packetAddress + 20, out var reference32) ||
-                !TryReadUInt32(ctx, address, out var value32))
-            {
-                return;
-            }
-
-            mask = mask32;
-            reference = reference32;
-            value = value32;
+            hasCurrent = false;
         }
 
-        var compareFunction = control & 0xFFu;
-        ForceSatisfyGpuWait(ctx, address, value, mask, reference, compareFunction, is64Bit);
         TraceSubmittedWait(
-            address,
-            value,
-            mask,
-            reference,
-            compareFunction,
-            is64Bit ? 64 : 32,
-            tracePacket);
+            waitAddress, currentValue, mask, reference, compareFunction,
+            is64Bit ? 64 : 32, tracePacket);
+
+        var waiter = new GpuWaitRegistry.WaitingDcb
+        {
+            CommandBufferAddress = commandAddress,
+            ResumeAddress = packetAddress + ((ulong)length * sizeof(uint)),
+            TotalDwords = dwordCount,
+            ResumeOffset = offset + length,
+            ReferenceValue = reference,
+            Mask = mask,
+            CompareFunction = compareFunction,
+            Is64Bit = is64Bit,
+            RegisteredTicks = System.Diagnostics.Stopwatch.GetTimestamp(),
+            State = state,
+        };
+
+        if (hasCurrent && GpuWaitRegistry.Compare(waiter, currentValue))
+        {
+            return false; // already satisfied — keep parsing
+        }
+
+        if (!_gpuWaitSuspendEnabled)
+        {
+            if (hasCurrent)
+            {
+                ForceSatisfyGpuWait(ctx, waiter, currentValue);
+            }
+
+            return false;
+        }
+
+        if (!hasCurrent)
+        {
+            return false; // cannot evaluate the label — do not stall the DCB
+        }
+
+        GpuWaitRegistry.Register(waitAddress, waiter);
+        if (tracePacket)
+        {
+            TraceAgc(
+                $"agc.dcb.suspended addr=0x{waitAddress:X16} ref=0x{reference:X16} " +
+                $"mask=0x{mask:X16} cur=0x{currentValue:X16} cmp={compareFunction}");
+        }
+
+        return true;
     }
 
     /// <summary>
-    /// GPU work is executed synchronously, so by the time the guest submits a
-    /// WAIT_REG_MEM the awaited work is logically complete. If the wait would
-    /// still block — because a compute/EOP completion label was never written —
-    /// write a value that satisfies the comparison so neither the GPU-side wait
-    /// nor the guest's CPU-side poll on the same address spins forever. Only the
-    /// monotonic "reached a value" comparisons are forced; equality-style
-    /// completion labels (the common compute-done signal) are the target.
+    /// Writes a value that satisfies the waiter's comparison so a wait whose
+    /// completion label is never written cannot deadlock. Used only by the
+    /// legacy force mode and the stale-waiter safety valve.
     /// </summary>
     private static void ForceSatisfyGpuWait(
         CpuContext ctx,
-        ulong address,
-        ulong value,
-        ulong mask,
-        ulong reference,
-        uint compareFunction,
-        bool is64Bit)
+        in GpuWaitRegistry.WaitingDcb waiter,
+        ulong value)
     {
+        var address = waiter.WaitAddress;
+        var mask = waiter.Mask;
         if (address == 0 || mask == 0)
         {
             return;
         }
 
-        var maskedValue = value & mask;
-        var maskedRef = reference & mask;
-        ulong? target = compareFunction switch
+        var maskedRef = waiter.ReferenceValue & mask;
+        ulong? satisfyMasked = waiter.CompareFunction switch
         {
-            2 when maskedValue > maskedRef => maskedRef,             // <=
-            3 when maskedValue != maskedRef => maskedRef,            // ==
-            5 when maskedValue < maskedRef => maskedRef,             // >=
+            1 => maskedRef == 0 ? null : (maskedRef - 1) & mask,            // <
+            2 => maskedRef,                                                 // <=
+            3 => maskedRef,                                                 // ==
+            4 => (~maskedRef) & mask,                                       // !=
+            5 => maskedRef,                                                 // >=
+            6 => maskedRef == mask ? null : (maskedRef + 1) & mask,         // >
             _ => null,
         };
 
-        if (target is not { } satisfyMasked)
+        if (satisfyMasked is not { } satisfy)
         {
             return;
         }
 
-        var newValue = (value & ~mask) | (satisfyMasked & mask);
-        if (is64Bit)
+        var newValue = (value & ~mask) | (satisfy & mask);
+        if (waiter.Is64Bit)
         {
             ctx.TryWriteUInt64(address, newValue);
         }
@@ -2939,23 +3064,90 @@ public static class AgcExports
         }
     }
 
-    private static void ObserveSubmittedStandardWaitRegMem(
+    // WAIT_REG_MEM packets whose condition is not met suspend their DCB into
+    // GpuWaitRegistry. Each submit re-checks every suspended DCB against current
+    // guest memory (labels are advanced by ReleaseMem/WriteData/DmaData packets
+    // or direct CPU writes) and resumes the ones now satisfied. A resumed DCB
+    // can itself write labels that unblock others, so loop to a fixed point.
+    private static void DrainResumableDcbs(
         CpuContext ctx,
-        ulong packetAddress,
-        bool tracePacket)
+        SubmittedGpuState gpuState,
+        bool tracePackets)
     {
-        if (!TryReadUInt32(ctx, packetAddress + 4, out var control) ||
-            !TryReadUInt64(ctx, packetAddress + 8, out var address) ||
-            !TryReadUInt32(ctx, packetAddress + 16, out var reference) ||
-            !TryReadUInt32(ctx, packetAddress + 20, out var mask) ||
-            !TryReadUInt32(ctx, address, out var value))
+        if (!_gpuWaitSuspendEnabled)
         {
             return;
         }
 
-        var compareFunction = control & 0x7u;
-        ForceSatisfyGpuWait(ctx, address, value, mask, reference, compareFunction, is64Bit: false);
-        TraceSubmittedWait(address, value, mask, reference, compareFunction, 32, tracePacket);
+        for (var pass = 0; pass < 256; pass++)
+        {
+            var woken = GpuWaitRegistry.CollectSatisfied((address, is64Bit) =>
+                is64Bit
+                    ? TryReadUInt64(ctx, address, out var value64) ? value64 : (ulong?)null
+                    : TryReadUInt32(ctx, address, out var value32) ? value32 : (ulong?)null);
+
+            if (woken is null)
+            {
+                if (_gpuWaitStaleTicks > 0 &&
+                    GpuWaitRegistry.CollectStale(
+                        System.Diagnostics.Stopwatch.GetTimestamp(),
+                        _gpuWaitStaleTicks) is { } stale)
+                {
+                    foreach (var waiter in stale)
+                    {
+                        ResumeSuspendedDcb(ctx, gpuState, waiter, tracePackets, forced: true);
+                    }
+
+                    continue;
+                }
+
+                return;
+            }
+
+            foreach (var waiter in woken)
+            {
+                ResumeSuspendedDcb(ctx, gpuState, waiter, tracePackets, forced: false);
+            }
+        }
+    }
+
+    private static void ResumeSuspendedDcb(
+        CpuContext ctx,
+        SubmittedGpuState gpuState,
+        in GpuWaitRegistry.WaitingDcb waiter,
+        bool tracePackets,
+        bool forced)
+    {
+        if (forced)
+        {
+            ulong value = 0;
+            if (waiter.Is64Bit)
+            {
+                TryReadUInt64(ctx, waiter.WaitAddress, out value);
+            }
+            else if (TryReadUInt32(ctx, waiter.WaitAddress, out var value32))
+            {
+                value = value32;
+            }
+
+            ForceSatisfyGpuWait(ctx, waiter, value);
+        }
+
+        var remainingDwords = waiter.TotalDwords - waiter.ResumeOffset;
+        if (remainingDwords == 0)
+        {
+            return;
+        }
+
+        if (tracePackets)
+        {
+            TraceAgc(
+                $"agc.dcb.resumed addr=0x{waiter.WaitAddress:X16} " +
+                $"resume=0x{waiter.ResumeAddress:X16} dwords={remainingDwords} forced={forced}");
+        }
+
+        var state = waiter.State as SubmittedDcbState ?? gpuState.Graphics;
+        ParseSubmittedDcb(ctx, gpuState, state, waiter.ResumeAddress, remainingDwords, tracePackets);
     }
 
     private static void TraceSubmittedWait(
