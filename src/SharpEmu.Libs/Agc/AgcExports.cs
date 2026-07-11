@@ -5858,6 +5858,12 @@ public static class AgcExports
             29 => 4UL,
             36 => 1UL,
             49 => 1UL,
+            // Texture-descriptor format 50 is the sampled view of an
+            // A2R10G10B10 (render format 9) surface — 32bpp. Without a
+            // bytes-per-texel entry GetTextureByteCount returns 0 and the
+            // texture resolver bails to a black fallback before it can alias
+            // the on-GPU render target (Void Terrarium's composite pass).
+            50 => 4UL,
             Gen5TextureFormatR8G8B8A8Unorm => 4UL,
             62 => 4UL,
             64 => 4UL,

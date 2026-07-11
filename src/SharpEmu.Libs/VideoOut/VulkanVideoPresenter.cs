@@ -956,6 +956,12 @@ internal static unsafe class VulkanVideoPresenter
             // numberType=1) miss the on-GPU alias and upload zeroed guest RAM
             // instead — the black composite. Registration already yields the
             // same code, so relaxing the guard makes the alias match succeed.
+            // Texture format 50 is the sampled view of an A2R10G10B10 (render
+            // format 9) surface; map it to the same canonical guest format so
+            // an on-GPU render target registered as 9 aliases when a composite
+            // pass samples it as 50 (otherwise the sample reads zeroed guest
+            // RAM and the frame is black).
+            (50, _) => 9,
             (_, _) when IsKnownGuestTextureFormat(format) => format,
             _ => 0,
         };
@@ -5293,6 +5299,10 @@ internal static unsafe class VulkanVideoPresenter
                 (29, _) => Format.R32Sfloat,
                 (36, _) => Format.R8Unorm,
                 (49, _) => Format.R8Uint,
+                // 50 = sampled view of an A2R10G10B10 render target (see
+                // GetGuestTextureFormat); the view must match the on-GPU image
+                // format so the alias binds with correct colors.
+                (50, _) => Format.A2R10G10B10UnormPack32,
                 (56, _) => Format.R8G8B8A8Unorm,
                 (62, _) => Format.R8G8B8A8Unorm,
                 (64, _) => Format.R8G8B8A8Unorm,
