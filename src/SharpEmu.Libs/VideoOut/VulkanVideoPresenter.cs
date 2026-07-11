@@ -1220,7 +1220,7 @@ internal static unsafe class VulkanVideoPresenter
         private sealed record PendingGuestSubmission(
             Fence Fence,
             CommandBuffer CommandBuffer,
-            TranslatedDrawResources Resources,
+            IReadOnlyList<TranslatedDrawResources> Resources,
             IReadOnlyList<GuestImageResource> TraceImages,
             string DebugName);
 
@@ -1990,9 +1990,58 @@ internal static unsafe class VulkanVideoPresenter
             return commandBuffer;
         }
 
+        // Translated draws are recorded into a shared command buffer and
+        // submitted once per drained work batch: on MoltenVK every
+        // vkQueueSubmit is a Metal command-buffer commit (~0.8ms), which used
+        // to be paid per draw and dominated the frame time.
+        private CommandBuffer _batchCommandBuffer;
+        private bool _batchOpen;
+        private int _batchDrawCount;
+        private readonly List<TranslatedDrawResources> _batchResources = new();
+        private readonly List<GuestImageResource> _batchTraceImages = new();
+
+        private CommandBuffer BeginBatchedGuestCommands()
+        {
+            if (_batchOpen)
+            {
+                return _batchCommandBuffer;
+            }
+
+            _batchCommandBuffer = AllocateGuestCommandBuffer();
+            var beginInfo = new CommandBufferBeginInfo
+            {
+                SType = StructureType.CommandBufferBeginInfo,
+                Flags = CommandBufferUsageFlags.OneTimeSubmitBit,
+            };
+            Check(
+                _vk.BeginCommandBuffer(_batchCommandBuffer, &beginInfo),
+                "vkBeginCommandBuffer(batch)");
+            _batchOpen = true;
+            _batchDrawCount = 0;
+            return _batchCommandBuffer;
+        }
+
+        private void FlushBatchedGuestCommands()
+        {
+            if (!_batchOpen)
+            {
+                return;
+            }
+
+            _batchOpen = false;
+            Check(_vk.EndCommandBuffer(_batchCommandBuffer), "vkEndCommandBuffer(batch)");
+            SubmitGuestCommandBuffer(
+                _batchCommandBuffer,
+                _batchResources.ToArray(),
+                _batchTraceImages.ToArray());
+            _batchResources.Clear();
+            _batchTraceImages.Clear();
+            _batchCommandBuffer = default;
+        }
+
         private void SubmitGuestCommandBuffer(
             CommandBuffer commandBuffer,
-            TranslatedDrawResources resources,
+            IReadOnlyList<TranslatedDrawResources> resources,
             IReadOnlyList<GuestImageResource> traceImages)
         {
             var fenceInfo = new FenceCreateInfo
@@ -2027,7 +2076,7 @@ internal static unsafe class VulkanVideoPresenter
                     commandBuffer,
                     resources,
                     traceImages,
-                    resources.DebugName));
+                    resources.Count > 0 ? resources[0].DebugName : "batch"));
         }
 
         private void SubmitGuestCommandBufferAndWait(CommandBuffer commandBuffer)
@@ -2102,7 +2151,11 @@ internal static unsafe class VulkanVideoPresenter
                     TraceGuestImageContents(image);
                 }
 
-                DestroyTranslatedDrawResources(submission.Resources);
+                foreach (var resources in submission.Resources)
+                {
+                    DestroyTranslatedDrawResources(resources);
+                }
+
                 var commandBuffer = submission.CommandBuffer;
                 _vk.FreeCommandBuffers(
                     _device,
@@ -4501,6 +4554,7 @@ internal static unsafe class VulkanVideoPresenter
 
         private void ExecuteComputeDispatch(VulkanComputeGuestDispatch work)
         {
+            FlushBatchedGuestCommands();
             if (_deviceLost)
             {
                 return;
@@ -4587,7 +4641,7 @@ internal static unsafe class VulkanVideoPresenter
                     {
                         SubmitGuestCommandBuffer(
                             commandBuffer,
-                            resources,
+                            [resources],
                             GetTraceImages(resources));
                         submitted = true;
                     }
@@ -4745,16 +4799,14 @@ internal static unsafe class VulkanVideoPresenter
                     $"SharpEmu offscreen rt=0x{work.Target.Address:X16} " +
                     $"{work.Target.Width}x{work.Target.Height} fmt{work.Target.Format}";
 
-                commandBuffer = AllocateGuestCommandBuffer();
+                commandBuffer = BeginBatchedGuestCommands();
                 _commandBuffer = commandBuffer;
-                var beginInfo = new CommandBufferBeginInfo
-                {
-                    SType = StructureType.CommandBufferBeginInfo,
-                    Flags = CommandBufferUsageFlags.OneTimeSubmitBit,
-                };
-                Check(
-                    _vk.BeginCommandBuffer(_commandBuffer, &beginInfo),
-                    "vkBeginCommandBuffer(offscreen)");
+
+                // Lifetime: recorded commands reference these resources, so
+                // they join the batch before recording and are destroyed only
+                // after the batch's fence signals.
+                _batchResources.Add(resources);
+                submitted = true;
 
                 BeginDebugLabel(_commandBuffer, resources.DebugName);
                 RecordTextureUploads(resources, PipelineStageFlags.FragmentShaderBit);
@@ -4820,12 +4872,12 @@ internal static unsafe class VulkanVideoPresenter
                     &toShaderRead);
                 EndDebugLabel(_commandBuffer);
 
-                Check(_vk.EndCommandBuffer(_commandBuffer), "vkEndCommandBuffer(offscreen)");
-                SubmitGuestCommandBuffer(
-                    commandBuffer,
-                    resources,
-                    GetTraceImages(resources, target));
-                submitted = true;
+                _batchTraceImages.AddRange(GetTraceImages(resources, target));
+                if (++_batchDrawCount >= 64)
+                {
+                    FlushBatchedGuestCommands();
+                }
+
                 target.Initialized = true;
                 MarkSampledImagesInitialized(resources);
                 MarkStorageImagesInitialized(resources, traceContents: false);
@@ -4852,6 +4904,7 @@ internal static unsafe class VulkanVideoPresenter
                     if (writeCount <= (traceSmallWrites ? 48 : 3))
                     {
                         _commandBuffer = _presentationCommandBuffer;
+                        FlushBatchedGuestCommands();
                         Check(
                             _vk.QueueWaitIdle(_queue),
                             "vkQueueWaitIdle(guest write trace)");
@@ -4890,15 +4943,10 @@ internal static unsafe class VulkanVideoPresenter
             finally
             {
                 _commandBuffer = _presentationCommandBuffer;
-                if (!submitted && commandBuffer.Handle != 0)
-                {
-                    _vk.FreeCommandBuffers(
-                        _device,
-                        _commandPool,
-                        1,
-                        &commandBuffer);
-                }
-
+                // The command buffer is the shared batch; it is submitted and
+                // freed by FlushBatchedGuestCommands. Resources joined the
+                // batch list before recording, so only pre-recording failures
+                // (submitted still false) own their cleanup here.
                 if (!submitted && resources is not null)
                 {
                     DestroyTranslatedDrawResources(resources);
@@ -4913,6 +4961,10 @@ internal static unsafe class VulkanVideoPresenter
             {
                 return;
             }
+
+            // Runs on its own command buffer; earlier batched draws must land
+            // first to keep queue-order semantics.
+            FlushBatchedGuestCommands();
 
             if (work.Pixels is { } pixels)
             {
@@ -5019,6 +5071,7 @@ internal static unsafe class VulkanVideoPresenter
 
         private void UploadGuestImageInitialData(GuestImageResource target, byte[] pixels)
         {
+            FlushBatchedGuestCommands();
             var byteCount = (ulong)pixels.Length;
             var staging = CreateBuffer(
                 byteCount,
@@ -5634,6 +5687,8 @@ internal static unsafe class VulkanVideoPresenter
 
                 completedWork++;
             }
+
+            FlushBatchedGuestCommands();
 
             if (!TryTakePresentation(_presentedSequence, out var presentation))
             {
