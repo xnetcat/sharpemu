@@ -53,6 +53,10 @@ public static class AudioOutExports
         public int BufferByteLength =>
             checked((int)BufferLength * Channels * BytesPerSample);
 
+        // Linear playback gain, 1.0 == 0 dB (guest volume 32768). Updated by
+        // sceAudioOutSetVolume and applied during downmix.
+        public volatile float Volume = 1.0f;
+
         public void PaceSilence()
         {
             long delay;
@@ -164,7 +168,7 @@ public static class AudioOutExports
     [SysAbiExport(
         Nid = "QOQtbeDqsT4",
         ExportName = "sceAudioOutOutput",
-        Target = Generation.Gen5,
+        Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libSceAudioOut")]
     public static int AudioOutOutput(CpuContext ctx)
     {
@@ -195,7 +199,8 @@ public static class AudioOutExports
                     port.BufferLength,
                     port.Channels,
                     port.BytesPerSample,
-                    port.IsFloat))
+                    port.IsFloat,
+                    port.Volume))
             {
                 port.PaceSilence();
             }
@@ -216,11 +221,46 @@ public static class AudioOutExports
     public static int AudioOutSetVolume(CpuContext ctx)
     {
         var handle = unchecked((int)ctx[CpuRegister.Rdi]);
-        return SetReturn(
-            ctx,
-            Ports.ContainsKey(handle)
-                ? 0
-                : (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        var channelFlags = unchecked((uint)ctx[CpuRegister.Rsi]);
+        var volumeArrayAddress = ctx[CpuRegister.Rdx];
+        if (!Ports.TryGetValue(handle, out var port))
+        {
+            return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        // sceAudioOutSetVolume takes a per-channel volume array (0..32768,
+        // where 32768 == 0 dB) plus a channel bitmask. Collapse the enabled
+        // channels to a single linear master gain for the stereo downmix.
+        const int unityVolume = 32768;
+        var maxVolume = 0;
+        var found = false;
+        if (volumeArrayAddress != 0)
+        {
+            for (var channel = 0; channel < 8; channel++)
+            {
+                if ((channelFlags & (1u << channel)) == 0)
+                {
+                    continue;
+                }
+
+                Span<byte> raw = stackalloc byte[sizeof(int)];
+                if (!ctx.Memory.TryRead(volumeArrayAddress + (ulong)(channel * sizeof(int)), raw))
+                {
+                    return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+                }
+
+                var value = System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(raw);
+                maxVolume = Math.Max(maxVolume, value);
+                found = true;
+            }
+        }
+
+        if (found)
+        {
+            port.Volume = Math.Clamp(maxVolume / (float)unityVolume, 0f, 1f);
+        }
+
+        return SetReturn(ctx, 0);
     }
 
     private static int SetReturn(CpuContext ctx, int result)

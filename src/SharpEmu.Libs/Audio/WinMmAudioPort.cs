@@ -57,7 +57,8 @@ internal sealed class WinMmAudioPort : IHostAudioPort
         uint frames,
         int channels,
         int bytesPerSample,
-        bool isFloat)
+        bool isFloat,
+        float volume)
     {
         lock (_gate)
         {
@@ -88,7 +89,8 @@ internal sealed class WinMmAudioPort : IHostAudioPort
                     checked((int)frames),
                     channels,
                     bytesPerSample,
-                    isFloat);
+                    isFloat,
+                    volume);
                 return QueueBuffer(output.AsSpan(0, outputLength));
             }
             finally

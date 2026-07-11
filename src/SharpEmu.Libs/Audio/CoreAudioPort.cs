@@ -68,7 +68,8 @@ internal sealed unsafe class CoreAudioPort : IHostAudioPort
         uint frames,
         int channels,
         int bytesPerSample,
-        bool isFloat)
+        bool isFloat,
+        float volume)
     {
         lock (_gate)
         {
@@ -115,7 +116,8 @@ internal sealed unsafe class CoreAudioPort : IHostAudioPort
                     checked((int)frames),
                     channels,
                     bytesPerSample,
-                    isFloat);
+                    isFloat,
+                    volume);
                 converted.AsSpan(0, outputLength).CopyTo(new Span<byte>(audioData, outputLength));
             }
             finally
