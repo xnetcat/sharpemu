@@ -5801,10 +5801,19 @@ internal static unsafe class VulkanVideoPresenter
                         _availableGuestImages[target.Address] = guestTextureFormat;
                     }
                 }
+                var guestWritesMode = Environment.GetEnvironmentVariable("SHARPEMU_TRACE_GUEST_WRITES");
                 var traceSmallWrites =
-                    Environment.GetEnvironmentVariable("SHARPEMU_TRACE_GUEST_WRITES") == "small" &&
+                    guestWritesMode == "small" &&
                     target.Width <= 512 && target.Height <= 256;
-                if (ShouldTraceGuestImageWriteForDiagnostics(target.Address) || traceSmallWrites)
+                // "large" mode: read back every >=2560x1440 render target right
+                // after it is drawn, so the composite chain (G-buffers -> lighting
+                // -> final composite -> display buffer) can be traced to find
+                // exactly where a target goes black (unproduced input vs. a bad
+                // shader that outputs black from non-black inputs).
+                var traceLargeWrites =
+                    guestWritesMode == "large" &&
+                    target.Width >= 2560 && target.Height >= 1440;
+                if (ShouldTraceGuestImageWriteForDiagnostics(target.Address) || traceSmallWrites || traceLargeWrites)
                 {
                     var writeCount = _tracedGuestWriteCounts.TryGetValue(
                         target.Address,
@@ -5812,7 +5821,7 @@ internal static unsafe class VulkanVideoPresenter
                         ? previousCount + 1
                         : 1;
                     _tracedGuestWriteCounts[target.Address] = writeCount;
-                    if (writeCount <= (traceSmallWrites ? 48 : 3))
+                    if (writeCount <= (traceLargeWrites ? 2 : traceSmallWrites ? 48 : 3))
                     {
                         _commandBuffer = _presentationCommandBuffer;
                         FlushBatchedGuestCommands();
