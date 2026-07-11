@@ -3509,7 +3509,8 @@ public static class AgcExports
                     globalBufferBase: pixelEvaluation.GlobalMemoryBindings.Count,
                     totalGlobalBufferCount: totalGlobalBuffers,
                     imageBindingBase: pixelEvaluation.ImageBindings.Count,
-                    initialScalarBufferIndex: _bakeScalars ? -1 : guestGlobalBuffers + 1))
+                    initialScalarBufferIndex: _bakeScalars ? -1 : guestGlobalBuffers + 1,
+                    requiredVertexOutputCount: (int)GetInterpolatedAttributeCount(pixelState)))
             {
                 ReturnPooledEvaluationArrays(exportEvaluation);
                 ReturnPooledEvaluationArrays(pixelEvaluation);

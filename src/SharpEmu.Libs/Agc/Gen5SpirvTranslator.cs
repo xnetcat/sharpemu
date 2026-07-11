@@ -46,7 +46,8 @@ internal static partial class Gen5SpirvTranslator
         int globalBufferBase = 0,
         int totalGlobalBufferCount = -1,
         int imageBindingBase = 0,
-        int initialScalarBufferIndex = -1)
+        int initialScalarBufferIndex = -1,
+        int requiredVertexOutputCount = 0)
     {
         var context = new CompilationContext(
             Gen5SpirvStage.Vertex,
@@ -59,7 +60,8 @@ internal static partial class Gen5SpirvTranslator
             globalBufferBase,
             totalGlobalBufferCount,
             imageBindingBase,
-            initialScalarBufferIndex);
+            initialScalarBufferIndex,
+            requiredVertexOutputCount: requiredVertexOutputCount);
         return context.TryCompile(out shader, out error);
     }
 
@@ -101,6 +103,13 @@ internal static partial class Gen5SpirvTranslator
         // (deferred G-buffer) draw compiles one pixel variant per slot, each
         // selecting that slot's export here.
         private readonly int _pixelRenderTargetSlot;
+        // Vertex stage only: the fragment shader paired with this vertex shader
+        // declares interpolated inputs for locations 0..(this-1). Metal requires
+        // every fragment input location to be written by the vertex shader, so
+        // the vertex stage must export at least this many param outputs (any it
+        // does not naturally export are zero-filled) or pipeline creation fails
+        // with "Fragment input(s) `user(locnN)` ... not written by vertex shader".
+        private readonly int _requiredVertexOutputCount;
         private readonly uint _localSizeX;
         private readonly uint _localSizeY;
         private readonly uint _localSizeZ;
@@ -184,9 +193,11 @@ internal static partial class Gen5SpirvTranslator
             int totalGlobalBufferCount,
             int imageBindingBase,
             int initialScalarBufferIndex,
-            int pixelRenderTargetSlot = 0)
+            int pixelRenderTargetSlot = 0,
+            int requiredVertexOutputCount = 0)
         {
             _stage = stage;
+            _requiredVertexOutputCount = requiredVertexOutputCount;
             _state = state;
             _evaluation = evaluation;
             _outputKind = outputKind;
@@ -668,6 +679,13 @@ internal static partial class Gen5SpirvTranslator
                     .OfType<Gen5ExportControl>()
                     .Where(export => export.Target is >= 32 and < 64)
                     .Select(export => export.Target - 32)
+                    // Cover every location the paired fragment shader reads, even
+                    // ones this vertex program never exports, so Metal's exact
+                    // vertex-out/fragment-in interface match succeeds. Extras are
+                    // zero-filled in EmitInitialState.
+                    .Concat(Enumerable
+                        .Range(0, Math.Max(_requiredVertexOutputCount, 0))
+                        .Select(location => (uint)location))
                     .Distinct()
                     .Order()
                     .ToArray();
@@ -839,6 +857,16 @@ internal static partial class Gen5SpirvTranslator
             {
                 StoreV(5, Load(_uintType, _vertexIndexInput), guardWithExec: false);
                 StoreV(8, Load(_uintType, _instanceIndexInput), guardWithExec: false);
+
+                // Give every declared param output a defined starting value.
+                // Outputs the program actually exports overwrite this; the
+                // extras that only exist to satisfy the fragment interface stay
+                // zero. The explicit store also keeps SPIRV-Cross from pruning
+                // an unexported output (which would re-break the interface).
+                foreach (var output in _vertexOutputs.Values)
+                {
+                    Store(output, _module.ConstantNull(_vec4Type));
+                }
             }
             else if (_stage == Gen5SpirvStage.Pixel)
             {

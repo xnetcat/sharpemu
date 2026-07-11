@@ -1311,6 +1311,11 @@ internal static unsafe class VulkanVideoPresenter
             public uint InstanceCount = 1;
             public PrimitiveTopology Topology = PrimitiveTopology.TriangleList;
             public VulkanGuestBlendState Blend = VulkanGuestBlendState.Default;
+            // Vulkan format of this draw's color target. Needed to suppress
+            // blending on formats Metal cannot blend (integer / 32-bit float),
+            // which otherwise makes vkCreateGraphicsPipelines fail and can
+            // trip a Metal validation assertion.
+            public Format TargetFormat = Format.Undefined;
             public VulkanGuestRect? Scissor;
             public VulkanGuestViewport? Viewport;
             public VulkanGuestRasterState Raster = VulkanGuestRasterState.Default;
@@ -3067,7 +3072,8 @@ internal static unsafe class VulkanVideoPresenter
         private TranslatedDrawResources CreateTranslatedDrawResources(
             VulkanTranslatedGuestDraw draw,
             RenderPass renderPass,
-            Extent2D extent)
+            Extent2D extent,
+            Format targetFormat)
         {
             var vertexSpirv = draw.VertexSpirv;
             if (vertexSpirv.Length == 0 &&
@@ -3094,6 +3100,7 @@ internal static unsafe class VulkanVideoPresenter
                 Viewport = draw.RenderState.Viewport,
                 Raster = draw.RenderState.Raster,
                 Depth = draw.RenderState.Depth,
+                TargetFormat = targetFormat,
             };
 
             try
@@ -3600,7 +3607,8 @@ internal static unsafe class VulkanVideoPresenter
                     };
                     var colorBlendAttachment = new PipelineColorBlendAttachmentState
                     {
-                        BlendEnable = resources.Blend.Enable,
+                        BlendEnable = resources.Blend.Enable &&
+                            IsBlendableFormat(resources.TargetFormat),
                         SrcColorBlendFactor = ToVkBlendFactor(resources.Blend.ColorSrcFactor),
                         DstColorBlendFactor = ToVkBlendFactor(resources.Blend.ColorDstFactor),
                         ColorBlendOp = ToVkBlendOp(resources.Blend.ColorFunc),
@@ -5653,7 +5661,8 @@ internal static unsafe class VulkanVideoPresenter
                 resources = CreateTranslatedDrawResources(
                     work.Draw,
                     target.RenderPass,
-                    extent);
+                    extent,
+                    format);
                 resources.DebugName =
                     $"SharpEmu offscreen rt=0x{work.Target.Address:X16} " +
                     $"{work.Target.Width}x{work.Target.Height} fmt{work.Target.Format}";
@@ -6723,7 +6732,8 @@ internal static unsafe class VulkanVideoPresenter
                     translatedResources = CreateTranslatedDrawResources(
                         translatedDraw,
                         _renderPass,
-                        _extent);
+                        _extent,
+                        _swapchainFormat);
                     if (ShouldTracePresentedGuestImageContentsForDiagnostics() &&
                         !_firstGuestDrawPresented &&
                         translatedResources.Textures is
@@ -7154,6 +7164,28 @@ internal static unsafe class VulkanVideoPresenter
                 $"{sequence:D4}-0x{image.Address:X16}-{image.Width}x{image.Height}-{image.Format}.rgba");
             File.WriteAllBytes(path, bytes.ToArray());
         }
+
+        // Metal cannot blend into integer render targets or 32-bit-per-channel
+        // float targets (unsupported on Apple-family GPUs). Enabling blend on
+        // one makes vkCreateGraphicsPipelines fail with ErrorInitializationFailed
+        // (and trips a Metal "not blendable" validation assertion), so the draw
+        // is silently dropped. Force blend off for those; blending on an integer
+        // target is meaningless on real hardware anyway.
+        private static bool IsBlendableFormat(Format format) =>
+            format switch
+            {
+                Format.R8Uint or Format.R8Sint or
+                Format.R8G8B8A8Uint or Format.R8G8B8A8Sint or
+                Format.R16G16Uint or Format.R16G16Sint or
+                Format.R16G16B16A16Uint or Format.R16G16B16A16Sint or
+                Format.R32Uint or Format.R32Sint or
+                Format.R32G32Uint or Format.R32G32Sint or
+                Format.R32G32B32A32Uint or Format.R32G32B32A32Sint or
+                Format.R32Sfloat or
+                Format.R32G32Sfloat or
+                Format.R32G32B32A32Sfloat => false,
+                _ => true,
+            };
 
         private static uint GetReadbackBytesPerPixel(Format format) =>
             format switch
