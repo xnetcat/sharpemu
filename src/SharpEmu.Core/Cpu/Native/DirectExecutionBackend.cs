@@ -3501,6 +3501,12 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					case GuestNativeCallExitReason.Returned:
 						thread.ExitValue = thread.Context[CpuRegister.Rax];
 						thread.State = GuestThreadRunState.Exited;
+						if (_logGuestThreads)
+						Console.Error.WriteLine(
+							$"[LOADER][INFO] Guest thread exited: name='{thread.Name}' " +
+							$"exitValue=0x{thread.ExitValue:X16} imports={Interlocked.Read(ref thread.ImportCount)} " +
+							$"lastNid={Volatile.Read(ref thread.LastImportNid) ?? "none"} " +
+							$"entry=0x{thread.EntryPoint:X16} ret=0x{Volatile.Read(ref thread.LastReturnRip):X16}");
 						break;
 					case GuestNativeCallExitReason.Blocked:
 						thread.State = GuestThreadRunState.Blocked;
