@@ -2339,7 +2339,10 @@ public static partial class KernelMemoryCompatExports
             searchStart = 0;
         }
 
-        var align = alignment == 0 ? 0x1000UL : alignment;
+        // PS5 direct memory is allocated in 16 KiB pages; when the guest does
+        // not care about alignment, default to that granularity rather than the
+        // host 4 KiB page so physical offsets stay on true page boundaries.
+        var align = alignment == 0 ? OrbisPageSize : alignment;
         ulong selectedAddress;
         lock (_memoryGate)
         {
@@ -2408,7 +2411,7 @@ public static partial class KernelMemoryCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
-        var effectiveAlignment = alignment == 0 ? 0x1000UL : alignment;
+        var effectiveAlignment = alignment == 0 ? OrbisPageSize : alignment;
         ulong aligned;
         lock (_memoryGate)
         {
@@ -2567,7 +2570,7 @@ public static partial class KernelMemoryCompatExports
         ulong mappedAddress;
         lock (_memoryGate)
         {
-            var effectiveAlignment = alignment == 0 ? 0x1000UL : alignment;
+            var effectiveAlignment = alignment == 0 ? OrbisPageSize : alignment;
             var fixedMapping = (flags & 0x10UL) != 0;
             var desiredAddress = requestedAddress != 0
                 ? requestedAddress
@@ -4006,7 +4009,7 @@ public static partial class KernelMemoryCompatExports
             return 0;
         }
 
-        var effectiveAlignment = alignment == 0 ? 0x1000UL : alignment;
+        var effectiveAlignment = alignment == 0 ? OrbisPageSize : alignment;
         if (_nextVirtualAddress == 0)
         {
             _nextVirtualAddress = 0x0100_0000UL;
@@ -5330,7 +5333,7 @@ public static partial class KernelMemoryCompatExports
             return false;
         }
 
-        var effectiveAlignment = alignment == 0 ? 0x1000UL : alignment;
+        var effectiveAlignment = alignment == 0 ? OrbisPageSize : alignment;
         if (!TryFindAllocatableDirectMemoryRangeLocked(searchStart, searchEnd, length, effectiveAlignment, allocationLimit, out var freePosition) ||
             !TryAddU64(freePosition, length, out var endAddress))
         {
