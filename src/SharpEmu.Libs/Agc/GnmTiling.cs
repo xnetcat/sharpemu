@@ -26,15 +26,36 @@ internal static class GnmTiling
         "1",
         StringComparison.Ordinal);
 
+    private static readonly bool _disabled = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_DETILE"),
+        "0",
+        StringComparison.Ordinal);
+
     private static readonly HashSet<uint> _reportedModes = new();
 
-    public static bool Enabled => _enabled;
+    public static bool Enabled => _enabled || !_disabled;
+
+    /// <summary>
+    /// Base swizzle modes (256 B / 4 KiB / 64 KiB Z/S/D/R) whose blocks are laid
+    /// out linearly in memory, so the within-block equation alone deswizzles them
+    /// exactly. These are safe to detile by default. The bank/pipe-XOR variants
+    /// (_T = 13-16, _X = 21-27) reorder whole blocks in a way we only approximate,
+    /// so those stay behind SHARPEMU_DETILE=1 until validated per title.
+    /// </summary>
+    private static bool IsTrustedByDefault(uint swizzleMode) =>
+        swizzleMode is >= 1 and <= 12;
+
+    // Detile a surface when it is verified-correct by default (trusted base mode),
+    // or when the user opts the approximate modes in with SHARPEMU_DETILE=1.
+    // SHARPEMU_DETILE=0 forces the old raw-upload behavior for everything.
+    private static bool ShouldDetile(uint swizzleMode) =>
+        swizzleMode != 0 && !_disabled && (_enabled || IsTrustedByDefault(swizzleMode));
 
     /// <summary>
     /// True when a surface with the given swizzle mode needs deswizzling.
     /// Mode 0 is linear and never needs it.
     /// </summary>
-    public static bool NeedsDetile(uint swizzleMode) => _enabled && swizzleMode != 0;
+    public static bool NeedsDetile(uint swizzleMode) => ShouldDetile(swizzleMode);
 
     /// <summary>
     /// Deswizzles <paramref name="tiled"/> into linear row-major order.
@@ -51,7 +72,7 @@ internal static class GnmTiling
         int elementsHigh,
         int bytesPerElement)
     {
-        if (!_enabled || swizzleMode == 0 || elementsWide <= 0 || elementsHigh <= 0 || bytesPerElement <= 0)
+        if (!ShouldDetile(swizzleMode) || elementsWide <= 0 || elementsHigh <= 0 || bytesPerElement <= 0)
         {
             return false;
         }
@@ -88,23 +109,40 @@ internal static class GnmTiling
             return false;
         }
 
+        // Precompute the within-block element offset for each (x, y) inside a
+        // single block. The swizzle equation only depends on the in-block
+        // coordinates, so this table is reused for every block — turning the
+        // per-pixel bit-interleave (a loop + calls) into a single array lookup.
+        // Detiling a 2048x2048 texture is millions of elements; without this the
+        // per-pixel math makes DETILE unusably slow during asset streaming.
+        var blockTable = new int[blockWidth * blockHeight];
+        for (var by = 0; by < blockHeight; by++)
+        {
+            for (var bx = 0; bx < blockWidth; bx++)
+            {
+                blockTable[by * blockWidth + bx] = (int)(kind == SwizzleKind.ZOrder
+                    ? MortonInterleave((uint)bx, (uint)by, blockWidth, blockHeight)
+                    : StandardSwizzleOffset((uint)bx, (uint)by, blockWidth, blockHeight));
+            }
+        }
+
         for (var y = 0; y < elementsHigh; y++)
         {
+            var blockY = y / blockHeight;
+            var inBlockY = y % blockHeight;
+            var rowBlockBase = (long)blockY * blocksPerRow;
+            var tableRowBase = inBlockY * blockWidth;
+            var destRowBase = (long)y * elementsWide * bytesPerElement;
             for (var x = 0; x < elementsWide; x++)
             {
                 var blockX = x / blockWidth;
-                var blockY = y / blockHeight;
                 var inBlockX = x % blockWidth;
-                var inBlockY = y % blockHeight;
 
-                var blockIndex = blockY * blocksPerRow + blockX;
-                var withinBlock = kind == SwizzleKind.ZOrder
-                    ? MortonInterleave((uint)inBlockX, (uint)inBlockY, blockWidth, blockHeight)
-                    : StandardSwizzleOffset((uint)inBlockX, (uint)inBlockY, blockWidth, blockHeight);
+                var blockIndex = rowBlockBase + blockX;
+                var withinBlock = blockTable[tableRowBase + inBlockX];
 
-                var sourceElement = (long)blockIndex * blockElements + withinBlock;
-                var sourceByte = sourceElement * bytesPerElement;
-                var destByte = ((long)y * elementsWide + x) * bytesPerElement;
+                var sourceByte = (blockIndex * blockElements + withinBlock) * (long)bytesPerElement;
+                var destByte = destRowBase + (long)x * bytesPerElement;
                 if (sourceByte + bytesPerElement > tiled.Length ||
                     destByte + bytesPerElement > linear.Length)
                 {
