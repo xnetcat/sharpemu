@@ -790,6 +790,8 @@ public static class VideoOutExports
             flipEvents = new List<FlipEventRegistration>(port.FlipEvents);
         }
 
+        PaceFlip(port.FlipRate);
+
         if (submitGpuImage &&
             bufferIndex >= 0 &&
             TryGetDisplayBufferInfo(handle, bufferIndex, out var displayBuffer))
@@ -860,6 +862,51 @@ public static class VideoOutExports
             $"[LOADER][PERF] videoout submitted_fps={submitted / elapsedSeconds:F1} " +
             $"presented_fps={presentedCount / elapsedSeconds:F1} " +
             $"draws={draws} draw_ms={drawMs:F0} pipelines={pipelines} spirv={spirvCompiles}");
+    }
+
+    private static readonly bool _flipPacingDisabled = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_NO_FLIP_PACING"),
+        "1",
+        StringComparison.Ordinal);
+    private static long _lastFlipPacingTimestamp;
+
+    /// <summary>
+    /// Emulates the display vblank cadence: hardware completes flips at the
+    /// requested rate, which is what paces the game's main loop. Without this
+    /// the guest runs as fast as the GPU pipeline drains, so frame delivery
+    /// is bursty and animation judders. When the emulator runs slower than
+    /// the target rate the sleep never engages.
+    /// </summary>
+    private static void PaceFlip(int flipRate)
+    {
+        if (_flipPacingDisabled)
+        {
+            return;
+        }
+
+        var refreshRate = flipRate switch
+        {
+            1 => 30,
+            2 => 20,
+            _ => 60,
+        };
+        var intervalTicks = Stopwatch.Frequency / refreshRate;
+        var now = Stopwatch.GetTimestamp();
+        var last = Interlocked.Read(ref _lastFlipPacingTimestamp);
+        var target = last + intervalTicks;
+        if (target <= now)
+        {
+            Interlocked.CompareExchange(ref _lastFlipPacingTimestamp, now, last);
+            return;
+        }
+
+        var waitMilliseconds = (target - now) * 1000 / Stopwatch.Frequency;
+        if (waitMilliseconds is > 0 and < 100)
+        {
+            Thread.Sleep((int)waitMilliseconds);
+        }
+
+        Interlocked.CompareExchange(ref _lastFlipPacingTimestamp, target, last);
     }
 
     private static int RegisterBufferRange(VideoOutPortState port, int startIndex, ReadOnlySpan<ulong> addresses, BufferAttribute attribute, int requestedGroupIndex = -1)
