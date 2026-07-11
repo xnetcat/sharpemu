@@ -18,7 +18,8 @@ internal static partial class Gen5SpirvTranslator
         out string error,
         int globalBufferBase = 0,
         int totalGlobalBufferCount = -1,
-        int imageBindingBase = 0)
+        int imageBindingBase = 0,
+        int initialScalarBufferIndex = -1)
     {
         var context = new CompilationContext(
             Gen5SpirvStage.Pixel,
@@ -30,7 +31,8 @@ internal static partial class Gen5SpirvTranslator
             1,
             globalBufferBase,
             totalGlobalBufferCount,
-            imageBindingBase);
+            imageBindingBase,
+            initialScalarBufferIndex);
         return context.TryCompile(out shader, out error);
     }
 
@@ -41,7 +43,8 @@ internal static partial class Gen5SpirvTranslator
         out string error,
         int globalBufferBase = 0,
         int totalGlobalBufferCount = -1,
-        int imageBindingBase = 0)
+        int imageBindingBase = 0,
+        int initialScalarBufferIndex = -1)
     {
         var context = new CompilationContext(
             Gen5SpirvStage.Vertex,
@@ -53,7 +56,8 @@ internal static partial class Gen5SpirvTranslator
             1,
             globalBufferBase,
             totalGlobalBufferCount,
-            imageBindingBase);
+            imageBindingBase,
+            initialScalarBufferIndex);
         return context.TryCompile(out shader, out error);
     }
 
@@ -76,7 +80,8 @@ internal static partial class Gen5SpirvTranslator
             Math.Max(localSizeZ, 1),
             0,
             -1,
-            0);
+            0,
+            -1);
         return context.TryCompile(out shader, out error);
     }
 
@@ -93,6 +98,7 @@ internal static partial class Gen5SpirvTranslator
         private readonly int _globalBufferBase;
         private readonly int _totalGlobalBufferCount;
         private readonly int _imageBindingBase;
+        private readonly int _initialScalarBufferIndex;
         private readonly List<uint> _interfaces = [];
         private readonly Dictionary<uint, uint> _pixelInputs = [];
         private readonly Dictionary<uint, uint> _vertexOutputs = [];
@@ -167,7 +173,8 @@ internal static partial class Gen5SpirvTranslator
             uint localSizeZ,
             int globalBufferBase,
             int totalGlobalBufferCount,
-            int imageBindingBase)
+            int imageBindingBase,
+            int initialScalarBufferIndex)
         {
             _stage = stage;
             _state = state;
@@ -181,6 +188,7 @@ internal static partial class Gen5SpirvTranslator
                 ? evaluation.GlobalMemoryBindings.Count
                 : totalGlobalBufferCount;
             _imageBindingBase = imageBindingBase;
+            _initialScalarBufferIndex = initialScalarBufferIndex;
         }
 
         public bool TryCompile(out Gen5SpirvShader shader, out string error)
@@ -767,15 +775,38 @@ internal static partial class Gen5SpirvTranslator
 
         private void EmitInitialState()
         {
-            for (uint index = 0;
-                 index < _evaluation.InitialScalarRegisters.Count &&
-                 index < ScalarRegisterCount;
-                 index++)
+            if (_initialScalarBufferIndex >= 0)
             {
-                var value = _evaluation.InitialScalarRegisters[(int)index];
-                if (value != 0)
+                // Initial scalar registers arrive in a per-draw buffer instead
+                // of being baked as constants, so animated user data (colors,
+                // scroll offsets) reuses one translation and pipeline. Only
+                // registers the program can observe need loading.
+                var consumed = Gen5ShaderTranslator.ComputeConsumedScalarMask(_state.Program);
+                for (uint index = 0;
+                     index < _evaluation.InitialScalarRegisters.Count &&
+                     index < ScalarRegisterCount;
+                     index++)
                 {
-                    StoreS(index, UInt(value));
+                    if (Gen5ShaderTranslator.IsScalarConsumed(consumed, index))
+                    {
+                        StoreS(
+                            index,
+                            LoadBufferWord(_initialScalarBufferIndex, UInt(index)));
+                    }
+                }
+            }
+            else
+            {
+                for (uint index = 0;
+                     index < _evaluation.InitialScalarRegisters.Count &&
+                     index < ScalarRegisterCount;
+                     index++)
+                {
+                    var value = _evaluation.InitialScalarRegisters[(int)index];
+                    if (value != 0)
+                    {
+                        StoreS(index, UInt(value));
+                    }
                 }
             }
 

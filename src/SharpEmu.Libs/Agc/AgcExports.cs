@@ -339,7 +339,9 @@ public static class AgcExports
         VulkanGuestRenderState RenderState,
         IReadOnlyList<uint> PixelUserData,
         uint RawBlendControl,
-        uint RawColorInfo);
+        uint RawColorInfo,
+        IReadOnlyList<uint> PixelInitialScalars,
+        IReadOnlyList<uint> VertexInitialScalars);
 
     private sealed record TranslatedImageBinding(
         TextureDescriptor Descriptor,
@@ -2429,7 +2431,7 @@ public static class AgcExports
                         "draw-fallback");
                     var textures = CreateVulkanGuestDrawTextures(ctx, translatedDraw.Textures, out var fallbackTextureCount);
                     var globalMemoryBuffers =
-                        CreateVulkanGuestMemoryBuffers(translatedDraw.GlobalMemoryBindings);
+                        CreateTranslatedDrawGlobalBuffers(translatedDraw);
                     VulkanVideoPresenter.SubmitTranslatedDraw(
                         translatedDraw.PixelSpirv,
                         textures,
@@ -3104,7 +3106,7 @@ public static class AgcExports
                     translatedDraw.Textures,
                     out _);
                 var globalMemoryBuffers =
-                    CreateVulkanGuestMemoryBuffers(translatedDraw.GlobalMemoryBindings);
+                    CreateTranslatedDrawGlobalBuffers(translatedDraw);
                 var vertexBuffers =
                     CreateVulkanGuestVertexBuffers(translatedDraw.VertexInputs);
                 TraceRectListVertices(translatedDraw, vertexBuffers);
@@ -3141,7 +3143,7 @@ public static class AgcExports
                         translatedDraw.Textures,
                         out _);
                     var globalMemoryBuffers =
-                        CreateVulkanGuestMemoryBuffers(translatedDraw.GlobalMemoryBindings);
+                        CreateTranslatedDrawGlobalBuffers(translatedDraw);
                     TraceDrawCompact(drawSequence, translatedDraw, textures, []);
                     VulkanVideoPresenter.SubmitStorageTranslatedDraw(
                         translatedDraw.PixelSpirv,
@@ -3260,8 +3262,12 @@ public static class AgcExports
                 HasPixelColorExport(pixelState, target.Slot))
             .ToArray();
         var outputKind = GetPixelOutputKind(renderTargets.FirstOrDefault().NumberType);
-        var exportStateFingerprint = ComputeShaderStateFingerprint(exportEvaluation);
-        var pixelStateFingerprint = ComputeShaderStateFingerprint(pixelEvaluation);
+        var exportStateFingerprint = _bakeScalars
+            ? ComputeShaderStateFingerprint(exportEvaluation)
+            : ComputeShaderStructuralFingerprint(exportEvaluation);
+        var pixelStateFingerprint = _bakeScalars
+            ? ComputeShaderStateFingerprint(pixelEvaluation)
+            : ComputeShaderStructuralFingerprint(pixelEvaluation);
         var shaderKey = (
             exportShaderAddress,
             exportStateFingerprint,
@@ -3276,9 +3282,14 @@ public static class AgcExports
 
         if (compiled.Vertex is null || compiled.Pixel is null)
         {
-            var totalGlobalBuffers =
+            var guestGlobalBuffers =
                 pixelEvaluation.GlobalMemoryBindings.Count +
                 exportEvaluation.GlobalMemoryBindings.Count;
+            // Two per-draw initial-scalar buffers ride after the guest
+            // buffers: [pixel guest][vertex guest][pixel sgprs][vertex sgprs].
+            var totalGlobalBuffers = _bakeScalars
+                ? guestGlobalBuffers
+                : guestGlobalBuffers + 2;
             if (!Gen5SpirvTranslator.TryCompilePixelShader(
                     pixelState,
                     pixelEvaluation,
@@ -3287,7 +3298,8 @@ public static class AgcExports
                     out error,
                     globalBufferBase: 0,
                     totalGlobalBufferCount: totalGlobalBuffers,
-                    imageBindingBase: 0) ||
+                    imageBindingBase: 0,
+                    initialScalarBufferIndex: _bakeScalars ? -1 : guestGlobalBuffers) ||
                 !Gen5SpirvTranslator.TryCompileVertexShader(
                     exportState,
                     exportEvaluation,
@@ -3295,7 +3307,8 @@ public static class AgcExports
                     out error,
                     globalBufferBase: pixelEvaluation.GlobalMemoryBindings.Count,
                     totalGlobalBufferCount: totalGlobalBuffers,
-                    imageBindingBase: pixelEvaluation.ImageBindings.Count))
+                    imageBindingBase: pixelEvaluation.ImageBindings.Count,
+                    initialScalarBufferIndex: _bakeScalars ? -1 : guestGlobalBuffers + 1))
             {
                 return false;
             }
@@ -3377,7 +3390,9 @@ public static class AgcExports
                 CbColor0Info + renderTargets.FirstOrDefault().Slot * CbColorRegisterStride,
                 out var rawInfo)
                 ? rawInfo
-                : 0);
+                : 0,
+            pixelEvaluation.InitialScalarRegisters,
+            exportEvaluation.InitialScalarRegisters);
         return true;
     }
 
@@ -3479,6 +3494,77 @@ public static class AgcExports
         }
 
         return (uint)(maxAttribute + 1);
+    }
+
+    private static readonly bool _bakeScalars = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_BAKE_SGPRS"),
+        "1",
+        StringComparison.Ordinal);
+
+    /// <summary>
+    /// Fingerprint of everything that shapes the translated SPIR-V besides
+    /// scalar register values (those arrive in a per-draw buffer): the
+    /// resolved binding set with its format-shaping descriptor words, vertex
+    /// input layouts, and compute system registers. Value churn in user data
+    /// no longer forces a new translation and pipeline.
+    /// </summary>
+    private static ulong ComputeShaderStructuralFingerprint(Gen5ShaderEvaluation evaluation)
+    {
+        const ulong prime = 1099511628211UL;
+        var hash = 14695981039346656037UL;
+        void Mix(ulong value) => hash = (hash ^ value) * prime;
+
+        foreach (var binding in evaluation.ImageBindings)
+        {
+            Mix(binding.Pc);
+            Mix((ulong)(uint)binding.Opcode.GetHashCode());
+            if (binding.ResourceDescriptor.Count > 3)
+            {
+                Mix(binding.ResourceDescriptor[1]);
+                Mix(binding.ResourceDescriptor[3]);
+            }
+
+            foreach (var word in binding.SamplerDescriptor)
+            {
+                Mix(word);
+            }
+
+            Mix(binding.MipLevel ?? 0xFFFF_FFFFUL);
+        }
+
+        foreach (var binding in evaluation.GlobalMemoryBindings)
+        {
+            Mix(binding.ScalarAddress);
+            Mix((ulong)binding.InstructionPcs.Count);
+            foreach (var pc in binding.InstructionPcs)
+            {
+                Mix(pc);
+            }
+        }
+
+        if (evaluation.VertexInputs is { } vertexInputs)
+        {
+            foreach (var input in vertexInputs)
+            {
+                Mix(input.Pc);
+                Mix(input.Location);
+                Mix(input.ComponentCount);
+                Mix(input.DataFormat);
+                Mix(input.NumberFormat);
+                Mix(input.Stride);
+                Mix(input.OffsetBytes);
+            }
+        }
+
+        if (evaluation.ComputeSystemRegisters is { } computeSystemRegisters)
+        {
+            Mix(computeSystemRegisters.WorkGroupXRegister ?? uint.MaxValue);
+            Mix(computeSystemRegisters.WorkGroupYRegister ?? uint.MaxValue);
+            Mix(computeSystemRegisters.WorkGroupZRegister ?? uint.MaxValue);
+            Mix(computeSystemRegisters.ThreadGroupSizeRegister ?? uint.MaxValue);
+        }
+
+        return hash;
     }
 
     private static ulong ComputeShaderStateFingerprint(Gen5ShaderEvaluation evaluation)
@@ -3915,6 +4001,41 @@ public static class AgcExports
         }
 
         return textures;
+    }
+
+    /// <summary>
+    /// Guest storage buffers for a translated draw, followed by the per-draw
+    /// initial scalar registers of each stage (pixel then vertex), matching
+    /// the binding layout the shaders were compiled against.
+    /// </summary>
+    private static IReadOnlyList<VulkanGuestMemoryBuffer> CreateTranslatedDrawGlobalBuffers(
+        TranslatedGuestDraw translatedDraw)
+    {
+        var buffers = CreateVulkanGuestMemoryBuffers(translatedDraw.GlobalMemoryBindings);
+        if (_bakeScalars)
+        {
+            return buffers;
+        }
+
+        var combined = new List<VulkanGuestMemoryBuffer>(buffers.Count + 2);
+        combined.AddRange(buffers);
+        combined.Add(new VulkanGuestMemoryBuffer(0, PackScalarRegisters(translatedDraw.PixelInitialScalars)));
+        combined.Add(new VulkanGuestMemoryBuffer(0, PackScalarRegisters(translatedDraw.VertexInitialScalars)));
+        return combined;
+    }
+
+    private static byte[] PackScalarRegisters(IReadOnlyList<uint> registers)
+    {
+        var bytes = new byte[256 * sizeof(uint)];
+        var count = Math.Min(registers.Count, 256);
+        for (var index = 0; index < count; index++)
+        {
+            BinaryPrimitives.WriteUInt32LittleEndian(
+                bytes.AsSpan(index * sizeof(uint)),
+                registers[index]);
+        }
+
+        return bytes;
     }
 
     private static IReadOnlyList<VulkanGuestMemoryBuffer> CreateVulkanGuestMemoryBuffers(

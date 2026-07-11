@@ -11,6 +11,74 @@ namespace SharpEmu.Libs.Agc;
 
 internal static class Gen5ShaderTranslator
 {
+    /// <summary>
+    /// Bitmask (256 bits) of scalar registers whose values the program can
+    /// observe: scalar source operands (widened for 64-bit pairs), the
+    /// descriptor/sampler/address ranges named by instruction controls, and
+    /// the implicit state registers. Deterministic per instruction stream, so
+    /// the SPIR-V that loads exactly these registers from the per-draw
+    /// initial-state buffer is byte-stable across draws.
+    /// </summary>
+    internal static ulong[] ComputeConsumedScalarMask(Gen5ShaderProgram program)
+    {
+        var mask = new ulong[4];
+        AddConsumedScalar(mask, 106, 2);
+        AddConsumedScalar(mask, 124, 2);
+        AddConsumedScalar(mask, 126, 2);
+        foreach (var instruction in program.Instructions)
+        {
+            foreach (var source in instruction.Sources)
+            {
+                if (source.Kind == Gen5OperandKind.ScalarRegister)
+                {
+                    AddConsumedScalar(mask, source.Value, 2);
+                }
+            }
+
+            // Scalar memory bases can be a 4-dword buffer descriptor.
+            if (instruction.Encoding is Gen5ShaderEncoding.Smem or Gen5ShaderEncoding.Smrd &&
+                instruction.Sources.Count > 0 &&
+                instruction.Sources[0].Kind == Gen5OperandKind.ScalarRegister)
+            {
+                AddConsumedScalar(mask, instruction.Sources[0].Value, 4);
+            }
+
+            switch (instruction.Control)
+            {
+                case Gen5ImageControl image:
+                    AddConsumedScalar(mask, image.ScalarResource, 8);
+                    AddConsumedScalar(mask, image.ScalarSampler, 4);
+                    break;
+                case Gen5ScalarMemoryControl { DynamicOffsetRegister: { } offsetRegister }:
+                    AddConsumedScalar(mask, offsetRegister, 2);
+                    break;
+                case Gen5GlobalMemoryControl global:
+                    AddConsumedScalar(mask, global.ScalarAddress, 2);
+                    break;
+                case Gen5BufferMemoryControl buffer:
+                    AddConsumedScalar(mask, buffer.ScalarResource, 4);
+                    break;
+            }
+        }
+
+        return mask;
+    }
+
+    private static void AddConsumedScalar(ulong[] mask, uint register, uint count)
+    {
+        for (uint index = 0; index < count; index++)
+        {
+            var target = register + index;
+            if (target < 256)
+            {
+                mask[target >> 6] |= 1UL << (int)(target & 63);
+            }
+        }
+    }
+
+    internal static bool IsScalarConsumed(ulong[] mask, uint register) =>
+        register < 256 && (mask[register >> 6] & (1UL << (int)(register & 63))) != 0;
+
     private const int MaxInstructions = 4096;
     private const int MinimumUserDataDwords = 16;
     private const int MaximumUserDataDwords = 256;
