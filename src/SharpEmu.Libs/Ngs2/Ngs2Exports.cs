@@ -261,6 +261,132 @@ public static class Ngs2Exports
         return SetReturn(ctx, 0);
     }
 
+    [SysAbiExport(
+        Nid = "pgFAiLR5qT4",
+        ExportName = "sceNgs2SystemQueryBufferSize",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNgs2")]
+    public static int Ngs2SystemQueryBufferSize(CpuContext ctx) => WriteBufferSize(ctx, ctx[CpuRegister.Rsi]);
+
+    [SysAbiExport(
+        Nid = "0eFLVCfWVds",
+        ExportName = "sceNgs2RackQueryBufferSize",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNgs2")]
+    public static int Ngs2RackQueryBufferSize(CpuContext ctx) => WriteBufferSize(ctx, ctx[CpuRegister.Rdx]);
+
+    // Report a fixed working-memory footprint for the requested object. The
+    // out struct (SceNgs2BufferAllocator-style) begins with the size field.
+    private static int WriteBufferSize(CpuContext ctx, ulong outAddress)
+    {
+        if (outAddress == 0)
+        {
+            return SetReturn(ctx, OrbisNgs2ErrorInvalidOutAddress);
+        }
+
+        Span<byte> info = stackalloc byte[RenderBufferInfoSize];
+        info.Clear();
+        BinaryPrimitives.WriteUInt64LittleEndian(info[0..8], 0x10000);
+        BinaryPrimitives.WriteUInt64LittleEndian(info[8..16], 0x100);
+        return ctx.Memory.TryWrite(outAddress, info)
+            ? SetReturn(ctx, 0)
+            : SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    [SysAbiExport(
+        Nid = "l4Q2dWEH6UM",
+        ExportName = "sceNgs2SystemSetGrainSamples",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNgs2")]
+    public static int Ngs2SystemSetGrainSamples(CpuContext ctx) => ValidateSystem(ctx);
+
+    [SysAbiExport(
+        Nid = "-tbc2SxQD60",
+        ExportName = "sceNgs2SystemSetSampleRate",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNgs2")]
+    public static int Ngs2SystemSetSampleRate(CpuContext ctx) => ValidateSystem(ctx);
+
+    [SysAbiExport(
+        Nid = "gThZqM5PYlQ",
+        ExportName = "sceNgs2SystemLock",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNgs2")]
+    public static int Ngs2SystemLock(CpuContext ctx) => ValidateSystem(ctx);
+
+    [SysAbiExport(
+        Nid = "JXRC5n0RQls",
+        ExportName = "sceNgs2SystemUnlock",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNgs2")]
+    public static int Ngs2SystemUnlock(CpuContext ctx) => ValidateSystem(ctx);
+
+    [SysAbiExport(
+        Nid = "-TOuuAQ-buE",
+        ExportName = "sceNgs2VoiceGetState",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNgs2")]
+    public static int Ngs2VoiceGetState(CpuContext ctx)
+    {
+        var voiceHandle = ctx[CpuRegister.Rdi];
+        var stateAddress = ctx[CpuRegister.Rsi];
+        var stateSize = (int)Math.Min(ctx[CpuRegister.Rdx], 0x400);
+        lock (StateGate)
+        {
+            if (!Voices.ContainsKey(voiceHandle))
+            {
+                return SetReturn(ctx, OrbisNgs2ErrorInvalidVoiceHandle);
+            }
+        }
+
+        // Report an idle (not-in-use) voice: all-zero state block.
+        if (stateAddress != 0 && stateSize > 0)
+        {
+            if (!TryClearGuestBuffer(ctx, stateAddress, (ulong)stateSize))
+            {
+                return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            }
+        }
+
+        return SetReturn(ctx, 0);
+    }
+
+    [SysAbiExport(
+        Nid = "rEh728kXk3w",
+        ExportName = "sceNgs2VoiceGetStateFlags",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNgs2")]
+    public static int Ngs2VoiceGetStateFlags(CpuContext ctx)
+    {
+        var voiceHandle = ctx[CpuRegister.Rdi];
+        var flagsAddress = ctx[CpuRegister.Rsi];
+        lock (StateGate)
+        {
+            if (!Voices.ContainsKey(voiceHandle))
+            {
+                return SetReturn(ctx, OrbisNgs2ErrorInvalidVoiceHandle);
+            }
+        }
+
+        // No flags set: voice is idle.
+        if (flagsAddress != 0 && !ctx.TryWriteUInt64(flagsAddress, 0))
+        {
+            return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        return SetReturn(ctx, 0);
+    }
+
+    private static int ValidateSystem(CpuContext ctx)
+    {
+        lock (StateGate)
+        {
+            return SetReturn(
+                ctx,
+                Systems.ContainsKey(ctx[CpuRegister.Rdi]) ? 0 : OrbisNgs2ErrorInvalidSystemHandle);
+        }
+    }
+
     private static bool TryCreateHandle(CpuContext ctx, uint type, ulong ownerHandle, out ulong handle)
     {
         handle = 0;
