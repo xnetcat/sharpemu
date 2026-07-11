@@ -1299,16 +1299,24 @@ internal static class Gen5ShaderTranslator
                 var scalarOffset = (extra >> 25) & 0x7F;
                 var offset = SignExtend(extra & 0x1FFFFF, 21);
                 var count = ScalarLoadDwordCount(opcode);
+                var scalarOffsetOperand = Gen5Operand.Source(scalarOffset);
+                var dynamicOffsetRegister = scalarOffsetOperand.Kind ==
+                    Gen5OperandKind.ScalarRegister
+                    ? scalarOffsetOperand.Value
+                    : (uint?)null;
                 sources =
                 [
                     Gen5Operand.Scalar(scalarBase),
-                    Gen5Operand.Scalar(scalarOffset),
+                    scalarOffsetOperand,
                 ];
                 destinations = Enumerable
                     .Range((int)scalarDestination, checked((int)count))
                     .Select(index => Gen5Operand.Scalar((uint)index))
                     .ToArray();
-                control = new Gen5ScalarMemoryControl(count, offset, scalarOffset);
+                control = new Gen5ScalarMemoryControl(
+                    count,
+                    offset,
+                    dynamicOffsetRegister);
                 break;
             }
             case Gen5ShaderEncoding.Vop1:
