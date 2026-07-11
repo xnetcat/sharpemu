@@ -1771,6 +1771,35 @@ public static class AgcExports
             : SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
     }
 
+    // The SRC counterpart of sceAgcDmaDataPatchSetDstAddressOrOffset. Patches
+    // the source field (offset +24, matching the layout written by
+    // sceAgcDcbDmaData) of a NOP/RDmaData packet. Games patch this to point a
+    // GPU DMA at the data it should copy — commonly a completion/label write.
+    // When it is missing the source stays 0, ApplySubmittedDmaData skips the
+    // copy (copied=False), and whatever the guest waits on that label for never
+    // fires (observed: Void Terrarium's first draw batch presents a black frame
+    // then the render pipeline stalls with no further flips).
+    [SysAbiExport(
+        Nid = "cdDRpqcFGbU",
+        ExportName = "sceAgcDmaDataPatchSetSrcAddressOrOffsetOrImmediate",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int DmaDataPatchSetSrcAddressOrOffsetOrImmediate(CpuContext ctx)
+    {
+        var commandAddress = ctx[CpuRegister.Rdi];
+        var sourceValue = ctx[CpuRegister.Rsi];
+        if (!TryGetPacketIdentity(ctx, commandAddress, out var op, out var register) ||
+            op != ItNop ||
+            register != RDmaData)
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        return ctx.TryWriteUInt64(commandAddress + 24, sourceValue)
+            ? SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK)
+            : SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
     [SysAbiExport(
         Nid = "3KDcnM3lrcU",
         ExportName = "sceAgcWaitRegMemPatchAddress",
