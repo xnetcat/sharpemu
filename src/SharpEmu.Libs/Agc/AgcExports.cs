@@ -2872,6 +2872,7 @@ public static class AgcExports
         }
 
         var compareFunction = control & 0xFFu;
+        ForceSatisfyGpuWait(ctx, address, value, mask, reference, compareFunction, is64Bit);
         TraceSubmittedWait(
             address,
             value,
@@ -2880,6 +2881,55 @@ public static class AgcExports
             compareFunction,
             is64Bit ? 64 : 32,
             tracePacket);
+    }
+
+    /// <summary>
+    /// GPU work is executed synchronously, so by the time the guest submits a
+    /// WAIT_REG_MEM the awaited work is logically complete. If the wait would
+    /// still block — because a compute/EOP completion label was never written —
+    /// write a value that satisfies the comparison so neither the GPU-side wait
+    /// nor the guest's CPU-side poll on the same address spins forever. Only the
+    /// monotonic "reached a value" comparisons are forced; equality-style
+    /// completion labels (the common compute-done signal) are the target.
+    /// </summary>
+    private static void ForceSatisfyGpuWait(
+        CpuContext ctx,
+        ulong address,
+        ulong value,
+        ulong mask,
+        ulong reference,
+        uint compareFunction,
+        bool is64Bit)
+    {
+        if (address == 0 || mask == 0)
+        {
+            return;
+        }
+
+        var maskedValue = value & mask;
+        var maskedRef = reference & mask;
+        ulong? target = compareFunction switch
+        {
+            2 when maskedValue > maskedRef => maskedRef,             // <=
+            3 when maskedValue != maskedRef => maskedRef,            // ==
+            5 when maskedValue < maskedRef => maskedRef,             // >=
+            _ => null,
+        };
+
+        if (target is not { } satisfyMasked)
+        {
+            return;
+        }
+
+        var newValue = (value & ~mask) | (satisfyMasked & mask);
+        if (is64Bit)
+        {
+            ctx.TryWriteUInt64(address, newValue);
+        }
+        else
+        {
+            TryWriteUInt32(ctx, address, unchecked((uint)newValue));
+        }
     }
 
     private static void ObserveSubmittedStandardWaitRegMem(
@@ -2896,7 +2946,9 @@ public static class AgcExports
             return;
         }
 
-        TraceSubmittedWait(address, value, mask, reference, control & 0x7u, 32, tracePacket);
+        var compareFunction = control & 0x7u;
+        ForceSatisfyGpuWait(ctx, address, value, mask, reference, compareFunction, is64Bit: false);
+        TraceSubmittedWait(address, value, mask, reference, compareFunction, 32, tracePacket);
     }
 
     private static void TraceSubmittedWait(
