@@ -318,7 +318,11 @@ public static partial class KernelMemoryCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_OK;
         }
 
-        const ulong MaxSane = 512UL * 1024 * 1024;
+        // Only obviously-bogus destinations or absurd sizes are rejected. Large
+        // but plausible clears (engines zero multi-hundred-MB resource pools in
+        // one call) are allowed; the write loop below clamps to the mapped range
+        // if the request runs off the end of a region instead of hard-faulting.
+        const ulong MaxSane = 2UL * 1024 * 1024 * 1024;
         if (destination < 0x1000 || destination >= CanonicalUserUpper || length > MaxSane)
         {
             Console.WriteLine("!!! CRITICAL: Bad Memset Call !!!");
@@ -336,6 +340,12 @@ public static partial class KernelMemoryCompatExports
             var take = (int)Math.Min((ulong)chunk.Length, remaining);
             if (!TryWriteCompat(ctx, cursor, chunk.AsSpan(0, take)))
             {
+                // The request ran off the end of the mapped region. Clamp to the
+                // bytes already written rather than faulting: an oversized clear
+                // (e.g. a resource pool zeroed with a stale, too-large size) then
+                // clears the valid prefix and returns success, matching what the
+                // guest observes on hardware instead of a silent memory fault
+                // that leaves the buffer — and the caller — in a broken state.
                 if (length <= 0x40)
                 {
                     var recoveryIndex = Interlocked.Increment(ref _inaccessibleMemsetRecoveryCount);
@@ -349,7 +359,16 @@ public static partial class KernelMemoryCompatExports
                     return (int)OrbisGen2Result.ORBIS_GEN2_OK;
                 }
 
-                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+                var clampIndex = Interlocked.Increment(ref _inaccessibleMemsetRecoveryCount);
+                if (clampIndex <= 8)
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][WARNING] memset clamped to mapped range#{clampIndex}: rip=0x{ctx.Rip:X16} " +
+                        $"dst=0x{destination:X16} len=0x{length:X} written=0x{cursor - destination:X} val=0x{value:X2}");
+                }
+
+                ctx[CpuRegister.Rax] = destination;
+                return (int)OrbisGen2Result.ORBIS_GEN2_OK;
             }
 
             cursor += (ulong)take;
