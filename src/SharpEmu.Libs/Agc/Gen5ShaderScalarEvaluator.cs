@@ -10,6 +10,20 @@ namespace SharpEmu.Libs.Agc;
 
 internal static class Gen5ShaderScalarEvaluator
 {
+    // When a scalar POINTER load can't be resolved statically (its descriptor
+    // register read back garbage — e.g. 0 or 0xFFFFFFFF, a per-draw descriptor
+    // setup race), abort-and-drop-the-draw loses the whole pass. Demon's Souls'
+    // deferred-lighting / composite pixel shaders hit this intermittently, so
+    // the passes that would produce the composite's feeder targets get dropped
+    // and the frame stays black. Degrading instead (feed 0, keep translating,
+    // like the buffer-load path already does) lets the pass render with the
+    // unresolved resource missing rather than not at all. STRICT reverts.
+    private static readonly bool _strictScalarLoad =
+        string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_STRICT_SCALAR_LOAD"),
+            "1",
+            StringComparison.Ordinal);
+
     private const int ScalarRegisterCount = 256;
     private const int ImageDescriptorDwords = 8;
     private const int SamplerDescriptorDwords = 4;
@@ -1416,7 +1430,7 @@ internal static class Gen5ShaderScalarEvaluator
                     index,
                     out value))
             {
-                if (isBufferLoad)
+                if (isBufferLoad || !_strictScalarLoad)
                 {
                     scalarRegisters[destination.Value] = 0;
                     continue;
