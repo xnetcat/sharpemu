@@ -97,6 +97,22 @@ internal static partial class Gen5SpirvTranslator
         private readonly Gen5ShaderEvaluation _evaluation;
         private readonly Gen5PixelOutputKind _outputKind;
 
+        // Safety valve for the PC-dispatcher loop. Each iteration executes one
+        // GCN basic block; a correctly-translated shader always reaches its
+        // terminal block (pc out of range -> default -> exit) well within any
+        // real control flow. A mistranslated shader whose loop-exit condition is
+        // wrong would otherwise spin the dispatcher forever, hanging the single
+        // Metal queue and freezing every later submission (black screen, no
+        // recovery). Bounding the iteration count guarantees the invocation
+        // terminates instead: the effect may be wrong for that shader, but the
+        // GPU never wedges. 0 disables the guard (original unbounded behaviour).
+        private static readonly int _maxDispatcherSteps =
+            int.TryParse(
+                Environment.GetEnvironmentVariable("SHARPEMU_SHADER_MAX_STEPS"),
+                out var maxSteps) && maxSteps >= 0
+                ? maxSteps
+                : 100_000;
+
         // Which pixel-shader MRT export target (EXP_MRT0..7 == render-target
         // slot) is routed to the single fragment output. The offscreen draw
         // path renders one bound color target per pass, so a multi-render-target
@@ -146,6 +162,7 @@ internal static partial class Gen5SpirvTranslator
         private uint _exec;
         private uint _programCounter;
         private uint _programActive;
+        private uint _iterationGuard;
         private uint _globalBuffers;
         private uint _storageUintPointer;
         private uint _lds;
@@ -283,6 +300,22 @@ internal static partial class Gen5SpirvTranslator
                 _module.AddStatement(SpirvOp.Branch, loopContinue);
                 _module.AddLabel(loopContinue);
                 var active = Load(_boolType, _programActive);
+                if (_maxDispatcherSteps > 0)
+                {
+                    var steps = IAdd(Load(_uintType, _iterationGuard), UInt(1));
+                    Store(_iterationGuard, steps);
+                    var withinLimit = _module.AddInstruction(
+                        SpirvOp.ULessThan,
+                        _boolType,
+                        steps,
+                        UInt((uint)_maxDispatcherSteps));
+                    active = _module.AddInstruction(
+                        SpirvOp.LogicalAnd,
+                        _boolType,
+                        active,
+                        withinLimit);
+                }
+
                 _module.AddStatement(
                     SpirvOp.BranchConditional,
                     active,
@@ -418,6 +451,16 @@ internal static partial class Gen5SpirvTranslator
                 _privateBoolPointer,
                 SpirvStorageClass.Private,
                 _module.ConstantBool(true));
+            if (_maxDispatcherSteps > 0)
+            {
+                _iterationGuard = _module.AddGlobalVariable(
+                    _privateUintPointer,
+                    SpirvStorageClass.Private,
+                    _module.Constant(_uintType, 0));
+                _interfaces.Add(_iterationGuard);
+                _module.AddName(_iterationGuard, "pcGuard");
+            }
+
             _interfaces.Add(_scalarRegisters);
             _interfaces.Add(_vectorRegisters);
             _interfaces.Add(_scc);
