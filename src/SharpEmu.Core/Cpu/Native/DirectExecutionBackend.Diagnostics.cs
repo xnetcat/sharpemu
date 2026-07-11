@@ -45,7 +45,18 @@ public sealed partial class DirectExecutionBackend
 
 		if (total % 500000 == 0 && !_perfHleNoDict)
 		{
-			var top = _perfHleCounts
+			// Snapshot via foreach (a safe moving enumerator) before sorting.
+			// LINQ over a ConcurrentDictionary uses ICollection.CopyTo, which
+			// throws ArgumentException if another thread adds a key between the
+			// Count read and the copy — that exception was being swallowed into
+			// a CPU_TRAP return and crashing the guest.
+			var snapshot = new System.Collections.Generic.List<System.Collections.Generic.KeyValuePair<string, long>>(_perfHleCounts.Count + 16);
+			foreach (var kvp in _perfHleCounts)
+			{
+				snapshot.Add(kvp);
+			}
+
+			var top = snapshot
 				.OrderByDescending(kvp => kvp.Value)
 				.Take(20)
 				.Select(kvp => $"{kvp.Key}={kvp.Value}");

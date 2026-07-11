@@ -524,7 +524,14 @@ public static class KernelPthreadCompatExports
         }
 
         _ = KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, mutexAddress, 0);
-        state.Semaphore.Dispose();
+
+        // Do NOT dispose the semaphore here: a guest may destroy a mutex that
+        // another thread is concurrently locking/waiting on (common during
+        // teardown/reinit), and disposing it out from under the waiter throws
+        // ObjectDisposedException — which the import gateway swallows into a
+        // CPU_TRAP return, failing the peer's lock and crashing engines that
+        // assert on the result. The SemaphoreSlim is pure-managed here (its
+        // WaitHandle is never touched), so letting the GC reclaim it is safe.
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
