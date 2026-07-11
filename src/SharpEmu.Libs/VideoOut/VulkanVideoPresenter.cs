@@ -1106,6 +1106,7 @@ internal static unsafe class VulkanVideoPresenter
             _hostBufferPool = new();
         private readonly Dictionary<ulong, HostBufferAllocation> _hostBufferAllocations = new();
         private readonly Queue<PendingGuestSubmission> _pendingGuestSubmissions = new();
+        private readonly Stack<DescriptorPool> _recycledDescriptorPools = new();
 
         private readonly record struct GraphicsPipelineKey(
             string VertexShader,
@@ -2599,14 +2600,39 @@ internal static unsafe class VulkanVideoPresenter
                 };
             }
 
-            fixed (DescriptorPoolSize* poolSizePointer = poolSizes)
+            if (_recycledDescriptorPools.TryPop(out var recycledPool))
             {
+                Check(
+                    _vk.ResetDescriptorPool(_device, recycledPool, 0),
+                    "vkResetDescriptorPool");
+                resources.DescriptorPool = recycledPool;
+            }
+            else
+            {
+                // Generously sized so any draw's set fits, making the pool
+                // recyclable regardless of the draw's binding mix.
+                var genericPoolSizes = stackalloc DescriptorPoolSize[3];
+                genericPoolSizes[0] = new DescriptorPoolSize
+                {
+                    Type = DescriptorType.CombinedImageSampler,
+                    DescriptorCount = 32,
+                };
+                genericPoolSizes[1] = new DescriptorPoolSize
+                {
+                    Type = DescriptorType.StorageImage,
+                    DescriptorCount = 16,
+                };
+                genericPoolSizes[2] = new DescriptorPoolSize
+                {
+                    Type = DescriptorType.StorageBuffer,
+                    DescriptorCount = 16,
+                };
                 var poolInfo = new DescriptorPoolCreateInfo
                 {
                     SType = StructureType.DescriptorPoolCreateInfo,
                     MaxSets = 1,
-                    PoolSizeCount = (uint)poolSizes.Length,
-                    PPoolSizes = poolSizePointer,
+                    PoolSizeCount = 3,
+                    PPoolSizes = genericPoolSizes,
                 };
                 DescriptorPool descriptorPool;
                 Check(
@@ -6751,7 +6777,14 @@ internal static unsafe class VulkanVideoPresenter
 
             if (resources.DescriptorPool.Handle != 0)
             {
-                _vk.DestroyDescriptorPool(_device, resources.DescriptorPool, null);
+                if (_recycledDescriptorPools.Count < 256)
+                {
+                    _recycledDescriptorPools.Push(resources.DescriptorPool);
+                }
+                else
+                {
+                    _vk.DestroyDescriptorPool(_device, resources.DescriptorPool, null);
+                }
             }
 
             if (!resources.DescriptorLayoutCached &&
