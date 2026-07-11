@@ -1584,6 +1584,45 @@ public static partial class KernelMemoryCompatExports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
+    // Stat an AMPR APR file by the id returned from sceKernelAprResolveFilepathsToIds.
+    // Games call this after resolving ids to learn each asset's size before
+    // issuing the streaming read. When it is missing the guest gets no size back
+    // and dereferences a null result pointer (observed SIGSEGV write to 0x0 in
+    // Void Terrarium). Signature: (SceKernelAprFileId id, SceKernelStat* stat).
+    [SysAbiExport(
+        Nid = "ApkYaHb8Sek",
+        ExportName = "sceKernelAprGetFileStat",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int KernelAprGetFileStat(CpuContext ctx)
+    {
+        var fileId = unchecked((uint)ctx[CpuRegister.Rdi]);
+        var statAddress = ctx[CpuRegister.Rsi];
+        if (statAddress == 0)
+        {
+            KernelRuntimeCompatExports.TrySetErrno(ctx, Einval);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        if (!AmprFileRegistry.TryGetHostPath(fileId, out var hostPath))
+        {
+            LogIoTrace("apr_get_file_stat", $"id=0x{fileId:X8}", "result=id_not_registered");
+            KernelRuntimeCompatExports.TrySetErrno(ctx, 2);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+        }
+
+        if (!TryWriteHostPathStat(ctx, statAddress, hostPath))
+        {
+            LogIoTrace("apr_get_file_stat", hostPath, $"id=0x{fileId:X8} result=not_found");
+            KernelRuntimeCompatExports.TrySetErrno(ctx, 2);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+        }
+
+        LogIoTrace("apr_get_file_stat", hostPath, $"id=0x{fileId:X8}");
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
     [SysAbiExport(
         Nid = "kBwCPsYX-m4",
         ExportName = "sceKernelFstat",
