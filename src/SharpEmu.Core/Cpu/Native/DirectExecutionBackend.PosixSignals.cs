@@ -87,6 +87,7 @@ public sealed unsafe partial class DirectExecutionBackend
 		}
 
 		WarmUpPosixSignalPath();
+		SharpEmu.HLE.GuestImageWriteTracker.WarmUp();
 
 		if (!InstallPosixSignalHandler(PosixSigSegv) ||
 			!InstallPosixSignalHandler(PosixSigBus) ||
@@ -191,6 +192,17 @@ public sealed unsafe partial class DirectExecutionBackend
 		_posixSignalHandlerDepth++;
 		try
 		{
+			// Guest-image write tracking runs first: it only needs the fault
+			// address (safe for host and guest threads alike) and must resume
+			// the faulting write immediately after restoring write access.
+			if (signal != PosixSigIll &&
+				siginfo != 0 &&
+				SharpEmu.HLE.GuestImageWriteTracker.TryHandleWriteFault(
+					*(ulong*)((byte*)siginfo + PosixSigInfoAddressOffset)))
+			{
+				return;
+			}
+
 			if (TryHandlePosixFault(signal, siginfo, ucontext))
 			{
 				return;

@@ -166,6 +166,10 @@ public static class AgcExports
             Environment.GetEnvironmentVariable("SHARPEMU_LOG_AGC_SHADER"),
             "1",
             StringComparison.Ordinal);
+    private static readonly bool _traceDraws = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_TRACE_DRAWS"),
+        "1",
+        StringComparison.Ordinal);
     private static long _dcbWriteDataTraceCount;
     private static long _dcbWaitRegMemTraceCount;
     private static long _createShaderTraceCount;
@@ -332,7 +336,10 @@ public static class AgcExports
         IReadOnlyList<Gen5GlobalMemoryBinding> GlobalMemoryBindings,
         IReadOnlyList<Gen5VertexInputBinding> VertexInputs,
         IReadOnlyList<RenderTargetDescriptor> RenderTargets,
-        VulkanGuestRenderState RenderState);
+        VulkanGuestRenderState RenderState,
+        IReadOnlyList<uint> PixelUserData,
+        uint RawBlendControl,
+        uint RawColorInfo);
 
     private sealed record TranslatedImageBinding(
         TextureDescriptor Descriptor,
@@ -2221,6 +2228,11 @@ public static class AgcExports
                 TraceSubmittedPacket(ctx, currentAddress, offset, header, length, op, register);
             }
 
+            if (_traceDraws)
+            {
+                CountSubmittedOpcode(op, register);
+            }
+
             if (op == ItSetShReg &&
                 TryReadTextureDescriptor(ctx, currentAddress, length, out var texture))
             {
@@ -2374,6 +2386,7 @@ public static class AgcExports
 
             if (op == ItNop && register == RFlip && length >= 6)
             {
+                SyncCpuWrittenGuestImages(ctx);
                 if (!TryReadUInt32(ctx, currentAddress + 4, out var videoOutHandle) ||
                     !TryReadUInt32(ctx, currentAddress + 8, out var displayBufferIndexRaw) ||
                     !TryReadUInt32(ctx, currentAddress + 12, out var flipMode) ||
@@ -2516,11 +2529,134 @@ public static class AgcExports
             destinationAddress != 0 &&
             sourceAddress != 0 &&
             TryCopyGuestMemory(ctx, sourceAddress, destinationAddress, byteCount);
+        if (copied)
+        {
+            MirrorDmaWriteToGuestImage(ctx, destinationAddress, byteCount, fillValue: null);
+        }
+
         if (tracePacket)
         {
             TraceAgc(
                 $"agc.dcb.dma_data dst=0x{destinationAddress:X16} src=0x{sourceAddress:X16} " +
                 $"bytes={byteCount} copied={copied}");
+        }
+    }
+
+    /// <summary>
+    /// PS5 render targets alias guest memory, so a CP DMA fill or copy that
+    /// lands on an RT is visible to later GPU reads. Our render targets live
+    /// in Vulkan images, so mirror DMA writes into them: fills become
+    /// vkCmdClearColorImage, copies re-upload the guest bytes. Without this,
+    /// per-frame DMA clears never reach the image (the fog layer in Dreaming
+    /// Sarah accumulates until it saturates, washing the scene out).
+    /// </summary>
+    /// <summary>
+    /// PS5 render targets alias unified memory, so the game's CPU can rewrite a
+    /// surface (Chowdren memsets its fog-noise layer every frame) and the GPU
+    /// observes it. Our Vulkan guest images are separate storage, so re-upload
+    /// CPU-authored surfaces once per flip. Surfaces only the GPU writes keep
+    /// all-zero guest memory and are skipped, preserving their GPU content.
+    /// </summary>
+    private static long _guestImageSyncTraceCount;
+
+    private static void SyncCpuWrittenGuestImages(CpuContext ctx)
+    {
+        if (!SharpEmu.HLE.GuestImageWriteTracker.Enabled)
+        {
+            return;
+        }
+
+        foreach (var (address, width, height) in VulkanVideoPresenter.GetGuestImageExtents())
+        {
+            if (!SharpEmu.HLE.GuestImageWriteTracker.ConsumeDirty(address))
+            {
+                continue;
+            }
+
+            var byteCount = (ulong)width * height * 4;
+            if (byteCount == 0 || byteCount > MaxPresentedTextureBytes)
+            {
+                continue;
+            }
+
+            var pixels = new byte[byteCount];
+            if (ctx.Memory.TryRead(address, pixels))
+            {
+                VulkanVideoPresenter.SubmitGuestImageWrite(address, pixels);
+                if (Interlocked.Increment(ref _guestImageSyncTraceCount) <= 64)
+                {
+                    Console.Error.WriteLine(
+                        $"[SYNC] cpu-write addr=0x{address:X} {width}x{height}");
+                }
+            }
+
+            SharpEmu.HLE.GuestImageWriteTracker.Rearm(address);
+        }
+    }
+
+    private static long _dmaMirrorTraceCount;
+    private static readonly Dictionary<(uint Op, uint Register), long> _submittedOpcodeCounts = new();
+    private static long _submittedOpcodeTotal;
+
+    private static void CountSubmittedOpcode(uint op, uint register)
+    {
+        var key = (op, op == ItNop ? register : uint.MaxValue);
+        lock (_submittedOpcodeCounts)
+        {
+            _submittedOpcodeCounts[key] =
+                _submittedOpcodeCounts.TryGetValue(key, out var count) ? count + 1 : 1;
+            if (++_submittedOpcodeTotal % 500_000 == 0)
+            {
+                var summary = string.Join(
+                    ' ',
+                    _submittedOpcodeCounts
+                        .OrderByDescending(entry => entry.Value)
+                        .Select(entry => entry.Key.Register == uint.MaxValue
+                            ? $"0x{entry.Key.Op:X2}:{entry.Value}"
+                            : $"0x{entry.Key.Op:X2}/r{entry.Key.Register}:{entry.Value}"));
+                Console.Error.WriteLine($"[PKT] total={_submittedOpcodeTotal} {summary}");
+            }
+        }
+    }
+
+    private static void MirrorDmaWriteToGuestImage(
+        CpuContext ctx,
+        ulong destinationAddress,
+        ulong byteCount,
+        uint? fillValue)
+    {
+        var hasImage = VulkanVideoPresenter.TryGetGuestImageExtent(
+            destinationAddress,
+            out var width,
+            out var height);
+        if (_traceDraws && Interlocked.Increment(ref _dmaMirrorTraceCount) <= 400)
+        {
+            Console.Error.WriteLine(
+                $"[DMA] dst=0x{destinationAddress:X} bytes={byteCount} " +
+                $"fill={(fillValue is { } f ? $"0x{f:X8}" : "copy")} image={hasImage}");
+        }
+
+        if (!hasImage)
+        {
+            return;
+        }
+
+        var imageBytes = (ulong)width * height * 4;
+        if (imageBytes == 0 || byteCount < imageBytes)
+        {
+            return;
+        }
+
+        if (fillValue is { } fill)
+        {
+            VulkanVideoPresenter.SubmitGuestImageFill(destinationAddress, fill);
+            return;
+        }
+
+        var pixels = new byte[imageBytes];
+        if (ctx.Memory.TryRead(destinationAddress, pixels))
+        {
+            VulkanVideoPresenter.SubmitGuestImageWrite(destinationAddress, pixels);
         }
     }
 
@@ -2570,6 +2706,10 @@ public static class AgcExports
                         fillValue,
                         destinationAddress,
                         byteCount);
+                if (copied)
+                {
+                    MirrorDmaWriteToGuestImage(ctx, destinationAddress, byteCount, fillValue);
+                }
             }
             else
             {
@@ -2578,6 +2718,10 @@ public static class AgcExports
                     sourceAddress,
                     destinationAddress,
                     byteCount);
+                if (copied)
+                {
+                    MirrorDmaWriteToGuestImage(ctx, destinationAddress, byteCount, fillValue: null);
+                }
             }
         }
         else if (sourceSelect == 2)
@@ -2588,6 +2732,10 @@ public static class AgcExports
                 sourceLow,
                 destinationAddress,
                 byteCount);
+            if (copied)
+            {
+                MirrorDmaWriteToGuestImage(ctx, destinationAddress, byteCount, sourceLow);
+            }
         }
         else
         {
@@ -2961,6 +3109,8 @@ public static class AgcExports
                     CreateVulkanGuestVertexBuffers(translatedDraw.VertexInputs);
                 TraceRectListVertices(translatedDraw, vertexBuffers);
                 TraceGrassDrawVertices(translatedDraw, textures, vertexBuffers);
+                TraceDrawCompact(drawSequence, translatedDraw, textures, vertexBuffers);
+                ProvideRenderTargetInitialData(ctx, firstTarget);
                 VulkanVideoPresenter.SubmitOffscreenTranslatedDraw(
                     translatedDraw.PixelSpirv,
                     textures,
@@ -2992,6 +3142,7 @@ public static class AgcExports
                         out _);
                     var globalMemoryBuffers =
                         CreateVulkanGuestMemoryBuffers(translatedDraw.GlobalMemoryBindings);
+                    TraceDrawCompact(drawSequence, translatedDraw, textures, []);
                     VulkanVideoPresenter.SubmitStorageTranslatedDraw(
                         translatedDraw.PixelSpirv,
                         textures,
@@ -3030,6 +3181,12 @@ public static class AgcExports
             return;
         }
 
+        TraceDrawCompactMiss(
+            drawSequence,
+            vertexCount,
+            hasExportShader && hasPixelShader
+                ? translationError
+                : $"missing-shaders es={hasExportShader} ps={hasPixelShader} ena={hasPsInputEna} addr={hasPsInputAddr}");
         TraceShaderTranslationMiss(
             ctx,
             state,
@@ -3208,8 +3365,69 @@ public static class AgcExports
             globalMemoryBindings,
             vertexInputs,
             renderTargets,
-            CreateRenderState(state.CxRegisters, renderTargets.FirstOrDefault()));
+            ApplyFillClearHack(
+                CreateRenderState(state.CxRegisters, renderTargets.FirstOrDefault()),
+                textures,
+                vertexInputs,
+                pixelEvaluation.InitialScalarRegisters),
+            pixelEvaluation.InitialScalarRegisters.Take(8).ToArray(),
+            state.CxRegisters.TryGetValue(CbBlend0Control, out var rawBlend) ? rawBlend : 0,
+            state.CxRegisters.TryGetValue(
+                CbColor0Info + renderTargets.FirstOrDefault().Slot * CbColorRegisterStride,
+                out var rawInfo)
+                ? rawInfo
+                : 0);
         return true;
+    }
+
+    private static readonly bool _fillClearHack = !string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_FILL_CLEAR"),
+        "1",
+        StringComparison.Ordinal);
+
+    /// <summary>
+    /// Treat an untextured fill that outputs pure transparent black through
+    /// premultiplied blending as an overwrite. Chowdren issues exactly this
+    /// draw once per frame to reset its effect layers (fog smoke, vignette
+    /// masks); under the blend factors it sets (One, OneMinusSrcAlpha) a
+    /// (0,0,0,0) source is a mathematical no-op, so without this the layers
+    /// accumulate until they saturate and the fog composites as a flat veil
+    /// over the whole scene. Disable with SHARPEMU_DISABLE_FILL_CLEAR=1.
+    /// </summary>
+    private static VulkanGuestRenderState ApplyFillClearHack(
+        VulkanGuestRenderState renderState,
+        IReadOnlyList<TranslatedImageBinding> textures,
+        IReadOnlyList<Gen5VertexInputBinding> vertexInputs,
+        IReadOnlyList<uint> pixelUserData)
+    {
+        if (!_fillClearHack ||
+            textures.Count != 0 ||
+            vertexInputs.Count != 0 ||
+            pixelUserData.Count < 4 ||
+            renderState.Blend is not
+            {
+                Enable: true,
+                ColorSrcFactor: 1,
+                ColorDstFactor: 5,
+                ColorFunc: 0,
+            })
+        {
+            return renderState;
+        }
+
+        for (var index = 0; index < 4; index++)
+        {
+            // Positive or negative zero.
+            if ((pixelUserData[index] & 0x7FFF_FFFFu) != 0)
+            {
+                return renderState;
+            }
+        }
+
+        return renderState with
+        {
+            Blend = renderState.Blend with { Enable = false },
+        };
     }
 
     private static VulkanGuestIndexBuffer? CreateVulkanIndexBuffer(
@@ -3874,6 +4092,111 @@ public static class AgcExports
     }
 
 
+
+    /// <summary>
+    /// On PS5 render targets alias guest memory, so pixels the game wrote with
+    /// the CPU are visible before the first GPU draw (Chowdren pre-fills its
+    /// fog/overlay layers that way). Seed newly created Vulkan guest images
+    /// with the current guest memory contents to preserve that base layer.
+    /// </summary>
+    private static void ProvideRenderTargetInitialData(
+        CpuContext ctx,
+        RenderTargetDescriptor target)
+    {
+        if (!VulkanVideoPresenter.GuestImageWantsInitialData(target.Address))
+        {
+            return;
+        }
+
+        var byteCount = (ulong)target.Width * target.Height * 4;
+        if (byteCount == 0 || byteCount > MaxPresentedTextureBytes)
+        {
+            return;
+        }
+
+        var initialData = new byte[byteCount];
+        var readOk = ctx.Memory.TryRead(target.Address, initialData);
+        var nonZero = readOk && initialData.AsSpan().IndexOfAnyExcept((byte)0) >= 0;
+        if (_traceDraws && _rtSeedTraced.Add(target.Address))
+        {
+            Console.Error.WriteLine(
+                $"[RTSEED] addr=0x{target.Address:X} {target.Width}x{target.Height} " +
+                $"read={readOk} nonZero={nonZero}");
+        }
+
+        if (nonZero)
+        {
+            VulkanVideoPresenter.ProvideGuestImageInitialData(target.Address, initialData);
+        }
+    }
+
+    private static readonly HashSet<ulong> _rtSeedTraced = new();
+
+    private static void TraceDrawCompact(
+        ulong sequence,
+        TranslatedGuestDraw draw,
+        IReadOnlyList<VulkanGuestDrawTexture> textures,
+        IReadOnlyList<VulkanGuestVertexBuffer> vertexBuffers)
+    {
+        if (!_traceDraws)
+        {
+            return;
+        }
+
+        var target = draw.RenderTargets.FirstOrDefault();
+        var blend = draw.RenderState.Blend;
+        var viewport = draw.RenderState.Viewport is { } vp
+            ? $"{vp.X:0.#},{vp.Y:0.#},{vp.Width:0.#}x{vp.Height:0.#}"
+            : "none";
+        var textureList = string.Join(
+            '|',
+            textures.Select(texture =>
+                $"0x{texture.Address:X}:{texture.Width}x{texture.Height}" +
+                $":f{texture.Format}/n{texture.NumberType}/d{texture.DstSelect:X3}" +
+                (texture.IsFallback ? ":FALLBACK" : string.Empty)));
+        var positions = string.Empty;
+        var positionBuffer = vertexBuffers.FirstOrDefault(buffer => buffer.Location == 0);
+        if (positionBuffer is { Data.Length: >= 8 })
+        {
+            var stride = Math.Max(positionBuffer.Stride, 4u);
+            var vertexTotal = (int)((positionBuffer.Data.Length - positionBuffer.OffsetBytes) / stride);
+            var sampled = new List<string>();
+            foreach (var vertex in new[] { 0, 1, vertexTotal - 1 })
+            {
+                var baseOffset = (int)(positionBuffer.OffsetBytes + vertex * stride);
+                if (vertex < 0 || baseOffset + 8 > positionBuffer.Data.Length)
+                {
+                    continue;
+                }
+
+                sampled.Add(
+                    $"{BitConverter.ToSingle(positionBuffer.Data, baseOffset):0.##}," +
+                    $"{BitConverter.ToSingle(positionBuffer.Data, baseOffset + 4):0.##}");
+            }
+
+            positions = string.Join(';', sampled);
+        }
+
+        Console.Error.WriteLine(
+            $"[DRAW] seq={sequence} es=0x{draw.ExportShaderAddress:X} ps=0x{draw.PixelShaderAddress:X} " +
+            $"target=0x{target.Address:X}:{target.Width}x{target.Height}:f{target.Format}/n{target.NumberType} " +
+            $"prim=0x{draw.PrimitiveType:X} verts={draw.VertexCount} indexed={draw.IndexBuffer is not null} " +
+            $"blend={(blend.Enable ? 1 : 0)}:{blend.ColorSrcFactor}/{blend.ColorDstFactor}/{blend.ColorFunc}" +
+            $":a{blend.AlphaSrcFactor}/{blend.AlphaDstFactor}/{blend.AlphaFunc}/s{(blend.SeparateAlphaBlend ? 1 : 0)} " +
+            $"mask=0x{blend.WriteMask:X} viewport={viewport} textures={textureList} pos={positions} " +
+            $"ps_s0..3={string.Join(',', draw.PixelUserData.Take(4).Select(value => BitConverter.UInt32BitsToSingle(value).ToString("0.###")))} " +
+            $"rawblend=0x{draw.RawBlendControl:X8} info=0x{draw.RawColorInfo:X8}");
+    }
+
+    private static void TraceDrawCompactMiss(ulong sequence, uint vertexCount, string error)
+    {
+        if (!_traceDraws)
+        {
+            return;
+        }
+
+        Console.Error.WriteLine($"[DRAW] seq={sequence} MISS verts={vertexCount} error={error}");
+    }
 
     private static int _grassTraceCount;
 
