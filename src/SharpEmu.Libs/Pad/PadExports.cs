@@ -181,10 +181,11 @@ public static class PadExports
             buttons |= 0x4000;
         }
         BinaryPrimitives.WriteUInt32LittleEndian(data[0x00..], buttons);
-        var leftX = acceptsKeyboardInput ? ReadAnalogStick(IsKeyDown(0x41), IsKeyDown(0x44)) : (byte)128;
-        var leftY = acceptsKeyboardInput ? ReadAnalogStick(IsKeyDown(0x57), IsKeyDown(0x53)) : (byte)128;
-        var rightX = acceptsKeyboardInput ? ReadAnalogStick(IsKeyDown(0x4A), IsKeyDown(0x4C)) : (byte)128;
-        var rightY = acceptsKeyboardInput ? ReadAnalogStick(IsKeyDown(0x49), IsKeyDown(0x4B)) : (byte)128;
+        UpdateAnalogRamps(acceptsKeyboardInput);
+        var leftX = acceptsKeyboardInput ? RampToByte(0) : (byte)128;
+        var leftY = acceptsKeyboardInput ? RampToByte(1) : (byte)128;
+        var rightX = acceptsKeyboardInput ? RampToByte(2) : (byte)128;
+        var rightY = acceptsKeyboardInput ? RampToByte(3) : (byte)128;
         data[0x04] = leftX;
         data[0x05] = leftY;
         data[0x06] = rightX;
@@ -336,10 +337,55 @@ public static class PadExports
         return buttons;
     }
 
-    private static byte ReadAnalogStick(bool negative, bool positive)
+    // Per-axis ramp state in [-1, 1]: keyboard axes accelerate toward full
+    // deflection and decay back to center over a short window so movement and
+    // aiming feel analog rather than snapping between three states. Order:
+    // LX, LY, RX, RY.
+    private static readonly float[] _analogRamp = new float[4];
+    private static long _lastAnalogRampTimestamp;
+
+    private static readonly (int Negative, int Positive)[] _analogAxisKeys =
     {
-        if (negative && !positive) return 0;
-        if (positive && !negative) return 255;
-        return 128;
+        (0x41, 0x44), // A / D  -> left X
+        (0x57, 0x53), // W / S  -> left Y
+        (0x4A, 0x4C), // J / L  -> right X
+        (0x49, 0x4B), // I / K  -> right Y
+    };
+
+    private static void UpdateAnalogRamps(bool acceptsKeyboardInput)
+    {
+        var now = System.Diagnostics.Stopwatch.GetTimestamp();
+        var previous = _lastAnalogRampTimestamp;
+        _lastAnalogRampTimestamp = now;
+        if (!acceptsKeyboardInput || previous == 0)
+        {
+            return;
+        }
+
+        var dt = (float)((now - previous) / (double)System.Diagnostics.Stopwatch.Frequency);
+        // Reach full deflection in ~140 ms and recentre in ~90 ms.
+        const float attackPerSecond = 7.0f;
+        const float releasePerSecond = 11.0f;
+        for (var axis = 0; axis < _analogRamp.Length; axis++)
+        {
+            var negative = IsKeyDown(_analogAxisKeys[axis].Negative);
+            var positive = IsKeyDown(_analogAxisKeys[axis].Positive);
+            var target = positive && !negative ? 1f : negative && !positive ? -1f : 0f;
+            var current = _analogRamp[axis];
+            var rate = (target == 0f ? releasePerSecond : attackPerSecond) * dt;
+            if (current < target)
+            {
+                current = Math.Min(target, current + rate);
+            }
+            else if (current > target)
+            {
+                current = Math.Max(target, current - rate);
+            }
+
+            _analogRamp[axis] = current;
+        }
     }
+
+    private static byte RampToByte(int axis) =>
+        (byte)Math.Clamp((int)MathF.Round(128f + _analogRamp[axis] * 127f), 0, 255);
 }
