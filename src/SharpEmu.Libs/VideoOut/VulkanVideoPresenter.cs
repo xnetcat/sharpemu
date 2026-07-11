@@ -1132,7 +1132,8 @@ internal static unsafe class VulkanVideoPresenter
         private sealed record HostBufferAllocation(
             VkBuffer Buffer,
             DeviceMemory Memory,
-            HostBufferPoolKey Key);
+            HostBufferPoolKey Key,
+            nint Mapped);
 
         private sealed class TranslatedDrawResources
         {
@@ -2000,6 +2001,48 @@ internal static unsafe class VulkanVideoPresenter
         private readonly List<TranslatedDrawResources> _batchResources = new();
         private readonly List<GuestImageResource> _batchTraceImages = new();
 
+        // Consecutive draws into the same target stay inside one render pass:
+        // on MoltenVK every render pass is a Metal render encoder, and one
+        // encoder per draw was the dominant per-draw fixed cost after submit
+        // batching. The pass closes when the target changes, when a draw
+        // needs transfer/storage work outside a pass, or when the batch
+        // flushes.
+        private GuestImageResource? _openPassTarget;
+
+        private void CloseOpenTranslatedRenderPass()
+        {
+            if (_openPassTarget is not { } target)
+            {
+                return;
+            }
+
+            _openPassTarget = null;
+            _vk.CmdEndRenderPass(_batchCommandBuffer);
+            var toShaderRead = new ImageMemoryBarrier
+            {
+                SType = StructureType.ImageMemoryBarrier,
+                SrcAccessMask = AccessFlags.ColorAttachmentWriteBit,
+                DstAccessMask = AccessFlags.ShaderReadBit,
+                OldLayout = ImageLayout.ColorAttachmentOptimal,
+                NewLayout = ImageLayout.ShaderReadOnlyOptimal,
+                SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                Image = target.Image,
+                SubresourceRange = ColorSubresourceRange(),
+            };
+            _vk.CmdPipelineBarrier(
+                _batchCommandBuffer,
+                PipelineStageFlags.ColorAttachmentOutputBit,
+                PipelineStageFlags.FragmentShaderBit,
+                0,
+                0,
+                null,
+                0,
+                null,
+                1,
+                &toShaderRead);
+        }
+
         private CommandBuffer BeginBatchedGuestCommands()
         {
             if (_batchOpen)
@@ -2028,6 +2071,7 @@ internal static unsafe class VulkanVideoPresenter
                 return;
             }
 
+            CloseOpenTranslatedRenderPass();
             _batchOpen = false;
             Check(_vk.EndCommandBuffer(_batchCommandBuffer), "vkEndCommandBuffer(batch)");
             SubmitGuestCommandBuffer(
@@ -3988,27 +4032,29 @@ internal static unsafe class VulkanVideoPresenter
                     usage,
                     MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
                     out var allocatedMemory);
-                allocation = new HostBufferAllocation(buffer, allocatedMemory, key);
+                // Persistently mapped: map/unmap per draw was a measurable
+                // share of the per-draw fixed cost, and HOST_COHERENT memory
+                // may legally stay mapped for its lifetime.
+                void* persistentMapping;
+                Check(
+                    _vk.MapMemory(_device, allocatedMemory, 0, capacity, 0, &persistentMapping),
+                    "vkMapMemory(host persistent)");
+                allocation = new HostBufferAllocation(
+                    buffer,
+                    allocatedMemory,
+                    key,
+                    (nint)persistentMapping);
                 _hostBufferAllocations.Add(buffer.Handle, allocation);
             }
 
             memory = allocation.Memory;
-            void* mapped;
-            Check(_vk.MapMemory(_device, memory, 0, size, 0, &mapped), "vkMapMemory(host)");
-            try
+            fixed (byte* source = data)
             {
-                fixed (byte* source = data)
-                {
-                    System.Buffer.MemoryCopy(
-                        source,
-                        mapped,
-                        checked((long)size),
-                        data.Length);
-                }
-            }
-            finally
-            {
-                _vk.UnmapMemory(_device, memory);
+                System.Buffer.MemoryCopy(
+                    source,
+                    (void*)allocation.Mapped,
+                    checked((long)allocation.Key.Capacity),
+                    data.Length);
             }
 
             return allocation.Buffer;
@@ -4809,67 +4855,66 @@ internal static unsafe class VulkanVideoPresenter
                 submitted = true;
 
                 BeginDebugLabel(_commandBuffer, resources.DebugName);
-                RecordTextureUploads(resources, PipelineStageFlags.FragmentShaderBit);
-                RecordStorageImagesForWrite(resources, PipelineStageFlags.FragmentShaderBit);
-
-                var toColorAttachment = new ImageMemoryBarrier
+                var hasStorageImages = false;
+                var needsTextureUploads = false;
+                foreach (var texture in resources.Textures)
                 {
-                    SType = StructureType.ImageMemoryBarrier,
-                    SrcAccessMask = target.Initialized ? AccessFlags.ShaderReadBit : 0,
-                    DstAccessMask = AccessFlags.ColorAttachmentWriteBit,
-                    OldLayout = target.Initialized
-                        ? ImageLayout.ShaderReadOnlyOptimal
-                        : ImageLayout.Undefined,
-                    NewLayout = ImageLayout.ColorAttachmentOptimal,
-                    SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
-                    DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
-                    Image = target.Image,
-                    SubresourceRange = ColorSubresourceRange(),
-                };
-                _vk.CmdPipelineBarrier(
-                    _commandBuffer,
-                    target.Initialized
-                        ? PipelineStageFlags.FragmentShaderBit
-                        : PipelineStageFlags.TopOfPipeBit,
-                    PipelineStageFlags.ColorAttachmentOutputBit,
-                    0,
-                    0,
-                    null,
-                    0,
-                    null,
-                    1,
-                    &toColorAttachment);
+                    if (texture is null)
+                    {
+                        continue;
+                    }
 
-                RecordTranslatedGraphicsPass(
-                    resources,
-                    target.RenderPass,
-                    target.Framebuffer,
-                    extent);
-                RecordStorageImagesForRead(resources, PipelineStageFlags.FragmentShaderBit);
+                    hasStorageImages |= texture.IsStorage;
+                    needsTextureUploads |= texture.NeedsUpload;
+                }
 
-                var toShaderRead = new ImageMemoryBarrier
+                if (hasStorageImages ||
+                    needsTextureUploads ||
+                    !ReferenceEquals(_openPassTarget, target))
                 {
-                    SType = StructureType.ImageMemoryBarrier,
-                    SrcAccessMask = AccessFlags.ColorAttachmentWriteBit,
-                    DstAccessMask = AccessFlags.ShaderReadBit,
-                    OldLayout = ImageLayout.ColorAttachmentOptimal,
-                    NewLayout = ImageLayout.ShaderReadOnlyOptimal,
-                    SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
-                    DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
-                    Image = target.Image,
-                    SubresourceRange = ColorSubresourceRange(),
-                };
-                _vk.CmdPipelineBarrier(
-                    _commandBuffer,
-                    PipelineStageFlags.ColorAttachmentOutputBit,
-                    PipelineStageFlags.FragmentShaderBit,
-                    0,
-                    0,
-                    null,
-                    0,
-                    null,
-                    1,
-                    &toShaderRead);
+                    CloseOpenTranslatedRenderPass();
+                    RecordTextureUploads(resources, PipelineStageFlags.FragmentShaderBit);
+                    RecordStorageImagesForWrite(resources, PipelineStageFlags.FragmentShaderBit);
+
+                    var toColorAttachment = new ImageMemoryBarrier
+                    {
+                        SType = StructureType.ImageMemoryBarrier,
+                        SrcAccessMask = target.Initialized ? AccessFlags.ShaderReadBit : 0,
+                        DstAccessMask = AccessFlags.ColorAttachmentWriteBit,
+                        OldLayout = target.Initialized
+                            ? ImageLayout.ShaderReadOnlyOptimal
+                            : ImageLayout.Undefined,
+                        NewLayout = ImageLayout.ColorAttachmentOptimal,
+                        SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                        DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                        Image = target.Image,
+                        SubresourceRange = ColorSubresourceRange(),
+                    };
+                    _vk.CmdPipelineBarrier(
+                        _commandBuffer,
+                        target.Initialized
+                            ? PipelineStageFlags.FragmentShaderBit
+                            : PipelineStageFlags.TopOfPipeBit,
+                        PipelineStageFlags.ColorAttachmentOutputBit,
+                        0,
+                        0,
+                        null,
+                        0,
+                        null,
+                        1,
+                        &toColorAttachment);
+
+                    BeginTranslatedRenderPass(target.RenderPass, target.Framebuffer, extent);
+                    _openPassTarget = target;
+                }
+
+                RecordTranslatedDrawInPass(resources, extent);
+                if (hasStorageImages)
+                {
+                    CloseOpenTranslatedRenderPass();
+                    RecordStorageImagesForRead(resources, PipelineStageFlags.FragmentShaderBit);
+                }
+
                 EndDebugLabel(_commandBuffer);
 
                 _batchTraceImages.AddRange(GetTraceImages(resources, target));
@@ -6637,6 +6682,16 @@ internal static unsafe class VulkanVideoPresenter
             Framebuffer framebuffer,
             Extent2D extent)
         {
+            BeginTranslatedRenderPass(renderPass, framebuffer, extent);
+            RecordTranslatedDrawInPass(resources, extent);
+            _vk.CmdEndRenderPass(_commandBuffer);
+        }
+
+        private void BeginTranslatedRenderPass(
+            RenderPass renderPass,
+            Framebuffer framebuffer,
+            Extent2D extent)
+        {
             var clearValue = default(ClearValue);
             var renderPassInfo = new RenderPassBeginInfo
             {
@@ -6651,6 +6706,12 @@ internal static unsafe class VulkanVideoPresenter
                 _commandBuffer,
                 &renderPassInfo,
                 SubpassContents.Inline);
+        }
+
+        private void RecordTranslatedDrawInPass(
+            TranslatedDrawResources resources,
+            Extent2D extent)
+        {
             _vk.CmdBindPipeline(
                 _commandBuffer,
                 PipelineBindPoint.Graphics,
@@ -6672,7 +6733,6 @@ internal static unsafe class VulkanVideoPresenter
             var drawScissor = ClampScissor(resources.Scissor, extent);
             if (drawScissor.Width == 0 || drawScissor.Height == 0)
             {
-                _vk.CmdEndRenderPass(_commandBuffer);
                 return;
             }
 
@@ -6759,7 +6819,6 @@ internal static unsafe class VulkanVideoPresenter
                     $"{drawViewport.Width:0.###}x{drawViewport.Height:0.###} " +
                     $"name={resources.DebugName}");
             }
-            _vk.CmdEndRenderPass(_commandBuffer);
         }
 
         private void DestroyTranslatedDrawResources(TranslatedDrawResources resources)
