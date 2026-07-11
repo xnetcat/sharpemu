@@ -2117,6 +2117,31 @@ public static class KernelMemoryCompatExports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
+    /// <summary>
+    /// Invokes the registered runtime thread-destructor callback (set via
+    /// <c>_sceKernelSetThreadDtors</c>) on the exiting guest thread. C++
+    /// runtimes register this to flush per-thread cleanup that would
+    /// otherwise leak.
+    /// </summary>
+    public static void RunThreadDtors(CpuContext ctx)
+    {
+        var callback = _threadDtorsCallback;
+        if (callback == 0)
+        {
+            return;
+        }
+
+        _ = GuestThreadExecution.Scheduler?.TryCallGuestFunction(
+            ctx,
+            callback,
+            0,
+            0,
+            0,
+            0,
+            "kernel_thread_dtors",
+            out _);
+    }
+
     [SysAbiExport(
         Nid = "Tz4RNUCBbGI",
         ExportName = "_sceKernelRtldThreadAtexitIncrement",

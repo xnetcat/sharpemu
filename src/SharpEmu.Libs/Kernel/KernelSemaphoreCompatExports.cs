@@ -99,38 +99,130 @@ public static class KernelSemaphoreCompatExports
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
+        uint timeoutUsec = 0;
+        if (timeoutAddress != 0 && !TryReadUInt32(ctx, timeoutAddress, out timeoutUsec))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
         lock (semaphore.Gate)
         {
             if (semaphore.Count >= needCount)
             {
                 semaphore.Count -= needCount;
+                if (timeoutAddress != 0)
+                {
+                    _ = TryWriteUInt32(ctx, timeoutAddress, timeoutUsec);
+                }
+
                 TraceSemaphore($"wait handle=0x{handle:X8} name='{semaphore.Name}' need={needCount} count={semaphore.Count}");
                 return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
             }
 
-            if (timeoutAddress != 0)
+            semaphore.WaitingThreads++;
+        }
+
+        // Block cooperatively: the wake predicate atomically acquires the
+        // tokens (so a wake commits the acquisition), while the resume
+        // handler distinguishes a real acquisition from a deadline expiry.
+        var acquired = false;
+        var deadline = timeoutAddress != 0
+            ? GuestThreadExecution.ComputeDeadlineTimestamp(TimeSpan.FromMicroseconds(timeoutUsec))
+            : 0;
+
+        bool WakePredicate()
+        {
+            lock (semaphore.Gate)
             {
-                if (!TryReadUInt32(ctx, timeoutAddress, out _))
+                if (semaphore.Count >= needCount)
                 {
-                    return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+                    semaphore.Count -= needCount;
+                    semaphore.WaitingThreads = Math.Max(0, semaphore.WaitingThreads - 1);
+                    acquired = true;
+                    return true;
                 }
 
-                _ = TryWriteUInt32(ctx, timeoutAddress, 0);
-                TraceSemaphore($"wait-timeout handle=0x{handle:X8} name='{semaphore.Name}' need={needCount} count={semaphore.Count}");
-                return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT);
+                return false;
             }
+        }
 
-            if (!GuestThreadExecution.RequestCurrentThreadBlock(ctx, "sceKernelWaitSema"))
+        int ResumeWait()
+        {
+            if (timeoutAddress != 0)
             {
-                TraceSemaphore($"wait-would-block handle=0x{handle:X8} name='{semaphore.Name}' need={needCount} count={semaphore.Count}");
-                return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_TRY_AGAIN);
+                _ = TryWriteUInt32(ctx, timeoutAddress, 0);
             }
 
-            semaphore.WaitingThreads++;
+            if (acquired)
+            {
+                TraceSemaphore($"wait-wake handle=0x{handle:X8} name='{semaphore.Name}' need={needCount} count={semaphore.Count}");
+                return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+            }
+
+            lock (semaphore.Gate)
+            {
+                semaphore.WaitingThreads = Math.Max(0, semaphore.WaitingThreads - 1);
+            }
+
+            TraceSemaphore($"wait-timeout handle=0x{handle:X8} name='{semaphore.Name}' need={needCount} count={semaphore.Count}");
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT;
+        }
+
+        if (GuestThreadExecution.RequestCurrentThreadBlock(
+                ctx,
+                "sceKernelWaitSema",
+                GetSemaphoreWakeKey(handle),
+                ResumeWait,
+                WakePredicate,
+                deadline))
+        {
             TraceSemaphore($"wait-block handle=0x{handle:X8} name='{semaphore.Name}' need={needCount} count={semaphore.Count} waiters={semaphore.WaitingThreads}");
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
         }
+
+        // Not a guest thread (or no scheduler): fall back to a host-thread
+        // wait so the semantics still hold on non-cooperative callers.
+        return WaitSemaphoreOnHostThread(ctx, semaphore, handle, needCount, timeoutAddress, timeoutUsec);
     }
+
+    private static int WaitSemaphoreOnHostThread(
+        CpuContext ctx,
+        KernelSemaphoreState semaphore,
+        uint handle,
+        int needCount,
+        ulong timeoutAddress,
+        uint timeoutUsec)
+    {
+        var deadlineMs = timeoutAddress != 0
+            ? Environment.TickCount64 + Math.Max(1L, timeoutUsec / 1000L)
+            : long.MaxValue;
+        lock (semaphore.Gate)
+        {
+            while (semaphore.Count < needCount)
+            {
+                var remaining = deadlineMs - Environment.TickCount64;
+                if (timeoutAddress != 0 && remaining <= 0)
+                {
+                    semaphore.WaitingThreads = Math.Max(0, semaphore.WaitingThreads - 1);
+                    _ = TryWriteUInt32(ctx, timeoutAddress, 0);
+                    return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT);
+                }
+
+                Monitor.Wait(semaphore.Gate, (int)Math.Min(remaining, 100));
+            }
+
+            semaphore.Count -= needCount;
+            semaphore.WaitingThreads = Math.Max(0, semaphore.WaitingThreads - 1);
+            if (timeoutAddress != 0)
+            {
+                _ = TryWriteUInt32(ctx, timeoutAddress, 0);
+            }
+
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
+        }
+    }
+
+    private static string GetSemaphoreWakeKey(uint handle) => $"sceKernelWaitSema:{handle:X8}";
 
     [SysAbiExport(
         Nid = "12wOHk8ywb0",
@@ -194,9 +286,15 @@ public static class KernelSemaphoreCompatExports
             }
 
             semaphore.Count += signalCount;
+            // Wake host-thread waiters parked in the fallback path.
+            Monitor.PulseAll(semaphore.Gate);
             TraceSemaphore($"signal handle=0x{handle:X8} name='{semaphore.Name}' signal={signalCount} count={semaphore.Count} waiters={semaphore.WaitingThreads}");
-            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
         }
+
+        // Wake cooperatively-blocked guest threads; their wake predicate
+        // acquires the tokens atomically, so this respects the new count.
+        _ = GuestThreadExecution.Scheduler?.WakeBlockedThreads(GetSemaphoreWakeKey(handle));
+        return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
     }
 
     [SysAbiExport(
@@ -229,9 +327,12 @@ public static class KernelSemaphoreCompatExports
 
             semaphore.Count = setCount < 0 ? semaphore.InitialCount : setCount;
             semaphore.WaitingThreads = 0;
+            Monitor.PulseAll(semaphore.Gate);
             TraceSemaphore($"cancel handle=0x{handle:X8} name='{semaphore.Name}' set={setCount} count={semaphore.Count}");
-            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
         }
+
+        _ = GuestThreadExecution.Scheduler?.WakeBlockedThreads(GetSemaphoreWakeKey(handle));
+        return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
     }
 
     [SysAbiExport(

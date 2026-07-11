@@ -279,6 +279,9 @@ public static class KernelExports
     public static int PthreadExit(CpuContext ctx)
     {
         var value = ctx[CpuRegister.Rdi];
+        // Run cleanup on the still-executable thread before unwinding it.
+        KernelPthreadExtendedCompatExports.RunThreadLocalDestructors(ctx);
+        KernelMemoryCompatExports.RunThreadDtors(ctx);
         GuestThreadExecution.RequestCurrentEntryExit("scePthreadExit", value);
         ctx[CpuRegister.Rax] = value;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
@@ -292,6 +295,8 @@ public static class KernelExports
     public static int PosixPthreadExit(CpuContext ctx)
     {
         var value = ctx[CpuRegister.Rdi];
+        KernelPthreadExtendedCompatExports.RunThreadLocalDestructors(ctx);
+        KernelMemoryCompatExports.RunThreadDtors(ctx);
         GuestThreadExecution.RequestCurrentEntryExit("pthread_exit", value);
         ctx[CpuRegister.Rax] = value;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;

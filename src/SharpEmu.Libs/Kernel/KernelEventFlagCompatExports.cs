@@ -232,23 +232,41 @@ public static class KernelEventFlagCompatExports
                 return SetReturn(ctx, immediateWaitResult);
             }
 
-            if (timeoutAddress != 0)
-            {
-                _ = TryWriteUInt32(ctx, timeoutAddress, 0);
-                _ = TryWriteResultPattern(ctx, resultAddress, state.Bits);
-                TraceEventFlag($"wait-timeout handle=0x{handle:X16} pattern=0x{pattern:X16} timeout={timeoutUsec} ret=0x{returnRip:X16}");
-                return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT);
-            }
+            // Timed waits block on a deadline instead of returning TIMED_OUT
+            // immediately; a zero-microsecond timeout still degrades to an
+            // instant poll because the deadline is already in the past.
+            var deadline = timeoutAddress != 0
+                ? GuestThreadExecution.ComputeDeadlineTimestamp(TimeSpan.FromMicroseconds(timeoutUsec))
+                : 0;
+            var hostDeadlineMs = timeoutAddress != 0
+                ? Environment.TickCount64 + Math.Max(0L, timeoutUsec / 1000L)
+                : long.MaxValue;
 
             var currentGuestThread = GuestThreadExecution.CurrentGuestThreadHandle;
             var currentFiber = FiberExports.GetCurrentFiberAddressForDiagnostics(ctx);
             var managedThread = Environment.CurrentManagedThreadId;
             var blockedWaitResult = OrbisGen2Result.ORBIS_GEN2_OK;
+            var satisfied = false;
             var requestedBlock = GuestThreadExecution.RequestCurrentThreadBlock(
                 ctx,
                 "sceKernelWaitEventFlag",
                 GetEventFlagWakeKey(handle),
-                () => (int)blockedWaitResult,
+                () =>
+                {
+                    if (satisfied)
+                    {
+                        return (int)blockedWaitResult;
+                    }
+
+                    // Deadline expiry: report timeout with the current bits.
+                    if (timeoutAddress != 0)
+                    {
+                        _ = TryWriteUInt32(ctx, timeoutAddress, 0);
+                    }
+
+                    _ = TryWriteResultPattern(ctx, resultAddress, state.Bits);
+                    return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT;
+                },
                 () =>
                 {
                     if (!TryPrepareBlockedWait(
@@ -263,8 +281,10 @@ public static class KernelEventFlagCompatExports
                     }
 
                     blockedWaitResult = preparedResult;
+                    satisfied = true;
                     return true;
-                });
+                },
+                deadline);
             TraceEventFlag($"wait-unsatisfied handle=0x{handle:X16} pattern=0x{pattern:X16} bits=0x{state.Bits:X16} guest_thread=0x{currentGuestThread:X16} fiber=0x{currentFiber:X16} managed={managedThread} block={requestedBlock} ret=0x{returnRip:X16} frames={FormatFrameChain(ctx)}");
             TraceEventFlag($"wait-object handle=0x{handle:X16} name='{state.Name}' {FormatGuestWaitObject(ctx)}");
             if (!requestedBlock)
@@ -300,7 +320,18 @@ public static class KernelEventFlagCompatExports
                             return SetReturn(ctx, pumpedWaitResult);
                         }
 
-                        Monitor.Wait(state.Gate, HostWaitPumpMilliseconds);
+                        var remaining = hostDeadlineMs - Environment.TickCount64;
+                        if (timeoutAddress != 0 && remaining <= 0)
+                        {
+                            state.WaitingThreads = Math.Max(0, state.WaitingThreads - 1);
+                            releaseWaiter = false;
+                            _ = TryWriteUInt32(ctx, timeoutAddress, 0);
+                            _ = TryWriteResultPattern(ctx, resultAddress, state.Bits);
+                            TraceEventFlag($"wait-timeout handle=0x{handle:X16} pattern=0x{pattern:X16} bits=0x{state.Bits:X16} ret=0x{returnRip:X16}");
+                            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT);
+                        }
+
+                        Monitor.Wait(state.Gate, (int)Math.Min(remaining, HostWaitPumpMilliseconds));
                     }
                 }
                 finally

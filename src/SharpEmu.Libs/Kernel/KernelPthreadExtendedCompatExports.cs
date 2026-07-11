@@ -226,6 +226,7 @@ public static class KernelPthreadExtendedCompatExports
             state.Attributes = state.Attributes with { AffinityMask = mask };
         }
 
+        _ = GuestThreadExecution.Scheduler?.TrySetGuestThreadAffinity(thread, mask);
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
@@ -307,6 +308,9 @@ public static class KernelPthreadExtendedCompatExports
             GetOrCreateThreadStateLocked(thread).Priority = priority;
         }
 
+        // Apply to the live scheduler thread so runtime priority changes take
+        // effect, not just the local bookkeeping snapshot.
+        _ = GuestThreadExecution.Scheduler?.TrySetGuestThreadPriority(thread, priority);
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
@@ -1221,6 +1225,72 @@ public static class KernelPthreadExtendedCompatExports
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libKernel")]
     public static int OrbisPthreadGetspecific(CpuContext ctx) => PosixPthreadGetspecific(ctx);
+
+    private const int PthreadDestructorIterations = 4;
+
+    /// <summary>
+    /// Runs the current thread's pthread TLS-key destructors, as POSIX
+    /// requires on thread exit. Each key holding a non-null value with a
+    /// registered destructor has its value cleared first and the destructor
+    /// then invoked with the previous value; this repeats up to
+    /// PTHREAD_DESTRUCTOR_ITERATIONS times so destructors that set new
+    /// thread-local values are themselves cleaned up. Called on the exiting
+    /// guest thread while it is still executable.
+    /// </summary>
+    public static void RunThreadLocalDestructors(CpuContext ctx)
+    {
+        var scheduler = GuestThreadExecution.Scheduler;
+        if (scheduler is null)
+        {
+            return;
+        }
+
+        var threadHandle = KernelPthreadState.GetCurrentThreadHandle();
+        if (!_threadLocalSpecific.TryGetValue(threadHandle, out var values))
+        {
+            return;
+        }
+
+        for (var iteration = 0; iteration < PthreadDestructorIterations; iteration++)
+        {
+            var ranAny = false;
+            foreach (var entry in values)
+            {
+                var value = entry.Value;
+                if (value == 0 ||
+                    !_tlsKeys.TryGetValue(entry.Key, out var keyState) ||
+                    keyState.Destructor == 0)
+                {
+                    continue;
+                }
+
+                // Clear before invoking, per POSIX, so a destructor that
+                // re-sets the key is handled on the next iteration.
+                if (!values.TryUpdate(entry.Key, 0, value))
+                {
+                    continue;
+                }
+
+                ranAny = true;
+                _ = scheduler.TryCallGuestFunction(
+                    ctx,
+                    keyState.Destructor,
+                    value,
+                    0,
+                    0,
+                    0,
+                    "pthread_tls_destructor",
+                    out _);
+            }
+
+            if (!ranAny)
+            {
+                break;
+            }
+        }
+
+        _threadLocalSpecific.TryRemove(threadHandle, out _);
+    }
 
     private static int PthreadRwlockLockCore(CpuContext ctx, ulong rwlockAddress, bool write)
     {

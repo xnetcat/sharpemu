@@ -64,6 +64,9 @@ public static class KernelRuntimeCompatExports
     [ThreadStatic]
     private static int _shortUsleepCount;
 
+    private static readonly bool _stopwatchTicksAreNanoseconds =
+        Stopwatch.Frequency == 1_000_000_000L;
+
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate ulong RdtscDelegate();
 
@@ -100,8 +103,10 @@ public static class KernelRuntimeCompatExports
         else
         {
             _shortUsleepCount = 0;
-            var sleepMilliseconds = (int)Math.Min((micros + 999UL) / 1000UL, int.MaxValue);
-            Thread.Sleep(sleepMilliseconds);
+            // Precise sleep: rounding microseconds up to Thread.Sleep
+            // milliseconds (which itself overshoots by a scheduler quantum)
+            // hard-caps games that pace their frame loop with usleep.
+            HostTiming.SleepMicroseconds((long)Math.Min(micros, long.MaxValue));
         }
 
         ctx[CpuRegister.Rax] = 0;
@@ -198,8 +203,18 @@ public static class KernelRuntimeCompatExports
         else
         {
             var elapsedTicks = Stopwatch.GetTimestamp() - _processStartCounter;
-            seconds = elapsedTicks / Stopwatch.Frequency;
-            nanoseconds = (elapsedTicks % Stopwatch.Frequency) * 1_000_000_000L / Stopwatch.Frequency;
+            if (_stopwatchTicksAreNanoseconds)
+            {
+                // Constant divisors let the JIT strength-reduce the division;
+                // games call this thousands of times per second.
+                seconds = elapsedTicks / 1_000_000_000L;
+                nanoseconds = elapsedTicks - seconds * 1_000_000_000L;
+            }
+            else
+            {
+                seconds = elapsedTicks / Stopwatch.Frequency;
+                nanoseconds = (elapsedTicks % Stopwatch.Frequency) * 1_000_000_000L / Stopwatch.Frequency;
+            }
         }
 
         if (!ctx.TryWriteUInt64(timeAddress, unchecked((ulong)seconds)) ||

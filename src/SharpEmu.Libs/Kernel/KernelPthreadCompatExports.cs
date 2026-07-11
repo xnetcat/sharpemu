@@ -19,7 +19,13 @@ public static class KernelPthreadCompatExports
     private const int MutexObjectSize = 0x100;
     private const int MutexAttrObjectSize = 0x40;
     private const int CondObjectSize = 0x100;
-    private const int DefaultSpuriousCondWakeMilliseconds = 1;
+    // Signals/broadcasts pulse the monitor directly, so the periodic
+    // re-check is mostly a safety net; at 1 ms every parked waiter woke
+    // 1000x/sec, burning CPU and stealing cycles from the frame loop. It
+    // stays bounded at 10 ms because the net also catches predicates the
+    // guest flips without a matching cond_signal through the HLE.
+    private const int DefaultSpuriousCondWakeMilliseconds = 10;
+    private static readonly TimeSpan _condSpuriousWakeTimeout = ComputeCondSpuriousWakeTimeout();
     private const int PthreadOnceUninitialized = 0;
     private const int PthreadOnceInProgress = 1;
     private const int PthreadOnceDone = 2;
@@ -1215,6 +1221,10 @@ public static class KernelPthreadCompatExports
             TracePthreadCond(broadcast ? "broadcast" : "signal", condAddress, mutexAddress: 0, state, timed: false, (int)OrbisGen2Result.ORBIS_GEN2_OK);
         }
 
+        // Also wake cooperatively-blocked waiters immediately rather than
+        // leaving them to the periodic epoch re-check; they re-validate the
+        // signal epoch on resume, so an over-broad wake is harmless.
+        _ = GuestThreadExecution.Scheduler?.WakeBlockedThreads("pthread_cond_wait");
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
@@ -1285,7 +1295,9 @@ public static class KernelPthreadCompatExports
         return TimeSpan.FromTicks((long)timeoutUsec * 10L);
     }
 
-    private static TimeSpan GetCondSpuriousWakeTimeout()
+    private static TimeSpan GetCondSpuriousWakeTimeout() => _condSpuriousWakeTimeout;
+
+    private static TimeSpan ComputeCondSpuriousWakeTimeout()
     {
         if (int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_PTHREAD_COND_SPURIOUS_WAKE_MS"), out var milliseconds))
         {

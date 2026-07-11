@@ -30,11 +30,33 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 		public ExportedFunction? Export { get; }
 
-		public ImportStubEntry(ulong address, string nid, ExportedFunction? export)
+		// Precomputed per-import classification: DispatchImport runs for
+		// every guest HLE call, so per-call string pattern matches and NID
+		// hashing are hoisted to stub-setup time.
+		public bool IsLeaf { get; }
+
+		public bool SuppressStrlenTrace { get; }
+
+		public bool IsLoopGuardBoundary { get; }
+
+		public ulong NidHash { get; }
+
+		public ImportStubEntry(
+			ulong address,
+			string nid,
+			ExportedFunction? export,
+			bool isLeaf,
+			bool suppressStrlenTrace,
+			bool isLoopGuardBoundary,
+			ulong nidHash)
 		{
 			Address = address;
 			Nid = nid;
 			Export = export;
+			IsLeaf = isLeaf;
+			SuppressStrlenTrace = suppressStrlenTrace;
+			IsLoopGuardBoundary = isLoopGuardBoundary;
+			NidHash = nidHash;
 		}
 	}
 
@@ -322,7 +344,6 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private long _importLoopPatternStartTimestamp;
 
-	private readonly Dictionary<string, ulong> _importNidHashCache = new Dictionary<string, ulong>(StringComparer.Ordinal);
 
 	private enum GuestThreadRunState
 	{
@@ -351,9 +372,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 		public string Name { get; init; } = string.Empty;
 
-		public int Priority { get; init; }
+		public int Priority { get; set; }
 
-		public ulong AffinityMask { get; init; }
+		public ulong AffinityMask { get; set; }
 
 		public CpuContext Context { get; init; } = null!;
 
@@ -848,7 +869,6 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		_importLoopSignatureWriteIndex = 0;
 		_importLoopPatternHits = 0;
 		_importLoopPatternStartTimestamp = 0;
-		_importNidHashCache.Clear();
 		lock (_importResultLogSampleGate)
 		{
 			_importResultLogSamples.Clear();
@@ -908,7 +928,14 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		foreach (var (num4, text2) in importStubs)
 		{
 			_ = _moduleManager.TryGetExport(text2, out var resolvedExport);
-			_importEntries[num] = new ImportStubEntry(num4, text2, resolvedExport);
+			_importEntries[num] = new ImportStubEntry(
+				num4,
+				text2,
+				resolvedExport,
+				IsLeafImport(text2),
+				ShouldSuppressStrlenTrace(text2),
+				IsImportLoopGuardBoundary(text2),
+				StableHash64(text2));
 			if ((num4 >= 34393242112L && num4 <= 34393242624L) || (num4 >= 34393258496L && num4 <= 34393259008L))
 			{
 				if (resolvedExport is not null)
@@ -3368,6 +3395,52 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		return hostAffinityMask;
 	}
 
+	public bool TrySetGuestThreadPriority(ulong guestThreadHandle, int guestPriority)
+	{
+		lock (_guestThreadGate)
+		{
+			if (!_guestThreads.TryGetValue(guestThreadHandle, out var thread))
+			{
+				return false;
+			}
+
+			thread.Priority = guestPriority;
+			var host = thread.HostThread;
+			if (host is not null && host.IsAlive)
+			{
+				try
+				{
+					host.Priority = MapGuestThreadPriority(guestPriority);
+				}
+				catch (Exception exception) when (exception is ThreadStateException or InvalidOperationException)
+				{
+					// The thread may have exited between the alive check and
+					// the assignment; the stored priority still takes effect
+					// if it is ever restarted.
+				}
+			}
+
+			return true;
+		}
+	}
+
+	public bool TrySetGuestThreadAffinity(ulong guestThreadHandle, ulong affinityMask)
+	{
+		lock (_guestThreadGate)
+		{
+			if (!_guestThreads.TryGetValue(guestThreadHandle, out var thread))
+			{
+				return false;
+			}
+
+			thread.AffinityMask = affinityMask;
+			// A running thread applies its own affinity via
+			// ApplyGuestThreadAffinity; cross-thread affinity is not portable,
+			// so the new mask takes effect on the thread's next scheduling.
+			return true;
+		}
+	}
+
 	private void RunGuestThread(GuestThreadState thread, string reason)
 	{
 		var previousLastError = LastError;
@@ -4476,7 +4549,6 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		ClearImportHandlerTrampolines();
 		_importEntries = Array.Empty<ImportStubEntry>();
 		_runtimeSymbolsByName.Clear();
-		_importNidHashCache.Clear();
 		StopStallWatchdog();
 		if (_exceptionHandler != 0)
 		{
