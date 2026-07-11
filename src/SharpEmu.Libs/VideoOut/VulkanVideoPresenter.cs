@@ -248,6 +248,14 @@ internal static unsafe class VulkanVideoPresenter
     // geometry+composite path renders on its own.
     private static readonly bool _skipAllCompute =
         Environment.GetEnvironmentVariable("SHARPEMU_SKIP_ALL_COMPUTE") == "1";
+    // Diagnostic: skip compute dispatches whose GroupCountZ is at least this,
+    // to isolate a specific tall dispatch (e.g. Demon's Souls' 27x15x72 froxel
+    // shader that hangs the Metal queue) without needing its ASLR-varying
+    // address. 0 disables.
+    private static readonly uint _skipTallComputeZ =
+        uint.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_SKIP_TALL_COMPUTE_Z"), out var z)
+            ? z
+            : 0;
     private const uint GuestPrimitiveRectList = 0x11;
     private const uint GuestFormatR32Uint = 0x10004;
     private const uint GuestFormatR32Sint = 0x20004;
@@ -3185,7 +3193,12 @@ internal static unsafe class VulkanVideoPresenter
             {
                 foreach (var texture in draw.Textures)
                 {
-                    if (texture.IsStorage)
+                    // Skip address-0 storage bindings here: the real resolution
+                    // path uses a scratch image for those, but this warm-up pass
+                    // called ResolveStorageGuestImage directly, which throws on
+                    // address 0 and dropped the whole draw (Demon's Souls G-buffer
+                    // normals/IDs passes -> lighting had no input -> black).
+                    if (texture.IsStorage && texture.Address != 0)
                     {
                         _ = ResolveStorageGuestImage(texture);
                     }
@@ -5462,7 +5475,8 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             if (_skipAllCompute ||
-                AddressListContains("SHARPEMU_SKIP_COMPUTE_CS", work.ShaderAddress))
+                AddressListContains("SHARPEMU_SKIP_COMPUTE_CS", work.ShaderAddress) ||
+                (_skipTallComputeZ > 0 && work.GroupCountZ >= _skipTallComputeZ))
             {
                 TraceVulkanShader(
                     $"vk.compute_skip cs=0x{work.ShaderAddress:X16} " +
