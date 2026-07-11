@@ -58,7 +58,9 @@ public sealed class SelfLoader : ISelfLoader
     private const uint RelocationTypeGlobalData = 6;
     private const uint RelocationTypeJumpSlot = 7;
     private const uint RelocationTypeRelative = 8;
-    private const uint RelocationTypeTlsModuleId = 16;
+    private const uint RelocationTypeTlsModuleId = 16;   // R_X86_64_DTPMOD64
+    private const uint RelocationTypeTlsDtpOff64 = 17;    // R_X86_64_DTPOFF64
+    private const uint RelocationTypeTlsTpOff64 = 18;     // R_X86_64_TPOFF64
     private const ulong Ps5MainImageBase = 0x0000000800000000UL;
     private const ulong Ps4MainImageBase = 0x0000000000400000UL;
     private const ulong Ps5ModuleSearchStart = 0x0000000804000000UL;
@@ -194,6 +196,12 @@ public sealed class SelfLoader : ISelfLoader
         }
 
         MapLoadSegments(imageData, loadContext, programHeaders, virtualMemory, imageBase);
+        if (clearVirtualMemory)
+        {
+            // The main module owns the static TLS template; capture it before
+            // relocations so TPOFF64 offsets can be computed against its size.
+            RecordMainModuleTlsTemplate(programHeaders, virtualMemory, imageBase);
+        }
         var importStubs = ResolveAndPatchImportStubs(
             imageData,
             loadContext,
@@ -469,6 +477,37 @@ public sealed class SelfLoader : ISelfLoader
         return 0;
     }
 
+    private static void RecordMainModuleTlsTemplate(
+        IReadOnlyList<ProgramHeader> programHeaders,
+        IVirtualMemory virtualMemory,
+        ulong imageBase)
+    {
+        SharpEmu.HLE.GuestTlsTemplate.Reset();
+        if (!TryGetProgramHeader(programHeaders, ProgramHeaderType.Tls, out var tlsHeader, out _) ||
+            tlsHeader.MemorySize == 0)
+        {
+            return;
+        }
+
+        // tdata (initialized) bytes come from the mapped segment; tbss is the
+        // implicitly-zero remainder up to MemorySize.
+        var fileSize = (int)Math.Min(tlsHeader.FileSize, tlsHeader.MemorySize);
+        var initImage = fileSize > 0 ? new byte[fileSize] : [];
+        if (fileSize > 0 &&
+            !virtualMemory.TryRead(imageBase + tlsHeader.VirtualAddress, initImage))
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][TLS] Failed to read TLS init image at 0x{imageBase + tlsHeader.VirtualAddress:X}; seeding zeros.");
+            initImage = [];
+        }
+
+        SharpEmu.HLE.GuestTlsTemplate.Set(initImage, tlsHeader.MemorySize, tlsHeader.Alignment);
+        Console.Error.WriteLine(
+            $"[LOADER][TLS] Main module TLS template: memsz=0x{tlsHeader.MemorySize:X} " +
+            $"filesz=0x{tlsHeader.FileSize:X} align=0x{tlsHeader.Alignment:X} " +
+            $"block=0x{SharpEmu.HLE.GuestTlsTemplate.BlockSize:X}");
+    }
+
     private static IReadOnlyDictionary<ulong, string> ResolveAndPatchImportStubs(
         ReadOnlySpan<byte> imageData,
         LoadContext loadContext,
@@ -682,7 +721,12 @@ public sealed class SelfLoader : ISelfLoader
                 targetValue = AddSigned(stubAddress, descriptor.Addend);
             }
 
-            if (targetValue < 0x1000)
+            if (targetValue < 0x1000 && descriptor.ValueKind == RelocationValueKind.TlsOffset)
+            {
+                // A TLS offset (TPOFF64/DTPOFF64) is a signed displacement, not a
+                // mapped address, so a small or negative value here is expected.
+            }
+            else if (targetValue < 0x1000)
             {
                 if (descriptor.ValueKind == RelocationValueKind.TlsModuleId)
                 {
@@ -858,6 +902,26 @@ public sealed class SelfLoader : ISelfLoader
                 {
                     Console.Error.WriteLine($"[LOADER][FOCUS][SKIP] symbol read failed index={symbolIndex}");
                 }
+                continue;
+            }
+
+            if (relocation.Type is RelocationTypeTlsDtpOff64 or RelocationTypeTlsTpOff64)
+            {
+                // Variant II static TLS: the module block sits at
+                // [tp - blockSize, tp). DTPOFF64 is the module-relative offset
+                // (st_value + addend); TPOFF64 is that offset expressed relative
+                // to the thread pointer, i.e. minus the aligned block size.
+                var tlsSymbolOffset = AddSigned(symbol.Value, relocation.Addend);
+                var tlsValue = relocation.Type == RelocationTypeTlsTpOff64
+                    ? unchecked(tlsSymbolOffset - SharpEmu.HLE.GuestTlsTemplate.BlockSize)
+                    : tlsSymbolOffset;
+                descriptors.Add(new RelocationDescriptor(
+                    targetAddress,
+                    0,
+                    null,
+                    tlsValue,
+                    RelocationValueKind.TlsOffset,
+                    IsDataImport: false));
                 continue;
             }
 
@@ -1702,7 +1766,9 @@ public sealed class SelfLoader : ISelfLoader
             RelocationTypeGlobalData or
             RelocationTypeJumpSlot or
             RelocationTypeRelative or
-            RelocationTypeTlsModuleId;
+            RelocationTypeTlsModuleId or
+            RelocationTypeTlsDtpOff64 or
+            RelocationTypeTlsTpOff64;
     }
 
     private static readonly HashSet<uint> _reportedUnsupportedRelocationTypes = new();
@@ -2388,7 +2454,11 @@ public sealed class SelfLoader : ISelfLoader
     private enum RelocationValueKind : byte
     {
         Pointer = 0,
-        TlsModuleId = 1
+        TlsModuleId = 1,
+        // A pre-computed TLS offset written verbatim (TPOFF64/DTPOFF64). Unlike
+        // Pointer it is a signed displacement, not a mapped address, so it is
+        // patched as-is without the low-address validity warning.
+        TlsOffset = 2
     }
 
     private readonly record struct RelocationDescriptor(

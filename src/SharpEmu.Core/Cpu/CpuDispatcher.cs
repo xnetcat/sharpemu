@@ -372,11 +372,19 @@ public sealed class CpuDispatcher : ICpuDispatcher, IDisposable
 
     private static bool InitializeTls(CpuContext context, ulong tlsBase)
     {
-        return context.TryWriteUInt64(tlsBase - 0xF0, 0) &&
-               context.TryWriteUInt64(tlsBase + 0x00, tlsBase) &&
-               context.TryWriteUInt64(tlsBase + 0x10, tlsBase) &&
-               context.TryWriteUInt64(tlsBase + 0x28, 0xC0DEC0DECAFEBABEUL) &&
-               context.TryWriteUInt64(tlsBase + 0x60, tlsBase);
+        if (!context.TryWriteUInt64(tlsBase - 0xF0, 0) ||
+            !context.TryWriteUInt64(tlsBase + 0x00, tlsBase) ||
+            !context.TryWriteUInt64(tlsBase + 0x10, tlsBase) ||
+            !context.TryWriteUInt64(tlsBase + 0x28, 0xC0DEC0DECAFEBABEUL) ||
+            !context.TryWriteUInt64(tlsBase + 0x60, tlsBase))
+        {
+            return false;
+        }
+
+        // Seed the static TLS block below the thread pointer with the main
+        // module's initialized thread-locals (variant II layout).
+        SharpEmu.HLE.GuestTlsTemplate.SeedThreadBlock(context, tlsBase);
+        return true;
     }
 
     private static bool InitializeGuestFrameChainSentinel(CpuContext context)

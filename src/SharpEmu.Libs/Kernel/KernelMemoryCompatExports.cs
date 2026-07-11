@@ -2064,7 +2064,12 @@ public static class KernelMemoryCompatExports
 
         if (moduleId <= 1)
         {
-            return unchecked(ctx.FsBase + offset);
+            // Variant II: the main module's static TLS block sits below the
+            // thread pointer at [FsBase - blockSize, FsBase). When the module
+            // declares no TLS (blockSize == 0) this degrades to the previous
+            // FsBase-relative behavior.
+            var blockSize = SharpEmu.HLE.GuestTlsTemplate.BlockSize;
+            return unchecked(ctx.FsBase - blockSize + offset);
         }
 
         var key = (ctx.FsBase << 16) ^ (moduleId & 0xFFFFUL);

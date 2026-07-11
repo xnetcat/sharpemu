@@ -3323,11 +3323,19 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private static bool InitializeGuestThreadTls(CpuContext context, ulong tlsBase, ulong threadHandle)
 	{
-		return context.TryWriteUInt64(tlsBase - 0xF0, 0) &&
-			context.TryWriteUInt64(tlsBase + 0x00, tlsBase) &&
-			context.TryWriteUInt64(tlsBase + 0x10, threadHandle) &&
-			context.TryWriteUInt64(tlsBase + 0x28, 0xC0DEC0DECAFEBABEUL) &&
-			context.TryWriteUInt64(tlsBase + 0x60, tlsBase);
+		if (!context.TryWriteUInt64(tlsBase - 0xF0, 0) ||
+			!context.TryWriteUInt64(tlsBase + 0x00, tlsBase) ||
+			!context.TryWriteUInt64(tlsBase + 0x10, threadHandle) ||
+			!context.TryWriteUInt64(tlsBase + 0x28, 0xC0DEC0DECAFEBABEUL) ||
+			!context.TryWriteUInt64(tlsBase + 0x60, tlsBase))
+		{
+			return false;
+		}
+
+		// Seed initialized thread-locals into the static TLS block below the
+		// thread pointer so per-thread TLS matches the main thread.
+		SharpEmu.HLE.GuestTlsTemplate.SeedThreadBlock(context, tlsBase);
+		return true;
 	}
 
 	private static ThreadPriority MapGuestThreadPriority(int priority)
