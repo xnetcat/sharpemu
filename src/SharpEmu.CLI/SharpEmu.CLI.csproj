@@ -23,6 +23,16 @@ SPDX-License-Identifier: GPL-2.0-or-later
     <ImplicitUsings>enable</ImplicitUsings>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <Version>0.0.1</Version>
+
+    <!-- Game-loop friendly runtime defaults: workstation GC with background
+         collection keeps pauses short on the guest/render threads, dynamic
+         PGO optimizes the hot HLE dispatch and GPU translation paths, and
+         invariant globalization avoids ICU costs (none of the emulator's
+         parsing is culture-sensitive). -->
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
+    <TieredPgo>true</TieredPgo>
+    <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
 
   <PropertyGroup Condition="'$(Configuration)' == 'Release'">

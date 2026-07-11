@@ -27,8 +27,13 @@ internal static partial class Program
 
     private static int Main(string[] args)
     {
+        // Frame-loop friendly GC: avoids blocking gen-2 collections stalling
+        // the guest and render threads mid-frame.
+        System.Runtime.GCSettings.LatencyMode = System.Runtime.GCLatencyMode.SustainedLowLatency;
+
         if (OperatingSystem.IsMacOS())
         {
+            ConfigureMoltenVkDefaults();
             PreloadMacVulkanLoader();
 
             // AppKit (and therefore GLFW windowing) must run on the process
@@ -59,6 +64,39 @@ internal static partial class Program
         return RunEmulator(args);
     }
 
+    [DllImport("libSystem", EntryPoint = "setenv")]
+    private static extern int MacSetEnv(string name, string value, int overwrite);
+
+    /// <summary>
+    /// MoltenVK performance defaults, applied before the dylib loads. These
+    /// must go through the native environment: on Unix,
+    /// Environment.SetEnvironmentVariable only updates the managed copy and
+    /// is invisible to MoltenVK's getenv. Existing user values win
+    /// (overwrite=0).
+    /// </summary>
+    private static void ConfigureMoltenVkDefaults()
+    {
+        try
+        {
+            // Queue submits commit Metal command buffers from a background
+            // dispatch queue instead of blocking vkQueueSubmit callers.
+            _ = MacSetEnv("MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS", "0", 0);
+            // Compile Metal pipelines on multiple threads (off by default);
+            // reduces first-use shader/pipeline stutter.
+            _ = MacSetEnv("MVK_CONFIG_SHOULD_MAXIMIZE_CONCURRENT_COMPILATION", "1", 0);
+            // Metal argument buffers cut per-draw descriptor binding cost
+            // (Ryujinx enables the same on its MoltenVK backend).
+            _ = MacSetEnv("MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS", "1", 0);
+            // Recoverable VK_ERROR_DEVICE_LOST should not tear the device down.
+            _ = MacSetEnv("MVK_CONFIG_RESUME_LOST_DEVICE", "1", 0);
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][WARN] Failed to set MoltenVK defaults: {exception.Message}");
+        }
+    }
+
     /// <summary>
     /// Makes a Vulkan loader visible to GLFW's dlopen("libvulkan.1.dylib").
     /// Homebrew's Vulkan libraries are arm64-only and cannot load into this
@@ -68,13 +106,15 @@ internal static partial class Program
     /// </summary>
     private static void PreloadMacVulkanLoader()
     {
+        var userLibDir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            ".sharpemu", "x64lib");
         var candidates = new[]
         {
             Path.Combine(AppContext.BaseDirectory, "libvulkan.1.dylib"),
             Path.Combine(AppContext.BaseDirectory, "libMoltenVK.dylib"),
-            Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-                ".sharpemu", "x64lib", "libvulkan.1.dylib"),
+            Path.Combine(userLibDir, "libvulkan.1.dylib"),
+            Path.Combine(userLibDir, "libMoltenVK.dylib"),
         };
         foreach (var candidate in candidates)
         {
