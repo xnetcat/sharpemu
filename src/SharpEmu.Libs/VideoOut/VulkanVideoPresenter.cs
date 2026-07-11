@@ -521,6 +521,24 @@ internal static unsafe class VulkanVideoPresenter
         }
     }
 
+    private static long _perfDrawCount;
+    private static long _perfDrawTicks;
+    private static long _perfPipelineCreations;
+    private static long _perfSpirvCompilations;
+
+    internal static (long Draws, double DrawMs, long Pipelines, long SpirvCompilations)
+        ReadAndResetPerfCounters()
+    {
+        var draws = Interlocked.Exchange(ref _perfDrawCount, 0);
+        var ticks = Interlocked.Exchange(ref _perfDrawTicks, 0);
+        var pipelines = Interlocked.Exchange(ref _perfPipelineCreations, 0);
+        var spirv = Interlocked.Exchange(ref _perfSpirvCompilations, 0);
+        return (draws, ticks * 1000.0 / System.Diagnostics.Stopwatch.Frequency, pipelines, spirv);
+    }
+
+    internal static void CountSpirvCompilation() =>
+        Interlocked.Increment(ref _perfSpirvCompilations);
+
     internal static IReadOnlyList<(ulong Address, uint Width, uint Height)> GetGuestImageExtents()
     {
         lock (_gate)
@@ -1154,6 +1172,7 @@ internal static unsafe class VulkanVideoPresenter
             public bool NeedsUpload;
             public bool OwnsStorage;
             public bool IsStorage;
+            public bool Cached;
             public VulkanGuestSampler SamplerState;
             public Sampler Sampler;
             public GuestImageResource? GuestImage;
@@ -2864,6 +2883,7 @@ internal static unsafe class VulkanVideoPresenter
                     resources.Pipeline = pipeline;
                     resources.PipelineCached = true;
                     _graphicsPipelines.Add(pipelineKey, pipeline);
+                    Interlocked.Increment(ref _perfPipelineCreations);
                     SetDebugName(
                         ObjectType.Pipeline,
                         pipeline.Handle,
@@ -3122,7 +3142,133 @@ internal static unsafe class VulkanVideoPresenter
                 };
             }
 
-            return CreateTextureResource(texture);
+            return GetOrCreateCachedTextureResource(texture);
+        }
+
+        private readonly Dictionary<TextureCacheKey, TextureResource> _textureCache = new();
+
+        private readonly record struct TextureCacheKey(
+            ulong Address,
+            uint Width,
+            uint Height,
+            uint Format,
+            uint NumberType,
+            uint DstSelect,
+            uint TileMode,
+            uint Pitch,
+            VulkanGuestSampler Sampler);
+
+        /// <summary>
+        /// Guest textures are static assets in the common case, but every draw
+        /// used to restage and reupload them (a fresh image, device memory and
+        /// staging buffer per draw). Cache the uploaded resource per descriptor
+        /// identity and invalidate through the CPU write tracker, so animated
+        /// or streamed texture memory still refreshes.
+        /// </summary>
+        private TextureResource GetOrCreateCachedTextureResource(VulkanGuestDrawTexture texture)
+        {
+            if (texture.Address == 0 || texture.RgbaPixels.Length == 0)
+            {
+                return CreateTextureResource(texture);
+            }
+
+            var key = new TextureCacheKey(
+                texture.Address,
+                texture.Width,
+                texture.Height,
+                texture.Format,
+                texture.NumberType,
+                texture.DstSelect,
+                texture.TileMode,
+                texture.Pitch,
+                texture.Sampler);
+            if (_textureCache.TryGetValue(key, out var cached))
+            {
+                return cached;
+            }
+
+            var resource = CreateTextureResource(texture);
+            if (resource.OwnsStorage)
+            {
+                resource.Cached = true;
+                _textureCache[key] = resource;
+                SharpEmu.HLE.GuestImageWriteTracker.Track(
+                    texture.Address,
+                    (ulong)texture.RgbaPixels.Length);
+            }
+
+            return resource;
+        }
+
+        private void EvictDirtyCachedTextures()
+        {
+            if (_textureCache.Count == 0)
+            {
+                return;
+            }
+
+            List<TextureCacheKey>? evicted = null;
+            foreach (var entry in _textureCache)
+            {
+                if (SharpEmu.HLE.GuestImageWriteTracker.ConsumeDirty(entry.Key.Address))
+                {
+                    (evicted ??= []).Add(entry.Key);
+                }
+            }
+
+            if (evicted is null && _textureCache.Count <= 2048)
+            {
+                return;
+            }
+
+            Check(_vk.QueueWaitIdle(_queue), "vkQueueWaitIdle(texture cache evict)");
+            if (_textureCache.Count > 2048)
+            {
+                foreach (var entry in _textureCache)
+                {
+                    DestroyCachedTextureResource(entry.Value);
+                }
+
+                _textureCache.Clear();
+                return;
+            }
+
+            foreach (var key in evicted!)
+            {
+                if (_textureCache.Remove(key, out var resource))
+                {
+                    DestroyCachedTextureResource(resource);
+                    SharpEmu.HLE.GuestImageWriteTracker.Rearm(key.Address);
+                }
+            }
+        }
+
+        private void DestroyCachedTextureResource(TextureResource texture)
+        {
+            texture.Cached = false;
+            if (texture.View.Handle != 0)
+            {
+                _vk.DestroyImageView(_device, texture.View, null);
+            }
+
+            if (texture.Image.Handle != 0 && texture.GuestImage is null)
+            {
+                _vk.DestroyImage(_device, texture.Image, null);
+                if (texture.ImageMemory.Handle != 0)
+                {
+                    _vk.FreeMemory(_device, texture.ImageMemory, null);
+                }
+            }
+
+            if (texture.StagingBuffer.Handle != 0)
+            {
+                _vk.DestroyBuffer(_device, texture.StagingBuffer, null);
+            }
+
+            if (texture.StagingMemory.Handle != 0)
+            {
+                _vk.FreeMemory(_device, texture.StagingMemory, null);
+            }
         }
 
         private static bool IsCompatibleGuestImageAlias(
@@ -4511,6 +4657,25 @@ internal static unsafe class VulkanVideoPresenter
                 return;
             }
 
+            var perfStart = System.Diagnostics.Stopwatch.GetTimestamp();
+            Interlocked.Increment(ref _perfDrawCount);
+            Interlocked.Add(
+                ref _perfDrawTicks,
+                -perfStart);
+            try
+            {
+                ExecuteOffscreenDrawCore(work);
+            }
+            finally
+            {
+                Interlocked.Add(
+                    ref _perfDrawTicks,
+                    System.Diagnostics.Stopwatch.GetTimestamp());
+            }
+        }
+
+        private void ExecuteOffscreenDrawCore(VulkanOffscreenGuestDraw work)
+        {
             var format = GetRenderTargetFormat(work.Target.Format, work.Target.NumberType);
             if (format == Format.Undefined)
             {
@@ -5416,6 +5581,7 @@ internal static unsafe class VulkanVideoPresenter
                 CollectCompletedGuestSubmissions(waitForOldest: false);
             }
 
+            EvictDirtyCachedTextures();
             var completedWork = 0;
             while (completedWork < MaxGuestWorkPerRender &&
                    TryTakeGuestWork(out var work))
@@ -6065,6 +6231,13 @@ internal static unsafe class VulkanVideoPresenter
                     null,
                     1,
                     &toShaderRead);
+                if (texture.Cached)
+                {
+                    // The queue executes command buffers in submission order,
+                    // so once this upload is recorded every later draw can
+                    // reuse the image without restaging it.
+                    texture.NeedsUpload = false;
+                }
             }
         }
 
@@ -6512,7 +6685,7 @@ internal static unsafe class VulkanVideoPresenter
         {
             foreach (var texture in resources.Textures)
             {
-                if (texture is null)
+                if (texture is null || texture.Cached)
                 {
                     continue;
                 }

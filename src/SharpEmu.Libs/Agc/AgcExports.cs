@@ -3313,6 +3313,7 @@ public static class AgcExports
                 pixelStateFingerprint,
                 compiled.Pixel,
                 pixelState.Program);
+            VulkanVideoPresenter.CountSpirvCompilation();
             lock (_submitTraceGate)
             {
                 _graphicsSpirvCache.TryAdd(shaderKey, compiled);
