@@ -4225,6 +4225,12 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 		_stallWatchdogStop = false;
 		long num = (long)((double)stallWatchdogSeconds * Stopwatch.Frequency);
+		int periodicSnapshotSeconds =
+			int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_PERIODIC_SNAPSHOT_SECONDS"), out var pss)
+				? Math.Max(0, pss)
+				: 0;
+		long periodicSnapshotTicks = (long)((double)periodicSnapshotSeconds * Stopwatch.Frequency);
+		long lastPeriodicSnapshot = Stopwatch.GetTimestamp();
 		_stallWatchdogThread = new Thread(new ThreadStart(delegate
 		{
 			while (!_stallWatchdogStop)
@@ -4233,6 +4239,14 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				if (_stallWatchdogStop)
 				{
 					break;
+				}
+				if (periodicSnapshotTicks > 0 &&
+					Stopwatch.GetTimestamp() - lastPeriodicSnapshot >= periodicSnapshotTicks)
+				{
+					lastPeriodicSnapshot = Stopwatch.GetTimestamp();
+					Console.Error.WriteLine("[LOADER][ERROR] --- periodic snapshot ---");
+					LogStallWatchdogSnapshot();
+					Console.Error.Flush();
 				}
 				long num2 = Stopwatch.GetTimestamp() - Volatile.Read(ref _lastProgressTimestamp);
 				if (num2 < num)
