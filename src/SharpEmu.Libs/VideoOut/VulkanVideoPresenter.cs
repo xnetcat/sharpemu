@@ -197,6 +197,15 @@ internal static unsafe class VulkanVideoPresenter
     // pooled guest-data arrays until the render thread uploads them.
     private const int MaxPendingGuestWork = 64;
     private const int MaxGuestWorkPerRender = 256;
+    // Cap the guest-submission fence wait so a GPU submission whose fence never
+    // signals (a mistranslated compute shader that hangs the Metal queue) cannot
+    // freeze the render thread forever and starve the swapchain present.
+    // SHARPEMU_FENCE_WAIT_TIMEOUT_MS overrides; default 3s.
+    private static readonly ulong _guestFenceWaitTimeoutNs =
+        ulong.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_FENCE_WAIT_TIMEOUT_MS"), out var fenceMs) && fenceMs > 0
+            ? fenceMs * 1_000_000UL
+            : 3_000_000_000UL;
+    private static readonly HashSet<string> _tracedFenceTimeouts = new();
     private const uint GuestPrimitiveRectList = 0x11;
     private const uint GuestFormatR32Uint = 0x10004;
     private const uint GuestFormatR32Sint = 0x20004;
@@ -1062,6 +1071,20 @@ internal static unsafe class VulkanVideoPresenter
                 latest.Sequence == presentedSequence ||
                 latest.RequiredGuestWorkSequence > _completedGuestWorkSequence)
             {
+                if (_latestPresentation is { } rej &&
+                    rej.GuestImageAddress != 0 &&
+                    _tracedGuestImagePresentRejections.Add(rej.Sequence))
+                {
+                    var reason = rej.Sequence == presentedSequence
+                        ? "already-presented(seq==presented)"
+                        : rej.RequiredGuestWorkSequence > _completedGuestWorkSequence
+                            ? $"work-not-done(req={rej.RequiredGuestWorkSequence}>done={_completedGuestWorkSequence})"
+                            : "unknown";
+                    Console.Error.WriteLine(
+                        $"[LOADER][WARN] vk.guest_present_rejected addr=0x{rej.GuestImageAddress:X16} " +
+                        $"seq={rej.Sequence} presentedSeq={presentedSequence} reason={reason}");
+                }
+
                 presentation = default;
                 return false;
             }
@@ -1070,6 +1093,8 @@ internal static unsafe class VulkanVideoPresenter
             return true;
         }
     }
+
+    private static readonly HashSet<long> _tracedGuestImagePresentRejections = new();
 
     private static void EnqueueGuestWorkLocked(object work)
     {
@@ -2625,7 +2650,25 @@ internal static unsafe class VulkanVideoPresenter
                     1,
                     &fence,
                     true,
-                    ulong.MaxValue);
+                    _guestFenceWaitTimeoutNs);
+                if (result == Result.Timeout)
+                {
+                    // A GPU submission whose fence never signals (typically a
+                    // mistranslated compute shader that hangs the Metal queue)
+                    // would otherwise block the render thread forever, starving
+                    // the swapchain present (black screen). Log the culprit and
+                    // continue so at least the last good frame can be shown.
+                    if (_tracedFenceTimeouts.Add(oldest.DebugName))
+                    {
+                        Console.Error.WriteLine(
+                            $"[LOADER][WARN] vk.fence_wait_timeout submission='{oldest.DebugName}' " +
+                            $"— GPU work not completing after {_guestFenceWaitTimeoutNs / 1_000_000}ms; " +
+                            "render thread continuing (present not blocked).");
+                    }
+
+                    return;
+                }
+
                 Check(result, $"vkWaitForFences(guest: {oldest.DebugName})");
             }
 
@@ -6540,6 +6583,13 @@ internal static unsafe class VulkanVideoPresenter
             while (completedWork < MaxGuestWorkPerRender &&
                    TryTakeGuestWork(out var work))
             {
+                var traceWork = ShouldTracePresentedGuestImageContentsForDiagnostics();
+                var workStart = traceWork ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
+                if (traceWork && work is VulkanComputeGuestDispatch or VulkanOffscreenGuestDraw)
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] vk.render_work_enter #{completedWork} {work.GetType().Name}");
+                }
                 try
                 {
                     switch (work)
@@ -6560,6 +6610,23 @@ internal static unsafe class VulkanVideoPresenter
                     CompleteGuestWork();
                 }
 
+                if (workStart != 0)
+                {
+                    var elapsedMs = (System.Diagnostics.Stopwatch.GetTimestamp() - workStart)
+                        * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+                    if (elapsedMs > 250.0)
+                    {
+                        var desc = work switch
+                        {
+                            VulkanComputeGuestDispatch c => $"compute cs=0x{c.ShaderAddress:X16} groups={c.GroupCountX}x{c.GroupCountY}x{c.GroupCountZ}",
+                            VulkanOffscreenGuestDraw d => $"draw rt=0x{d.Target.Address:X16} {d.Target.Width}x{d.Target.Height}",
+                            _ => work.GetType().Name,
+                        };
+                        Console.Error.WriteLine(
+                            $"[LOADER][WARN] vk.slow_render_work {elapsedMs:F0}ms: {desc}");
+                    }
+                }
+
                 completedWork++;
             }
 
@@ -6567,7 +6634,22 @@ internal static unsafe class VulkanVideoPresenter
 
             if (!TryTakePresentation(_presentedSequence, out var presentation))
             {
+                if (ShouldTracePresentedGuestImageContentsForDiagnostics())
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][WARN] vk.present_not_taken seq={_presentedSequence} " +
+                        "— presentation submitted but its required guest work isn't complete; nothing shown.");
+                }
+
                 return;
+            }
+
+            if (ShouldTracePresentedGuestImageContentsForDiagnostics())
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][TRACE] vk.present_taken addr=0x{presentation.GuestImageAddress:X16} " +
+                    $"drawKind={presentation.DrawKind} hasPixels={presentation.Pixels is not null} " +
+                    $"hasTranslatedDraw={presentation.TranslatedDraw is not null}");
             }
 
             if (presentation.Pixels is null &&
@@ -6603,6 +6685,15 @@ internal static unsafe class VulkanVideoPresenter
                     out presentedGuestImage) ||
                  !presentedGuestImage.Initialized))
             {
+                if (ShouldTracePresentedGuestImageContentsForDiagnostics())
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][WARN] vk.present_dropped addr=0x{presentation.GuestImageAddress:X16} " +
+                        $"found={(presentedGuestImage is not null)} " +
+                        $"initialized={(presentedGuestImage?.Initialized ?? false)} " +
+                        $"— no swapchain present this frame (black).");
+                }
+
                 return;
             }
             if (presentedGuestImage is not null)
@@ -8094,6 +8185,20 @@ internal static unsafe class VulkanVideoPresenter
                     $"format={_swapchainFormat} nonzero_bytes={nonzeroBytes}/{byteCount} " +
                     $"nonblack_pixels={nonblackPixels}/{(ulong)_extent.Width * _extent.Height} " +
                     $"hash=0x{hash:X16}");
+
+                var dumpDir = Environment.GetEnvironmentVariable("SHARPEMU_GUEST_IMAGE_DUMP_DIR");
+                if (!string.IsNullOrWhiteSpace(dumpDir))
+                {
+                    Directory.CreateDirectory(dumpDir);
+                    var seq = Interlocked.Increment(ref _guestImageDumpSequence);
+                    var path = Path.Combine(
+                        dumpDir,
+                        $"present-{seq:D4}-{_extent.Width}x{_extent.Height}-{_swapchainFormat}.bgra");
+                    File.WriteAllBytes(path, bytes.ToArray());
+                    Console.Error.WriteLine($"[LOADER][TRACE] vk.swapchain_dump path={path}");
+                    // Re-arm so subsequent presented frames are captured too.
+                    _tracedPresentedSwapchain = false;
+                }
             }
             finally
             {
