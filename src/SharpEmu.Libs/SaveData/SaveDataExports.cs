@@ -254,18 +254,31 @@ public static class SaveDataExports
     {
         var userId = unchecked((int)ctx[CpuRegister.Rdi]);
         var reserved = ctx[CpuRegister.Rsi];
-        var resourceAddress = ctx[CpuRegister.Rdx];
-
-        if (resourceAddress == 0)
-        {
-            return SetReturn(ctx, OrbisSaveDataErrorParameter);
-        }
 
         var id = (uint)Interlocked.Increment(ref _nextTransactionResource);
 
-        if (!TryWriteUInt32(ctx, resourceAddress, id))
+        // The resource-out pointer's argument slot varies by SDK revision: some
+        // callers pass it in rdx, others in rcx (a 4-arg form where rdx holds a
+        // count/flag). Void Terrarium passes rdx=0x1 (not a pointer) and the
+        // real out-pointer in rcx. Probe the plausible candidates and write the
+        // handle to the first writable one instead of faulting on a bad rdx.
+        // This is a stub-level create (matches shadPS4's return-OK semantics);
+        // never return MEMORY_FAULT for it, or the guest treats savedata init as
+        // failed and never advances.
+        var resourceAddress = 0UL;
+        foreach (var candidate in new[]
+                 {
+                     ctx[CpuRegister.Rdx],
+                     ctx[CpuRegister.Rcx],
+                     ctx[CpuRegister.R8],
+                     ctx[CpuRegister.R9],
+                 })
         {
-            return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            if (candidate != 0 && TryWriteUInt32(ctx, candidate, id))
+            {
+                resourceAddress = candidate;
+                break;
+            }
         }
 
         TraceSaveData(
