@@ -206,6 +206,11 @@ internal static unsafe class VulkanVideoPresenter
             ? fenceMs * 1_000_000UL
             : 3_000_000_000UL;
     private static readonly HashSet<string> _tracedFenceTimeouts = new();
+    // Diagnostic: skip every compute dispatch (mistranslated compute shaders
+    // run long / GPU-hang and starve the present). Isolates whether the
+    // geometry+composite path renders on its own.
+    private static readonly bool _skipAllCompute =
+        Environment.GetEnvironmentVariable("SHARPEMU_SKIP_ALL_COMPUTE") == "1";
     private const uint GuestPrimitiveRectList = 0x11;
     private const uint GuestFormatR32Uint = 0x10004;
     private const uint GuestFormatR32Sint = 0x20004;
@@ -5366,7 +5371,8 @@ internal static unsafe class VulkanVideoPresenter
                 return;
             }
 
-            if (AddressListContains("SHARPEMU_SKIP_COMPUTE_CS", work.ShaderAddress))
+            if (_skipAllCompute ||
+                AddressListContains("SHARPEMU_SKIP_COMPUTE_CS", work.ShaderAddress))
             {
                 TraceVulkanShader(
                     $"vk.compute_skip cs=0x{work.ShaderAddress:X16} " +
