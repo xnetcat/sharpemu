@@ -3572,6 +3572,17 @@ public static partial class KernelMemoryCompatExports
     [ThreadStatic]
     private static StringBuilder? _formatBuilder;
 
+    // printf length modifier collapsed to the widths our conversions care about.
+    // Kept as an enum rather than a per-argument substring so the hot format
+    // loop avoids a string allocation and string comparisons on every spec.
+    private enum PrintfLength
+    {
+        None,
+        Char,   // hh
+        Short,  // h
+        Long,   // l / ll / j / z / t / L
+    }
+
     private static string FormatString<TArgumentSource>(
         CpuContext ctx,
         string format,
@@ -3673,19 +3684,27 @@ public static partial class KernelMemoryCompatExports
                 }
             }
 
-            var lengthMod = "";
+            var lengthMod = PrintfLength.None;
             if (i < format.Length)
             {
-                if (i + 1 < format.Length &&
-                    ((format[i] == 'h' && format[i + 1] == 'h') ||
-                     (format[i] == 'l' && format[i + 1] == 'l')))
+                if (i + 1 < format.Length && format[i] == 'h' && format[i + 1] == 'h')
                 {
-                    lengthMod = format.Substring(i, 2);
+                    lengthMod = PrintfLength.Char;
                     i += 2;
                 }
-                else if (format[i] is 'h' or 'l' or 'j' or 'z' or 't' or 'L')
+                else if (i + 1 < format.Length && format[i] == 'l' && format[i + 1] == 'l')
                 {
-                    lengthMod = format[i].ToString();
+                    lengthMod = PrintfLength.Long;
+                    i += 2;
+                }
+                else if (format[i] == 'h')
+                {
+                    lengthMod = PrintfLength.Short;
+                    i++;
+                }
+                else if (format[i] is 'l' or 'j' or 'z' or 't' or 'L')
+                {
+                    lengthMod = PrintfLength.Long;
                     i++;
                 }
             }
@@ -3709,13 +3728,9 @@ public static partial class KernelMemoryCompatExports
                     {
                         long value = lengthMod switch
                         {
-                            "hh" => unchecked((sbyte)argumentSource.NextGpArg()),
-                            "h" => unchecked((short)argumentSource.NextGpArg()),
-                            "l" => unchecked((long)argumentSource.NextGpArg()),
-                            "ll" => unchecked((long)argumentSource.NextGpArg()),
-                            "j" => unchecked((long)argumentSource.NextGpArg()),
-                            "z" => unchecked((long)argumentSource.NextGpArg()),
-                            "t" => unchecked((long)argumentSource.NextGpArg()),
+                            PrintfLength.Char => unchecked((sbyte)argumentSource.NextGpArg()),
+                            PrintfLength.Short => unchecked((short)argumentSource.NextGpArg()),
+                            PrintfLength.Long => unchecked((long)argumentSource.NextGpArg()),
                             _ => unchecked((int)argumentSource.NextGpArg())
                         };
 
@@ -3733,13 +3748,9 @@ public static partial class KernelMemoryCompatExports
                     {
                         ulong value = lengthMod switch
                         {
-                            "hh" => (byte)argumentSource.NextGpArg(),
-                            "h" => (ushort)argumentSource.NextGpArg(),
-                            "l" => argumentSource.NextGpArg(),
-                            "ll" => argumentSource.NextGpArg(),
-                            "j" => argumentSource.NextGpArg(),
-                            "z" => argumentSource.NextGpArg(),
-                            "t" => argumentSource.NextGpArg(),
+                            PrintfLength.Char => (byte)argumentSource.NextGpArg(),
+                            PrintfLength.Short => (ushort)argumentSource.NextGpArg(),
+                            PrintfLength.Long => argumentSource.NextGpArg(),
                             _ => (uint)argumentSource.NextGpArg()
                         };
 
@@ -3753,13 +3764,9 @@ public static partial class KernelMemoryCompatExports
                     {
                         ulong value = lengthMod switch
                         {
-                            "hh" => (byte)argumentSource.NextGpArg(),
-                            "h" => (ushort)argumentSource.NextGpArg(),
-                            "l" => argumentSource.NextGpArg(),
-                            "ll" => argumentSource.NextGpArg(),
-                            "j" => argumentSource.NextGpArg(),
-                            "z" => argumentSource.NextGpArg(),
-                            "t" => argumentSource.NextGpArg(),
+                            PrintfLength.Char => (byte)argumentSource.NextGpArg(),
+                            PrintfLength.Short => (ushort)argumentSource.NextGpArg(),
+                            PrintfLength.Long => argumentSource.NextGpArg(),
                             _ => (uint)argumentSource.NextGpArg()
                         };
 
@@ -3778,13 +3785,9 @@ public static partial class KernelMemoryCompatExports
                     {
                         ulong value = lengthMod switch
                         {
-                            "hh" => (byte)argumentSource.NextGpArg(),
-                            "h" => (ushort)argumentSource.NextGpArg(),
-                            "l" => argumentSource.NextGpArg(),
-                            "ll" => argumentSource.NextGpArg(),
-                            "j" => argumentSource.NextGpArg(),
-                            "z" => argumentSource.NextGpArg(),
-                            "t" => argumentSource.NextGpArg(),
+                            PrintfLength.Char => (byte)argumentSource.NextGpArg(),
+                            PrintfLength.Short => (ushort)argumentSource.NextGpArg(),
+                            PrintfLength.Long => argumentSource.NextGpArg(),
                             _ => (uint)argumentSource.NextGpArg()
                         };
 
@@ -3809,12 +3812,12 @@ public static partial class KernelMemoryCompatExports
                 case 's':
                     {
                         var strAddr = argumentSource.NextGpArg();
-                        TracePrintfStringArgument(ctx, lengthMod, strAddr);
+                        TracePrintfStringArgument(ctx, lengthMod == PrintfLength.Long ? "l" : "", strAddr);
                         if (strAddr == 0)
                         {
                             sb.Append("(null)");
                         }
-                        else if (lengthMod == "l")
+                        else if (lengthMod == PrintfLength.Long)
                         {
                             if (TryReadWideCString(ctx, strAddr, 1_048_576, out var wideUnits))
                             {
@@ -3845,7 +3848,7 @@ public static partial class KernelMemoryCompatExports
                 case 'c':
                     {
                         string renderedChar;
-                        if (lengthMod == "l")
+                        if (lengthMod == PrintfLength.Long)
                         {
                             var scalar = unchecked((ushort)argumentSource.NextGpArg());
                             renderedChar = TryConvertWideScalarToString(scalar, out var wideCharText)
