@@ -3,6 +3,8 @@
 
 using SharpEmu.HLE;
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Threading;
 
 namespace SharpEmu.Libs.Audio;
@@ -15,6 +17,52 @@ public static class AudioOut2Exports
     private static long _nextContextHandle = 1;
     private static long _nextUserHandle = 1;
     private static int _nextPortId;
+
+    // Per-context audio parameters captured at ContextCreate so ContextAdvance
+    // can pace to the real playback cadence (grain samples at the sample rate).
+    private static readonly ConcurrentDictionary<ulong, ContextState> Contexts = new();
+
+    private sealed class ContextState
+    {
+        private readonly object _paceGate = new();
+        private long _nextAdvanceTimestamp;
+
+        public ContextState(uint frequency, uint channels, uint grainSamples)
+        {
+            Frequency = frequency == 0 ? 48000 : frequency;
+            Channels = channels == 0 ? 2 : channels;
+            GrainSamples = grainSamples == 0 ? 256 : grainSamples;
+        }
+
+        public uint Frequency { get; }
+        public uint Channels { get; }
+        public uint GrainSamples { get; }
+
+        // Blocks the advancing thread until one grain worth of wall-clock time
+        // has elapsed since the previous advance, matching hardware timing so
+        // audio-gated titles neither spin nor drift ahead.
+        public void PaceAdvance()
+        {
+            long delay;
+            lock (_paceGate)
+            {
+                var now = Stopwatch.GetTimestamp();
+                if (_nextAdvanceTimestamp < now)
+                {
+                    _nextAdvanceTimestamp = now;
+                }
+
+                delay = _nextAdvanceTimestamp - now;
+                _nextAdvanceTimestamp += checked(
+                    (long)Math.Ceiling(Stopwatch.Frequency * (double)GrainSamples / Frequency));
+            }
+
+            if (delay > 0)
+            {
+                Thread.Sleep(TimeSpan.FromSeconds((double)delay / Stopwatch.Frequency));
+            }
+        }
+    }
 
     [SysAbiExport(
         Nid = "g2tViFIohHE",
@@ -94,7 +142,24 @@ public static class AudioOut2Exports
             return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
+        // Read channels/frequency/grain from the reset-param blob so the
+        // context can pace advances to the real audio cadence.
+        uint channels = 2;
+        uint frequency = 48000;
+        uint grain = 256;
+        Span<byte> param = stackalloc byte[0x10];
+        if (ctx.Memory.TryRead(paramAddress, param))
+        {
+            var pc = BinaryPrimitives.ReadUInt32LittleEndian(param[0x04..]);
+            var pf = BinaryPrimitives.ReadUInt32LittleEndian(param[0x08..]);
+            var pg = BinaryPrimitives.ReadUInt32LittleEndian(param[0x0C..]);
+            if (pc is > 0 and <= 8) channels = pc;
+            if (pf is >= 8000 and <= 192000) frequency = pf;
+            if (pg is > 0 and <= 0x4000) grain = pg;
+        }
+
         var handle = (ulong)Interlocked.Increment(ref _nextContextHandle);
+        Contexts[handle] = new ContextState(frequency, channels, grain);
         return TryWriteUInt64(ctx, outContextAddress, handle)
             ? SetReturn(ctx, 0)
             : SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
@@ -105,7 +170,59 @@ public static class AudioOut2Exports
         ExportName = "sceAudioOut2ContextDestroy",
         Target = Generation.Gen5,
         LibraryName = "libSceAudioOut2")]
-    public static int AudioOut2ContextDestroy(CpuContext ctx) => SetReturn(ctx, 0);
+    public static int AudioOut2ContextDestroy(CpuContext ctx)
+    {
+        Contexts.TryRemove(ctx[CpuRegister.Rdi], out _);
+        return SetReturn(ctx, 0);
+    }
+
+    [SysAbiExport(
+        Nid = "DxGyV8dtOR8",
+        ExportName = "sceAudioOut2ContextBedWrite",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAudioOut2")]
+    public static int AudioOut2ContextBedWrite(CpuContext ctx) => SetReturn(ctx, 0);
+
+    [SysAbiExport(
+        Nid = "aII9h5nli9U",
+        ExportName = "sceAudioOut2ContextPush",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAudioOut2")]
+    public static int AudioOut2ContextPush(CpuContext ctx) => SetReturn(ctx, 0);
+
+    [SysAbiExport(
+        Nid = "PE2zHMqLSHs",
+        ExportName = "sceAudioOut2ContextAdvance",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAudioOut2")]
+    public static int AudioOut2ContextAdvance(CpuContext ctx)
+    {
+        // Advancing renders one grain of audio on hardware; pace it to the same
+        // wall-clock cadence so the guest audio thread runs at the right speed.
+        if (Contexts.TryGetValue(ctx[CpuRegister.Rdi], out var context))
+        {
+            context.PaceAdvance();
+        }
+
+        return SetReturn(ctx, 0);
+    }
+
+    [SysAbiExport(
+        Nid = "R7d0F1g2qsU",
+        ExportName = "sceAudioOut2ContextGetQueueLevel",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAudioOut2")]
+    public static int AudioOut2ContextGetQueueLevel(CpuContext ctx)
+    {
+        // The advance path paces synchronously, so the queue is always drained.
+        var levelAddress = ctx[CpuRegister.Rsi];
+        if (levelAddress != 0)
+        {
+            _ = TryWriteUInt64(ctx, levelAddress, 0);
+        }
+
+        return SetReturn(ctx, 0);
+    }
 
     [SysAbiExport(
         Nid = "JK2wamZPzwM",

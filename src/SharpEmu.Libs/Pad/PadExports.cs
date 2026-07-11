@@ -174,6 +174,35 @@ public static class PadExports
     {
         Span<byte> data = stackalloc byte[PadDataSize];
         data.Clear();
+
+        // A physical gamepad, when present, takes precedence over the keyboard
+        // emulation so a real controller drives the guest directly.
+        if (!OperatingSystem.IsWindows() && HostWindowInput.GamepadConnected)
+        {
+            var pad = HostWindowInput.GetGamepadState();
+            var padButtons = pad.Buttons;
+            if (IsAutoCrossActive())
+            {
+                padButtons |= 0x4000;
+            }
+            BinaryPrimitives.WriteUInt32LittleEndian(data[0x00..], padButtons);
+            data[0x04] = pad.LeftX;
+            data[0x05] = pad.LeftY;
+            data[0x06] = pad.RightX;
+            data[0x07] = pad.RightY;
+            data[0x08] = pad.L2;
+            data[0x09] = pad.R2;
+            BinaryPrimitives.WriteSingleLittleEndian(data[0x18..], 1.0f);
+            data[0x4C] = 1;
+            var padTicks = Stopwatch.GetTimestamp();
+            BinaryPrimitives.WriteUInt64LittleEndian(
+                data[0x50..],
+                ((ulong)(padTicks / Stopwatch.Frequency) * 1_000_000UL) +
+                ((ulong)(padTicks % Stopwatch.Frequency) * 1_000_000UL / (ulong)Stopwatch.Frequency));
+            data[0x68] = 1;
+            return ctx.Memory.TryWrite(dataAddress, data);
+        }
+
         var acceptsKeyboardInput = IsEmulatorWindowFocused();
         var buttons = acceptsKeyboardInput ? ReadKeyboardButtons() : 0;
         if (IsAutoCrossActive())
