@@ -8,6 +8,12 @@ internal static partial class Gen5SpirvTranslator
     private const uint ScalarRegisterCount = 256;
     private const uint VectorRegisterCount = 512;
     private const uint LdsDwordCount = 8192;
+    // Graphics stages model LDS as a per-invocation Private array rather than
+    // real workgroup-shared memory. A full 32 KB Private array per vertex/pixel
+    // invocation is wasteful and risks Metal compile limits, and per-invocation
+    // write-then-read correctness only needs deterministic address→slot masking,
+    // so a smaller array is safe.
+    private const uint PrivateLdsDwordCount = 2048;
     private const uint RdnaWaveLaneCount = 32;
 
     public static bool TryCompilePixelShader(
@@ -166,7 +172,8 @@ internal static partial class Gen5SpirvTranslator
         private uint _globalBuffers;
         private uint _storageUintPointer;
         private uint _lds;
-        private uint _workgroupUintPointer;
+        private uint _ldsElementPointer;
+        private uint _ldsDwordMask;
         private uint _positionOutput;
         private uint _pixelOutput;
         private uint _vertexIndexInput;
@@ -479,19 +486,36 @@ internal static partial class Gen5SpirvTranslator
 
         private void DeclareLds()
         {
-            if (_stage != Gen5SpirvStage.Compute || !UsesLds())
+            if (!UsesLds())
             {
                 return;
             }
 
-            var ldsArrayType = _module.TypeArray(_uintType, LdsDwordCount);
-            var ldsPointer =
-                _module.TypePointer(SpirvStorageClass.Workgroup, ldsArrayType);
-            _workgroupUintPointer =
-                _module.TypePointer(SpirvStorageClass.Workgroup, _uintType);
-            _lds = _module.AddGlobalVariable(
-                ldsPointer,
-                SpirvStorageClass.Workgroup);
+            // Compute shaders get genuine workgroup-shared LDS. Graphics stages
+            // (NGG export/vertex, pixel) cannot use the Workgroup storage class
+            // in SPIR-V, but they still emit ds_write/ds_read — typically as
+            // per-invocation scratch/spill or as NGG staging whose cross-lane
+            // reads don't feed this stage's exports. Model those as a
+            // per-invocation Private array so the shader is valid SPIR-V and its
+            // draw stops being dropped. Index masking in LdsPointer keeps the
+            // arbitrary computed addresses inside the array.
+            var storageClass = _stage == Gen5SpirvStage.Compute
+                ? SpirvStorageClass.Workgroup
+                : SpirvStorageClass.Private;
+            var dwordCount = _stage == Gen5SpirvStage.Compute
+                ? LdsDwordCount
+                : PrivateLdsDwordCount;
+            _ldsDwordMask = dwordCount - 1;
+
+            var ldsArrayType = _module.TypeArray(_uintType, dwordCount);
+            var ldsPointer = _module.TypePointer(storageClass, ldsArrayType);
+            _ldsElementPointer = _module.TypePointer(storageClass, _uintType);
+            _lds = storageClass == SpirvStorageClass.Workgroup
+                ? _module.AddGlobalVariable(ldsPointer, storageClass)
+                : _module.AddGlobalVariable(
+                    ldsPointer,
+                    storageClass,
+                    _module.ConstantNull(ldsArrayType));
             _module.AddName(_lds, "lds");
             _interfaces.Add(_lds);
         }
@@ -1214,9 +1238,8 @@ internal static partial class Gen5SpirvTranslator
             out string error)
         {
             error = string.Empty;
-            if (_stage != Gen5SpirvStage.Compute ||
-                _lds == 0 ||
-                _workgroupUintPointer == 0 ||
+            if (_lds == 0 ||
+                _ldsElementPointer == 0 ||
                 instruction.Control is not Gen5DataShareControl control)
             {
                 error = "invalid LDS instruction";
@@ -1261,6 +1284,29 @@ internal static partial class Gen5SpirvTranslator
                         GetRawSource(instruction, 2));
                     return true;
                 }
+                case "DsWriteB96":
+                case "DsWriteB128":
+                {
+                    // ds_write_b96 stores 3 consecutive dwords, ds_write_b128
+                    // stores 4, from data0..data0+N at the address's offset.
+                    var dwordCount = instruction.Opcode == "DsWriteB128" ? 4 : 3;
+                    if (instruction.Sources.Count < 1 + dwordCount)
+                    {
+                        error = "missing LDS write128 source";
+                        return false;
+                    }
+
+                    var address = GetRawSource(instruction, 0);
+                    var offset = EffectiveDsOffsetBytes(control.Offset0);
+                    for (var dword = 0; dword < dwordCount; dword++)
+                    {
+                        StoreLds(
+                            LdsPointer(address, offset + (uint)(dword * sizeof(uint))),
+                            GetRawSource(instruction, 1 + dword));
+                    }
+
+                    return true;
+                }
                 case "DsWrite2B32":
                 case "DsWrite2St64B32":
                 {
@@ -1298,6 +1344,31 @@ internal static partial class Gen5SpirvTranslator
                         _uintType,
                         LdsPointer(address, EffectiveDsOffsetBytes(control.Offset0)));
                     StoreV(instruction.Destinations[0].Value, value);
+                    return true;
+                }
+                case "DsReadB96":
+                case "DsReadB128":
+                {
+                    // ds_read_b96 loads 3 consecutive dwords, ds_read_b128 loads
+                    // 4, into dest..dest+N from the address's offset.
+                    var dwordCount = instruction.Opcode == "DsReadB128" ? 4 : 3;
+                    if (instruction.Destinations.Count < dwordCount ||
+                        instruction.Sources.Count < 1)
+                    {
+                        error = "missing LDS read128 operand";
+                        return false;
+                    }
+
+                    var address = GetRawSource(instruction, 0);
+                    var offset = EffectiveDsOffsetBytes(control.Offset0);
+                    for (var dword = 0; dword < dwordCount; dword++)
+                    {
+                        var value = Load(
+                            _uintType,
+                            LdsPointer(address, offset + (uint)(dword * sizeof(uint))));
+                        StoreV(instruction.Destinations[dword].Value, value);
+                    }
+
                     return true;
                 }
                 case "DsRead2B32":
@@ -1340,10 +1411,16 @@ internal static partial class Gen5SpirvTranslator
             var addressWithOffset = offsetBytes == 0
                 ? address
                 : IAdd(address, UInt(offsetBytes));
-            var index = ShiftRightLogical(addressWithOffset, UInt(2));
+            // Mask the dword index into the array bounds. LDS is a power-of-two
+            // dword count, so this is a no-op for in-range compute addresses but
+            // prevents out-of-bounds access when a graphics-stage scratch write
+            // uses an arbitrary computed byte address.
+            var index = BitwiseAnd(
+                ShiftRightLogical(addressWithOffset, UInt(2)),
+                UInt(_ldsDwordMask));
             return _module.AddInstruction(
                 SpirvOp.AccessChain,
-                _workgroupUintPointer,
+                _ldsElementPointer,
                 _lds,
                 index);
         }

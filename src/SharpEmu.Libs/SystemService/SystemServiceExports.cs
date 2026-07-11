@@ -42,6 +42,35 @@ public static class SystemServiceExports
     }
 
     [SysAbiExport(
+        Nid = "SsC-m-S9JTA",
+        ExportName = "sceSystemServiceParamGetString",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceSystemService")]
+    public static int SystemServiceParamGetString(CpuContext ctx)
+    {
+        _ = unchecked((int)ctx[CpuRegister.Rdi]); // parameter id (nickname, etc.)
+        var bufferAddress = ctx[CpuRegister.Rsi];
+        var bufferSize = unchecked((int)ctx[CpuRegister.Rdx]);
+        if (bufferAddress == 0 || bufferSize <= 0)
+        {
+            return SetReturn(ctx, OrbisSystemServiceErrorParameter);
+        }
+
+        // String params are typically the user nickname. Callers that gate UI
+        // or text setup on a successful read (and skip it on failure) stall on
+        // a black screen when this returns NOT_FOUND, so return a neutral
+        // non-empty default and success.
+        var value = System.Text.Encoding.UTF8.GetBytes("SharpEmu");
+        var writeLength = Math.Min(value.Length, bufferSize - 1);
+        Span<byte> output = stackalloc byte[writeLength + 1];
+        value.AsSpan(0, writeLength).CopyTo(output);
+        output[writeLength] = 0;
+        return ctx.Memory.TryWrite(bufferAddress, output)
+            ? SetReturn(ctx, 0)
+            : SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    [SysAbiExport(
         Nid = "rPo6tV8D9bM",
         ExportName = "sceSystemServiceGetStatus",
         Target = Generation.Gen4 | Generation.Gen5,

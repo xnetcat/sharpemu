@@ -520,9 +520,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private Thread? _stallWatchdogThread;
 
-	private volatile bool _guestDispatcherStop;
+	private volatile bool _readyDispatchStop;
 
-	private Thread? _guestDispatcherThread;
+	private Thread? _readyDispatchThread;
 
 	private GCHandle _selfHandle;
 
@@ -885,7 +885,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		_contextualUnresolvedReturnSites.Clear();
 		_stallWatchdogTriggered = 0;
 		_stallWatchdogStop = false;
-		_guestDispatcherStop = false;
+		_readyDispatchStop = false;
 		_patchedEa020eLookupCall = false;
 		MarkExecutionProgress();
 		BindTlsBase(context);
@@ -4145,7 +4145,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			}
 			Console.Error.WriteLine("[LOADER][INFO] Calling guest entry...");
 			StartStallWatchdog();
-			StartGuestDispatcher();
+			StartReadyThreadDispatcher();
 			int num6 = -1;
 			try
 			{
@@ -4194,7 +4194,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 		finally
 		{
-			StopGuestDispatcher();
+			StopReadyThreadDispatcher();
 			StopStallWatchdog();
 			ActiveEntryReturnSentinelRip = 0uL;
 			TlsSetValue(_hostRspSlotTlsIndex, previousHostRspSlotValue);
@@ -4229,79 +4229,6 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		return 20;
 	}
 
-	// The cooperative scheduler only dispatches Ready guest threads from Pump(),
-	// which is invoked by BLOCKING HLE primitives. A guest thread that hot-spins
-	// on a NON-blocking HLE call never triggers Pump, so any thread that gets
-	// woken (Ready) while a spinner holds the CPU is never dispatched — it sits
-	// Ready forever and the game livelocks. Real cases: the Bluepoint Engine job
-	// workers spinning on sceFiberSwitch + scePthreadMutexUnlock (Demon's Souls,
-	// streaming/frame-2 producer never runs), and an audio thread spinning on
-	// sceAudioOutOutput (Void Terrarium). This background dispatcher pumps Ready
-	// threads independently of the cooperative path so a spinning consumer can no
-	// longer starve a Ready producer. SHARPEMU_GUEST_DISPATCHER=0 disables it.
-	private void StartGuestDispatcher()
-	{
-		if (string.Equals(
-				Environment.GetEnvironmentVariable("SHARPEMU_GUEST_DISPATCHER"),
-				"0",
-				StringComparison.Ordinal) ||
-			_guestDispatcherThread != null)
-		{
-			return;
-		}
-
-		int intervalMs = 1;
-		if (int.TryParse(
-				Environment.GetEnvironmentVariable("SHARPEMU_GUEST_DISPATCHER_MS"),
-				out int configured) &&
-			configured > 0)
-		{
-			intervalMs = configured;
-		}
-
-		_guestDispatcherThread = new Thread(new ThreadStart(delegate
-		{
-			while (!_guestDispatcherStop)
-			{
-				Thread.Sleep(intervalMs);
-				if (_guestDispatcherStop)
-				{
-					break;
-				}
-				if (Volatile.Read(ref _readyGuestThreadCount) > 0 &&
-					_cpuContext is { } dispatcherContext)
-				{
-					Pump(dispatcherContext, "background_dispatcher");
-				}
-			}
-		}))
-		{
-			IsBackground = true,
-			Name = "SharpEmu-GuestDispatcher"
-		};
-		_guestDispatcherThread.Start();
-	}
-
-	private void StopGuestDispatcher()
-	{
-		_guestDispatcherStop = true;
-		Thread? guestDispatcherThread = _guestDispatcherThread;
-		if (guestDispatcherThread == null)
-		{
-			return;
-		}
-		if (!ReferenceEquals(Thread.CurrentThread, guestDispatcherThread))
-		{
-			try
-			{
-				guestDispatcherThread.Join(300);
-			}
-			catch
-			{
-			}
-		}
-		_guestDispatcherThread = null;
-	}
 
 	private void StartStallWatchdog()
 	{
@@ -4407,6 +4334,114 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			}
 		}
 		_stallWatchdogThread = null;
+	}
+
+	// A guest thread only gets dispatched to a native thread when some running
+	// guest thread calls Pump (which happens inside blocking HLE primitives:
+	// waits, usleep, pthread_create, entry_return). That leaves a starvation
+	// hole: a guest thread that spins on a non-blocking HLE call (e.g.
+	// sceAudioOutOutput) never pumps, so any thread that was made Ready — for
+	// example a job worker woken by sceKernelSetEventFlag — sits in the ready
+	// queue forever. Import progress keeps advancing (the spin), so the stall
+	// watchdog never fires either, and the whole game deadlocks with 0 draws.
+	//
+	// This background dispatcher closes the hole: it drains the ready queue on
+	// a short interval regardless of whether any guest thread pumps. It is
+	// deliberately self-contained (it does not touch Pump or the pump-depth
+	// guard) so it cannot alter the existing cooperative dispatch path.
+	private void StartReadyThreadDispatcher()
+	{
+		if (_readyDispatchThread != null)
+		{
+			return;
+		}
+		_readyDispatchStop = false;
+		_readyDispatchThread = new Thread(new ThreadStart(delegate
+		{
+			while (!_readyDispatchStop)
+			{
+				Thread.Sleep(1);
+				if (_readyDispatchStop)
+				{
+					break;
+				}
+				if (Volatile.Read(ref _readyGuestThreadCount) > 0)
+				{
+					DispatchReadyGuestThreads();
+				}
+			}
+		}))
+		{
+			IsBackground = true,
+			Name = "SharpEmu-ReadyDispatch",
+		};
+		_readyDispatchThread.Start();
+	}
+
+	private void StopReadyThreadDispatcher()
+	{
+		_readyDispatchStop = true;
+		Thread? readyDispatchThread = _readyDispatchThread;
+		if (readyDispatchThread == null)
+		{
+			return;
+		}
+		if (!ReferenceEquals(Thread.CurrentThread, readyDispatchThread))
+		{
+			try
+			{
+				readyDispatchThread.Join(300);
+			}
+			catch
+			{
+			}
+		}
+		_readyDispatchThread = null;
+	}
+
+	// Dequeue every currently-ready guest thread and start a native thread for
+	// each, mirroring Pump's dispatch step. Dequeue and the Ready->Running
+	// transition happen under _guestThreadGate, so this races safely with a
+	// concurrent Pump: each ready thread is claimed once (the State check skips
+	// any that another dispatcher already took).
+	private void DispatchReadyGuestThreads()
+	{
+		while (true)
+		{
+			GuestThreadState? thread = null;
+			lock (_guestThreadGate)
+			{
+				while (_readyGuestThreads.Count > 0)
+				{
+					var candidate = _readyGuestThreads.Dequeue();
+					Interlocked.Decrement(ref _readyGuestThreadCount);
+					if (candidate.State == GuestThreadRunState.Ready)
+					{
+						candidate.State = GuestThreadRunState.Running;
+						thread = candidate;
+						break;
+					}
+				}
+			}
+
+			if (thread == null)
+			{
+				return;
+			}
+
+			var dispatched = thread;
+			var hostThread = new Thread(() => RunGuestThread(dispatched, "ready-dispatch"))
+			{
+				IsBackground = true,
+				Name = $"SharpEmu-{dispatched.Name}",
+				Priority = MapGuestThreadPriority(dispatched.Priority),
+			};
+			lock (_guestThreadGate)
+			{
+				dispatched.HostThread = hostThread;
+			}
+			hostThread.Start();
+		}
 	}
 
 	private void LogStallWatchdogSnapshot()
@@ -4658,7 +4693,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		ClearImportHandlerTrampolines();
 		_importEntries = Array.Empty<ImportStubEntry>();
 		_runtimeSymbolsByName.Clear();
-		StopGuestDispatcher();
+		StopReadyThreadDispatcher();
 		StopStallWatchdog();
 		if (_exceptionHandler != 0)
 		{
