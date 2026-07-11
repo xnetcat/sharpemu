@@ -520,6 +520,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private Thread? _stallWatchdogThread;
 
+	private volatile bool _guestDispatcherStop;
+
+	private Thread? _guestDispatcherThread;
+
 	private GCHandle _selfHandle;
 
 	private nint _selfHandlePtr;
@@ -881,6 +885,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		_contextualUnresolvedReturnSites.Clear();
 		_stallWatchdogTriggered = 0;
 		_stallWatchdogStop = false;
+		_guestDispatcherStop = false;
 		_patchedEa020eLookupCall = false;
 		MarkExecutionProgress();
 		BindTlsBase(context);
@@ -4140,6 +4145,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			}
 			Console.Error.WriteLine("[LOADER][INFO] Calling guest entry...");
 			StartStallWatchdog();
+			StartGuestDispatcher();
 			int num6 = -1;
 			try
 			{
@@ -4188,6 +4194,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 		finally
 		{
+			StopGuestDispatcher();
 			StopStallWatchdog();
 			ActiveEntryReturnSentinelRip = 0uL;
 			TlsSetValue(_hostRspSlotTlsIndex, previousHostRspSlotValue);
@@ -4220,6 +4227,80 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			return Math.Max(0, result);
 		}
 		return 20;
+	}
+
+	// The cooperative scheduler only dispatches Ready guest threads from Pump(),
+	// which is invoked by BLOCKING HLE primitives. A guest thread that hot-spins
+	// on a NON-blocking HLE call never triggers Pump, so any thread that gets
+	// woken (Ready) while a spinner holds the CPU is never dispatched — it sits
+	// Ready forever and the game livelocks. Real cases: the Bluepoint Engine job
+	// workers spinning on sceFiberSwitch + scePthreadMutexUnlock (Demon's Souls,
+	// streaming/frame-2 producer never runs), and an audio thread spinning on
+	// sceAudioOutOutput (Void Terrarium). This background dispatcher pumps Ready
+	// threads independently of the cooperative path so a spinning consumer can no
+	// longer starve a Ready producer. SHARPEMU_GUEST_DISPATCHER=0 disables it.
+	private void StartGuestDispatcher()
+	{
+		if (string.Equals(
+				Environment.GetEnvironmentVariable("SHARPEMU_GUEST_DISPATCHER"),
+				"0",
+				StringComparison.Ordinal) ||
+			_guestDispatcherThread != null)
+		{
+			return;
+		}
+
+		int intervalMs = 1;
+		if (int.TryParse(
+				Environment.GetEnvironmentVariable("SHARPEMU_GUEST_DISPATCHER_MS"),
+				out int configured) &&
+			configured > 0)
+		{
+			intervalMs = configured;
+		}
+
+		_guestDispatcherThread = new Thread(new ThreadStart(delegate
+		{
+			while (!_guestDispatcherStop)
+			{
+				Thread.Sleep(intervalMs);
+				if (_guestDispatcherStop)
+				{
+					break;
+				}
+				if (Volatile.Read(ref _readyGuestThreadCount) > 0 &&
+					_cpuContext is { } dispatcherContext)
+				{
+					Pump(dispatcherContext, "background_dispatcher");
+				}
+			}
+		}))
+		{
+			IsBackground = true,
+			Name = "SharpEmu-GuestDispatcher"
+		};
+		_guestDispatcherThread.Start();
+	}
+
+	private void StopGuestDispatcher()
+	{
+		_guestDispatcherStop = true;
+		Thread? guestDispatcherThread = _guestDispatcherThread;
+		if (guestDispatcherThread == null)
+		{
+			return;
+		}
+		if (!ReferenceEquals(Thread.CurrentThread, guestDispatcherThread))
+		{
+			try
+			{
+				guestDispatcherThread.Join(300);
+			}
+			catch
+			{
+			}
+		}
+		_guestDispatcherThread = null;
 	}
 
 	private void StartStallWatchdog()
@@ -4577,6 +4658,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		ClearImportHandlerTrampolines();
 		_importEntries = Array.Empty<ImportStubEntry>();
 		_runtimeSymbolsByName.Clear();
+		StopGuestDispatcher();
 		StopStallWatchdog();
 		if (_exceptionHandler != 0)
 		{
