@@ -210,6 +210,16 @@ internal static unsafe class VulkanVideoPresenter
              out var renderBudgetMs) && renderBudgetMs >= 0
             ? renderBudgetMs
             : 12L) * System.Diagnostics.Stopwatch.Frequency / 1000L;
+    // Max time the main-thread Render() will block waiting for a frame slot's
+    // GPU fence before skipping the frame and returning to the event pump.
+    // Prevents the window freezing behind a slow-compute GPU backlog.
+    // SHARPEMU_FRAME_WAIT_BUDGET_MS overrides; default 8ms.
+    private static readonly ulong _frameSlotWaitBudgetNs =
+        (ulong.TryParse(
+             Environment.GetEnvironmentVariable("SHARPEMU_FRAME_WAIT_BUDGET_MS"),
+             out var frameWaitMs) && frameWaitMs > 0
+            ? frameWaitMs
+            : 8UL) * 1_000_000UL;
     // Cap the guest-submission fence wait so a GPU submission whose fence never
     // signals (a mistranslated compute shader that hangs the Metal queue) cannot
     // freeze the render thread forever and starve the swapchain present.
@@ -2801,17 +2811,30 @@ internal static unsafe class VulkanVideoPresenter
             }
         }
 
-        private void WaitFrameSlot(int slot)
+        private void WaitFrameSlot(int slot) => TryWaitFrameSlot(slot, ulong.MaxValue);
+
+        // Returns false when the slot's fence is still unsignaled after
+        // timeoutNs (the GPU is behind, e.g. a slow-compute backlog). Callers
+        // on the macOS main thread must NOT wait forever here or the Cocoa
+        // event pump stalls and the window goes "Not Responding" (F1 overlay /
+        // close stop working). A bounded wait lets Render() skip the frame and
+        // return to the pump; the fence still signals later and the frame is
+        // retried.
+        private bool TryWaitFrameSlot(int slot, ulong timeoutNs)
         {
             if (_frameFencePending.Length <= slot || !_frameFencePending[slot])
             {
-                return;
+                return true;
             }
 
             var fence = _frameFences[slot];
-            Check(
-                _vk.WaitForFences(_device, 1, &fence, true, ulong.MaxValue),
-                "vkWaitForFences(frame)");
+            var waitResult = _vk.WaitForFences(_device, 1, &fence, true, timeoutNs);
+            if (waitResult == Result.Timeout)
+            {
+                return false;
+            }
+
+            Check(waitResult, "vkWaitForFences(frame)");
             Check(_vk.ResetFences(_device, 1, &fence), "vkResetFences(frame)");
             _frameFencePending[slot] = false;
             if (_frameTimelines[slot] > _completedTimeline)
@@ -2826,6 +2849,7 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             ProcessDeferredTextureDestroys();
+            return true;
         }
 
         private void WaitAllFrameSlots()
@@ -6598,7 +6622,16 @@ internal static unsafe class VulkanVideoPresenter
             // Reuse of a frame slot waits only on that slot's fence, keeping
             // up to MaxFramesInFlight frames pipelined between CPU and GPU.
             var frameSlot = _currentFrameSlot;
-            WaitFrameSlot(frameSlot);
+            if (!TryWaitFrameSlot(frameSlot, _frameSlotWaitBudgetNs))
+            {
+                // The GPU is still finishing this slot's previous frame (slow
+                // compute backlog). Don't block the macOS main thread — return
+                // to the Cocoa event pump so the window keeps handling input
+                // (F1 overlay, drag, close) and redrawing. The frame is retried
+                // next Render(); the fence signals once the GPU catches up.
+                return;
+            }
+
             _presentationCommandBuffer = _frameCommandBuffers[frameSlot];
             _commandBuffer = _presentationCommandBuffer;
             if (!_deviceLost)
@@ -6611,9 +6644,24 @@ internal static unsafe class VulkanVideoPresenter
             var renderWorkDeadline = _renderWorkBudgetTicks > 0
                 ? System.Diagnostics.Stopwatch.GetTimestamp() + _renderWorkBudgetTicks
                 : long.MaxValue;
-            while (completedWork < MaxGuestWorkPerRender &&
-                   TryTakeGuestWork(out var work))
+            while (completedWork < MaxGuestWorkPerRender)
             {
+                // Never block the macOS main thread waiting for in-flight GPU
+                // work to drain. If submission is at capacity (a slow-compute
+                // backlog), stop processing and let the event pump run; the
+                // remaining queued work is picked up on later frames as the GPU
+                // completions free up capacity (collected non-blockingly here).
+                CollectCompletedGuestSubmissions(waitForOldest: false);
+                if (_pendingGuestSubmissions.Count >= MaxInFlightGuestSubmissions)
+                {
+                    break;
+                }
+
+                if (!TryTakeGuestWork(out var work))
+                {
+                    break;
+                }
+
                 var traceWork = ShouldTracePresentedGuestImageContentsForDiagnostics();
                 var workStart = traceWork ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
                 if (traceWork && work is VulkanComputeGuestDispatch or VulkanOffscreenGuestDraw)
