@@ -46,12 +46,39 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
     private static bool VirtualFree(void* lpAddress, nuint dwSize, uint dwFreeType) =>
         HostMemory.Free(lpAddress, dwSize, dwFreeType);
 
-    private static bool VirtualProtect(void* lpAddress, nuint dwSize, uint flNewProtect, out uint lpflOldProtect) =>
-        HostMemory.Protect(lpAddress, dwSize, flNewProtect, out lpflOldProtect);
+    private static long _perfProtectCalls;
+    private static long _perfCommitCalls;
+    private static readonly bool _perfMemCounters =
+        string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_PERF_MEM"), "1", StringComparison.Ordinal);
+
+    private static bool VirtualProtect(void* lpAddress, nuint dwSize, uint flNewProtect, out uint lpflOldProtect)
+    {
+        if (_perfMemCounters)
+        {
+            var n = System.Threading.Interlocked.Increment(ref _perfProtectCalls);
+            if (n % 100000 == 0)
+            {
+                Console.Error.WriteLine($"[PERF][MEM] mprotect_calls={n} commit_calls={System.Threading.Interlocked.Read(ref _perfCommitCalls)}");
+            }
+        }
+
+        return HostMemory.Protect(lpAddress, dwSize, flNewProtect, out lpflOldProtect);
+    }
+
+    private static long _perfQueryCalls;
 
     private static nuint VirtualQuery(void* lpAddress, out HostMemory.BasicInfo lpBuffer, nuint dwLength)
     {
         _ = dwLength;
+        if (_perfMemCounters)
+        {
+            var n = System.Threading.Interlocked.Increment(ref _perfQueryCalls);
+            if (n % 500000 == 0)
+            {
+                Console.Error.WriteLine($"[PERF][MEM] virtualquery_calls={n}");
+            }
+        }
+
         return HostMemory.Query(lpAddress, out lpBuffer);
     }
 
@@ -1036,6 +1063,11 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
             if (VirtualAlloc((void*)pageAddress, (nuint)commitSize, MEM_COMMIT, commitProtection) == null)
             {
                 return false;
+            }
+
+            if (_perfMemCounters)
+            {
+                System.Threading.Interlocked.Increment(ref _perfCommitCalls);
             }
 
             pageAddress = rangeEnd;

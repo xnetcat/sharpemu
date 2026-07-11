@@ -28,6 +28,14 @@ public sealed partial class DirectExecutionBackend
 				return 18446744071562199042uL;
 			}
 
+			if (_perfHleHistogram)
+			{
+				var startTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+				var r = directExecutionBackend.DispatchImport(importIndex, argPackPtr);
+				RecordPerfHleDispatchTime(System.Diagnostics.Stopwatch.GetTimestamp() - startTicks);
+				return r;
+			}
+
 			return directExecutionBackend.DispatchImport(importIndex, argPackPtr);
 		}
 		catch (Exception ex)
@@ -93,6 +101,10 @@ public sealed partial class DirectExecutionBackend
 			return 18446744071562199042uL;
 		}
 		ImportStubEntry importStubEntry = _importEntries[importIndex];
+		if (_perfHleHistogram)
+		{
+			RecordPerfHleCall(importStubEntry.Export?.Name ?? importStubEntry.Nid);
+		}
 		int num2 = Volatile.Read(in _rawSentinelRecoveries);
 		if (num2 != _lastReportedRawSentinelRecoveries)
 		{

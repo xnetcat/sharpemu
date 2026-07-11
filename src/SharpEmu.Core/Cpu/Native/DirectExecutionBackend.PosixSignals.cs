@@ -61,6 +61,9 @@ public sealed unsafe partial class DirectExecutionBackend
 	private static bool _posixSignalWarmup;
 	private static readonly nint[] _posixPreviousActions = new nint[32];
 	private static int _posixSignalTraceCount;
+	private static long _perfSignalCount;
+	private static readonly bool _perfSignalCounter =
+		string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_PERF_MEM"), "1", StringComparison.Ordinal);
 
 	[ThreadStatic]
 	private static int _posixSignalHandlerDepth;
@@ -190,6 +193,14 @@ public sealed unsafe partial class DirectExecutionBackend
 		}
 
 		_posixSignalHandlerDepth++;
+		if (_perfSignalCounter)
+		{
+			var n = Interlocked.Increment(ref _perfSignalCount);
+			if (n % 100000 == 0)
+			{
+				Console.Error.WriteLine($"[PERF][MEM] posix_faults={n}");
+			}
+		}
 		try
 		{
 			// Guest-image write tracking runs first: it only needs the fault

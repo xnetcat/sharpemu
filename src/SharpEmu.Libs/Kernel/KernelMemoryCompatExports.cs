@@ -3137,7 +3137,6 @@ public static partial class KernelMemoryCompatExports
         }
 
         var rendered = FormatString(ctx, format, ref vaCursor);
-
         return WriteSnprintfOutput(ctx, destination, bufferSize, rendered);
     }
 
@@ -3551,19 +3550,37 @@ public static partial class KernelMemoryCompatExports
         return FormatStringFromVarArgs(ctx, format, firstGpArgIndex: 3);
     }
 
+    [ThreadStatic]
+    private static StringBuilder? _formatBuilder;
+
     private static string FormatString<TArgumentSource>(
         CpuContext ctx,
         string format,
         ref TArgumentSource argumentSource)
         where TArgumentSource : struct, IPrintfArgumentSource
     {
-        var sb = new StringBuilder(format.Length + 32);
+        // printf formatting is one of the hottest HLE paths during loading, so
+        // reuse a per-thread builder and append literal runs as spans instead of
+        // allocating a builder and appending char-by-char on every call.
+        var sb = _formatBuilder ??= new StringBuilder(256);
+        sb.Clear();
+        if (sb.Capacity < format.Length + 32)
+        {
+            sb.EnsureCapacity(format.Length + 32);
+        }
 
         for (var i = 0; i < format.Length; i++)
         {
             if (format[i] != '%')
             {
-                sb.Append(format[i]);
+                var literalStart = i;
+                while (i < format.Length && format[i] != '%')
+                {
+                    i++;
+                }
+
+                sb.Append(format.AsSpan(literalStart, i - literalStart));
+                i--;
                 continue;
             }
 
