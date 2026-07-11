@@ -343,6 +343,21 @@ public sealed class SelfLoader : ISelfLoader
             return new LoadContext(IsSelf: true, elfOffset, selfHeader.FileSize, segments);
         }
 
+        // Not a recognized (fake-signed) SELF. Only a bare, decrypted ELF is
+        // acceptable here; anything else — most commonly a still-encrypted
+        // retail eboot — must be reported clearly rather than failing later
+        // with an opaque "not a valid ELF header" message.
+        const uint ElfMagicBigEndian = 0x7F454C46; // "\x7fELF"
+        var leadingWord = BinaryPrimitives.ReadUInt32BigEndian(imageData[..sizeof(uint)]);
+        if (leadingWord != ElfMagicBigEndian)
+        {
+            throw new InvalidDataException(
+                $"Image is neither a decrypted ELF nor a recognized fake-signed SELF " +
+                $"(leading bytes 0x{leadingWord:X8}). This is almost certainly a still-encrypted " +
+                $"retail eboot — SharpEmu has no decryption keys and requires a decrypted / " +
+                $"fake-signed (fSELF) image.");
+        }
+
         return new LoadContext(IsSelf: false, ElfOffset: 0, SelfFileSize: 0, Array.Empty<SelfSegment>());
     }
 
@@ -789,10 +804,11 @@ public sealed class SelfLoader : ISelfLoader
 
             if (!IsSupportedRelocationType(relocation.Type))
             {
-                if (IsFocusRelocationOffset(relocation.Offset, imageBase))
-                {
-                    Console.Error.WriteLine($"[LOADER][FOCUS][SKIP] unsupported type={relocation.Type}");
-                }
+                // Surface unsupported relocation types loudly instead of
+                // skipping silently: TLS-relative (17/18), COPY (5), and
+                // IRELATIVE/ifunc (37) leave their targets unrelocated, which
+                // manifests later as reads of zero or calls into address 0.
+                ReportUnsupportedRelocation(relocation.Type, relocation.Offset, imageBase);
                 continue;
             }
 
@@ -1689,6 +1705,37 @@ public sealed class SelfLoader : ISelfLoader
             RelocationTypeTlsModuleId;
     }
 
+    private static readonly HashSet<uint> _reportedUnsupportedRelocationTypes = new();
+
+    private static void ReportUnsupportedRelocation(uint relocationType, ulong offset, ulong imageBase)
+    {
+        // Report each distinct unsupported type once to keep the log useful.
+        lock (_reportedUnsupportedRelocationTypes)
+        {
+            if (!_reportedUnsupportedRelocationTypes.Add(relocationType))
+            {
+                if (IsFocusRelocationOffset(offset, imageBase))
+                {
+                    Console.Error.WriteLine($"[LOADER][FOCUS][SKIP] unsupported type={relocationType}");
+                }
+
+                return;
+            }
+        }
+
+        var name = relocationType switch
+        {
+            5 => "R_X86_64_COPY",
+            17 => "R_X86_64_DTPOFF64",
+            18 => "R_X86_64_TPOFF64",
+            37 => "R_X86_64_IRELATIVE (ifunc)",
+            _ => "unknown",
+        };
+        Console.Error.WriteLine(
+            $"[LOADER][WARN] Unsupported relocation type {relocationType} ({name}) left unrelocated " +
+            $"(first at off=0x{offset:X16}); dependent reads/calls may be invalid.");
+    }
+
     private static ulong DetermineRequestedImageBase(
         IVirtualMemory virtualMemory,
         ulong totalImageSize,
@@ -2247,6 +2294,16 @@ public sealed class SelfLoader : ISelfLoader
         if (header.ProgramHeaderEntrySize != ProgramHeaderSize)
         {
             throw new InvalidDataException($"Unsupported ELF program header entry size: {header.ProgramHeaderEntrySize}.");
+        }
+
+        // The CPU backend executes guest instructions natively, so a non
+        // x86-64 image can only fail deep in execution with an opaque SIGILL.
+        // Catch it here with an actionable message. (EM_X86_64 == 62.)
+        const ushort ElfMachineX86_64 = 62;
+        if (header.Machine != ElfMachineX86_64)
+        {
+            throw new InvalidDataException(
+                $"Unsupported ELF machine type 0x{header.Machine:X4}; SharpEmu only runs x86-64 (EM_X86_64) images.");
         }
     }
 

@@ -99,7 +99,7 @@ public sealed partial class DirectExecutionBackend
 			Console.Error.WriteLine($"[LOADER][TRACE] Raw sentinel recoveries: {num2} (last import index={importIndex})");
 			_lastReportedRawSentinelRecoveries = num2;
 		}
-		if (IsLeafImport(importStubEntry.Nid) &&
+		if (importStubEntry.IsLeaf &&
 			TryDispatchLeafImport(cpuContext, importStubEntry, argPackPtr, num, out var leafResult))
 		{
 			return leafResult;
@@ -185,13 +185,13 @@ public sealed partial class DirectExecutionBackend
 		}
 		if (!isGuestWorker &&
 			!ActiveForcedGuestExit &&
-			ShouldForceGuestExitOnImportLoop(importStubEntry.Nid, num7, num, value, value2) &&
+			ShouldForceGuestExitOnImportLoop(in importStubEntry, num7, num, value, value2) &&
 			TryForceGuestExitToHostStub(argPackPtr, num, num7, importStubEntry.Nid))
 		{
 			cpuContext[CpuRegister.Rax] = 1uL;
 			return 1uL;
 		}
-		bool flag0 = ShouldSuppressStrlenTrace(importStubEntry.Nid);
+		bool flag0 = importStubEntry.SuppressStrlenTrace;
 		bool flag = num7 >= 2156221920u && num7 <= 2156225024u;
 		bool flag2 = num7 >= 2156351360u && num7 <= 2156352080u;
 		bool flag3 = num >= 1020 && num <= 1040;
@@ -923,7 +923,7 @@ public sealed partial class DirectExecutionBackend
 			ActiveCpuContext.TryWriteUInt64(returnSlotAddress, hostExit);
 	}
 
-	private bool ShouldForceGuestExitOnImportLoop(string nid, ulong returnRip, long dispatchIndex, ulong arg0, ulong arg1)
+	private bool ShouldForceGuestExitOnImportLoop(in ImportStubEntry entry, ulong returnRip, long dispatchIndex, ulong arg0, ulong arg1)
 	{
 		if (dispatchIndex < 1200)
 		{
@@ -933,18 +933,18 @@ public sealed partial class DirectExecutionBackend
 		{
 			return false;
 		}
-		if (IsImportLoopGuardBoundary(nid))
+		if (entry.IsLoopGuardBoundary)
 		{
 			ResetImportLoopPattern();
 			return false;
 		}
-		if (!_importNidHashCache.TryGetValue(nid, out var value))
-		{
-			value = StableHash64(nid);
-			_importNidHashCache[nid] = value;
-		}
+		var value = entry.NidHash;
 		RecordImportLoopSignature(value, returnRip, BuildImportLoopSignature(value, returnRip, arg0, arg1));
-		if ((dispatchIndex & 0x3F) != 0)
+		// The O(period x repeats) pattern scan is a boot/hang watchdog, not a
+		// steady-state feature; sampling every 256th dispatch keeps its cost
+		// off the hot path while still tripping within a couple of thousand
+		// dispatches of a genuine import loop.
+		if ((dispatchIndex & 0xFF) != 0)
 		{
 			return false;
 		}
