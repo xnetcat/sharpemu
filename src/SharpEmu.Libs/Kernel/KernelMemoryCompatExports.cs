@@ -1500,9 +1500,21 @@ public static partial class KernelMemoryCompatExports
             var hostPath = ResolveGuestPath(guestPath);
             if (!TryGetAprFileSize(hostPath, out var fileSize))
             {
+                // Per-file resolve: a missing entry gets an invalid id
+                // (0xFFFFFFFF, already written above) and size 0, and the batch
+                // CONTINUES. Aborting the whole batch on the first miss left the
+                // remaining paths unresolved and could stall the guest's asset
+                // streaming when a batch happens to include an absent (e.g.
+                // patch/DLC) file; the caller checks per-file id/size.
                 LogIoTrace("apr_resolve", guestPath, $"host='{hostPath}' index={i} count={count} result=not_found");
-                KernelRuntimeCompatExports.TrySetErrno(ctx, 2);
-                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+                if (sizesAddress != 0 &&
+                    !TryWriteUInt64Compat(ctx, sizesAddress + (i * sizeof(ulong)), 0))
+                {
+                    KernelRuntimeCompatExports.TrySetErrno(ctx, Efault);
+                    return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+                }
+
+                continue;
             }
 
             var fileId = AmprFileRegistry.Register(guestPath, hostPath);
