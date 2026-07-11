@@ -166,6 +166,13 @@ public static class AgcExports
         Environment.GetEnvironmentVariable("SHARPEMU_LOG_AGC"),
         "1",
         StringComparison.Ordinal);
+    // Drop a draw on an undecodable texture descriptor instead of substituting
+    // a 1x1 fallback binding. Off by default so a garbage descriptor degrades
+    // the pass rather than dropping it (Demon's Souls composite feeders).
+    private static readonly bool _strictShaderDescriptors = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_STRICT_SHADER_DESCRIPTORS"),
+        "1",
+        StringComparison.Ordinal);
     private static readonly bool _traceAgcShader =
         _traceAgc ||
         string.Equals(
@@ -3818,10 +3825,23 @@ public static class AgcExports
         {
             if (!TryDecodeTextureDescriptor(binding.ResourceDescriptor, out var texture))
             {
-                error = $"invalid texture descriptor at pc=0x{binding.Pc:X}";
-                ReturnPooledEvaluationArrays(exportEvaluation);
-                ReturnPooledEvaluationArrays(pixelEvaluation);
-                return false;
+                // A garbage/zeroed texture descriptor (from a per-draw descriptor
+                // setup race — the same root as scalar-load-failed) would drop
+                // the whole draw, so Demon's Souls' deferred-lighting/composite
+                // passes that produce the composite's feeder targets never run
+                // and the frame stays black. Substitute a 1x1 fallback binding so
+                // the pass still renders (that one sampled texture reads black)
+                // rather than dropping it entirely. STRICT reverts.
+                if (_strictShaderDescriptors)
+                {
+                    error = $"invalid texture descriptor at pc=0x{binding.Pc:X}";
+                    ReturnPooledEvaluationArrays(exportEvaluation);
+                    ReturnPooledEvaluationArrays(pixelEvaluation);
+                    return false;
+                }
+
+                texture = new TextureDescriptor(
+                    0x1000, 1, 1, 56, 0, 0, 0, 0, 0, 1, 0);
             }
 
             if (_traceAgcShader)
