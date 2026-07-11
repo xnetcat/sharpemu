@@ -152,6 +152,12 @@ public static class AgcExports
     private static readonly Dictionary<
         (ulong Es, ulong EsState, ulong Ps, ulong PsState, Gen5PixelOutputKind Output),
         (byte[] Vertex, byte[] Pixel)> _graphicsSpirvCache = new();
+    // Per-render-target pixel variants for multi-render-target draws: each
+    // routes its own MRT export slot to the fragment output. Keyed by the
+    // shader identity plus the target's output kind and slot.
+    private static readonly Dictionary<
+        (ulong Ps, ulong PsState, Gen5PixelOutputKind Output, uint Slot), byte[]>
+        _pixelTargetSpirvCache = new();
     private static readonly Dictionary<
         (ulong Cs, ulong State, uint LocalX, uint LocalY, uint LocalZ),
         byte[]> _computeSpirvCache = new();
@@ -342,6 +348,7 @@ public static class AgcExports
         IReadOnlyList<Gen5GlobalMemoryBinding> GlobalMemoryBindings,
         IReadOnlyList<Gen5VertexInputBinding> VertexInputs,
         IReadOnlyList<RenderTargetDescriptor> RenderTargets,
+        IReadOnlyList<byte[]> PixelSpirvByTarget,
         VulkanGuestRenderState RenderState,
         IReadOnlyList<uint> PixelUserData,
         uint RawBlendControl,
@@ -3202,36 +3209,65 @@ public static class AgcExports
             var firstTarget = translatedDraw.RenderTargets.FirstOrDefault();
             if (firstTarget.Address != 0)
             {
-                var textures = CreateVulkanGuestDrawTextures(
-                    ctx,
-                    translatedDraw.Textures,
-                    out _);
-                var globalMemoryBuffers =
-                    CreateTranslatedDrawGlobalBuffers(translatedDraw);
-                var vertexBuffers =
-                    CreateVulkanGuestVertexBuffers(translatedDraw.VertexInputs);
-                TraceRectListVertices(translatedDraw, vertexBuffers);
-                TraceGrassDrawVertices(translatedDraw, textures, vertexBuffers);
-                TraceDrawCompact(drawSequence, translatedDraw, textures, vertexBuffers);
-                ProvideRenderTargetInitialData(ctx, firstTarget);
-                VulkanVideoPresenter.SubmitOffscreenTranslatedDraw(
-                    translatedDraw.PixelSpirv,
-                    textures,
-                    globalMemoryBuffers,
-                    translatedDraw.AttributeCount,
-                    new VulkanGuestRenderTarget(
-                        firstTarget.Address,
-                        firstTarget.Width,
-                            firstTarget.Height,
-                            firstTarget.Format,
-                            firstTarget.NumberType),
+                // Render every bound color target. A deferred G-buffer draw
+                // writes several targets in one guest pass; we render one bound
+                // target per Vulkan pass, each with the pixel variant that
+                // routes that target's MRT export slot to the fragment output.
+                // Secondary targets get fresh (per-submit) buffers and a
+                // non-pooled index copy so they never share a pooled array with
+                // the primary submit, whose fence may recycle it independently.
+                var drawRenderTargets = translatedDraw.RenderTargets;
+                for (var targetIndex = 0; targetIndex < drawRenderTargets.Count; targetIndex++)
+                {
+                    var renderTarget = drawRenderTargets[targetIndex];
+                    if (renderTarget.Address == 0)
+                    {
+                        continue;
+                    }
+
+                    var pixelSpirv = targetIndex < translatedDraw.PixelSpirvByTarget.Count
+                        ? translatedDraw.PixelSpirvByTarget[targetIndex]
+                        : translatedDraw.PixelSpirv;
+                    var isPrimary = targetIndex == 0;
+
+                    var textures = CreateVulkanGuestDrawTextures(
+                        ctx,
+                        translatedDraw.Textures,
+                        out _);
+                    var globalMemoryBuffers =
+                        CreateTranslatedDrawGlobalBuffers(translatedDraw);
+                    var vertexBuffers =
+                        CreateVulkanGuestVertexBuffers(translatedDraw.VertexInputs);
+                    var indexBuffer = isPrimary
+                        ? translatedDraw.IndexBuffer
+                        : CloneIndexBufferUnpooled(translatedDraw.IndexBuffer);
+                    if (isPrimary)
+                    {
+                        TraceRectListVertices(translatedDraw, vertexBuffers);
+                        TraceGrassDrawVertices(translatedDraw, textures, vertexBuffers);
+                        TraceDrawCompact(drawSequence, translatedDraw, textures, vertexBuffers);
+                    }
+
+                    ProvideRenderTargetInitialData(ctx, renderTarget);
+                    VulkanVideoPresenter.SubmitOffscreenTranslatedDraw(
+                        pixelSpirv,
+                        textures,
+                        globalMemoryBuffers,
+                        translatedDraw.AttributeCount,
+                        new VulkanGuestRenderTarget(
+                            renderTarget.Address,
+                            renderTarget.Width,
+                            renderTarget.Height,
+                            renderTarget.Format,
+                            renderTarget.NumberType),
                         translatedDraw.VertexSpirv,
                         translatedDraw.VertexCount,
                         translatedDraw.InstanceCount,
                         translatedDraw.PrimitiveType,
-                        translatedDraw.IndexBuffer,
+                        indexBuffer,
                         vertexBuffers,
                         translatedDraw.RenderState);
+                }
             }
             else
             {
@@ -3400,11 +3436,29 @@ public static class AgcExports
             return false;
         }
 
-        var renderTargets = GetRenderTargets(state.CxRegisters)
-            .Where(target =>
-                target.Slot == 0 &&
-                HasPixelColorExport(pixelState, target.Slot))
+        // Every bound color target the shader exports to. Deferred renderers
+        // draw a multi-render-target G-buffer (up to eight slots) in one pass;
+        // we render one bound target per pass, so keep them all here and give
+        // each its own pixel variant below. Fall back to slot 0 if we can't
+        // match any export to a bound target.
+        var allBoundTargets = GetRenderTargets(state.CxRegisters);
+        var renderTargets = allBoundTargets
+            .Where(target => HasPixelColorExport(pixelState, target.Slot))
             .ToArray();
+        if (renderTargets.Length == 0)
+        {
+            renderTargets = allBoundTargets
+                .Where(target => target.Slot == 0)
+                .ToArray();
+        }
+        if (_traceAgcShader && allBoundTargets.Count > 1)
+        {
+            TraceAgcShader(
+                $"agc.mrt_filter ps=0x{pixelShaderAddress:X16} " +
+                $"bound=[{string.Join(",", allBoundTargets.Select(t => $"s{t.Slot}:0x{t.Address:X}:exp{(HasPixelColorExport(pixelState, t.Slot) ? 1 : 0)}"))}] " +
+                $"kept={renderTargets.Length}");
+        }
+
         var outputKind = GetPixelOutputKind(renderTargets.FirstOrDefault().NumberType);
         var exportStateFingerprint = _bakeScalars
             ? ComputeShaderStateFingerprint(exportEvaluation)
@@ -3418,6 +3472,16 @@ public static class AgcExports
             pixelShaderAddress,
             pixelStateFingerprint,
             outputKind);
+
+        var guestGlobalBuffers =
+            pixelEvaluation.GlobalMemoryBindings.Count +
+            exportEvaluation.GlobalMemoryBindings.Count;
+        // Two per-draw initial-scalar buffers ride after the guest buffers:
+        // [pixel guest][vertex guest][pixel sgprs][vertex sgprs].
+        var totalGlobalBuffers = _bakeScalars
+            ? guestGlobalBuffers
+            : guestGlobalBuffers + 2;
+
         (byte[] Vertex, byte[] Pixel) compiled;
         lock (_submitTraceGate)
         {
@@ -3426,14 +3490,6 @@ public static class AgcExports
 
         if (compiled.Vertex is null || compiled.Pixel is null)
         {
-            var guestGlobalBuffers =
-                pixelEvaluation.GlobalMemoryBindings.Count +
-                exportEvaluation.GlobalMemoryBindings.Count;
-            // Two per-draw initial-scalar buffers ride after the guest
-            // buffers: [pixel guest][vertex guest][pixel sgprs][vertex sgprs].
-            var totalGlobalBuffers = _bakeScalars
-                ? guestGlobalBuffers
-                : guestGlobalBuffers + 2;
             if (!Gen5SpirvTranslator.TryCompilePixelShader(
                     pixelState,
                     pixelEvaluation,
@@ -3443,7 +3499,8 @@ public static class AgcExports
                     globalBufferBase: 0,
                     totalGlobalBufferCount: totalGlobalBuffers,
                     imageBindingBase: 0,
-                    initialScalarBufferIndex: _bakeScalars ? -1 : guestGlobalBuffers) ||
+                    initialScalarBufferIndex: _bakeScalars ? -1 : guestGlobalBuffers,
+                    pixelRenderTargetSlot: (int)renderTargets.FirstOrDefault().Slot) ||
                 !Gen5SpirvTranslator.TryCompileVertexShader(
                     exportState,
                     exportEvaluation,
@@ -3477,6 +3534,57 @@ public static class AgcExports
             {
                 _graphicsSpirvCache.TryAdd(shaderKey, compiled);
             }
+        }
+
+        // One pixel variant per bound color target. The primary target reuses
+        // the shader compiled above; each additional target routes its own MRT
+        // export slot to the fragment output so its pass writes real colour
+        // (secondary G-buffer targets were previously left empty).
+        var pixelSpirvByTarget = new byte[renderTargets.Length][];
+        if (renderTargets.Length > 0)
+        {
+            pixelSpirvByTarget[0] = compiled.Pixel;
+        }
+
+        for (var targetIndex = 1; targetIndex < renderTargets.Length; targetIndex++)
+        {
+            var slot = renderTargets[targetIndex].Slot;
+            var targetOutputKind = GetPixelOutputKind(renderTargets[targetIndex].NumberType);
+            var pixelKey = (pixelShaderAddress, pixelStateFingerprint, targetOutputKind, slot);
+            byte[]? targetPixel;
+            lock (_submitTraceGate)
+            {
+                _pixelTargetSpirvCache.TryGetValue(pixelKey, out targetPixel);
+            }
+
+            if (targetPixel is null)
+            {
+                if (!Gen5SpirvTranslator.TryCompilePixelShader(
+                        pixelState,
+                        pixelEvaluation,
+                        targetOutputKind,
+                        out var targetShader,
+                        out error,
+                        globalBufferBase: 0,
+                        totalGlobalBufferCount: totalGlobalBuffers,
+                        imageBindingBase: 0,
+                        initialScalarBufferIndex: _bakeScalars ? -1 : guestGlobalBuffers,
+                        pixelRenderTargetSlot: (int)slot))
+                {
+                    ReturnPooledEvaluationArrays(exportEvaluation);
+                    ReturnPooledEvaluationArrays(pixelEvaluation);
+                    return false;
+                }
+
+                targetPixel = targetShader.Spirv;
+                VulkanVideoPresenter.CountSpirvCompilation();
+                lock (_submitTraceGate)
+                {
+                    _pixelTargetSpirvCache.TryAdd(pixelKey, targetPixel);
+                }
+            }
+
+            pixelSpirvByTarget[targetIndex] = targetPixel;
         }
 
         var imageBindings = pixelEvaluation.ImageBindings
@@ -3530,6 +3638,7 @@ public static class AgcExports
             globalMemoryBindings,
             vertexInputs,
             renderTargets,
+            pixelSpirvByTarget,
             ApplyFillClearHack(
                 CreateRenderState(state.CxRegisters, renderTargets.FirstOrDefault()),
                 textures,
@@ -3631,6 +3740,25 @@ public static class AgcExports
             5 => Gen5PixelOutputKind.Sint,
             _ => Gen5PixelOutputKind.Float,
         };
+
+    /// <summary>
+    /// Copies an index buffer into a fresh, non-pooled array. Multi-render-
+    /// target draws submit the same geometry once per bound target; the pooled
+    /// index buffer belongs to the primary submit (whose fence recycles it), so
+    /// each additional target draws from an independent copy.
+    /// </summary>
+    private static VulkanGuestIndexBuffer? CloneIndexBufferUnpooled(
+        VulkanGuestIndexBuffer? indexBuffer)
+    {
+        if (indexBuffer is not { } source)
+        {
+            return null;
+        }
+
+        var copy = new byte[source.Data.Length];
+        Array.Copy(source.Data, copy, source.Data.Length);
+        return new VulkanGuestIndexBuffer(copy, source.Length, source.Is32Bit, Pooled: false);
+    }
 
     private static bool HasPixelColorExport(Gen5ShaderState state, uint target) =>
         state.Program.Instructions.Any(instruction =>

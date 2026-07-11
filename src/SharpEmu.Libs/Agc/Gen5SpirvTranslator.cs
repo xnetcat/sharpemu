@@ -19,7 +19,8 @@ internal static partial class Gen5SpirvTranslator
         int globalBufferBase = 0,
         int totalGlobalBufferCount = -1,
         int imageBindingBase = 0,
-        int initialScalarBufferIndex = -1)
+        int initialScalarBufferIndex = -1,
+        int pixelRenderTargetSlot = 0)
     {
         var context = new CompilationContext(
             Gen5SpirvStage.Pixel,
@@ -32,7 +33,8 @@ internal static partial class Gen5SpirvTranslator
             globalBufferBase,
             totalGlobalBufferCount,
             imageBindingBase,
-            initialScalarBufferIndex);
+            initialScalarBufferIndex,
+            pixelRenderTargetSlot);
         return context.TryCompile(out shader, out error);
     }
 
@@ -92,6 +94,13 @@ internal static partial class Gen5SpirvTranslator
         private readonly Gen5ShaderState _state;
         private readonly Gen5ShaderEvaluation _evaluation;
         private readonly Gen5PixelOutputKind _outputKind;
+
+        // Which pixel-shader MRT export target (EXP_MRT0..7 == render-target
+        // slot) is routed to the single fragment output. The offscreen draw
+        // path renders one bound color target per pass, so a multi-render-target
+        // (deferred G-buffer) draw compiles one pixel variant per slot, each
+        // selecting that slot's export here.
+        private readonly int _pixelRenderTargetSlot;
         private readonly uint _localSizeX;
         private readonly uint _localSizeY;
         private readonly uint _localSizeZ;
@@ -174,12 +183,14 @@ internal static partial class Gen5SpirvTranslator
             int globalBufferBase,
             int totalGlobalBufferCount,
             int imageBindingBase,
-            int initialScalarBufferIndex)
+            int initialScalarBufferIndex,
+            int pixelRenderTargetSlot = 0)
         {
             _stage = stage;
             _state = state;
             _evaluation = evaluation;
             _outputKind = outputKind;
+            _pixelRenderTargetSlot = pixelRenderTargetSlot;
             _localSizeX = localSizeX;
             _localSizeY = localSizeY;
             _localSizeZ = localSizeZ;
@@ -2097,7 +2108,11 @@ internal static partial class Gen5SpirvTranslator
 
             if (_stage == Gen5SpirvStage.Pixel)
             {
-                if (export.Target != 0)
+                // Pixel exports target EXP_MRT0..7 (== render-target slot). We
+                // render one bound color target per pass, so keep only the
+                // export for the slot this variant was compiled for and route it
+                // to the single fragment output.
+                if (export.Target != _pixelRenderTargetSlot)
                 {
                     return true;
                 }

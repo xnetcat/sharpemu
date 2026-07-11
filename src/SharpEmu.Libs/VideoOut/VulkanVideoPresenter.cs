@@ -3888,6 +3888,25 @@ internal static unsafe class VulkanVideoPresenter
                 };
             }
 
+            if (ShouldTraceVulkanResources() && texture.Address != 0)
+            {
+                if (_guestImages.TryGetValue(texture.Address, out var missImage))
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] vk.alias_miss addr=0x{texture.Address:X16} " +
+                        $"reason={(IsCompatibleGuestImageAlias(texture, missImage) ? "format" : "size")} " +
+                        $"tex={texture.Width}x{texture.Height}/f{texture.Format}/n{texture.NumberType}/vk{vkFormat} " +
+                        $"img={missImage.Width}x{missImage.Height}/imgfmt{missImage.Format} " +
+                        $"init={missImage.Initialized}");
+                }
+                else
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] vk.alias_miss addr=0x{texture.Address:X16} " +
+                        $"reason=absent tex={texture.Width}x{texture.Height}/f{texture.Format}/n{texture.NumberType}");
+                }
+            }
+
             return GetOrCreateCachedTextureResource(texture);
         }
 
