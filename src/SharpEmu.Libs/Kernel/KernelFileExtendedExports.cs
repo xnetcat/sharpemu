@@ -466,10 +466,10 @@ public static partial class KernelMemoryCompatExports
 
         // struct pollfd { int fd; short events; short revents; } == 8 bytes.
         var ready = 0;
+        Span<byte> buffer = stackalloc byte[8];
         for (uint i = 0; i < count && i < 4096; i++)
         {
             var entry = fdsAddress + i * 8;
-            Span<byte> buffer = stackalloc byte[8];
             if (!ctx.Memory.TryRead(entry, buffer))
             {
                 break;
@@ -526,10 +526,11 @@ public static partial class KernelMemoryCompatExports
         }
 
         // Each SceKernelAioRWRequest: offset(8) nbyte(8) buf(8) result(8) fd(4).
+        Span<byte> request = stackalloc byte[SizeofAioRwRequest];
+        Span<byte> result = stackalloc byte[16];
         for (var i = 0; i < count; i++)
         {
             var entry = requestsAddress + (ulong)(i * SizeofAioRwRequest);
-            Span<byte> request = stackalloc byte[SizeofAioRwRequest];
             if (!ctx.Memory.TryRead(entry, request))
             {
                 break;
@@ -544,7 +545,6 @@ public static partial class KernelMemoryCompatExports
             long transferred = KernelAioTransfer(ctx, fd, offset, nbyte, buf, write);
             if (resultPtr != 0)
             {
-                Span<byte> result = stackalloc byte[16];
                 BinaryPrimitives.WriteInt64LittleEndian(result[0..], transferred);
                 BinaryPrimitives.WriteUInt32LittleEndian(result[8..], AioStateCompleted);
                 _ = ctx.Memory.TryWrite(resultPtr, result);
@@ -621,10 +621,10 @@ public static partial class KernelMemoryCompatExports
         var count = unchecked((int)ctx[CpuRegister.Rdx]);
         if (statesAddress != 0 && count > 0 && count <= 0x10000)
         {
+            Span<byte> state = stackalloc byte[sizeof(uint)];
+            BinaryPrimitives.WriteUInt32LittleEndian(state, AioStateCompleted);
             for (var i = 0; i < count; i++)
             {
-                Span<byte> state = stackalloc byte[sizeof(uint)];
-                BinaryPrimitives.WriteUInt32LittleEndian(state, AioStateCompleted);
                 _ = ctx.Memory.TryWrite(statesAddress + (ulong)(i * sizeof(uint)), state);
             }
         }
