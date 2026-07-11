@@ -228,6 +228,20 @@ internal static unsafe class VulkanVideoPresenter
         ulong.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_FENCE_WAIT_TIMEOUT_MS"), out var fenceMs) && fenceMs > 0
             ? fenceMs * 1_000_000UL
             : 3_000_000_000UL;
+    // When making room in the in-flight submission queue from the macOS MAIN
+    // thread (Render() -> guest-work drain), block only this long per attempt
+    // instead of the full fence timeout. If a slow/capped compute submission
+    // isn't done yet, proceed anyway: the in-flight cap is soft, the fence and
+    // command-buffer pools are dynamic so a brief overshoot is safe, and the
+    // queue drains as GPU completions land on later frames. This keeps the
+    // window responsive (event pump runs) under a heavy compute backlog instead
+    // of the main thread sitting in vkWaitForFences for up to 3s per chunk.
+    // SHARPEMU_SUBMISSION_CAPACITY_WAIT_MS overrides; default 100ms; 0 restores
+    // the full blocking wait.
+    private static readonly ulong _submissionCapacityWaitNs =
+        ulong.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_SUBMISSION_CAPACITY_WAIT_MS"), out var capMs)
+            ? capMs * 1_000_000UL
+            : 100_000_000UL;
     private static readonly HashSet<string> _tracedFenceTimeouts = new();
     // Diagnostic: skip every compute dispatch (mistranslated compute shaders
     // run long / GPU-hang and starve the present). Isolates whether the
@@ -2676,21 +2690,35 @@ internal static unsafe class VulkanVideoPresenter
             CollectCompletedGuestSubmissions(waitForOldest: false);
             if (_pendingGuestSubmissions.Count >= MaxInFlightGuestSubmissions)
             {
-                CollectCompletedGuestSubmissions(waitForOldest: true);
+                // Bounded wait so the macOS main thread returns to its event
+                // pump promptly under a slow-compute backlog; if the oldest
+                // isn't done yet we proceed (soft cap, dynamic pools).
+                CollectCompletedGuestSubmissions(
+                    waitForOldest: true,
+                    maxWaitNs: _submissionCapacityWaitNs == 0
+                        ? _guestFenceWaitTimeoutNs
+                        : _submissionCapacityWaitNs);
             }
         }
 
-        private void CollectCompletedGuestSubmissions(bool waitForOldest)
+        private void CollectCompletedGuestSubmissions(bool waitForOldest, ulong maxWaitNs = 0)
         {
             if (waitForOldest && _pendingGuestSubmissions.TryPeek(out var oldest))
             {
                 var fence = oldest.Fence;
+                // maxWaitNs==0 => the full "is this submission hung" timeout,
+                // which also emits the one-shot hang warning below. A shorter
+                // capacity-probe wait (maxWaitNs>0) must NOT report a hang: the
+                // submission is still tracked and will be collected once the GPU
+                // finishes it on a later frame.
+                var isProbeWait = maxWaitNs != 0 && maxWaitNs < _guestFenceWaitTimeoutNs;
+                var waitNs = maxWaitNs != 0 ? maxWaitNs : _guestFenceWaitTimeoutNs;
                 var result = _vk.WaitForFences(
                     _device,
                     1,
                     &fence,
                     true,
-                    _guestFenceWaitTimeoutNs);
+                    waitNs);
                 if (result == Result.Timeout)
                 {
                     // A GPU submission whose fence never signals (typically a
@@ -2698,7 +2726,7 @@ internal static unsafe class VulkanVideoPresenter
                     // would otherwise block the render thread forever, starving
                     // the swapchain present (black screen). Log the culprit and
                     // continue so at least the last good frame can be shown.
-                    if (_tracedFenceTimeouts.Add(oldest.DebugName))
+                    if (!isProbeWait && _tracedFenceTimeouts.Add(oldest.DebugName))
                     {
                         Console.Error.WriteLine(
                             $"[LOADER][WARN] vk.fence_wait_timeout submission='{oldest.DebugName}' " +
