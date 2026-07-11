@@ -274,6 +274,33 @@ public static class SaveDataExports
         return SetReturn(ctx, 0);
     }
 
+    [SysAbiExport(
+        Nid = "lJUQuaKqoKY",
+        ExportName = "sceSaveDataDeleteTransactionResource",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceSaveData")]
+    public static int SaveDataDeleteTransactionResource(CpuContext ctx)
+    {
+        // Counterpart to CreateTransactionResource; nothing to free in the
+        // stub model, so acknowledge success so save teardown proceeds.
+        TraceSaveData($"delete_transaction_resource user={unchecked((int)ctx[CpuRegister.Rdi])}");
+        return SetReturn(ctx, 0);
+    }
+
+    [SysAbiExport(
+        Nid = "uW4vfTwMQVo",
+        ExportName = "sceSaveDataUmount2",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceSaveData")]
+    public static int SaveDataUmount2(CpuContext ctx)
+    {
+        // Unmounting a save directory always succeeds in the stub filesystem;
+        // returning an error here makes the game's save flow stall before it
+        // hands control to the title/gameplay state.
+        TraceSaveData($"umount2 user={unchecked((int)ctx[CpuRegister.Rdi])}");
+        return SetReturn(ctx, 0);
+    }
+
     private static bool TryReadSearchCond(CpuContext ctx, ulong address, out SearchCond cond)
     {
         cond = default;
