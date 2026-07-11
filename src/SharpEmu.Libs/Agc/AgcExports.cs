@@ -4669,15 +4669,13 @@ public static class AgcExports
             return pitch;
         }
 
-        var pitchAlignment = Math.Max(8UL, 64UL / bytesPerTexel);
-        var alignedPitch = AlignUp(pitch, pitchAlignment);
-        var sliceAlignment = Math.Max(64UL, 256UL / bytesPerTexel);
-        while ((alignedPitch * height) % sliceAlignment != 0)
-        {
-            alignedPitch += pitchAlignment;
-        }
-
-        return checked((uint)alignedPitch);
+        // GNM linear surfaces align the row pitch to 256 bytes, so a 32px
+        // RGBA8 texture is stored with a 64px (256-byte) pitch and a 288px
+        // one with 320px. Reading at the unpadded width made every padded
+        // tail land on the next row, which showed as transparent gaps every
+        // other row on small tiles and diagonal dashes on wider surfaces.
+        var pitchBytes = AlignUp((ulong)pitch * bytesPerTexel, 256UL);
+        return checked((uint)(pitchBytes / bytesPerTexel));
     }
 
     private static ulong AlignUp(ulong value, ulong alignment) =>
