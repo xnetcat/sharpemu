@@ -949,7 +949,14 @@ internal static unsafe class VulkanVideoPresenter
             (12, 4) => GuestFormatR16G16B16A16Uint,
             (12, 5) => GuestFormatR16G16B16A16Sint,
             (12, 7) => 71,
-            (_, 0) when IsKnownGuestTextureFormat(format) => format,
+            // A format value that is already a resolved combined texture format
+            // (e.g. 71 = R16G16B16A16Sfloat) maps to itself regardless of the
+            // descriptor's numberType. Guarding this on numberType==0 made a
+            // sampled read of such an image (compute/RT output sampled with
+            // numberType=1) miss the on-GPU alias and upload zeroed guest RAM
+            // instead — the black composite. Registration already yields the
+            // same code, so relaxing the guard makes the alias match succeed.
+            (_, _) when IsKnownGuestTextureFormat(format) => format,
             _ => 0,
         };
 
