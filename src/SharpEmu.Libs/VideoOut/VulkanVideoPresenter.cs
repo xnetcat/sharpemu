@@ -197,6 +197,19 @@ internal static unsafe class VulkanVideoPresenter
     // pooled guest-data arrays until the render thread uploads them.
     private const int MaxPendingGuestWork = 64;
     private const int MaxGuestWorkPerRender = 256;
+    // On macOS the whole window loop — including Render() and its guest-work
+    // drain — runs on the process main thread, so draining a large backlog of
+    // slow guest work (heavy compute) blocks the Cocoa event pump and marks the
+    // window "Not Responding" while starving the swapchain present. Cap the
+    // wall-clock time spent draining per Render() call; leftover work stays
+    // queued for the next frame. SHARPEMU_RENDER_WORK_BUDGET_MS overrides
+    // (0 disables the cap); default 12ms keeps the window interactive at ~60Hz.
+    private static readonly long _renderWorkBudgetTicks =
+        (long.TryParse(
+             Environment.GetEnvironmentVariable("SHARPEMU_RENDER_WORK_BUDGET_MS"),
+             out var renderBudgetMs) && renderBudgetMs >= 0
+            ? renderBudgetMs
+            : 12L) * System.Diagnostics.Stopwatch.Frequency / 1000L;
     // Cap the guest-submission fence wait so a GPU submission whose fence never
     // signals (a mistranslated compute shader that hangs the Metal queue) cannot
     // freeze the render thread forever and starve the swapchain present.
@@ -6595,6 +6608,9 @@ internal static unsafe class VulkanVideoPresenter
 
             EvictDirtyCachedTextures();
             var completedWork = 0;
+            var renderWorkDeadline = _renderWorkBudgetTicks > 0
+                ? System.Diagnostics.Stopwatch.GetTimestamp() + _renderWorkBudgetTicks
+                : long.MaxValue;
             while (completedWork < MaxGuestWorkPerRender &&
                    TryTakeGuestWork(out var work))
             {
@@ -6643,6 +6659,15 @@ internal static unsafe class VulkanVideoPresenter
                 }
 
                 completedWork++;
+
+                // Return to the main-thread event pump + present once the
+                // per-frame budget is spent; remaining guest work is drained
+                // on subsequent Render() calls. Without this a compute-heavy
+                // backlog freezes the window (macOS "Not Responding").
+                if (System.Diagnostics.Stopwatch.GetTimestamp() >= renderWorkDeadline)
+                {
+                    break;
+                }
             }
 
             FlushBatchedGuestCommands();
