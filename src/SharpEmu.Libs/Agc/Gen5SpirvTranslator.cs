@@ -26,7 +26,8 @@ internal static partial class Gen5SpirvTranslator
         int totalGlobalBufferCount = -1,
         int imageBindingBase = 0,
         int initialScalarBufferIndex = -1,
-        int pixelRenderTargetSlot = 0)
+        int pixelRenderTargetSlot = 0,
+        ulong storageBufferOffsetAlignment = 1)
     {
         var context = new CompilationContext(
             Gen5SpirvStage.Pixel,
@@ -40,7 +41,8 @@ internal static partial class Gen5SpirvTranslator
             totalGlobalBufferCount,
             imageBindingBase,
             initialScalarBufferIndex,
-            pixelRenderTargetSlot);
+            pixelRenderTargetSlot,
+            storageBufferOffsetAlignment: storageBufferOffsetAlignment);
         return context.TryCompile(out shader, out error);
     }
 
@@ -53,7 +55,8 @@ internal static partial class Gen5SpirvTranslator
         int totalGlobalBufferCount = -1,
         int imageBindingBase = 0,
         int initialScalarBufferIndex = -1,
-        int requiredVertexOutputCount = 0)
+        int requiredVertexOutputCount = 0,
+        ulong storageBufferOffsetAlignment = 1)
     {
         var context = new CompilationContext(
             Gen5SpirvStage.Vertex,
@@ -67,7 +70,8 @@ internal static partial class Gen5SpirvTranslator
             totalGlobalBufferCount,
             imageBindingBase,
             initialScalarBufferIndex,
-            requiredVertexOutputCount: requiredVertexOutputCount);
+            requiredVertexOutputCount: requiredVertexOutputCount,
+            storageBufferOffsetAlignment: storageBufferOffsetAlignment);
         return context.TryCompile(out shader, out error);
     }
 
@@ -81,7 +85,8 @@ internal static partial class Gen5SpirvTranslator
         out string error,
         int totalGlobalBufferCount = -1,
         int initialScalarBufferIndex = -1,
-        uint waveLaneCount = 32)
+        uint waveLaneCount = 32,
+        ulong storageBufferOffsetAlignment = 1)
     {
         var context = new CompilationContext(
             Gen5SpirvStage.Compute,
@@ -95,7 +100,8 @@ internal static partial class Gen5SpirvTranslator
             totalGlobalBufferCount,
             0,
             initialScalarBufferIndex,
-            waveLaneCount: waveLaneCount);
+            waveLaneCount: waveLaneCount,
+            storageBufferOffsetAlignment: storageBufferOffsetAlignment);
         return context.TryCompile(out shader, out error);
     }
 
@@ -162,6 +168,7 @@ internal static partial class Gen5SpirvTranslator
         private readonly int _totalGlobalBufferCount;
         private readonly int _imageBindingBase;
         private readonly int _initialScalarBufferIndex;
+        private readonly ulong _storageBufferOffsetAlignment;
         private readonly List<uint> _interfaces = [];
         private readonly Dictionary<uint, uint> _pixelInputs = [];
         private readonly Dictionary<uint, uint> _vertexOutputs = [];
@@ -250,7 +257,8 @@ internal static partial class Gen5SpirvTranslator
             int initialScalarBufferIndex,
             int pixelRenderTargetSlot = 0,
             int requiredVertexOutputCount = 0,
-            uint waveLaneCount = 32)
+            uint waveLaneCount = 32,
+            ulong storageBufferOffsetAlignment = 1)
         {
             _stage = stage;
             _requiredVertexOutputCount = requiredVertexOutputCount;
@@ -272,6 +280,17 @@ internal static partial class Gen5SpirvTranslator
                 : totalGlobalBufferCount;
             _imageBindingBase = imageBindingBase;
             _initialScalarBufferIndex = initialScalarBufferIndex;
+            if (storageBufferOffsetAlignment == 0 ||
+                (storageBufferOffsetAlignment & (storageBufferOffsetAlignment - 1)) != 0 ||
+                storageBufferOffsetAlignment > uint.MaxValue)
+            {
+                throw new ArgumentOutOfRangeException(
+                    nameof(storageBufferOffsetAlignment),
+                    storageBufferOffsetAlignment,
+                    "storage-buffer offset alignment must be a uint-sized power of two");
+            }
+
+            _storageBufferOffsetAlignment = storageBufferOffsetAlignment;
         }
 
         public bool TryCompile(out Gen5SpirvShader shader, out string error)
@@ -1633,6 +1652,7 @@ internal static partial class Gen5SpirvTranslator
             var byteAddress = IAdd(
                 dynamicOffset,
                 UInt(unchecked((uint)control.ImmediateOffsetBytes)));
+            byteAddress = ApplyGuestBufferByteBias(bindingIndex, byteAddress);
             var dwordAddress = ShiftRightLogical(byteAddress, UInt(2));
             for (var index = 0; index < instruction.Destinations.Count; index++)
             {
@@ -1671,15 +1691,95 @@ internal static partial class Gen5SpirvTranslator
             var byteAddress = IAdd(
                 LoadV(control.VectorAddress),
                 UInt(unchecked((uint)control.OffsetBytes)));
+            byteAddress = ApplyGuestBufferByteBias(bindingIndex, byteAddress);
             var dwordAddress = ShiftRightLogical(byteAddress, UInt(2));
+
+            if (instruction.Opcode is "GlobalAtomicAdd" or "GlobalAtomicUMax")
+            {
+                EmitExecConditional(() =>
+                {
+                    EmitConditional(IsBufferWordInRange(bindingIndex, dwordAddress), () =>
+                    {
+                        var original = _module.AddInstruction(
+                            instruction.Opcode == "GlobalAtomicAdd"
+                                ? SpirvOp.AtomicIAdd
+                                : SpirvOp.AtomicUMax,
+                            _uintType,
+                            BufferWordPointer(bindingIndex, dwordAddress),
+                            UInt(1),
+                            UInt(0x48),
+                            LoadV(control.VectorData));
+                        if (control.Glc)
+                        {
+                            StoreV(control.VectorData, original);
+                        }
+                    });
+                });
+                return true;
+            }
+
+            if (instruction.Opcode.StartsWith("GlobalStore", StringComparison.Ordinal))
+            {
+                EmitExecConditional(() =>
+                {
+                    if (TryGetSubdwordStoreInfo(
+                            instruction.Opcode,
+                            out var byteCount,
+                            out var sourceShift))
+                    {
+                        StoreBufferBytes(
+                            bindingIndex,
+                            byteAddress,
+                            LoadV(control.VectorData),
+                            byteCount,
+                            sourceShift);
+                        return;
+                    }
+
+                    for (uint index = 0; index < control.DwordCount; index++)
+                    {
+                        var address = index == 0
+                            ? byteAddress
+                            : IAdd(byteAddress, UInt(index * sizeof(uint)));
+                        StoreBufferBytes(
+                            bindingIndex,
+                            address,
+                            LoadV(control.VectorData + index),
+                            sizeof(uint),
+                            0);
+                    }
+                });
+                return true;
+            }
+
+            if (TryGetSubdwordLoadInfo(
+                    instruction.Opcode,
+                    out var loadByteCount,
+                    out var signExtend,
+                    out var d16,
+                    out var d16High))
+            {
+                StoreV(
+                    control.VectorData,
+                    LoadSubdwordBufferValue(
+                        bindingIndex,
+                        byteAddress,
+                        LoadV(control.VectorData),
+                        loadByteCount,
+                        signExtend,
+                        d16,
+                        d16High));
+                return true;
+            }
+
             for (uint index = 0; index < control.DwordCount; index++)
             {
                 var address = index == 0
-                    ? dwordAddress
-                    : IAdd(dwordAddress, UInt(index));
+                    ? byteAddress
+                    : IAdd(byteAddress, UInt(index * sizeof(uint)));
                 StoreV(
                     control.VectorData + index,
-                    LoadBufferWord(bindingIndex, address));
+                    LoadUnalignedBufferWord(bindingIndex, address));
             }
 
             return true;
@@ -1732,6 +1832,7 @@ internal static partial class Gen5SpirvTranslator
             byteAddress = IAdd(
                 byteAddress,
                 _module.AddInstruction(SpirvOp.IMul, _uintType, vectorIndex, stride));
+            byteAddress = ApplyGuestBufferByteBias(bindingIndex, byteAddress);
             var dwordAddress = ShiftRightLogical(byteAddress, UInt(2));
 
             if (instruction.Opcode is "BufferAtomicAdd" or "BufferAtomicUMax")
@@ -1761,22 +1862,60 @@ internal static partial class Gen5SpirvTranslator
             }
 
             if (instruction.Opcode.StartsWith("BufferStoreDword", StringComparison.Ordinal) ||
-                instruction.Opcode.StartsWith("BufferStoreFormat", StringComparison.Ordinal))
+                instruction.Opcode.StartsWith("BufferStoreFormat", StringComparison.Ordinal) ||
+                instruction.Opcode.StartsWith("BufferStoreByte", StringComparison.Ordinal) ||
+                instruction.Opcode.StartsWith("BufferStoreShort", StringComparison.Ordinal))
             {
                 EmitExecConditional(() =>
                 {
+                    if (TryGetSubdwordStoreInfo(
+                            instruction.Opcode,
+                            out var byteCount,
+                            out var sourceShift))
+                    {
+                        StoreBufferBytes(
+                            bindingIndex,
+                            byteAddress,
+                            LoadV(control.VectorData),
+                            byteCount,
+                            sourceShift);
+                        return;
+                    }
+
                     for (uint index = 0; index < control.DwordCount; index++)
                     {
                         var address = index == 0
-                            ? dwordAddress
-                            : IAdd(dwordAddress, UInt(index));
-                        StoreBufferWord(
+                            ? byteAddress
+                            : IAdd(byteAddress, UInt(index * sizeof(uint)));
+                        StoreBufferBytes(
                             bindingIndex,
                             address,
-                            LoadV(control.VectorData + index));
+                            LoadV(control.VectorData + index),
+                            sizeof(uint),
+                            0);
                     }
                 });
 
+                return true;
+            }
+
+            if (TryGetSubdwordLoadInfo(
+                    instruction.Opcode,
+                    out var loadByteCount,
+                    out var signExtend,
+                    out var d16,
+                    out var d16High))
+            {
+                StoreV(
+                    control.VectorData,
+                    LoadSubdwordBufferValue(
+                        bindingIndex,
+                        byteAddress,
+                        LoadV(control.VectorData),
+                        loadByteCount,
+                        signExtend,
+                        d16,
+                        d16High));
                 return true;
             }
 
@@ -1805,11 +1944,11 @@ internal static partial class Gen5SpirvTranslator
             for (uint index = 0; index < control.DwordCount; index++)
             {
                 var address = index == 0
-                    ? dwordAddress
-                    : IAdd(dwordAddress, UInt(index));
+                    ? byteAddress
+                    : IAdd(byteAddress, UInt(index * sizeof(uint)));
                 StoreV(
                     control.VectorData + index,
-                    LoadBufferWord(bindingIndex, address));
+                    LoadUnalignedBufferWord(bindingIndex, address));
             }
 
             return true;
@@ -2271,6 +2410,105 @@ internal static partial class Gen5SpirvTranslator
             }
 
             return result;
+        }
+
+        private uint LoadSubdwordBufferValue(
+            int bindingIndex,
+            uint byteAddress,
+            uint previous,
+            uint byteCount,
+            bool signExtend,
+            bool d16,
+            bool d16High)
+        {
+            var width = byteCount * 8;
+            var raw = BitwiseAnd(
+                LoadUnalignedBufferWord(bindingIndex, byteAddress),
+                UInt(byteCount == 1 ? 0xFFu : 0xFFFFu));
+            if (signExtend)
+            {
+                raw = Bitcast(
+                    _uintType,
+                    _module.AddInstruction(
+                        SpirvOp.BitFieldSExtract,
+                        _intType,
+                        Bitcast(_intType, raw),
+                        UInt(0),
+                        UInt(width)));
+            }
+
+            if (!d16)
+            {
+                return raw;
+            }
+
+            var half = BitwiseAnd(raw, UInt(0xFFFF));
+            return d16High
+                ? BitwiseOr(
+                    BitwiseAnd(previous, UInt(0x0000_FFFF)),
+                    ShiftLeftLogical(half, UInt(16)))
+                : BitwiseOr(
+                    BitwiseAnd(previous, UInt(0xFFFF_0000)),
+                    half);
+        }
+
+        private void StoreBufferBytes(
+            int bindingIndex,
+            uint byteAddress,
+            uint value,
+            uint byteCount,
+            uint sourceShift)
+        {
+            value = ShiftRightLogical(value, UInt(sourceShift));
+            for (uint index = 0; index < byteCount; index++)
+            {
+                var address = index == 0
+                    ? byteAddress
+                    : IAdd(byteAddress, UInt(index));
+                var dwordAddress = ShiftRightLogical(address, UInt(2));
+                var shift = ShiftLeftLogical(BitwiseAnd(address, UInt(3)), UInt(3));
+                var oldValue = LoadBufferWord(bindingIndex, dwordAddress);
+                var byteMask = ShiftLeftLogical(UInt(0xFF), shift);
+                var sourceByte = BitwiseAnd(
+                    ShiftRightLogical(value, UInt(index * 8)),
+                    UInt(0xFF));
+                var updated = BitwiseOr(
+                    BitwiseAnd(
+                        oldValue,
+                        _module.AddInstruction(SpirvOp.Not, _uintType, byteMask)),
+                    ShiftLeftLogical(sourceByte, shift));
+                StoreBufferWord(bindingIndex, dwordAddress, updated);
+            }
+        }
+
+        private static bool TryGetSubdwordLoadInfo(
+            string opcode,
+            out uint byteCount,
+            out bool signExtend,
+            out bool d16,
+            out bool d16High)
+        {
+            byteCount = opcode.Contains("byte", StringComparison.OrdinalIgnoreCase) ? 1u : 2u;
+            signExtend = opcode.Contains("Sbyte", StringComparison.Ordinal) ||
+                opcode.Contains("Sshort", StringComparison.Ordinal);
+            d16 = opcode.Contains("D16", StringComparison.Ordinal);
+            d16High = opcode.EndsWith("D16Hi", StringComparison.Ordinal);
+            return opcode.Contains("LoadUbyte", StringComparison.Ordinal) ||
+                opcode.Contains("LoadSbyte", StringComparison.Ordinal) ||
+                opcode.Contains("LoadUshort", StringComparison.Ordinal) ||
+                opcode.Contains("LoadSshort", StringComparison.Ordinal) ||
+                opcode.Contains("LoadShortD16", StringComparison.Ordinal);
+        }
+
+        private static bool TryGetSubdwordStoreInfo(
+            string opcode,
+            out uint byteCount,
+            out uint sourceShift)
+        {
+            byteCount = opcode.Contains("StoreByte", StringComparison.Ordinal) ? 1u : 2u;
+            sourceShift = opcode.EndsWith("D16Hi", StringComparison.Ordinal) ? 16u : 0u;
+            return opcode.Contains("StoreByte", StringComparison.Ordinal) ||
+                opcode.Contains("StoreShort", StringComparison.Ordinal);
         }
 
         private static bool IsFormatBufferLoad(string opcode) =>
@@ -3302,6 +3540,32 @@ internal static partial class Gen5SpirvTranslator
                 UInt(0));
         }
 
+        private uint ApplyGuestBufferByteBias(int binding, uint byteAddress)
+        {
+            var evaluationBinding = binding - _globalBufferBase;
+            if ((uint)evaluationBinding >=
+                (uint)_evaluation.GlobalMemoryBindings.Count)
+            {
+                // Runtime SGPR blocks and other synthetic descriptors do not
+                // alias guest virtual memory and are always bound at offset 0.
+                return byteAddress;
+            }
+
+            // The presenter binds the shared allocation at the largest aligned
+            // offset not greater than this guest resource's offset. Because the
+            // allocation base is aligned to the same power of two, the bytes
+            // discarded from the descriptor offset are exactly the low address
+            // bits below. Adding them here keeps scalar, MUBUF and GLOBAL paths
+            // byte-exact, including atomics and resources that overlap another
+            // descriptor at an unaligned guest address.
+            var byteBias =
+                _evaluation.GlobalMemoryBindings[evaluationBinding].BaseAddress &
+                (_storageBufferOffsetAlignment - 1);
+            return byteBias == 0
+                ? byteAddress
+                : IAdd(byteAddress, UInt(checked((uint)byteBias)));
+        }
+
         private void StoreBufferWord(int binding, uint dwordAddress, uint value)
         {
             EmitConditional(
@@ -3656,7 +3920,7 @@ internal static partial class Gen5SpirvTranslator
 
         private bool UsesSubgroupShuffle() =>
             _state.Program.Instructions.Any(instruction =>
-                instruction.Control is Gen5DppControl ||
+                instruction.Control is Gen5DppControl or Gen5Dpp8Control ||
                 instruction.Opcode is "VPermlane16B32" or "VPermlanex16B32");
 
         private bool UsesSubgroupBroadcast() =>

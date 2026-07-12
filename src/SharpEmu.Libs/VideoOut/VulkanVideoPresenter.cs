@@ -194,10 +194,19 @@ internal sealed record VulkanComputeGuestDispatch(
     bool IsIndirect,
     bool WritesGlobalMemory);
 
+internal sealed record VulkanOrderedGuestAction(
+    Action Action,
+    string DebugName);
+
 internal static unsafe class VulkanVideoPresenter
 {
     private const uint DefaultWindowWidth = 1280;
     private const uint DefaultWindowHeight = 720;
+    // Vulkan's portable upper bound for minStorageBufferOffsetAlignment is
+    // 256 bytes. Using that fixed power of two (instead of racing the render
+    // thread's physical-device query) gives shader translation and descriptor
+    // creation one stable aliasing contract on every conformant device.
+    internal const ulong GuestStorageBufferOffsetAlignment = 256;
     // The pending queue and per-render drain budget bound how much guest GPU
     // work can be buffered ahead of the presenter. Draws are batched into
     // shared command buffers, so draining a large batch per render tick is
@@ -783,6 +792,22 @@ internal static unsafe class VulkanVideoPresenter
         return workSequence;
     }
 
+    /// <summary>
+    /// Enqueues a CPU-visible PM4 side effect behind all GPU work submitted
+    /// before it. The render thread flushes its open batch and waits for the
+    /// corresponding guest fences before invoking the action.
+    /// </summary>
+    public static long SubmitOrderedGuestAction(Action action, string debugName)
+    {
+        ArgumentNullException.ThrowIfNull(action);
+        lock (_gate)
+        {
+            return _closed || _thread is null
+                ? 0
+                : EnqueueGuestWorkLocked(new VulkanOrderedGuestAction(action, debugName));
+        }
+    }
+
     public static bool WaitForGuestWork(
         long workSequence,
         int timeoutMilliseconds = System.Threading.Timeout.Infinite)
@@ -1359,6 +1384,7 @@ internal static unsafe class VulkanVideoPresenter
         private uint _maxComputeWorkGroupSizeY;
         private uint _maxComputeWorkGroupSizeZ;
         private uint _maxComputeWorkGroupInvocations;
+        private ulong _minStorageBufferOffsetAlignment = 1;
         private Device _device;
         private PipelineCache _pipelineCache;
         private string? _pipelineCachePath;
@@ -1462,6 +1488,7 @@ internal static unsafe class VulkanVideoPresenter
         private readonly Dictionary<HostBufferPoolKey, Stack<HostBufferAllocation>>
             _hostBufferPool = new();
         private readonly Dictionary<ulong, HostBufferAllocation> _hostBufferAllocations = new();
+        private readonly List<GuestBufferAllocation> _guestBufferAllocations = [];
         private readonly Queue<PendingGuestSubmission> _pendingGuestSubmissions = new();
         private readonly Stack<DescriptorPool> _recycledDescriptorPools = new();
 
@@ -1497,6 +1524,20 @@ internal static unsafe class VulkanVideoPresenter
             DeviceMemory Memory,
             HostBufferPoolKey Key,
             nint Mapped);
+
+        private readonly record struct DirtyGuestBufferRange(ulong Offset, ulong Length);
+
+        private sealed class GuestBufferAllocation
+        {
+            public ulong BaseAddress;
+            public ulong Size;
+            public VkBuffer Buffer;
+            public DeviceMemory Memory;
+            public nint Mapped;
+            public byte[] Shadow = [];
+            public ulong LastUseTimeline;
+            public List<DirtyGuestBufferRange> DirtyRanges { get; } = [];
+        }
 
         private sealed class TranslatedDrawResources
         {
@@ -1561,7 +1602,15 @@ internal static unsafe class VulkanVideoPresenter
             public VkBuffer Buffer;
             public DeviceMemory Memory;
             public nint Mapped;
+            // DescriptorOffset/Size include the shader-visible byte bias.
+            public ulong Offset;
             public ulong Size;
+            // GuestOffset/Size identify only the original guest resource and
+            // are used for dirty writeback; descriptor padding must not be
+            // published over unrelated guest bytes.
+            public ulong GuestOffset;
+            public ulong GuestSize;
+            public GuestBufferAllocation? Allocation;
         }
 
         private sealed class VertexBufferResource
@@ -2135,11 +2184,24 @@ internal static unsafe class VulkanVideoPresenter
             _maxComputeWorkGroupSizeY = properties.Limits.MaxComputeWorkGroupSize[1];
             _maxComputeWorkGroupSizeZ = properties.Limits.MaxComputeWorkGroupSize[2];
             _maxComputeWorkGroupInvocations = properties.Limits.MaxComputeWorkGroupInvocations;
+            _minStorageBufferOffsetAlignment = Math.Max(
+                properties.Limits.MinStorageBufferOffsetAlignment,
+                1UL);
+            if (GuestStorageBufferOffsetAlignment %
+                _minStorageBufferOffsetAlignment != 0)
+            {
+                throw new InvalidOperationException(
+                    $"Vulkan storage-buffer alignment " +
+                    $"{_minStorageBufferOffsetAlignment} is not compatible with " +
+                    $"the portable alias alignment " +
+                    $"{GuestStorageBufferOffsetAlignment}");
+            }
             Console.Error.WriteLine(
                 $"[LOADER][INFO] Vulkan compute limits groups=" +
                 $"{_maxComputeWorkGroupCountX}x{_maxComputeWorkGroupCountY}x{_maxComputeWorkGroupCountZ} " +
                 $"local={_maxComputeWorkGroupSizeX}x{_maxComputeWorkGroupSizeY}x" +
-                $"{_maxComputeWorkGroupSizeZ} invocations={_maxComputeWorkGroupInvocations}");
+                $"{_maxComputeWorkGroupSizeZ} invocations={_maxComputeWorkGroupInvocations} " +
+                $"storage_alignment={_minStorageBufferOffsetAlignment}");
         }
 
         private void CreateDevice()
@@ -3026,7 +3088,8 @@ internal static unsafe class VulkanVideoPresenter
             CommandBuffer commandBuffer,
             IReadOnlyList<TranslatedDrawResources> resources,
             IReadOnlyList<GuestImageResource> traceImages,
-            IReadOnlyList<(VkBuffer Buffer, DeviceMemory Memory)>? retireBuffers = null)
+            IReadOnlyList<(VkBuffer Buffer, DeviceMemory Memory)>? retireBuffers = null,
+            IReadOnlyList<TranslatedDrawResources>? referencedResources = null)
         {
             var fence = AcquireGuestFence();
             try
@@ -3048,6 +3111,28 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             _submitTimeline++;
+            foreach (var referenced in referencedResources ?? resources)
+            {
+                foreach (var globalBuffer in referenced.GlobalMemoryBuffers)
+                {
+                    if (globalBuffer.Allocation is not { } allocation)
+                    {
+                        continue;
+                    }
+
+                    allocation.LastUseTimeline = Math.Max(
+                        allocation.LastUseTimeline,
+                        _submitTimeline);
+                    if (globalBuffer.Writable)
+                    {
+                        MarkGuestBufferDirty(
+                            allocation,
+                            globalBuffer.GuestOffset,
+                            globalBuffer.GuestSize);
+                    }
+                }
+            }
+
             _pendingGuestSubmissions.Enqueue(
                 new PendingGuestSubmission(
                     fence,
@@ -3150,6 +3235,27 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             ProcessDeferredTextureDestroys();
+        }
+
+        private void WaitForAllGuestSubmissionsForCpuVisibility()
+        {
+            FlushBatchedGuestCommands();
+            while (_pendingGuestSubmissions.TryPeek(out var oldest))
+            {
+                var fence = oldest.Fence;
+                Check(
+                    _vk.WaitForFences(_device, 1, &fence, true, ulong.MaxValue),
+                    $"vkWaitForFences(cpu visibility: {oldest.DebugName})");
+                CollectCompletedGuestSubmissions(waitForOldest: false);
+            }
+        }
+
+        private void ExecuteOrderedGuestAction(VulkanOrderedGuestAction work)
+        {
+            WaitForAllGuestSubmissionsForCpuVisibility();
+            WriteBackAllDirtyGuestBuffers();
+            work.Action();
+            TraceVulkanShader($"vk.ordered_action name='{work.DebugName}'");
         }
 
         private static byte[]? TryReadGuestTexturePixels(VulkanGuestDrawTexture texture)
@@ -3570,6 +3676,7 @@ internal static unsafe class VulkanVideoPresenter
                     resources.Textures[index] = ResolveTextureResource(draw.Textures[index]);
                 }
 
+                PrepareGuestBufferAllocations(draw.GlobalMemoryBuffers);
                 for (var index = 0; index < draw.GlobalMemoryBuffers.Count; index++)
                 {
                     resources.GlobalMemoryBuffers[index] =
@@ -3668,6 +3775,7 @@ internal static unsafe class VulkanVideoPresenter
                     TraceVulkanShader("vk.compute_resources resolve ready");
                 }
 
+                PrepareGuestBufferAllocations(dispatch.GlobalMemoryBuffers);
                 for (var index = 0; index < dispatch.GlobalMemoryBuffers.Count; index++)
                 {
                     resources.GlobalMemoryBuffers[index] =
@@ -3856,7 +3964,7 @@ internal static unsafe class VulkanVideoPresenter
                         bufferInfoPointer[index] = new DescriptorBufferInfo
                         {
                             Buffer = resources.GlobalMemoryBuffers[index].Buffer,
-                            Offset = 0,
+                            Offset = resources.GlobalMemoryBuffers[index].Offset,
                             Range = resources.GlobalMemoryBuffers[index].Size,
                         };
                     }
@@ -5126,11 +5234,58 @@ internal static unsafe class VulkanVideoPresenter
         private GlobalBufferResource CreateGlobalBufferResource(
             VulkanGuestMemoryBuffer guestBuffer)
         {
-            var buffer = CreateHostBuffer(
-                guestBuffer.Data.AsSpan(0, guestBuffer.Length),
-                BufferUsageFlags.StorageBufferBit,
-                out var memory);
+            if (guestBuffer.BaseAddress == 0)
+            {
+                return CreateTransientGlobalBufferResource(guestBuffer);
+            }
+
             var size = (ulong)Math.Max(guestBuffer.Length, sizeof(uint));
+            var endAddress = checked(guestBuffer.BaseAddress + size);
+            var allocation = _guestBufferAllocations.Single(candidate =>
+                candidate.BaseAddress <= guestBuffer.BaseAddress &&
+                candidate.BaseAddress + candidate.Size >= endAddress);
+            var guestOffset = guestBuffer.BaseAddress - allocation.BaseAddress;
+            var descriptorOffset = guestOffset &
+                ~(GuestStorageBufferOffsetAlignment - 1);
+            var byteBias = guestOffset - descriptorOffset;
+            if (descriptorOffset % _minStorageBufferOffsetAlignment != 0)
+            {
+                throw new InvalidOperationException(
+                    $"guest buffer alias offset 0x{descriptorOffset:X} is not aligned to Vulkan's " +
+                    $"minStorageBufferOffsetAlignment={_minStorageBufferOffsetAlignment}");
+            }
+
+            var expectedBias = guestBuffer.BaseAddress &
+                (GuestStorageBufferOffsetAlignment - 1);
+            if (byteBias != expectedBias)
+            {
+                throw new InvalidOperationException(
+                    $"guest buffer allocation base 0x{allocation.BaseAddress:X16} " +
+                    $"does not satisfy alias alignment " +
+                    $"{GuestStorageBufferOffsetAlignment}");
+            }
+
+            var source = guestBuffer.Data.AsSpan(0, guestBuffer.Length);
+            var shadow = allocation.Shadow.AsSpan(checked((int)guestOffset), guestBuffer.Length);
+            if (!source.SequenceEqual(shadow))
+            {
+                // HOST_COHERENT does not permit racing a mapped CPU write with
+                // an in-flight shader access. Retire prior users, publish their
+                // dirty ranges to guest memory, then upload the current guest
+                // bytes (which may be newer than the parser's captured array).
+                WaitForAllGuestSubmissionsForCpuVisibility();
+                WriteBackAllDirtyGuestBuffers();
+                var live = new byte[guestBuffer.Length];
+                if (_guestMemory?.TryRead(guestBuffer.BaseAddress, live) == true)
+                {
+                    source = live;
+                }
+
+                source.CopyTo(new Span<byte>(
+                    (void*)(allocation.Mapped + checked((nint)guestOffset)),
+                    source.Length));
+                source.CopyTo(shadow);
+            }
 
             if (ShouldTraceVulkanResources() &&
                 _tracedGlobalBuffers.Add((guestBuffer.BaseAddress, guestBuffer.Length)))
@@ -5143,7 +5298,7 @@ internal static unsafe class VulkanVideoPresenter
             {
                 SetDebugName(
                     ObjectType.Buffer,
-                    buffer.Handle,
+                    allocation.Buffer.Handle,
                     $"SharpEmu global 0x{guestBuffer.BaseAddress:X16} {guestBuffer.Length}b");
             }
 
@@ -5156,13 +5311,196 @@ internal static unsafe class VulkanVideoPresenter
             {
                 BaseAddress = guestBuffer.BaseAddress,
                 Writable = guestBuffer.Writable,
+                Buffer = allocation.Buffer,
+                Memory = allocation.Memory,
+                Mapped = allocation.Mapped + checked((nint)guestOffset),
+                Offset = descriptorOffset,
+                Size = checked((size + byteBias + 3) & ~3UL),
+                GuestOffset = guestOffset,
+                GuestSize = size,
+                Allocation = allocation,
+            };
+        }
+
+        private GlobalBufferResource CreateTransientGlobalBufferResource(
+            VulkanGuestMemoryBuffer guestBuffer)
+        {
+            var buffer = CreateHostBuffer(
+                guestBuffer.Data.AsSpan(0, guestBuffer.Length),
+                BufferUsageFlags.StorageBufferBit,
+                out var memory);
+            var allocation = _hostBufferAllocations[buffer.Handle];
+            if (guestBuffer.Pooled)
+            {
+                System.Buffers.ArrayPool<byte>.Shared.Return(guestBuffer.Data);
+            }
+
+            return new GlobalBufferResource
+            {
+                BaseAddress = 0,
+                Writable = false,
                 Buffer = buffer,
                 Memory = memory,
-                Mapped = _hostBufferAllocations.TryGetValue(buffer.Handle, out var allocation)
-                    ? allocation.Mapped
-                    : 0,
-                Size = size,
+                Mapped = allocation.Mapped,
+                Offset = 0,
+                Size = (ulong)Math.Max(guestBuffer.Length, sizeof(uint)),
+                GuestOffset = 0,
+                GuestSize = (ulong)Math.Max(guestBuffer.Length, sizeof(uint)),
             };
+        }
+
+        private void PrepareGuestBufferAllocations(
+            IReadOnlyList<VulkanGuestMemoryBuffer> buffers)
+        {
+            if (buffers.Count == 0)
+            {
+                return;
+            }
+
+            var ranges = new List<(ulong Start, ulong End)>(buffers.Count);
+            foreach (var buffer in buffers)
+            {
+                if (buffer.BaseAddress == 0)
+                {
+                    continue;
+                }
+
+                var size = (ulong)Math.Max(buffer.Length, sizeof(uint));
+                var alignedStart = buffer.BaseAddress &
+                    ~(GuestStorageBufferOffsetAlignment - 1);
+                var paddedEnd = checked(buffer.BaseAddress + size + 3) & ~3UL;
+                ranges.Add((alignedStart, paddedEnd));
+            }
+
+            if (ranges.Count == 0)
+            {
+                return;
+            }
+
+            ranges.Sort(static (left, right) => left.Start.CompareTo(right.Start));
+            var merged = new List<(ulong Start, ulong End)>(ranges.Count);
+            foreach (var range in ranges)
+            {
+                if (merged.Count == 0 || range.Start > merged[^1].End)
+                {
+                    merged.Add(range);
+                    continue;
+                }
+
+                var previous = merged[^1];
+                merged[^1] = (previous.Start, Math.Max(previous.End, range.End));
+            }
+
+            foreach (var range in merged)
+            {
+                EnsureGuestBufferAllocation(range.Start, range.End);
+            }
+        }
+
+        private void EnsureGuestBufferAllocation(ulong requestedStart, ulong requestedEnd)
+        {
+            var start = requestedStart;
+            var end = requestedEnd;
+            List<GuestBufferAllocation> overlaps;
+            do
+            {
+                overlaps = _guestBufferAllocations
+                    .Where(allocation =>
+                        allocation.BaseAddress < end &&
+                        start < allocation.BaseAddress + allocation.Size)
+                    .ToList();
+                var expandedStart = overlaps.Aggregate(
+                    start,
+                    static (value, allocation) => Math.Min(value, allocation.BaseAddress));
+                var expandedEnd = overlaps.Aggregate(
+                    end,
+                    static (value, allocation) =>
+                        Math.Max(value, allocation.BaseAddress + allocation.Size));
+                if (expandedStart == start && expandedEnd == end)
+                {
+                    break;
+                }
+
+                start = expandedStart;
+                end = expandedEnd;
+            }
+            while (true);
+
+            if (overlaps.Count == 1 &&
+                overlaps[0].BaseAddress <= requestedStart &&
+                overlaps[0].BaseAddress + overlaps[0].Size >= requestedEnd)
+            {
+                return;
+            }
+
+            if (overlaps.Count > 0)
+            {
+                // Growing/merging an aliased allocation is rare. Synchronize
+                // only this structural transition so no in-flight descriptor
+                // can observe storage being replaced underneath it.
+                WaitForAllGuestSubmissionsForCpuVisibility();
+                WriteBackAllDirtyGuestBuffers();
+            }
+
+            var replacement = CreateGuestBufferAllocation(start, end);
+            foreach (var overlap in overlaps)
+            {
+                _guestBufferAllocations.Remove(overlap);
+                DestroyGuestBufferAllocation(overlap);
+            }
+
+            _guestBufferAllocations.Add(replacement);
+            _guestBufferAllocations.Sort(static (left, right) =>
+                left.BaseAddress.CompareTo(right.BaseAddress));
+            TraceVulkanShader(
+                $"vk.guest_buffer_allocation base=0x{start:X16} bytes={replacement.Size} " +
+                $"merged={overlaps.Count}");
+        }
+
+        private GuestBufferAllocation CreateGuestBufferAllocation(ulong start, ulong end)
+        {
+            var size = checked(end - start);
+            if (size == 0 || size > int.MaxValue)
+            {
+                throw new InvalidOperationException(
+                    $"guest buffer allocation is outside the supported host span: " +
+                    $"base=0x{start:X16} bytes={size}");
+            }
+
+            var buffer = CreateBuffer(
+                size,
+                BufferUsageFlags.StorageBufferBit,
+                MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
+                out var memory);
+            void* mapped;
+            Check(_vk.MapMemory(_device, memory, 0, size, 0, &mapped), "vkMapMemory(guest buffer)");
+            var shadow = new byte[checked((int)size)];
+            _ = _guestMemory?.TryRead(start, shadow);
+            shadow.CopyTo(new Span<byte>(mapped, shadow.Length));
+            SetDebugName(
+                ObjectType.Buffer,
+                buffer.Handle,
+                $"SharpEmu guest VA 0x{start:X16}-0x{end:X16}");
+            return new GuestBufferAllocation
+            {
+                BaseAddress = start,
+                Size = size,
+                Buffer = buffer,
+                Memory = memory,
+                Mapped = (nint)mapped,
+                Shadow = shadow,
+            };
+        }
+
+        private void DestroyGuestBufferAllocation(GuestBufferAllocation allocation)
+        {
+            if (allocation.Mapped != 0)
+            {
+                _vk.UnmapMemory(_device, allocation.Memory);
+            }
+
+            _vk.DestroyBuffer(_device, allocation.Buffer, null);
+            _vk.FreeMemory(_device, allocation.Memory, null);
         }
 
         private VertexBufferResource CreateVertexBufferResource(
@@ -5912,6 +6250,10 @@ internal static unsafe class VulkanVideoPresenter
                     BeginDebugLabel(_commandBuffer, resources.DebugName);
                     if (isFirstBatch)
                     {
+                        RecordGlobalBufferVisibilityBarrier(
+                            _commandBuffer,
+                            resources,
+                            PipelineStageFlags.ComputeShaderBit);
                         RecordTextureUploads(resources, PipelineStageFlags.ComputeShaderBit);
                         RecordStorageImagesForWrite(resources, PipelineStageFlags.ComputeShaderBit);
                     }
@@ -5980,7 +6322,11 @@ internal static unsafe class VulkanVideoPresenter
                     }
                     else
                     {
-                        SubmitGuestCommandBuffer(commandBuffer, [], []);
+                        SubmitGuestCommandBuffer(
+                            commandBuffer,
+                            [],
+                            [],
+                            referencedResources: [resources]);
                         chunksSubmitted++;
                         commandBuffer = default;
                     }
@@ -5990,12 +6336,12 @@ internal static unsafe class VulkanVideoPresenter
                 MarkStorageImagesInitialized(resources, traceContents: false);
                 if (work.WritesGlobalMemory)
                 {
-                    // A subsequent command buffer receives a fresh Vulkan
-                    // buffer from guest memory.  Preserve compute shader
-                    // buffer stores across that boundary instead of silently
-                    // discarding them when this dispatch is retired.
-                    Check(_vk.QueueWaitIdle(_queue), "vkQueueWaitIdle(compute global writeback)");
-                    WriteBackGlobalBuffers(resources);
+                    // The CPU submit thread may immediately consume an indirect
+                    // argument written by this dispatch. Wait for the specific
+                    // guest fences and publish only dirty ranges; a queue-wide
+                    // idle unnecessarily serialized presentation work too.
+                    WaitForAllGuestSubmissionsForCpuVisibility();
+                    WriteBackAllDirtyGuestBuffers();
                 }
                 TraceVulkanShader(
                     $"vk.compute_dispatch groups={work.GroupCountX}x" +
@@ -6138,7 +6484,68 @@ internal static unsafe class VulkanVideoPresenter
                 $"reason={reason}");
         }
 
-        private void WriteBackGlobalBuffers(TranslatedDrawResources resources)
+        private void RecordGlobalBufferVisibilityBarrier(
+            CommandBuffer commandBuffer,
+            TranslatedDrawResources resources,
+            PipelineStageFlags destinationStages)
+        {
+            if (resources.GlobalMemoryBuffers.Length == 0)
+            {
+                return;
+            }
+
+            // Queue submission order alone is not a shader-memory dependency.
+            // This makes stores through any aliased guest view available to
+            // later vertex/fragment/compute reads and writes on the same queue.
+            var barrier = new MemoryBarrier
+            {
+                SType = StructureType.MemoryBarrier,
+                SrcAccessMask = AccessFlags.ShaderWriteBit,
+                DstAccessMask = AccessFlags.ShaderReadBit | AccessFlags.ShaderWriteBit,
+            };
+            _vk.CmdPipelineBarrier(
+                commandBuffer,
+                PipelineStageFlags.AllCommandsBit,
+                destinationStages,
+                0,
+                1,
+                &barrier,
+                0,
+                null,
+                0,
+                null);
+        }
+
+        private static void MarkGuestBufferDirty(
+            GuestBufferAllocation allocation,
+            ulong offset,
+            ulong length)
+        {
+            if (length == 0)
+            {
+                return;
+            }
+
+            var start = offset;
+            var end = checked(offset + length);
+            for (var index = allocation.DirtyRanges.Count - 1; index >= 0; index--)
+            {
+                var existing = allocation.DirtyRanges[index];
+                var existingEnd = existing.Offset + existing.Length;
+                if (end < existing.Offset || existingEnd < start)
+                {
+                    continue;
+                }
+
+                start = Math.Min(start, existing.Offset);
+                end = Math.Max(end, existingEnd);
+                allocation.DirtyRanges.RemoveAt(index);
+            }
+
+            allocation.DirtyRanges.Add(new DirtyGuestBufferRange(start, end - start));
+        }
+
+        private void WriteBackAllDirtyGuestBuffers()
         {
             var memory = _guestMemory;
             if (memory is null)
@@ -6146,39 +6553,61 @@ internal static unsafe class VulkanVideoPresenter
                 return;
             }
 
-            foreach (var globalBuffer in resources.GlobalMemoryBuffers)
+            foreach (var allocation in _guestBufferAllocations)
             {
-                if (!globalBuffer.Writable ||
-                    globalBuffer.BaseAddress == 0 ||
-                    globalBuffer.Mapped == 0 ||
-                    globalBuffer.Size == 0 ||
-                    globalBuffer.Size > int.MaxValue)
+                if (allocation.DirtyRanges.Count != 0 &&
+                    allocation.LastUseTimeline > _completedTimeline)
                 {
+                    // A mapped HOST_COHERENT allocation still cannot be read
+                    // by the CPU while a shader may be writing it. Callers
+                    // normally retire the relevant fences first; keep this
+                    // helper fail-closed if a future path forgets to do so.
+                    TraceVulkanShader(
+                        $"vk.global_writeback_deferred base=0x{allocation.BaseAddress:X16} " +
+                        $"last_use={allocation.LastUseTimeline} completed={_completedTimeline}");
                     continue;
                 }
 
-                var bytes = new ReadOnlySpan<byte>(
-                    (void*)globalBuffer.Mapped,
-                    checked((int)globalBuffer.Size));
-                var wrote = memory.TryWrite(globalBuffer.BaseAddress, bytes);
-                var probe = bytes[..Math.Min(bytes.Length, 256)];
-                var nonzero = 0;
-                foreach (var value in probe)
+                for (var index = allocation.DirtyRanges.Count - 1; index >= 0; index--)
                 {
-                    nonzero += value == 0 ? 0 : 1;
-                }
+                    var range = allocation.DirtyRanges[index];
+                    if (range.Length == 0 || range.Length > int.MaxValue)
+                    {
+                        continue;
+                    }
 
-                var firstForRange = _tracedGlobalWritebacks.Count < 256 &&
-                    _tracedGlobalWritebacks.Add((globalBuffer.BaseAddress, globalBuffer.Size));
-                var traceSmallMutation = globalBuffer.Size <= 4096 &&
-                    _tracedSmallGlobalWritebackEvents++ < 1024;
-                if (firstForRange || traceSmallMutation)
-                {
-                    TraceVulkanShader(
-                        $"vk.global_writeback base=0x{globalBuffer.BaseAddress:X16} " +
-                        $"bytes={bytes.Length} probe_nonzero={nonzero}/{probe.Length} " +
-                        $"head={Convert.ToHexString(bytes[..Math.Min(bytes.Length, 32)])} " +
-                        $"wrote={wrote}");
+                    var bytes = new ReadOnlySpan<byte>(
+                        (void*)(allocation.Mapped + checked((nint)range.Offset)),
+                        checked((int)range.Length));
+                    var guestAddress = allocation.BaseAddress + range.Offset;
+                    var wrote = memory.TryWrite(guestAddress, bytes);
+                    if (wrote)
+                    {
+                        bytes.CopyTo(allocation.Shadow.AsSpan(
+                            checked((int)range.Offset),
+                            bytes.Length));
+                        allocation.DirtyRanges.RemoveAt(index);
+                    }
+
+                    var probe = bytes[..Math.Min(bytes.Length, 256)];
+                    var nonzero = 0;
+                    foreach (var value in probe)
+                    {
+                        nonzero += value == 0 ? 0 : 1;
+                    }
+
+                    var firstForRange = _tracedGlobalWritebacks.Count < 256 &&
+                        _tracedGlobalWritebacks.Add((guestAddress, range.Length));
+                    var traceSmallMutation = range.Length <= 4096 &&
+                        _tracedSmallGlobalWritebackEvents++ < 1024;
+                    if (firstForRange || traceSmallMutation)
+                    {
+                        TraceVulkanShader(
+                            $"vk.global_writeback base=0x{guestAddress:X16} " +
+                            $"bytes={bytes.Length} probe_nonzero={nonzero}/{probe.Length} " +
+                            $"head={Convert.ToHexString(bytes[..Math.Min(bytes.Length, 32)])} " +
+                            $"wrote={wrote}");
+                    }
                 }
             }
         }
@@ -6346,9 +6775,15 @@ internal static unsafe class VulkanVideoPresenter
 
                 if (hasStorageImages ||
                     needsTextureUploads ||
+                    resources.GlobalMemoryBuffers.Length != 0 ||
                     !ReferenceEquals(_openPassTarget, target))
                 {
                     CloseOpenTranslatedRenderPass();
+                    RecordGlobalBufferVisibilityBarrier(
+                        _commandBuffer,
+                        resources,
+                        PipelineStageFlags.VertexShaderBit |
+                        PipelineStageFlags.FragmentShaderBit);
                     RecordTextureUploads(resources, PipelineStageFlags.FragmentShaderBit);
                     RecordStorageImagesForWrite(resources, PipelineStageFlags.FragmentShaderBit);
 
@@ -7302,6 +7737,9 @@ internal static unsafe class VulkanVideoPresenter
                         case VulkanGuestImageWrite guestImageWrite:
                             ExecuteGuestImageWrite(guestImageWrite);
                             break;
+                        case VulkanOrderedGuestAction orderedAction:
+                            ExecuteOrderedGuestAction(orderedAction);
+                            break;
                     }
                 }
                 finally
@@ -7944,6 +8382,11 @@ internal static unsafe class VulkanVideoPresenter
         private void RecordTranslatedDraw(uint imageIndex, TranslatedDrawResources resources)
         {
             BeginDebugLabel(_commandBuffer, "SharpEmu swapchain draw");
+            RecordGlobalBufferVisibilityBarrier(
+                _commandBuffer,
+                resources,
+                PipelineStageFlags.VertexShaderBit |
+                PipelineStageFlags.FragmentShaderBit);
             RecordTextureUploads(resources, PipelineStageFlags.FragmentShaderBit);
             RecordStorageImagesForWrite(resources, PipelineStageFlags.FragmentShaderBit);
             RecordTranslatedGraphicsPass(
@@ -8567,7 +9010,7 @@ internal static unsafe class VulkanVideoPresenter
 
             foreach (var globalBuffer in resources.GlobalMemoryBuffers)
             {
-                if (globalBuffer is null)
+                if (globalBuffer is null || globalBuffer.Allocation is not null)
                 {
                     continue;
                 }
@@ -9098,6 +9541,12 @@ internal static unsafe class VulkanVideoPresenter
             }
             _samplers.Clear();
             _shaderDigests.Clear();
+            WriteBackAllDirtyGuestBuffers();
+            foreach (var allocation in _guestBufferAllocations)
+            {
+                DestroyGuestBufferAllocation(allocation);
+            }
+            _guestBufferAllocations.Clear();
             foreach (var allocation in _hostBufferAllocations.Values)
             {
                 _vk.DestroyBuffer(_device, allocation.Buffer, null);

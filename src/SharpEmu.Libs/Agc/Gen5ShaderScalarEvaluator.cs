@@ -333,6 +333,12 @@ internal static class Gen5ShaderScalarEvaluator
                 }
 
                 var key = (globalMemory.ScalarAddress, baseAddress);
+                var writable = instruction.Opcode.StartsWith(
+                        "GlobalStore",
+                        StringComparison.Ordinal) ||
+                    instruction.Opcode.StartsWith(
+                        "GlobalAtomic",
+                        StringComparison.Ordinal);
                 if (globalMemoryByAddress.TryGetValue(key, out var existingBinding))
                 {
                     if (existingBinding.InstructionPcs is List<uint> instructionPcs &&
@@ -340,6 +346,7 @@ internal static class Gen5ShaderScalarEvaluator
                     {
                         instructionPcs.Add(instruction.Pc);
                     }
+                    existingBinding.Writable |= writable;
                 }
                 else
                 {
@@ -358,6 +365,7 @@ internal static class Gen5ShaderScalarEvaluator
                         data,
                         dataLength,
                         DataPooled: true);
+                    binding.Writable = writable;
                     globalMemoryByAddress.Add(key, binding);
                     globalMemoryBindings.Add(binding);
                 }

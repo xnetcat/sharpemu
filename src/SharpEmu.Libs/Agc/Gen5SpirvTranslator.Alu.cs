@@ -17,6 +17,23 @@ internal static partial class Gen5SpirvTranslator
                 return true;
             }
 
+            if (instruction.Control is Gen5SdwaControl sdwa &&
+                (sdwa.Source0Select == 7 ||
+                 sdwa.Source1Select == 7 ||
+                 sdwa.DestinationSelect == 7 ||
+                 sdwa.DestinationUnused == 3))
+            {
+                error = $"reserved SDWA selector/modifier in {instruction.Opcode}";
+                return false;
+            }
+
+            if (instruction.Control is Gen5DppControl dppControl &&
+                !IsSupportedDppControl(dppControl.Control))
+            {
+                error = $"unsupported DPP16 control 0x{dppControl.Control:X3}";
+                return false;
+            }
+
             if (instruction.Opcode.StartsWith("VCmp", StringComparison.Ordinal))
             {
                 return TryEmitVectorCompare(instruction, out error);
@@ -890,6 +907,15 @@ internal static partial class Gen5SpirvTranslator
                     LoadV(destination));
             }
 
+            if (instruction.Control is Gen5SdwaControl destinationControl &&
+                destinationControl.ScalarDestination is null)
+            {
+                result = ApplySdwaDestination(
+                    destinationControl,
+                    result,
+                    LoadV(destination));
+            }
+
             StoreV(destination, result);
             return true;
         }
@@ -1089,7 +1115,21 @@ internal static partial class Gen5SpirvTranslator
                 _boolType,
                 Load(_boolType, _exec),
                 condition);
-            StoreWaveMask(106, activeCondition);
+            if (instruction.Control is Gen5DppControl compareDpp)
+            {
+                activeCondition = _module.AddInstruction(
+                    SpirvOp.Select,
+                    _boolType,
+                    IsDppWriteEnabled(compareDpp),
+                    activeCondition,
+                    Load(_boolType, _vcc));
+            }
+
+            var compareDestination = instruction.Control is Gen5SdwaControl
+                { ScalarDestination: { } scalarDestination }
+                ? scalarDestination
+                : 106u;
+            StoreWaveMask(compareDestination, activeCondition);
             if (opcode.StartsWith("VCmpx", StringComparison.Ordinal))
             {
                 StoreWaveMask(126, activeCondition);
@@ -1970,7 +2010,8 @@ internal static partial class Gen5SpirvTranslator
 
         private uint GetRawSource(
             Gen5ShaderInstruction instruction,
-            int sourceIndex)
+            int sourceIndex,
+            bool applySdwaIntegerModifiers = true)
         {
             if ((uint)sourceIndex >= instruction.Sources.Count)
             {
@@ -1998,6 +2039,11 @@ internal static partial class Gen5SpirvTranslator
             {
                 value = ApplyDppSource(dpp, value);
             }
+            else if (sourceIndex == 0 &&
+                     instruction.Control is Gen5Dpp8Control dpp8)
+            {
+                value = ApplyDpp8Source(dpp8, value);
+            }
 
             if (instruction.Control is Gen5SdwaControl sdwa)
             {
@@ -2017,9 +2063,99 @@ internal static partial class Gen5SpirvTranslator
                     5 => BitwiseAnd(ShiftRightLogical(value, UInt(16)), UInt(0xFFFF)),
                     _ => value,
                 };
+                var signExtend = sourceIndex switch
+                {
+                    0 => sdwa.Source0SignExtend,
+                    1 => sdwa.Source1SignExtend,
+                    _ => false,
+                };
+                if (signExtend && selector != 6)
+                {
+                    var width = selector <= 3 ? 8u : 16u;
+                    value = Bitcast(
+                        _uintType,
+                        _module.AddInstruction(
+                            SpirvOp.BitFieldSExtract,
+                            _intType,
+                            Bitcast(_intType, value),
+                            UInt(0),
+                            UInt(width)));
+                }
+
+                if (applySdwaIntegerModifiers)
+                {
+                    if ((sdwa.AbsoluteMask & (1u << sourceIndex)) != 0)
+                    {
+                        value = Bitcast(
+                            _uintType,
+                            Ext(5, _intType, Bitcast(_intType, value)));
+                    }
+
+                    if ((sdwa.NegateMask & (1u << sourceIndex)) != 0)
+                    {
+                        value = _module.AddInstruction(
+                            SpirvOp.ISub,
+                            _uintType,
+                            UInt(0),
+                            value);
+                    }
+                }
             }
 
             return value;
+        }
+
+        private uint ApplyDpp8Source(Gen5Dpp8Control control, uint value)
+        {
+            var lane = GuestWaveLane();
+            var laneInGroup = BitwiseAnd(lane, UInt(7));
+            var selector = UInt(control.LaneSelectors & 7);
+            for (var index = 1u; index < 8; index++)
+            {
+                selector = _module.AddInstruction(
+                    SpirvOp.Select,
+                    _uintType,
+                    _module.AddInstruction(
+                        SpirvOp.IEqual,
+                        _boolType,
+                        laneInGroup,
+                        UInt(index)),
+                    UInt((control.LaneSelectors >> checked((int)(index * 3))) & 7),
+                    selector);
+            }
+
+            var targetLane = IAdd(BitwiseAnd(lane, UInt(0xFFFF_FFF8)), selector);
+            targetLane = BitwiseAnd(targetLane, UInt(31));
+            var shuffled = _module.AddInstruction(
+                SpirvOp.GroupNonUniformShuffle,
+                _uintType,
+                UInt(3),
+                value,
+                targetLane);
+            if (control.FetchInactive)
+            {
+                return shuffled;
+            }
+
+            var activeWord = _module.AddInstruction(
+                SpirvOp.Select,
+                _uintType,
+                Load(_boolType, _exec),
+                UInt(1),
+                UInt(0));
+            var sourceActive = IsNotZero(
+                _module.AddInstruction(
+                    SpirvOp.GroupNonUniformShuffle,
+                    _uintType,
+                    UInt(3),
+                    activeWord,
+                    targetLane));
+            return _module.AddInstruction(
+                SpirvOp.Select,
+                _uintType,
+                sourceActive,
+                shuffled,
+                UInt(0));
         }
 
         private uint ApplyDppSource(Gen5DppControl control, uint value)
@@ -2069,6 +2205,62 @@ internal static partial class Gen5SpirvTranslator
                 shuffled,
                 UInt(0));
         }
+
+        private uint ApplySdwaDestination(
+            Gen5SdwaControl control,
+            uint value,
+            uint previous)
+        {
+            var (shift, width) = control.DestinationSelect switch
+            {
+                0 => (0u, 8u),
+                1 => (8u, 8u),
+                2 => (16u, 8u),
+                3 => (24u, 8u),
+                4 => (0u, 16u),
+                5 => (16u, 16u),
+                _ => (0u, 32u),
+            };
+            if (width == 32)
+            {
+                return value;
+            }
+
+            var lowMask = width == 8 ? 0xFFu : 0xFFFFu;
+            var fieldMask = lowMask << checked((int)shift);
+            var upperStart = shift + width;
+            var upperMask = upperStart == 32
+                ? 0u
+                : uint.MaxValue << checked((int)upperStart);
+            var positioned = ShiftLeftLogical(
+                BitwiseAnd(value, UInt(lowMask)),
+                UInt(shift));
+            return control.DestinationUnused switch
+            {
+                0 => positioned,
+                1 => BitwiseOr(
+                    positioned,
+                    _module.AddInstruction(
+                        SpirvOp.Select,
+                        _uintType,
+                        IsNotZero(BitwiseAnd(positioned, UInt(1u << checked((int)(shift + width - 1))))),
+                        UInt(upperMask),
+                        UInt(0))),
+                2 => BitwiseOr(
+                    BitwiseAnd(previous, UInt(~fieldMask)),
+                    positioned),
+                _ => throw new InvalidOperationException("reserved SDWA destination-unused mode"),
+            };
+        }
+
+        private static bool IsSupportedDppControl(uint control) =>
+            control <= 0xFF ||
+            control is >= 0x101 and <= 0x10F or
+                >= 0x111 and <= 0x11F or
+                >= 0x121 and <= 0x12F or
+                0x140 or 0x141 or
+                >= 0x150 and <= 0x15F or
+                >= 0x160 and <= 0x16F;
 
         private void GetDppSourceLane(
             Gen5DppControl control,
@@ -2167,7 +2359,7 @@ internal static partial class Gen5SpirvTranslator
 
         private uint IsDppWriteEnabled(Gen5DppControl control)
         {
-            GetDppSourceLane(control, out var targetLane, out var inRange);
+            GetDppSourceLane(control, out _, out var inRange);
             var lane = GuestWaveLane();
             var row = ShiftRightLogical(lane, UInt(4));
             var bank = BitwiseAnd(lane, UInt(3));
@@ -2177,38 +2369,9 @@ internal static partial class Gen5SpirvTranslator
             var bankEnabled = IsNotZero(BitwiseAnd(
                 UInt(control.BankMask),
                 ShiftLeftLogical(UInt(1), bank)));
-            var sourceAvailable = inRange;
-            if (!control.FetchInactive)
-            {
-                var safeTarget = _module.AddInstruction(
-                    SpirvOp.Select,
-                    _uintType,
-                    inRange,
-                    targetLane,
-                    lane);
-                safeTarget = BitwiseAnd(safeTarget, UInt(31));
-                var activeWord = _module.AddInstruction(
-                    SpirvOp.Select,
-                    _uintType,
-                    Load(_boolType, _exec),
-                    UInt(1),
-                    UInt(0));
-                var shuffledActive = _module.AddInstruction(
-                    SpirvOp.GroupNonUniformShuffle,
-                    _uintType,
-                    UInt(3),
-                    activeWord,
-                    safeTarget);
-                sourceAvailable = _module.AddInstruction(
-                    SpirvOp.LogicalAnd,
-                    _boolType,
-                    sourceAvailable,
-                    IsNotZero(shuffledActive));
-            }
-
             var sourceAllowsWrite = control.BoundControl
                 ? _module.ConstantBool(true)
-                : sourceAvailable;
+                : inRange;
             return _module.AddInstruction(
                 SpirvOp.LogicalAnd,
                 _boolType,
@@ -2238,7 +2401,12 @@ internal static partial class Gen5SpirvTranslator
             }
             else
             {
-                value = Bitcast(_floatType, GetRawSource(instruction, sourceIndex));
+                value = Bitcast(
+                    _floatType,
+                    GetRawSource(
+                        instruction,
+                        sourceIndex,
+                        applySdwaIntegerModifiers: false));
             }
 
             uint absoluteMask = 0;
@@ -2752,6 +2920,17 @@ internal static partial class Gen5SpirvTranslator
             Gen5ShaderInstruction instruction,
             bool exchangeRows)
         {
+            if (instruction.Control is not Gen5Vop3Control control ||
+                (control.OperandSelect & ~3u) != 0 ||
+                control.AbsoluteMask != 0 ||
+                control.NegateMask != 0 ||
+                control.OutputModifier != 0 ||
+                control.Clamp)
+            {
+                throw new InvalidOperationException(
+                    $"invalid permlane modifiers for {instruction.Opcode}");
+            }
+
             var value = GetRawSource(instruction, 0);
             var selectorLow = GetRawSource(instruction, 1);
             var selectorHigh = GetRawSource(instruction, 2);
@@ -2788,12 +2967,38 @@ internal static partial class Gen5SpirvTranslator
             }
 
             var targetLane = IAdd(rowBase, selector);
-            return _module.AddInstruction(
+            targetLane = BitwiseAnd(targetLane, UInt(31));
+            var shuffled = _module.AddInstruction(
                 SpirvOp.GroupNonUniformShuffle,
                 _uintType,
                 UInt(3),
                 value,
-                BitwiseAnd(targetLane, UInt(31)));
+                targetLane);
+            var fetchInactive = (control.OperandSelect & 1) != 0;
+            if (fetchInactive)
+            {
+                return shuffled;
+            }
+
+            var activeWord = _module.AddInstruction(
+                SpirvOp.Select,
+                _uintType,
+                Load(_boolType, _exec),
+                UInt(1),
+                UInt(0));
+            var sourceActive = IsNotZero(
+                _module.AddInstruction(
+                    SpirvOp.GroupNonUniformShuffle,
+                    _uintType,
+                    UInt(3),
+                    activeWord,
+                    targetLane));
+            return _module.AddInstruction(
+                SpirvOp.Select,
+                _uintType,
+                sourceActive,
+                shuffled,
+                UInt(0));
         }
 
         private uint EmitFloatResult(

@@ -228,16 +228,21 @@ internal sealed record Gen5Vop3Control(
     uint NegateMask,
     uint OutputModifier,
     bool Clamp,
+    uint OperandSelect,
     uint? ScalarDestination) : Gen5InstructionControl;
 
 internal sealed record Gen5SdwaControl(
     uint DestinationSelect,
+    uint DestinationUnused,
     uint Source0Select,
     uint Source1Select,
+    bool Source0SignExtend,
+    bool Source1SignExtend,
     uint AbsoluteMask,
     uint NegateMask,
     uint OutputModifier,
-    bool Clamp) : Gen5InstructionControl;
+    bool Clamp,
+    uint? ScalarDestination) : Gen5InstructionControl;
 
 internal sealed record Gen5DppControl(
     uint Control,
@@ -247,6 +252,10 @@ internal sealed record Gen5DppControl(
     uint NegateMask,
     uint BankMask,
     uint RowMask) : Gen5InstructionControl;
+
+internal sealed record Gen5Dpp8Control(
+    uint LaneSelectors,
+    bool FetchInactive) : Gen5InstructionControl;
 
 internal sealed record Gen5ScalarMemoryControl(
     uint DestinationCount,
