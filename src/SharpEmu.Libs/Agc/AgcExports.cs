@@ -64,6 +64,9 @@ public static class AgcExports
     private const uint ComputePgmLo = 0x20C;
     private const uint ComputePgmHi = 0x20D;
     private const uint ComputePgmRsrc2 = 0x213;
+    private const uint ComputeStartX = 0x204;
+    private const uint ComputeStartY = 0x205;
+    private const uint ComputeStartZ = 0x206;
     private const uint ComputeNumThreadX = 0x207;
     private const uint ComputeNumThreadY = 0x208;
     private const uint ComputeNumThreadZ = 0x209;
@@ -105,8 +108,8 @@ public static class AgcExports
     private const uint EsUserDataRegister = 0xCC;
     private const uint ComputeUserDataRegister = 0x240;
     private const uint NggUserDataScalarRegisterBase = 8;
-    private const uint Gen5TextureFormatR8G8B8A8Unorm = 56;
-    private const uint Gen5TextureFormatR16G16B16A16Float = 71;
+    private const uint Gen5TextureFormatR8G8B8A8Unorm = 10;
+    private const uint Gen5TextureFormatR16G16B16A16Float = 12;
     private const uint Gen5TextureType2D = 9;
     private const ulong MaxPresentedTextureBytes = 128UL * 1024UL * 1024UL;
     private const ulong VideoOutPixelFormatA8R8G8B8Srgb = 0x80000000;
@@ -147,6 +150,8 @@ public static class AgcExports
     private static readonly HashSet<(ulong Ps, string Error)> _tracedShaderFailures = new();
     private static readonly HashSet<(int Handle, int Index, ulong Address, string Path)> _tracedDisplayBuffers = new();
     private static readonly HashSet<ulong> _tracedComputeShaders = new();
+    private static readonly HashSet<(ulong Address, uint X, uint Y, uint Z)>
+        _tracedDispatchArguments = new();
     private static readonly HashSet<uint> _tracedSubmittedDrawOpcodes = new();
     private static readonly Dictionary<(ulong Ps, ulong State, Gen5PixelOutputKind Output), byte[]> _pixelSpirvCache = new();
     private static readonly Dictionary<
@@ -384,7 +389,10 @@ public static class AgcExports
     private readonly record struct ComputeDispatch(
         uint GroupCountX,
         uint GroupCountY,
-        uint GroupCountZ);
+        uint GroupCountZ,
+        uint BaseGroupX,
+        uint BaseGroupY,
+        uint BaseGroupZ);
 
     private sealed class SubmittedDcbState
     {
@@ -3841,7 +3849,7 @@ public static class AgcExports
                 }
 
                 texture = new TextureDescriptor(
-                    0x1000, 1, 1, 56, 0, 0, 0, 0, 0, 1, 0);
+                    0, 1, 1, Gen5TextureFormatR8G8B8A8Unorm, 0, 0, 0, 0, 0, 1, 0xFAC);
             }
 
             if (_traceAgcShader)
@@ -4756,6 +4764,30 @@ public static class AgcExports
         return buffers;
     }
 
+    /// <summary>
+    /// Guest storage buffers for a compute dispatch followed by its initial
+    /// scalar registers. Dispatch-specific SGPR values remain runtime data so
+    /// one translated pipeline serves every matching shader/resource shape.
+    /// </summary>
+    private static IReadOnlyList<VulkanGuestMemoryBuffer> CreateTranslatedComputeGlobalBuffers(
+        Gen5ShaderEvaluation evaluation)
+    {
+        var buffers = CreateVulkanGuestMemoryBuffers(evaluation.GlobalMemoryBindings);
+        if (_bakeScalars)
+        {
+            return buffers;
+        }
+
+        var combined = new List<VulkanGuestMemoryBuffer>(buffers.Count + 1);
+        combined.AddRange(buffers);
+        combined.Add(new VulkanGuestMemoryBuffer(
+            0,
+            PackScalarRegisters(evaluation.InitialScalarRegisters),
+            256 * sizeof(uint),
+            Pooled: true));
+        return combined;
+    }
+
     private static IReadOnlyList<VulkanGuestVertexBuffer> CreateVulkanGuestVertexBuffers(
         IReadOnlyList<Gen5VertexInputBinding> bindings)
     {
@@ -5404,6 +5436,7 @@ public static class AgcExports
         dispatch = default;
         ulong dimensionsAddress;
         uint initiator;
+        string dispatchSource;
         if (opcode == ItDispatchDirect)
         {
             if (packetLength < 5 ||
@@ -5413,6 +5446,7 @@ public static class AgcExports
             }
 
             dimensionsAddress = packetAddress + 4;
+            dispatchSource = "direct";
         }
         else if (packetLength >= 4)
         {
@@ -5421,6 +5455,8 @@ public static class AgcExports
             {
                 return false;
             }
+
+            dispatchSource = "absolute-indirect";
         }
         else
         {
@@ -5433,20 +5469,76 @@ public static class AgcExports
             }
 
             dimensionsAddress = state.IndirectArgsAddress + dataOffset;
+            dispatchSource = "base-indirect";
         }
 
         if ((initiator & 1) == 0 ||
-            !TryReadUInt32(ctx, dimensionsAddress, out var groupCountX) ||
-            !TryReadUInt32(ctx, dimensionsAddress + 4, out var groupCountY) ||
-            !TryReadUInt32(ctx, dimensionsAddress + 8, out var groupCountZ) ||
-            groupCountX == 0 ||
-            groupCountY == 0 ||
-            groupCountZ == 0)
+            !TryReadUInt32(ctx, dimensionsAddress, out var dispatchEndX) ||
+            !TryReadUInt32(ctx, dimensionsAddress + 4, out var dispatchEndY) ||
+            !TryReadUInt32(ctx, dimensionsAddress + 8, out var dispatchEndZ) ||
+            dispatchEndX == 0 ||
+            dispatchEndY == 0 ||
+            dispatchEndZ == 0)
         {
             return false;
         }
 
-        dispatch = new ComputeDispatch(groupCountX, groupCountY, groupCountZ);
+        // When FORCE_START_AT_000 is clear, RDNA2 interprets the three packet
+        // values as end coordinates, not group counts. Vulkan expresses the
+        // same operation as vkCmdDispatchBase(base, end - base). Ignoring the
+        // COMPUTE_START registers turned small high-base clears into apparent
+        // multi-million/billion-group dispatches and forced an unsafe cap.
+        const uint forceStartAtZero = 1u << 2;
+        uint baseGroupX = 0;
+        uint baseGroupY = 0;
+        uint baseGroupZ = 0;
+        if ((initiator & forceStartAtZero) == 0)
+        {
+            state.ShRegisters.TryGetValue(ComputeStartX, out baseGroupX);
+            state.ShRegisters.TryGetValue(ComputeStartY, out baseGroupY);
+            state.ShRegisters.TryGetValue(ComputeStartZ, out baseGroupZ);
+        }
+
+        if (dispatchEndX <= baseGroupX ||
+            dispatchEndY <= baseGroupY ||
+            dispatchEndZ <= baseGroupZ)
+        {
+            return false;
+        }
+
+        var groupCountX = dispatchEndX - baseGroupX;
+        var groupCountY = dispatchEndY - baseGroupY;
+        var groupCountZ = dispatchEndZ - baseGroupZ;
+
+        if (_traceAgcShader &&
+            ((ulong)groupCountX * groupCountY * groupCountZ >= 1_000_000UL ||
+             groupCountX >= 1_000_000u))
+        {
+            lock (_submitTraceGate)
+            {
+                if (_tracedDispatchArguments.Add(
+                        (dimensionsAddress, groupCountX, groupCountY, groupCountZ)))
+                {
+                    TraceAgcShader(
+                        $"agc.dispatch_args source={dispatchSource} op=0x{opcode:X2} " +
+                        $"packet=0x{packetAddress:X16} len={packetLength} " +
+                        $"dims=0x{dimensionsAddress:X16} " +
+                        $"raw={dispatchEndX:X8}/{dispatchEndY:X8}/{dispatchEndZ:X8} " +
+                        $"base={baseGroupX:X8}/{baseGroupY:X8}/{baseGroupZ:X8} " +
+                        $"count={groupCountX:X8}/{groupCountY:X8}/{groupCountZ:X8} " +
+                        $"initiator=0x{initiator:X8} " +
+                        $"indirect_base=0x{state.IndirectArgsAddress:X16}");
+                }
+            }
+        }
+
+        dispatch = new ComputeDispatch(
+            groupCountX,
+            groupCountY,
+            groupCountZ,
+            baseGroupX,
+            baseGroupY,
+            baseGroupZ);
         return true;
     }
 
@@ -5554,10 +5646,16 @@ public static class AgcExports
         {
             var shaderKey = (
                 shaderAddress,
-                ComputeShaderStateFingerprint(evaluation),
+                _bakeScalars
+                    ? ComputeShaderStateFingerprint(evaluation)
+                    : ComputeShaderStructuralFingerprint(evaluation),
                 localSizeX,
                 localSizeY,
                 localSizeZ);
+            var guestGlobalBufferCount = evaluation.GlobalMemoryBindings.Count;
+            var totalGlobalBufferCount = _bakeScalars
+                ? guestGlobalBufferCount
+                : guestGlobalBufferCount + 1;
             byte[] computeSpirv;
             lock (_submitTraceGate)
             {
@@ -5573,7 +5671,11 @@ public static class AgcExports
                         localSizeY,
                         localSizeZ,
                         out var compiledCompute,
-                        out computeError))
+                        out computeError,
+                        totalGlobalBufferCount,
+                        initialScalarBufferIndex: _bakeScalars
+                            ? -1
+                            : guestGlobalBufferCount))
                 {
                     computeSpirv = compiledCompute.Spirv;
                     DumpSpirv(
@@ -5606,7 +5708,7 @@ public static class AgcExports
                     translatedBindings,
                     out _);
                 var globalMemoryBuffers =
-                    CreateVulkanGuestMemoryBuffers(evaluation.GlobalMemoryBindings);
+                    CreateTranslatedComputeGlobalBuffers(evaluation);
                 var workSequence = VulkanVideoPresenter.SubmitComputeDispatch(
                     shaderAddress,
                     computeSpirv,
@@ -5615,6 +5717,9 @@ public static class AgcExports
                     dispatch.GroupCountX,
                     dispatch.GroupCountY,
                     dispatch.GroupCountZ,
+                    dispatch.BaseGroupX,
+                    dispatch.BaseGroupY,
+                    dispatch.BaseGroupZ,
                     writesGlobalMemory);
                 gpuDispatch = true;
                 if (writesGlobalMemory &&
@@ -5644,6 +5749,7 @@ public static class AgcExports
                 TraceAgcShader(
                     $"agc.compute_shader cs=0x{shaderAddress:X16} " +
                     $"groups={dispatch.GroupCountX}x{dispatch.GroupCountY}x{dispatch.GroupCountZ} " +
+                    $"base={dispatch.BaseGroupX}x{dispatch.BaseGroupY}x{dispatch.BaseGroupZ} " +
                     $"local={localSizeX}x{localSizeY}x{localSizeZ} " +
                     $"sys={DescribeComputeSystemRegisters(computeSystemRegisters)} " +
                     $"gpu={gpuDispatch} blits={blitCount} globals={evaluation.GlobalMemoryBindings.Count} " +
@@ -5998,22 +6104,6 @@ public static class AgcExports
             12 => 8UL,
             13 => 12UL,
             14 => 16UL,
-            20 => 4UL,
-            22 => 8UL,
-            29 => 4UL,
-            36 => 1UL,
-            49 => 1UL,
-            // Texture-descriptor format 50 is the sampled view of an
-            // A2R10G10B10 (render format 9) surface — 32bpp. Without a
-            // bytes-per-texel entry GetTextureByteCount returns 0 and the
-            // texture resolver bails to a black fallback before it can alias
-            // the on-GPU render target (Void Terrarium's composite pass).
-            50 => 4UL,
-            Gen5TextureFormatR8G8B8A8Unorm => 4UL,
-            62 => 4UL,
-            64 => 4UL,
-            Gen5TextureFormatR16G16B16A16Float => 8UL,
-            75 => 8UL,
             _ => 0UL,
         };
 
@@ -6320,9 +6410,12 @@ public static class AgcExports
         }
 
         // GFX10/RDNA2 T# layout: WIDTH is split across word1[31:30] (lo 2 bits)
-        // and word2[11:0] (hi 12 bits); FORMAT is the combined 9-bit field at
-        // word1[28:20]. Verified against Kyty's decode of the same game
-        // descriptors (fmt=56=8_8_8_8_UNORM, extent 1280x720, sw_mode 27).
+        // and word2[11:0] (hi 12 bits); FORMAT is the combined 9-bit unified
+        // field at word1[28:20]. Decode that field once here into the legacy
+        // data-format/number-format pair used by the translator and Vulkan
+        // boundary. Treating unified 13 as legacy data format 13, for example,
+        // turned an R16_FLOAT surface into a 96-bit RGB32 surface and overread
+        // every row by 6x.
         // GNM T# exposes a 38-bit baseaddr256 field, but RPCSX and the
         // Demon's Souls descriptors both show that only the low 32 bits are
         // part of the guest GPU VA. The upper baseaddr bits carry resource
@@ -6330,8 +6423,14 @@ public static class AgcExports
         var address = ((ulong)(uint)((((ulong)fields[1] << 32) | fields[0]) & 0x3F_FFFF_FFFFUL)) << 8;
         var width = (((fields[1] >> 30) & 0x3u) | ((fields[2] & 0xFFFu) << 2)) + 1;
         var height = ((fields[2] >> 14) & 0x3FFFu) + 1;
-        var format = (fields[1] >> 20) & 0x1FFu;
-        var numberType = (fields[1] >> 26) & 0xFu;
+        var unifiedFormat = (fields[1] >> 20) & 0x1FFu;
+        if (!Gfx10UnifiedFormat.TryDecode(
+                unifiedFormat,
+                out var format,
+                out var numberType))
+        {
+            return false;
+        }
         var tileMode = (fields[3] >> 20) & 0x1Fu;
         var type = (fields[3] >> 28) & 0xFu;
         var baseLevel = (fields[3] >> 12) & 0xFu;
@@ -6367,8 +6466,15 @@ public static class AgcExports
         var tileMode = 0u;
         if (fields.Count >= 4)
         {
-            format = (fields[1] >> 20) & 0x1FFu;
-            numberType = (fields[1] >> 26) & 0xFu;
+            var unifiedFormat = (fields[1] >> 20) & 0x1FFu;
+            if (!Gfx10UnifiedFormat.TryDecode(
+                    unifiedFormat,
+                    out format,
+                    out numberType))
+            {
+                format = Gen5TextureFormatR8G8B8A8Unorm;
+                numberType = 0;
+            }
             tileMode = (fields[3] >> 20) & 0x1Fu;
             if (format == 0)
             {

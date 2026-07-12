@@ -1761,46 +1761,15 @@ internal static class Gen5ShaderScalarEvaluator
     }
 
     private static (uint DataFormat, uint NumberFormat)
-        DecodeGfx10BufferFormat(uint format) =>
-        format switch
-        {
-            0 => (0, 0),
-            >= 1 and <= 6 => (1, format - 1),
-            >= 7 and <= 13 => (2, DecodeUnifiedNumber(format - 7, 7)),
-            >= 14 and <= 19 => (3, format - 14),
-            >= 20 and <= 22 => (4, DecodeIntegerOrFloatNumber(format - 20)),
-            >= 23 and <= 29 => (5, DecodeUnifiedNumber(format - 23, 7)),
-            >= 30 and <= 36 => (6, DecodeUnifiedNumber(format - 30, 7)),
-            >= 37 and <= 43 => (7, DecodeUnifiedNumber(format - 37, 7)),
-            >= 44 and <= 49 => (8, format - 44),
-            >= 50 and <= 55 => (9, format - 50),
-            >= 56 and <= 61 => (10, format - 56),
-            >= 62 and <= 64 => (11, DecodeIntegerOrFloatNumber(format - 62)),
-            >= 65 and <= 71 => (12, DecodeUnifiedNumber(format - 65, 7)),
-            >= 72 and <= 74 => (13, DecodeIntegerOrFloatNumber(format - 72)),
-            >= 75 and <= 77 => (14, DecodeIntegerOrFloatNumber(format - 75)),
-            128 => (1, 9),
-            129 => (3, 9),
-            130 => (10, 9),
-            132 => (34, 7),
-            133 => (16, 0),
-            134 => (17, 0),
-            135 => (18, 0),
-            136 => (19, 0),
-            140 => (4, 7),
-            _ => (0, 0),
-        };
-
-    private static uint DecodeUnifiedNumber(uint offset, uint formatCount) =>
-        offset == formatCount - 1 ? 7u : offset;
-
-    private static uint DecodeIntegerOrFloatNumber(uint offset) =>
-        offset switch
-        {
-            0 => 4,
-            1 => 5,
-            _ => 7,
-        };
+        DecodeGfx10BufferFormat(uint format)
+    {
+        return Gfx10UnifiedFormat.TryDecode(
+            format,
+            out var dataFormat,
+            out var numberFormat)
+            ? (dataFormat, numberFormat)
+            : (0, 0);
+    }
 
     private static bool TryReadUserDataScalarLoad(
         Gen5ShaderState state,

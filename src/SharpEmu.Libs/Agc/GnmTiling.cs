@@ -15,9 +15,6 @@ namespace SharpEmu.Libs.Agc;
 /// S and Z 2D single-sample modes plus the PS5's RB+ 64 KiB Z_X/R_X equations;
 /// other D/R and pipe/bank-XOR modes stay opt-in while their complete AddrLib
 /// equations are being ported.
-///
-/// Enable with <c>SHARPEMU_DETILE=1</c> while it is validated; the intent is to
-/// make it the default once verified against reference titles.
 /// </summary>
 internal static class GnmTiling
 {
@@ -108,16 +105,14 @@ internal static class GnmTiling
     public static bool Enabled => _enabled || !_disabled;
 
     /// <summary>
-    /// Base swizzle modes (256 B / 4 KiB / 64 KiB Z/S/D/R) whose blocks are laid
-    /// out linearly in memory, so the within-block equation alone deswizzles them
-    /// exactly. These are safe to detile by default. The bank/pipe-XOR variants
-    /// (_T = 13-16, _X = 21-27) reorder whole blocks in a way we only approximate,
-    /// so those stay behind SHARPEMU_DETILE=1 until validated per title.
+    /// Base S/Z modes and the Oberon RB+ 64 KiB Z_X/R_X modes for which this
+    /// implementation carries the exact AddrLib address equations. Other
+    /// bank/pipe-XOR variants remain opt-in.
     /// </summary>
     private static bool IsTrustedByDefault(uint swizzleMode) =>
         // Exact base S/Z modes. D/R use different GFX10 swizzle equations and
         // the T/X modes additionally apply pipe/bank XOR between blocks.
-        swizzleMode is 1 or 4 or 5 or 8 or 9;
+        swizzleMode is 1 or 4 or 5 or 8 or 9 or 24 or 27;
 
     // Detile a surface when it is verified-correct by default (trusted base mode),
     // or when the user opts the approximate modes in with SHARPEMU_DETILE=1.

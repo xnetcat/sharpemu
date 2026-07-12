@@ -78,7 +78,9 @@ internal static partial class Gen5SpirvTranslator
         uint localSizeY,
         uint localSizeZ,
         out Gen5SpirvShader shader,
-        out string error)
+        out string error,
+        int totalGlobalBufferCount = -1,
+        int initialScalarBufferIndex = -1)
     {
         var context = new CompilationContext(
             Gen5SpirvStage.Compute,
@@ -89,9 +91,9 @@ internal static partial class Gen5SpirvTranslator
             Math.Max(localSizeY, 1),
             Math.Max(localSizeZ, 1),
             0,
-            -1,
+            totalGlobalBufferCount,
             0,
-            -1);
+            initialScalarBufferIndex);
         return context.TryCompile(out shader, out error);
     }
 
