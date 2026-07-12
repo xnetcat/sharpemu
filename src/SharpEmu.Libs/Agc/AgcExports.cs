@@ -5564,23 +5564,34 @@ public static class AgcExports
                 _computeSpirvCache.TryGetValue(shaderKey, out computeSpirv!);
             }
 
-            if (computeSpirv is null &&
-                Gen5SpirvTranslator.TryCompileComputeShader(
-                    shaderState,
-                    evaluation,
-                    localSizeX,
-                    localSizeY,
-                    localSizeZ,
-                    out var compiledCompute,
-                    out computeError))
+            if (computeSpirv is null)
             {
-                computeSpirv = compiledCompute.Spirv;
-                DumpSpirv(
-                    "cs",
-                    shaderAddress,
-                    shaderKey.Item2,
-                    computeSpirv,
-                    shaderState.Program);
+                if (Gen5SpirvTranslator.TryCompileComputeShader(
+                        shaderState,
+                        evaluation,
+                        localSizeX,
+                        localSizeY,
+                        localSizeZ,
+                        out var compiledCompute,
+                        out computeError))
+                {
+                    computeSpirv = compiledCompute.Spirv;
+                    DumpSpirv(
+                        "cs",
+                        shaderAddress,
+                        shaderKey.Item2,
+                        computeSpirv,
+                        shaderState.Program);
+                }
+                else
+                {
+                    DumpSpirv(
+                        "failed-cs",
+                        shaderAddress,
+                        shaderKey.Item2,
+                        [],
+                        shaderState.Program);
+                }
             }
 
             if (computeSpirv is not null)
@@ -7212,8 +7223,7 @@ public static class AgcExports
         byte[] spirv,
         Gen5ShaderProgram program)
     {
-        if (spirv.Length == 0 ||
-            !string.Equals(
+        if (!string.Equals(
                 Environment.GetEnvironmentVariable("SHARPEMU_DUMP_SPIRV"),
                 "1",
                 StringComparison.Ordinal))
@@ -7224,7 +7234,10 @@ public static class AgcExports
         var directory = Path.Combine(AppContext.BaseDirectory, "shader-dumps");
         Directory.CreateDirectory(directory);
         var name = $"{shaderAddress:X16}-{stateFingerprint:X16}.{stage}";
-        File.WriteAllBytes(Path.Combine(directory, $"{name}.spv"), spirv);
+        if (spirv.Length != 0)
+        {
+            File.WriteAllBytes(Path.Combine(directory, $"{name}.spv"), spirv);
+        }
 
         var lines = new List<string>(program.Instructions.Count + 2)
         {

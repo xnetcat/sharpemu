@@ -97,6 +97,13 @@ internal static partial class Gen5SpirvTranslator
 
     private sealed partial class CompilationContext
     {
+        private const uint ImageDescriptorDwords = 8;
+        private const uint SamplerDescriptorDwords = 4;
+        private const int ScalarRegisterCount = 128;
+        private const long InitialScalarDefinition = -1;
+        private const long ConflictingScalarDefinition = -2;
+        private const long UnreachableScalarDefinition = -3;
+
         private readonly SpirvModuleBuilder _module = new();
         private readonly Gen5SpirvStage _stage;
         private readonly Gen5ShaderState _state;
@@ -156,6 +163,7 @@ internal static partial class Gen5SpirvTranslator
         private readonly List<SpirvImageResource> _imageResources = [];
         private readonly Dictionary<uint, int> _imageBindingByPc = [];
         private readonly Dictionary<uint, int> _bufferBindingByPc = [];
+        private readonly Dictionary<uint, long[]> _scalarDefinitionsBeforePc = [];
         private uint _voidType;
         private uint _boolType;
         private uint _uintType;
@@ -261,6 +269,8 @@ internal static partial class Gen5SpirvTranslator
                     error = "shader contains no executable blocks";
                     return false;
                 }
+
+                BuildScalarDefinitionInfo(blocks, _state.Program.Instructions);
 
                 var functionType = _module.TypeFunction(_voidType);
                 var main = _module.BeginFunction(_voidType, functionType);
@@ -1486,7 +1496,17 @@ internal static partial class Gen5SpirvTranslator
             out string error)
         {
             error = string.Empty;
-            if (!_bufferBindingByPc.TryGetValue(instruction.Pc, out var bindingIndex))
+            var scalarAddress = instruction.Sources.Count != 0 &&
+                instruction.Sources[0].Kind == Gen5OperandKind.ScalarRegister
+                ? instruction.Sources[0].Value
+                : uint.MaxValue;
+            if (!TryResolveDominatingBufferBinding(
+                    instruction.Pc,
+                    scalarAddress,
+                    registerCount: instruction.Opcode.StartsWith(
+                        "SBufferLoad",
+                        StringComparison.Ordinal) ? 4u : 2u,
+                    out var bindingIndex))
             {
                 foreach (var destination in instruction.Destinations)
                 {
@@ -1530,7 +1550,11 @@ internal static partial class Gen5SpirvTranslator
             out string error)
         {
             error = string.Empty;
-            if (!_bufferBindingByPc.TryGetValue(instruction.Pc, out var bindingIndex))
+            if (!TryResolveDominatingBufferBinding(
+                    instruction.Pc,
+                    control.ScalarAddress,
+                    registerCount: 2,
+                    out var bindingIndex))
             {
                 error = "missing global-memory binding";
                 return false;
@@ -1572,7 +1596,11 @@ internal static partial class Gen5SpirvTranslator
                 return false;
             }
 
-            if (!_bufferBindingByPc.TryGetValue(instruction.Pc, out var bindingIndex))
+            if (!TryResolveDominatingBufferBinding(
+                    instruction.Pc,
+                    control.ScalarResource,
+                    registerCount: 4,
+                    out var bindingIndex))
             {
                 error = "missing buffer-memory binding";
                 return false;
@@ -1668,6 +1696,121 @@ internal static partial class Gen5SpirvTranslator
             opcode.StartsWith("BufferLoadFormat", StringComparison.Ordinal) ||
             opcode.StartsWith("TBufferLoadFormat", StringComparison.Ordinal);
 
+        private static bool UsesSampler(string opcode) =>
+            opcode.StartsWith("ImageSample", StringComparison.Ordinal) ||
+            opcode.StartsWith("ImageGather", StringComparison.Ordinal);
+
+        private bool TryResolveDominatingBufferBinding(
+            uint pc,
+            uint scalarRegister,
+            uint registerCount,
+            out int bindingIndex)
+        {
+            if (_bufferBindingByPc.TryGetValue(pc, out bindingIndex))
+            {
+                return true;
+            }
+
+            for (var index = 0; index < _evaluation.GlobalMemoryBindings.Count; index++)
+            {
+                var binding = _evaluation.GlobalMemoryBindings[index];
+                if (binding.ScalarAddress != scalarRegister)
+                {
+                    continue;
+                }
+
+                foreach (var candidatePc in binding.InstructionPcs)
+                {
+                    if (!HasSameScalarDefinitions(
+                            candidatePc,
+                            pc,
+                            scalarRegister,
+                            registerCount))
+                    {
+                        continue;
+                    }
+
+                    bindingIndex = _globalBufferBase + index;
+                    _bufferBindingByPc.Add(pc, bindingIndex);
+                    return true;
+                }
+            }
+
+            bindingIndex = -1;
+            return false;
+        }
+
+        private bool TryResolveDominatingImageBinding(
+            Gen5ShaderInstruction instruction,
+            Gen5ImageControl control,
+            out int bindingIndex)
+        {
+            if (_imageBindingByPc.TryGetValue(instruction.Pc, out bindingIndex) &&
+                bindingIndex < _imageResources.Count)
+            {
+                return true;
+            }
+
+            var storage = Gen5ShaderTranslator.IsStorageImageOperation(instruction.Opcode);
+            for (var index = 0; index < _evaluation.ImageBindings.Count; index++)
+            {
+                var candidate = _evaluation.ImageBindings[index];
+                if (candidate.Control.ScalarResource != control.ScalarResource ||
+                    candidate.Control.ScalarSampler != control.ScalarSampler ||
+                    Gen5ShaderTranslator.IsStorageImageOperation(candidate.Opcode) != storage ||
+                    !HasSameScalarDefinitions(
+                        candidate.Pc,
+                        instruction.Pc,
+                        control.ScalarResource,
+                        ImageDescriptorDwords) ||
+                    UsesSampler(instruction.Opcode) &&
+                    !HasSameScalarDefinitions(
+                        candidate.Pc,
+                        instruction.Pc,
+                        control.ScalarSampler,
+                        SamplerDescriptorDwords))
+                {
+                    continue;
+                }
+
+                bindingIndex = index;
+                _imageBindingByPc.Add(instruction.Pc, index);
+                return true;
+            }
+
+            bindingIndex = -1;
+            return false;
+        }
+
+        private bool HasSameScalarDefinitions(
+            uint candidatePc,
+            uint targetPc,
+            uint firstRegister,
+            uint registerCount)
+        {
+            if (firstRegister + registerCount > ScalarRegisterCount ||
+                !_scalarDefinitionsBeforePc.TryGetValue(candidatePc, out var candidate) ||
+                !_scalarDefinitionsBeforePc.TryGetValue(targetPc, out var target))
+            {
+                return false;
+            }
+
+            for (var register = firstRegister;
+                 register < firstRegister + registerCount;
+                 register++)
+            {
+                var definition = candidate[register];
+                if (definition is ConflictingScalarDefinition or
+                        UnreachableScalarDefinition ||
+                    target[register] != definition)
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
         private bool TryEmitVertexInputFetch(
             Gen5BufferMemoryControl control,
             SpirvVertexInput input,
@@ -1705,10 +1848,21 @@ internal static partial class Gen5SpirvTranslator
             out string error)
         {
             error = string.Empty;
-            if (!_imageBindingByPc.TryGetValue(instruction.Pc, out var bindingIndex) ||
-                bindingIndex >= _imageResources.Count)
+            if (!TryResolveDominatingImageBinding(instruction, image, out var bindingIndex))
             {
-                error = "unresolved image binding";
+                var candidates = _evaluation.ImageBindings
+                    .Where(binding =>
+                        binding.Control.ScalarResource == image.ScalarResource &&
+                        binding.Control.ScalarSampler == image.ScalarSampler)
+                    .Take(16)
+                    .Select(binding =>
+                        $"{binding.Opcode}@0x{binding.Pc:X}" +
+                        $"/r={HasSameScalarDefinitions(binding.Pc, instruction.Pc, image.ScalarResource, ImageDescriptorDwords)}" +
+                        $"/s={!UsesSampler(instruction.Opcode) || HasSameScalarDefinitions(binding.Pc, instruction.Pc, image.ScalarSampler, SamplerDescriptorDwords)}");
+                error =
+                    $"unresolved image binding t=s{image.ScalarResource} " +
+                    $"s=s{image.ScalarSampler} " +
+                    $"candidates=[{string.Join(',', candidates)}]";
                 return false;
             }
 
@@ -2860,6 +3014,198 @@ internal static partial class Gen5SpirvTranslator
             }
 
             return blocks;
+        }
+
+        private void BuildScalarDefinitionInfo(
+            IReadOnlyList<ShaderBlock> blocks,
+            IReadOnlyList<Gen5ShaderInstruction> instructions)
+        {
+            var predecessors = new HashSet<int>[blocks.Count];
+            for (var index = 0; index < blocks.Count; index++)
+            {
+                predecessors[index] = [];
+            }
+
+            void AddEdge(int source, int destination)
+            {
+                if (destination < 0 || destination >= blocks.Count)
+                {
+                    return;
+                }
+
+                predecessors[destination].Add(source);
+            }
+
+            for (var blockIndex = 0; blockIndex < blocks.Count; blockIndex++)
+            {
+                var block = blocks[blockIndex];
+                var terminator = instructions[block.EndIndex - 1];
+                var hasFallthrough = blockIndex + 1 < blocks.Count;
+                if (terminator.Opcode == "SEndpgm")
+                {
+                    continue;
+                }
+
+                if (terminator.Opcode == "SBranch")
+                {
+                    if (TryGetBranchTargetPc(terminator, out var targetPc) &&
+                        TryFindBlock(blocks, targetPc, out var targetBlock))
+                    {
+                        AddEdge(blockIndex, targetBlock);
+                    }
+
+                    continue;
+                }
+
+                if (terminator.Opcode.StartsWith("SCbranch", StringComparison.Ordinal))
+                {
+                    if (TryGetBranchTargetPc(terminator, out var targetPc) &&
+                        TryFindBlock(blocks, targetPc, out var targetBlock))
+                    {
+                        AddEdge(blockIndex, targetBlock);
+                    }
+
+                    if (hasFallthrough)
+                    {
+                        AddEdge(blockIndex, blockIndex + 1);
+                    }
+
+                    continue;
+                }
+
+                if (hasFallthrough)
+                {
+                    AddEdge(blockIndex, blockIndex + 1);
+                }
+            }
+
+            var blockInputs = new long[blocks.Count][];
+            var blockOutputs = new long[blocks.Count][];
+            var hasOutput = new bool[blocks.Count];
+            var initialDefinitions = Enumerable.Repeat(
+                InitialScalarDefinition,
+                ScalarRegisterCount).ToArray();
+
+            static void MergeDefinitions(
+                long[] destination,
+                long[] source,
+                ref bool hasInput)
+            {
+                if (!hasInput)
+                {
+                    Array.Copy(source, destination, ScalarRegisterCount);
+                    hasInput = true;
+                    return;
+                }
+
+                for (var register = 0; register < ScalarRegisterCount; register++)
+                {
+                    if (destination[register] != source[register])
+                    {
+                        destination[register] = ConflictingScalarDefinition;
+                    }
+                }
+            }
+
+            static void ApplyScalarDefinitions(
+                long[] definitions,
+                ShaderBlock block,
+                IReadOnlyList<Gen5ShaderInstruction> blockInstructions)
+            {
+                for (var instructionIndex = block.StartIndex;
+                     instructionIndex < block.EndIndex;
+                     instructionIndex++)
+                {
+                    var instruction = blockInstructions[instructionIndex];
+                    foreach (var destination in instruction.Destinations)
+                    {
+                        if (destination.Kind == Gen5OperandKind.ScalarRegister &&
+                            destination.Value < ScalarRegisterCount)
+                        {
+                            definitions[destination.Value] = instruction.Pc + 1L;
+                        }
+                    }
+                }
+            }
+
+            var changed = true;
+            while (changed)
+            {
+                changed = false;
+                for (var blockIndex = 0; blockIndex < blocks.Count; blockIndex++)
+                {
+                    var input = Enumerable.Repeat(
+                        UnreachableScalarDefinition,
+                        ScalarRegisterCount).ToArray();
+                    var hasInput = false;
+                    if (blockIndex == 0)
+                    {
+                        MergeDefinitions(input, initialDefinitions, ref hasInput);
+                    }
+
+                    foreach (var predecessor in predecessors[blockIndex])
+                    {
+                        if (hasOutput[predecessor])
+                        {
+                            MergeDefinitions(
+                                input,
+                                blockOutputs[predecessor],
+                                ref hasInput);
+                        }
+                    }
+
+                    if (!hasInput)
+                    {
+                        continue;
+                    }
+
+                    var output = (long[])input.Clone();
+                    ApplyScalarDefinitions(output, blocks[blockIndex], instructions);
+                    if (!hasOutput[blockIndex] ||
+                        !blockInputs[blockIndex].AsSpan().SequenceEqual(input) ||
+                        !blockOutputs[blockIndex].AsSpan().SequenceEqual(output))
+                    {
+                        blockInputs[blockIndex] = input;
+                        blockOutputs[blockIndex] = output;
+                        hasOutput[blockIndex] = true;
+                        changed = true;
+                    }
+                }
+            }
+
+            _scalarDefinitionsBeforePc.Clear();
+            for (var blockIndex = 0; blockIndex < blocks.Count; blockIndex++)
+            {
+                if (!hasOutput[blockIndex])
+                {
+                    continue;
+                }
+
+                var definitions = (long[])blockInputs[blockIndex].Clone();
+                var block = blocks[blockIndex];
+                for (var instructionIndex = block.StartIndex;
+                     instructionIndex < block.EndIndex;
+                     instructionIndex++)
+                {
+                    var instruction = instructions[instructionIndex];
+                    if (instruction.Control is Gen5ImageControl or
+                            Gen5ScalarMemoryControl or
+                            Gen5GlobalMemoryControl or
+                            Gen5BufferMemoryControl)
+                    {
+                        _scalarDefinitionsBeforePc[instruction.Pc] =
+                            (long[])definitions.Clone();
+                    }
+                    foreach (var destination in instruction.Destinations)
+                    {
+                        if (destination.Kind == Gen5OperandKind.ScalarRegister &&
+                            destination.Value < ScalarRegisterCount)
+                        {
+                            definitions[destination.Value] = instruction.Pc + 1L;
+                        }
+                    }
+                }
+            }
         }
 
         private static int FindInstructionIndex(

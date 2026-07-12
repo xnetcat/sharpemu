@@ -33,6 +33,18 @@ internal static class Gen5ShaderScalarEvaluator
             "1",
             StringComparison.Ordinal);
 
+    // Uniform forward branches select material/resource bodies that remain
+    // statically present in the translated shader. Discover the skipped body's
+    // descriptors by default; SHARPEMU_CFG_RESOURCE_DISCOVERY=0 is a diagnostic
+    // opt-out. Conditional branches are deliberately not forked because their
+    // fall-through is already scanned and forking vector-mask conditions grows
+    // exponentially without adding descriptor coverage.
+    private static readonly bool _cfgResourceDiscovery =
+        !string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_CFG_RESOURCE_DISCOVERY"),
+            "0",
+            StringComparison.Ordinal);
+
     private const int ScalarRegisterCount = 256;
     private const int ImageDescriptorDwords = 8;
     private const int SamplerDescriptorDwords = 4;
@@ -46,6 +58,31 @@ internal static class Gen5ShaderScalarEvaluator
         ulong SizeBytes,
         uint NumberFormat,
         uint DataFormat);
+
+    private readonly record struct ScalarPathState(
+        uint StartPc,
+        uint[] ScalarRegisters,
+        ulong ExecMask,
+        bool ScalarConditionCode,
+        bool Supplemental);
+
+    private readonly record struct ScalarPathKey(uint StartPc, ulong StateHash);
+
+    private static ulong ComputeScalarStateHash(
+        IReadOnlyList<uint> registers,
+        ulong execMask,
+        bool scalarConditionCode)
+    {
+        const ulong prime = 1099511628211UL;
+        var hash = 14695981039346656037UL;
+        foreach (var value in registers)
+        {
+            hash = (hash ^ value) * prime;
+        }
+
+        hash = (hash ^ execMask) * prime;
+        return (hash ^ (scalarConditionCode ? 1UL : 0UL)) * prime;
+    }
 
     public static bool TryResolveImageBindings(
         CpuContext ctx,
@@ -100,36 +137,110 @@ internal static class Gen5ShaderScalarEvaluator
         // set already includes every instruction's destination registers, so
         // the per-load additions the loop used to make are redundant.
         var runtimeScalarRegisters = state.Program.RuntimeScalarRegisters;
-        var scalarConditionCode = false;
-        uint? skipUntilPc = null;
+        var resolvedImageByPc = new Dictionary<uint, int>();
+        var finalScalarRegisters = (uint[])scalarRegisters.Clone();
+        var pendingPaths = new Stack<ScalarPathState>();
+        var visitedPaths = new HashSet<ScalarPathKey>();
 
-        foreach (var instruction in state.Program.Instructions)
+        void QueuePath(
+            uint pc,
+            uint[] registers,
+            ulong pathExecMask,
+            bool pathScc,
+            bool supplemental)
         {
-            if (skipUntilPc.HasValue)
+            var key = new ScalarPathKey(
+                pc,
+                ComputeScalarStateHash(registers, pathExecMask, pathScc));
+            if (visitedPaths.Add(key))
             {
-                if (instruction.Pc < skipUntilPc.Value)
+                pendingPaths.Push(new ScalarPathState(
+                    pc,
+                    registers,
+                    pathExecMask,
+                    pathScc,
+                    supplemental));
+            }
+        }
+
+        if (state.Program.Instructions.Count != 0)
+        {
+            QueuePath(
+                state.Program.Instructions[0].Pc,
+                (uint[])scalarRegisters.Clone(),
+                execMask,
+                pathScc: false,
+                supplemental: false);
+        }
+
+        while (pendingPaths.Count != 0)
+        {
+            var path = pendingPaths.Pop();
+            scalarRegisters = path.ScalarRegisters;
+            execMask = path.ExecMask;
+            var scalarConditionCode = path.ScalarConditionCode;
+            uint? skipUntilPc = path.StartPc;
+
+            foreach (var instruction in state.Program.Instructions)
+            {
+                if (skipUntilPc.HasValue)
                 {
-                    continue;
+                    if (instruction.Pc < skipUntilPc.Value)
+                    {
+                        continue;
+                    }
+
+                    skipUntilPc = null;
                 }
 
-                skipUntilPc = null;
-            }
+                if (instruction.Opcode == "SEndpgm")
+                {
+                    break;
+                }
 
-            if (instruction.Opcode == "SEndpgm")
-            {
-                break;
-            }
+                if (instruction.Opcode == "SBranch" &&
+                    TryGetSoppBranchTargetPc(instruction, out var targetPc))
+                {
+                    if (targetPc > instruction.Pc)
+                    {
+                        // The regular scalar evaluation follows the uniform
+                        // branch. Evaluate its skipped fall-through region once
+                        // as supplemental resource discovery: large shaders use
+                        // forward S_BRANCH to select one material/resource body,
+                        // and SPIR-V still needs descriptors for every body that
+                        // remains in the statically translated CFG. Do not fork
+                        // SC_BRANCH targets here; their fall-through regions are
+                        // already visited linearly and forking every vector-mask
+                        // condition causes exponential state growth.
+                        if (_cfgResourceDiscovery)
+                        {
+                            var fallthroughPc = instruction.Pc +
+                                (uint)(instruction.Words.Count * sizeof(uint));
+                            QueuePath(
+                                fallthroughPc,
+                                (uint[])scalarRegisters.Clone(),
+                                execMask,
+                                scalarConditionCode,
+                                supplemental: true);
+                        }
 
-            if (instruction.Opcode == "SBranch" &&
-                TryGetSoppBranchTargetPc(instruction, out var targetPc) &&
-                targetPc > instruction.Pc)
-            {
-                skipUntilPc = targetPc;
-                continue;
-            }
+                        skipUntilPc = targetPc;
+                        continue;
+                    }
 
-            if (instruction.Encoding == Gen5ShaderEncoding.Sopc)
-            {
+                    // One linear pass over a supplemental body is sufficient
+                    // to discover its static memory/image instructions. Do not
+                    // iterate backward branches: loop-varying descriptors need
+                    // runtime descriptor indexing and cannot be represented by
+                    // cloning scalar states for an unbounded number of trips.
+                    if (path.Supplemental)
+                    {
+                        break;
+                    }
+                }
+
+                if (instruction.Encoding == Gen5ShaderEncoding.Sopc)
+                {
                 if (!TryExecuteScalarCompare(
                         instruction,
                         scalarRegisters,
@@ -142,7 +253,7 @@ internal static class Gen5ShaderScalarEvaluator
                 continue;
             }
 
-            if (instruction.Encoding == Gen5ShaderEncoding.Sopk &&
+                if (instruction.Encoding == Gen5ShaderEncoding.Sopk &&
                 instruction.Opcode.StartsWith("SCmpk", StringComparison.Ordinal))
             {
                 if (!TryExecuteScalarCompareK(
@@ -157,7 +268,7 @@ internal static class Gen5ShaderScalarEvaluator
                 continue;
             }
 
-            if (instruction.Encoding is
+                if (instruction.Encoding is
                 Gen5ShaderEncoding.Sop1 or
                 Gen5ShaderEncoding.Sop2 or
                 Gen5ShaderEncoding.Sopk)
@@ -181,20 +292,29 @@ internal static class Gen5ShaderScalarEvaluator
                 continue;
             }
 
-            if (instruction.Control is Gen5ScalarMemoryControl scalarMemory)
-            {
+                if (instruction.Control is Gen5ScalarMemoryControl scalarMemory)
+                {
                 // Destinations are already in the cached runtimeScalarRegisters
                 // set (it scans every instruction's destinations), so no
                 // per-load mutation is needed here.
-                if (!TryExecuteScalarLoad(ctx, state, instruction, scalarMemory, scalarRegisters, globalMemoryBindings, globalMemoryByAddress, runtimeScalarRegisters, out error))
+                var recordBinding =
+                    !path.Supplemental ||
+                    !HasGlobalMemoryBindingForPc(globalMemoryBindings, instruction.Pc);
+                if (!TryExecuteScalarLoad(ctx, state, instruction, scalarMemory, scalarRegisters, globalMemoryBindings, globalMemoryByAddress, runtimeScalarRegisters, recordBinding, out error))
                 {
                     return false;
                 }
                 continue;
             }
 
-            if (instruction.Control is Gen5GlobalMemoryControl globalMemory)
-            {
+                if (instruction.Control is Gen5GlobalMemoryControl globalMemory)
+                {
+                if (path.Supplemental &&
+                    HasGlobalMemoryBindingForPc(globalMemoryBindings, instruction.Pc))
+                {
+                    continue;
+                }
+
                 if (globalMemory.ScalarAddress >= ScalarRegisterCount - 1)
                 {
                     error =
@@ -215,7 +335,8 @@ internal static class Gen5ShaderScalarEvaluator
                 var key = (globalMemory.ScalarAddress, baseAddress);
                 if (globalMemoryByAddress.TryGetValue(key, out var existingBinding))
                 {
-                    if (existingBinding.InstructionPcs is List<uint> instructionPcs)
+                    if (existingBinding.InstructionPcs is List<uint> instructionPcs &&
+                        !instructionPcs.Contains(instruction.Pc))
                     {
                         instructionPcs.Add(instruction.Pc);
                     }
@@ -244,8 +365,14 @@ internal static class Gen5ShaderScalarEvaluator
                 continue;
             }
 
-            if (instruction.Control is Gen5BufferMemoryControl bufferMemory)
-            {
+                if (instruction.Control is Gen5BufferMemoryControl bufferMemory)
+                {
+                if (path.Supplemental &&
+                    HasGlobalMemoryBindingForPc(globalMemoryBindings, instruction.Pc))
+                {
+                    continue;
+                }
+
                 var writable = IsBufferMemoryWrite(instruction.Opcode);
                 if (bufferMemory.ScalarResource >= ScalarRegisterCount - 3)
                 {
@@ -269,8 +396,39 @@ internal static class Gen5ShaderScalarEvaluator
 
                 if (bufferDescriptor.BaseAddress == 0)
                 {
-                    error = $"buffer-address-null pc=0x{instruction.Pc:X}";
-                    return false;
+                    // A descriptor in a sibling block can be null for this
+                    // invocation even though the GPU branch never executes the
+                    // memory instruction. Vulkan still requires a descriptor
+                    // for the statically present block, so bind a bounded zero
+                    // buffer to this exact PC. It is never reused for another
+                    // resource register or instruction.
+                    var nullKey = (bufferMemory.ScalarResource, 0UL);
+                    if (globalMemoryByAddress.TryGetValue(nullKey, out var nullBinding))
+                    {
+                        nullBinding.Writable |= writable;
+                        if (nullBinding.InstructionPcs is List<uint> nullInstructionPcs &&
+                            !nullInstructionPcs.Contains(instruction.Pc))
+                        {
+                            nullInstructionPcs.Add(instruction.Pc);
+                        }
+                    }
+                    else
+                    {
+                        var binding = new Gen5GlobalMemoryBinding(
+                            bufferMemory.ScalarResource,
+                            0,
+                            new List<uint> { instruction.Pc },
+                            new byte[sizeof(uint)],
+                            sizeof(uint),
+                            DataPooled: false)
+                        {
+                            Writable = writable,
+                        };
+                        globalMemoryByAddress.Add(nullKey, binding);
+                        globalMemoryBindings.Add(binding);
+                    }
+
+                    continue;
                 }
 
                 if (resolveVertexInputs &&
@@ -315,7 +473,8 @@ internal static class Gen5ShaderScalarEvaluator
                 if (globalMemoryByAddress.TryGetValue(key, out var existingBinding))
                 {
                     existingBinding.Writable |= writable;
-                    if (existingBinding.InstructionPcs is List<uint> instructionPcs)
+                    if (existingBinding.InstructionPcs is List<uint> instructionPcs &&
+                        !instructionPcs.Contains(instruction.Pc))
                     {
                         instructionPcs.Add(instruction.Pc);
                     }
@@ -374,7 +533,12 @@ internal static class Gen5ShaderScalarEvaluator
                 continue;
             }
 
-            if (instruction.Control is not Gen5ImageControl image)
+                if (instruction.Control is not Gen5ImageControl image)
+                {
+                continue;
+            }
+
+            if (path.Supplemental && resolvedImageByPc.ContainsKey(instruction.Pc))
             {
                 continue;
             }
@@ -401,25 +565,55 @@ internal static class Gen5ShaderScalarEvaluator
                 return false;
             }
 
-            resolved.Add(new Gen5ImageBinding(
-                instruction.Pc,
-                instruction.Opcode,
-                image,
-                resourceDescriptor,
-                samplerDescriptor,
-                instruction.Opcode is "ImageLoadMip" or "ImageStoreMip" &&
-                TryResolveVectorConstantBefore(
-                    state.Program,
+                var imageBinding = new Gen5ImageBinding(
                     instruction.Pc,
-                    image.GetAddressRegister(2),
-                    out var mipLevel)
-                    ? mipLevel
-                    : null));
+                    instruction.Opcode,
+                    image,
+                    resourceDescriptor,
+                    samplerDescriptor,
+                    instruction.Opcode is "ImageLoadMip" or "ImageStoreMip" &&
+                    TryResolveVectorConstantBefore(
+                        state.Program,
+                        instruction.Pc,
+                        image.GetAddressRegister(2),
+                        out var mipLevel)
+                        ? mipLevel
+                        : null);
+                if (resolvedImageByPc.TryGetValue(instruction.Pc, out var existingIndex))
+                {
+                    var existing = resolved[existingIndex];
+                    var existingNull = existing.ResourceDescriptor.All(static word => word == 0);
+                    var candidateNull = resourceDescriptor.All(static word => word == 0);
+                    if (existingNull && !candidateNull)
+                    {
+                        resolved[existingIndex] = imageBinding;
+                    }
+                    else if (!candidateNull &&
+                             (!existing.ResourceDescriptor.SequenceEqual(resourceDescriptor) ||
+                              !existing.SamplerDescriptor.SequenceEqual(samplerDescriptor)))
+                    {
+                        error =
+                            $"dynamic-image-descriptor pc=0x{instruction.Pc:X} " +
+                            $"s{image.ScalarResource}/s{image.ScalarSampler}";
+                        return false;
+                    }
+                }
+                else
+                {
+                    resolvedImageByPc.Add(instruction.Pc, resolved.Count);
+                    resolved.Add(imageBinding);
+                }
+            }
+
+            if (!path.Supplemental)
+            {
+                finalScalarRegisters = (uint[])scalarRegisters.Clone();
+            }
         }
 
         evaluation = new Gen5ShaderEvaluation(
             initialScalarRegisters,
-            scalarRegisters,
+            finalScalarRegisters,
             resolved,
             globalMemoryBindings,
             state.ComputeSystemRegisters,
@@ -433,6 +627,11 @@ internal static class Gen5ShaderScalarEvaluator
         opcode.StartsWith("TBufferStore", StringComparison.Ordinal) ||
         opcode.StartsWith("BufferAtomic", StringComparison.Ordinal) ||
         opcode.StartsWith("TBufferAtomic", StringComparison.Ordinal);
+
+    private static bool HasGlobalMemoryBindingForPc(
+        IReadOnlyList<Gen5GlobalMemoryBinding> bindings,
+        uint pc) =>
+        bindings.Any(binding => binding.InstructionPcs.Contains(pc));
 
     private static bool TryCreateVertexInputBinding(
         Gen5ShaderInstruction instruction,
@@ -1314,6 +1513,7 @@ internal static class Gen5ShaderScalarEvaluator
         List<Gen5GlobalMemoryBinding> globalMemoryBindings,
         Dictionary<(uint ScalarAddress, ulong BaseAddress), Gen5GlobalMemoryBinding> globalMemoryByAddress,
         IReadOnlySet<uint> runtimeScalarRegisters,
+        bool recordBinding,
         out string error)
     {
         error = string.Empty;
@@ -1361,14 +1561,18 @@ internal static class Gen5ShaderScalarEvaluator
               scalarRegisters[scalarBase.Value + 2] == 0 &&
               scalarRegisters[scalarBase.Value + 3] == 0));
         var bufferSize = ulong.MaxValue;
-        if (isBufferLoad)
+        if (recordBinding && isBufferLoad)
         {
             bufferSize = hasBufferDescriptor ? bufferDescriptor.SizeBytes : ulong.MaxValue;
 
             var key = (scalarBase.Value, bufferDescriptor.BaseAddress);
             if (globalMemoryByAddress.TryGetValue(key, out var existingBinding))
             {
-                if (existingBinding.InstructionPcs is List<uint> instructionPcs) instructionPcs.Add(instruction.Pc);
+                if (existingBinding.InstructionPcs is List<uint> instructionPcs &&
+                    !instructionPcs.Contains(instruction.Pc))
+                {
+                    instructionPcs.Add(instruction.Pc);
+                }
             }
             else
             {
@@ -1389,12 +1593,13 @@ internal static class Gen5ShaderScalarEvaluator
                 globalMemoryBindings.Add(binding);
             }
         }
-        else if (baseAddress != 0)
+        else if (recordBinding && baseAddress != 0)
         {
             var key = (scalarBase.Value, baseAddress);
             if (globalMemoryByAddress.TryGetValue(key, out var existingBinding))
             {
-                if (existingBinding.InstructionPcs is List<uint> instructionPcs)
+                if (existingBinding.InstructionPcs is List<uint> instructionPcs &&
+                    !instructionPcs.Contains(instruction.Pc))
                 {
                     instructionPcs.Add(instruction.Pc);
                 }
