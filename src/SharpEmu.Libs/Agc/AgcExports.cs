@@ -5452,9 +5452,12 @@ public static class AgcExports
         var localSizeX = GetComputeLocalSize(state.ShRegisters, ComputeNumThreadX);
         var localSizeY = GetComputeLocalSize(state.ShRegisters, ComputeNumThreadY);
         var localSizeZ = GetComputeLocalSize(state.ShRegisters, ComputeNumThreadZ);
+        var writesGlobalMemory = shaderState.Program.Instructions.Any(static instruction =>
+            instruction.Opcode.StartsWith("BufferStore", StringComparison.Ordinal) ||
+            instruction.Opcode.StartsWith("TBufferStore", StringComparison.Ordinal));
         var gpuDispatch = false;
         var computeError = string.Empty;
-        if (hasStorageBinding &&
+        if ((hasStorageBinding || writesGlobalMemory) &&
             (ulong)localSizeX * localSizeY * localSizeZ <= 1024)
         {
             var shaderKey = (
@@ -5508,7 +5511,8 @@ public static class AgcExports
                     globalMemoryBuffers,
                     dispatch.GroupCountX,
                     dispatch.GroupCountY,
-                    dispatch.GroupCountZ);
+                    dispatch.GroupCountZ,
+                    writesGlobalMemory);
                 gpuDispatch = true;
             }
         }
@@ -5519,13 +5523,26 @@ public static class AgcExports
         {
             if (_tracedComputeShaders.Add(shaderAddress))
             {
+                var globalBuffers = evaluation.GlobalMemoryBindings.Count == 0
+                    ? string.Empty
+                    : $" global_buffers=[{string.Join(',', evaluation.GlobalMemoryBindings.Select(
+                        binding => $"0x{binding.BaseAddress:X16}:{binding.DataLength}"))}]";
+                var opcodes = string.Join(
+                    ',',
+                    shaderState.Program.Instructions
+                        .Select(instruction => instruction.Opcode)
+                        .Distinct()
+                        .Take(48));
                 TraceAgcShader(
                     $"agc.compute_shader cs=0x{shaderAddress:X16} " +
                     $"groups={dispatch.GroupCountX}x{dispatch.GroupCountY}x{dispatch.GroupCountZ} " +
                     $"local={localSizeX}x{localSizeY}x{localSizeZ} " +
                     $"sys={DescribeComputeSystemRegisters(computeSystemRegisters)} " +
-                    $"gpu={gpuDispatch} blits={blitCount}" +
+                    $"gpu={gpuDispatch} blits={blitCount} globals={evaluation.GlobalMemoryBindings.Count} " +
+                    $"global_writes={writesGlobalMemory}" +
                     (computeError.Length == 0 ? string.Empty : $" error={computeError}") +
+                    globalBuffers +
+                    $" opcodes=[{opcodes}]" +
                     $" bindings=[{string.Join(',', descriptions)}]");
             }
         }

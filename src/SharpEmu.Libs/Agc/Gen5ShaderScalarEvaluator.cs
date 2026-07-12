@@ -24,6 +24,15 @@ internal static class Gen5ShaderScalarEvaluator
             "1",
             StringComparison.Ordinal);
 
+    // A stale buffer descriptor should not discard an otherwise valid shader
+    // pass.  Treat it as an all-zero buffer by default; callers that need
+    // strict diagnostics can restore the old failure behaviour explicitly.
+    private static readonly bool _strictBufferLoad =
+        string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_STRICT_BUFFER_LOAD"),
+            "1",
+            StringComparison.Ordinal);
+
     private const int ScalarRegisterCount = 256;
     private const int ImageDescriptorDwords = 8;
     private const int SamplerDescriptorDwords = 4;
@@ -311,6 +320,7 @@ internal static class Gen5ShaderScalarEvaluator
                 }
                 else
                 {
+                    var dataPooled = true;
                     if (!TryReadGlobalMemory(
                             ctx,
                             bufferDescriptor.BaseAddress,
@@ -322,13 +332,27 @@ internal static class Gen5ShaderScalarEvaluator
                             ':',
                             Enumerable.Range(0, 4).Select(index =>
                                 $"{scalarRegisters[bufferMemory.ScalarResource + (uint)index]:X8}"));
-                        error =
-                            $"buffer-memory-read-failed pc=0x{instruction.Pc:X} " +
-                            $"address=0x{bufferDescriptor.BaseAddress:X16} " +
-                            $"bytes={bufferDescriptor.SizeBytes} " +
-                            $"stride={bufferDescriptor.Stride} records={bufferDescriptor.NumRecords} " +
-                            $"s{bufferMemory.ScalarResource}=[{descriptorWords}]";
-                        return false;
+                        if (_strictBufferLoad)
+                        {
+                            error =
+                                $"buffer-memory-read-failed pc=0x{instruction.Pc:X} " +
+                                $"address=0x{bufferDescriptor.BaseAddress:X16} " +
+                                $"bytes={bufferDescriptor.SizeBytes} " +
+                                $"stride={bufferDescriptor.Stride} records={bufferDescriptor.NumRecords} " +
+                                $"s{bufferMemory.ScalarResource}=[{descriptorWords}]";
+                            return false;
+                        }
+
+                        dataLength = checked((int)Math.Min(
+                            bufferDescriptor.SizeBytes,
+                            (ulong)MaxGlobalMemoryBindingBytes));
+                        data = new byte[Math.Max(dataLength, sizeof(uint))];
+                        dataLength = data.Length;
+                        dataPooled = false;
+                        Console.Error.WriteLine(
+                            $"[LOADER][WARN] AGC buffer read unavailable; using zero buffer " +
+                            $"pc=0x{instruction.Pc:X} address=0x{bufferDescriptor.BaseAddress:X16} " +
+                            $"bytes={bufferDescriptor.SizeBytes} s{bufferMemory.ScalarResource}=[{descriptorWords}]");
                     }
 
                     var binding = new Gen5GlobalMemoryBinding(
@@ -337,7 +361,7 @@ internal static class Gen5ShaderScalarEvaluator
                         new List<uint> { instruction.Pc },
                         data,
                         dataLength,
-                        DataPooled: true);
+                        DataPooled: dataPooled);
                     globalMemoryByAddress.Add(key, binding);
                     globalMemoryBindings.Add(binding);
                 }

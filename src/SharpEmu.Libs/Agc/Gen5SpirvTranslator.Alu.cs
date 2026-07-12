@@ -317,6 +317,7 @@ internal static partial class Gen5SpirvTranslator
                     result = EmitIntegerBinary(instruction, SpirvOp.IAdd);
                     break;
                 case "VAddcU32":
+                case "VAddCoCiU32":
                     result = EmitAddWithCarry(instruction);
                     break;
                 case "VSubI32":
@@ -367,6 +368,91 @@ internal static partial class Gen5SpirvTranslator
                         ShiftRightLogical64(
                             product,
                             _module.Constant64(_ulongType, 32)));
+                    break;
+                }
+                case "VMulHiI32":
+                {
+                    var wideLeft = _module.AddInstruction(
+                        SpirvOp.SConvert,
+                        _longType,
+                        Bitcast(_intType, GetRawSource(instruction, 0)));
+                    var wideRight = _module.AddInstruction(
+                        SpirvOp.SConvert,
+                        _longType,
+                        Bitcast(_intType, GetRawSource(instruction, 1)));
+                    var product = _module.AddInstruction(
+                        SpirvOp.IMul,
+                        _longType,
+                        wideLeft,
+                        wideRight);
+                    result = Bitcast(
+                        _uintType,
+                        _module.AddInstruction(
+                            SpirvOp.SConvert,
+                            _intType,
+                            _module.AddInstruction(
+                                SpirvOp.ShiftRightArithmetic,
+                                _longType,
+                                product,
+                                _module.Constant64(_longType, 32))));
+                    break;
+                }
+                case "VBcntU32B32":
+                    result = IAdd(
+                        _module.AddInstruction(
+                            SpirvOp.BitCount,
+                            _uintType,
+                            GetRawSource(instruction, 0)),
+                        GetRawSource(instruction, 1));
+                    break;
+                case "VMbcntHiU32B32":
+                {
+                    var countedBits = _module.AddInstruction(
+                        SpirvOp.BitCount,
+                        _uintType,
+                        GetRawSource(instruction, 0));
+                    var isUpperHalf = _module.AddInstruction(
+                        SpirvOp.UGreaterThanEqual,
+                        _boolType,
+                        Load(_uintType, _subgroupInvocationIdInput),
+                        UInt(32));
+                    result = IAdd(
+                        GetRawSource(instruction, 1),
+                        _module.AddInstruction(
+                            SpirvOp.Select,
+                            _uintType,
+                            isUpperHalf,
+                            countedBits,
+                            UInt(0)));
+                    break;
+                }
+                case "VMbcntLoU32B32":
+                {
+                    var lane = BitwiseAnd(
+                        Load(_uintType, _subgroupInvocationIdInput),
+                        UInt(31));
+                    var lowBitsMask = _module.AddInstruction(
+                        SpirvOp.ISub,
+                        _uintType,
+                        ShiftLeftLogical(UInt(1), lane),
+                        UInt(1));
+                    result = IAdd(
+                        GetRawSource(instruction, 1),
+                        _module.AddInstruction(
+                            SpirvOp.BitCount,
+                            _uintType,
+                            BitwiseAnd(GetRawSource(instruction, 0), lowBitsMask)));
+                    break;
+                }
+                case "VBfmB32":
+                {
+                    var width = BitwiseAnd(GetRawSource(instruction, 0), UInt(31));
+                    var lowMask = _module.AddInstruction(
+                        SpirvOp.ISub,
+                        _uintType,
+                        ShiftLeftLogical(UInt(1), width),
+                        UInt(1));
+                    result = ShiftLeftLogical(lowMask, GetRawSource(instruction, 1));
                     break;
                 }
                 case "VMadU32U24":
@@ -636,6 +722,50 @@ internal static partial class Gen5SpirvTranslator
                         left,
                         right);
                     StoreCarryOut(instruction, borrow);
+                    break;
+                }
+                case "VMadU64U32":
+                {
+                    // V_MAD_U64_U32 writes a 64-bit VGPR pair. The first two
+                    // sources are 32-bit factors; the third is a 64-bit addend
+                    // held in a VGPR or SGPR pair. Its SDST receives the carry
+                    // mask for the unsigned 64-bit addition.
+                    var wideLeft = _module.AddInstruction(
+                        SpirvOp.UConvert,
+                        _ulongType,
+                        GetRawSource(instruction, 0));
+                    var wideRight = _module.AddInstruction(
+                        SpirvOp.UConvert,
+                        _ulongType,
+                        GetRawSource(instruction, 1));
+                    var product = _module.AddInstruction(
+                        SpirvOp.IMul,
+                        _ulongType,
+                        wideLeft,
+                        wideRight);
+                    var addend = GetRawSource64(instruction, 2);
+                    var wideResult = _module.AddInstruction(
+                        SpirvOp.IAdd,
+                        _ulongType,
+                        product,
+                        addend);
+                    var carry = _module.AddInstruction(
+                        SpirvOp.ULessThan,
+                        _boolType,
+                        wideResult,
+                        addend);
+                    result = _module.AddInstruction(
+                        SpirvOp.UConvert,
+                        _uintType,
+                        wideResult);
+                    var high = _module.AddInstruction(
+                        SpirvOp.UConvert,
+                        _uintType,
+                        ShiftRightLogical64(
+                            wideResult,
+                            _module.Constant64(_ulongType, 32)));
+                    StoreV(destination + 1, high);
+                    StoreCarryOut(instruction, carry);
                     break;
                 }
                 case "VBfeU32":
@@ -1109,6 +1239,21 @@ internal static partial class Gen5SpirvTranslator
                                 left,
                                 right);
                             break;
+                        case "SMulHiU32":
+                        {
+                            var product = _module.AddInstruction(
+                                SpirvOp.IMul,
+                                _ulongType,
+                                _module.AddInstruction(SpirvOp.UConvert, _ulongType, left),
+                                _module.AddInstruction(SpirvOp.UConvert, _ulongType, right));
+                            result = _module.AddInstruction(
+                                SpirvOp.UConvert,
+                                _uintType,
+                                ShiftRightLogical64(
+                                    product,
+                                    _module.Constant64(_ulongType, 32)));
+                            break;
+                        }
                         case "SAndB32":
                             result = BitwiseAnd(left, right);
                             Store(_scc, IsNotZero(result));
@@ -1802,6 +1947,26 @@ internal static partial class Gen5SpirvTranslator
             if (operand.Kind == Gen5OperandKind.ScalarRegister)
             {
                 return LoadS64(operand.Value);
+            }
+
+            if (operand.Kind == Gen5OperandKind.VectorRegister)
+            {
+                var vectorLow = _module.AddInstruction(
+                    SpirvOp.UConvert,
+                    _ulongType,
+                    LoadV(operand.Value));
+                var high = _module.AddInstruction(
+                    SpirvOp.UConvert,
+                    _ulongType,
+                    LoadV(operand.Value + 1));
+                high = ShiftLeftLogical64(
+                    high,
+                    _module.Constant64(_ulongType, 32));
+                return _module.AddInstruction(
+                    SpirvOp.BitwiseOr,
+                    _ulongType,
+                    vectorLow,
+                    high);
             }
 
             var low = GetRawSource(instruction, sourceIndex);

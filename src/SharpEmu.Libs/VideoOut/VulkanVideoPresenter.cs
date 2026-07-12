@@ -182,7 +182,8 @@ internal sealed record VulkanComputeGuestDispatch(
     IReadOnlyList<VulkanGuestMemoryBuffer> GlobalMemoryBuffers,
     uint GroupCountX,
     uint GroupCountY,
-    uint GroupCountZ);
+    uint GroupCountZ,
+    bool WritesGlobalMemory);
 
 internal static unsafe class VulkanVideoPresenter
 {
@@ -704,13 +705,15 @@ internal static unsafe class VulkanVideoPresenter
         IReadOnlyList<VulkanGuestMemoryBuffer> globalMemoryBuffers,
         uint groupCountX,
         uint groupCountY,
-        uint groupCountZ)
+        uint groupCountZ,
+        bool writesGlobalMemory)
     {
         if (computeSpirv.Length == 0 ||
             groupCountX == 0 ||
             groupCountY == 0 ||
             groupCountZ == 0 ||
-            textures.All(texture => !texture.IsStorage))
+            textures.All(texture => !texture.IsStorage) &&
+            !writesGlobalMemory)
         {
             return;
         }
@@ -730,7 +733,8 @@ internal static unsafe class VulkanVideoPresenter
                     globalMemoryBuffers.ToArray(),
                     groupCountX,
                     groupCountY,
-                    groupCountZ));
+                    groupCountZ,
+                    writesGlobalMemory));
         }
     }
 
@@ -759,7 +763,12 @@ internal static unsafe class VulkanVideoPresenter
                 sequence,
                 GuestDrawKind.None,
                 TranslatedDraw: null,
-                RequiredGuestWorkSequence: 0,
+                // The AGC flip can be emitted immediately after queuing the
+                // render work that creates this image. Do not present it until
+                // that work has run on the render thread; otherwise the image
+                // has not reached _guestImages yet and every frame is dropped
+                // as an uninitialized black buffer.
+                RequiredGuestWorkSequence: _enqueuedGuestWorkSequence,
                 IsSplash: false,
                 GuestImageAddress: address);
         }
@@ -1407,8 +1416,10 @@ internal static unsafe class VulkanVideoPresenter
 
         private sealed class GlobalBufferResource
         {
+            public ulong BaseAddress;
             public VkBuffer Buffer;
             public DeviceMemory Memory;
+            public nint Mapped;
             public ulong Size;
         }
 
@@ -1485,7 +1496,14 @@ internal static unsafe class VulkanVideoPresenter
             _window = Window.Create(options);
             _window.Load += Initialize;
             _window.Render += Render;
-            _window.Closing += DisposeVulkan;
+            _window.Closing += () =>
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][WARN] Vulkan VideoOut window closing; " +
+                    $"requested={Volatile.Read(ref _presenterCloseRequested)} " +
+                    $"deviceLost={_deviceLost}");
+                DisposeVulkan();
+            };
         }
 
         public void Run() => _window.Run();
@@ -4778,8 +4796,12 @@ internal static unsafe class VulkanVideoPresenter
 
             return new GlobalBufferResource
             {
+                BaseAddress = guestBuffer.BaseAddress,
                 Buffer = buffer,
                 Memory = memory,
+                Mapped = _hostBufferAllocations.TryGetValue(buffer.Handle, out var allocation)
+                    ? allocation.Mapped
+                    : 0,
                 Size = size,
             };
         }
@@ -5474,6 +5496,44 @@ internal static unsafe class VulkanVideoPresenter
                 return;
             }
 
+            // MoltenVK on Apple GPUs has no buffer-robustness support.  A
+            // global-memory-only kernel is therefore unsafe until its guest
+            // buffer bounds are modelled precisely: a large clear/initialise
+            // dispatch can index past our conservative host mirror and fault
+            // the whole Metal command buffer.  These huge kernels only touch
+            // guest buffers (no image result is consumed by the renderer), so
+            // keep the zero-initialised guest memory instead of risking a
+            // device loss that turns the title screen permanently black.
+            var globalOnlyWorkgroups =
+                (ulong)work.GroupCountX * work.GroupCountY * work.GroupCountZ;
+            if (work.WritesGlobalMemory &&
+                work.Textures.Count == 0 &&
+                globalOnlyWorkgroups >= 1_000_000)
+            {
+                // The startup clear uses 64-lane groups and a 16 MiB mapped
+                // guest buffer.  Run the first 65,536 groups (4,194,304
+                // lanes) so it covers that mapped range, but never submit the
+                // malformed multi-million/billion-group tail to Metal.
+                if (work.GroupCountY == 1 &&
+                    work.GroupCountZ == 1 &&
+                    work.GroupCountX < 1_000_000_000)
+                {
+                    const uint safeWorkgroupCount = 65_536;
+                    var cappedCount = Math.Min(work.GroupCountX, safeWorkgroupCount);
+                    TraceVulkanShader(
+                        $"vk.compute_cap_unsafe_global cs=0x{work.ShaderAddress:X16} " +
+                        $"groups={work.GroupCountX}x1x1 capped={cappedCount}x1x1");
+                    work = work with { GroupCountX = cappedCount };
+                }
+                else
+                {
+                    TraceVulkanShader(
+                        $"vk.compute_skip_unsafe_global cs=0x{work.ShaderAddress:X16} " +
+                        $"groups={work.GroupCountX}x{work.GroupCountY}x{work.GroupCountZ}");
+                    return;
+                }
+            }
+
             if (_skipAllCompute ||
                 AddressListContains("SHARPEMU_SKIP_COMPUTE_CS", work.ShaderAddress) ||
                 (_skipTallComputeZ > 0 && work.GroupCountZ >= _skipTallComputeZ))
@@ -5603,6 +5663,15 @@ internal static unsafe class VulkanVideoPresenter
 
                 MarkSampledImagesInitialized(resources);
                 MarkStorageImagesInitialized(resources, traceContents: false);
+                if (work.WritesGlobalMemory)
+                {
+                    // A subsequent command buffer receives a fresh Vulkan
+                    // buffer from guest memory.  Preserve compute shader
+                    // buffer stores across that boundary instead of silently
+                    // discarding them when this dispatch is retired.
+                    Check(_vk.QueueWaitIdle(_queue), "vkQueueWaitIdle(compute global writeback)");
+                    WriteBackGlobalBuffers(resources);
+                }
                 TraceVulkanShader(
                     $"vk.compute_dispatch groups={work.GroupCountX}x" +
                     $"{work.GroupCountY}x{work.GroupCountZ} " +
@@ -5647,6 +5716,31 @@ internal static unsafe class VulkanVideoPresenter
                         DestroyTranslatedDrawResources(resources);
                     }
                 }
+            }
+        }
+
+        private void WriteBackGlobalBuffers(TranslatedDrawResources resources)
+        {
+            var memory = _guestMemory;
+            if (memory is null)
+            {
+                return;
+            }
+
+            foreach (var globalBuffer in resources.GlobalMemoryBuffers)
+            {
+                if (globalBuffer.BaseAddress == 0 ||
+                    globalBuffer.Mapped == 0 ||
+                    globalBuffer.Size == 0 ||
+                    globalBuffer.Size > int.MaxValue)
+                {
+                    continue;
+                }
+
+                var bytes = new ReadOnlySpan<byte>(
+                    (void*)globalBuffer.Mapped,
+                    checked((int)globalBuffer.Size));
+                memory.TryWrite(globalBuffer.BaseAddress, bytes);
             }
         }
 
@@ -6678,6 +6772,7 @@ internal static unsafe class VulkanVideoPresenter
         {
             if (Volatile.Read(ref _presenterCloseRequested))
             {
+                Console.Error.WriteLine("[LOADER][WARN] Vulkan VideoOut closing on host shutdown request.");
                 _window.Close();
                 return;
             }

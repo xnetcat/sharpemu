@@ -170,6 +170,7 @@ internal static partial class Gen5SpirvTranslator
         private uint _programActive;
         private uint _iterationGuard;
         private uint _globalBuffers;
+        private uint _storageBlockPointer;
         private uint _storageUintPointer;
         private uint _lds;
         private uint _ldsElementPointer;
@@ -545,6 +546,8 @@ internal static partial class Gen5SpirvTranslator
                 (uint)_totalGlobalBufferCount);
             var descriptorsPointer =
                 _module.TypePointer(SpirvStorageClass.StorageBuffer, descriptors);
+            _storageBlockPointer =
+                _module.TypePointer(SpirvStorageClass.StorageBuffer, block);
             _storageUintPointer =
                 _module.TypePointer(SpirvStorageClass.StorageBuffer, _uintType);
             _globalBuffers = _module.AddGlobalVariable(
@@ -1580,27 +1583,34 @@ internal static partial class Gen5SpirvTranslator
                 _module.AddInstruction(SpirvOp.IMul, _uintType, vectorIndex, stride));
             var dwordAddress = ShiftRightLogical(byteAddress, UInt(2));
 
-            if (instruction.Opcode == "BufferAtomicAdd")
+            if (instruction.Opcode is "BufferAtomicAdd" or "BufferAtomicUMax")
             {
                 EmitExecConditional(() =>
                 {
-                    var original = _module.AddInstruction(
-                        SpirvOp.AtomicIAdd,
-                        _uintType,
-                        BufferWordPointer(bindingIndex, dwordAddress),
-                        UInt(1),
-                        UInt(0x48),
-                        LoadV(control.VectorData));
-                    if (control.Glc)
+                    var inRange = IsBufferWordInRange(bindingIndex, dwordAddress);
+                    EmitConditional(inRange, () =>
                     {
-                        StoreV(control.VectorData, original);
-                    }
+                        var original = _module.AddInstruction(
+                            instruction.Opcode == "BufferAtomicAdd"
+                                ? SpirvOp.AtomicIAdd
+                                : SpirvOp.AtomicUMax,
+                            _uintType,
+                            BufferWordPointer(bindingIndex, dwordAddress),
+                            UInt(1),
+                            UInt(0x48),
+                            LoadV(control.VectorData));
+                        if (control.Glc)
+                        {
+                            StoreV(control.VectorData, original);
+                        }
+                    });
                 });
 
                 return true;
             }
 
-            if (instruction.Opcode.StartsWith("BufferStoreDword", StringComparison.Ordinal))
+            if (instruction.Opcode.StartsWith("BufferStoreDword", StringComparison.Ordinal) ||
+                instruction.Opcode.StartsWith("BufferStoreFormat", StringComparison.Ordinal))
             {
                 EmitExecConditional(() =>
                 {
@@ -2395,14 +2405,46 @@ internal static partial class Gen5SpirvTranslator
 
         private uint LoadBufferWord(int binding, uint dwordAddress)
         {
-            var pointer = BufferWordPointer(binding, dwordAddress);
-            return Load(_uintType, pointer);
+            var inRange = IsBufferWordInRange(binding, dwordAddress);
+            var safeAddress = _module.AddInstruction(
+                SpirvOp.Select,
+                _uintType,
+                inRange,
+                dwordAddress,
+                UInt(0));
+            var value = Load(_uintType, BufferWordPointer(binding, safeAddress));
+            return _module.AddInstruction(
+                SpirvOp.Select,
+                _uintType,
+                inRange,
+                value,
+                UInt(0));
         }
 
         private void StoreBufferWord(int binding, uint dwordAddress, uint value)
         {
-            var pointer = BufferWordPointer(binding, dwordAddress);
-            Store(pointer, value);
+            EmitConditional(
+                IsBufferWordInRange(binding, dwordAddress),
+                () => Store(BufferWordPointer(binding, dwordAddress), value));
+        }
+
+        private uint IsBufferWordInRange(int binding, uint dwordAddress)
+        {
+            var buffer = _module.AddInstruction(
+                SpirvOp.AccessChain,
+                _storageBlockPointer,
+                _globalBuffers,
+                UInt((uint)binding));
+            var length = _module.AddInstruction(
+                SpirvOp.ArrayLength,
+                _uintType,
+                buffer,
+                0);
+            return _module.AddInstruction(
+                SpirvOp.ULessThan,
+                _boolType,
+                dwordAddress,
+                length);
         }
 
         private uint BufferWordPointer(int binding, uint dwordAddress) =>
@@ -2595,13 +2637,18 @@ internal static partial class Gen5SpirvTranslator
 
         private void EmitExecConditional(Action emit)
         {
+            var active = Load(_boolType, _exec);
+            EmitConditional(active, emit);
+        }
+
+        private void EmitConditional(uint condition, Action emit)
+        {
             var activeLabel = _module.AllocateId();
             var mergeLabel = _module.AllocateId();
-            var active = Load(_boolType, _exec);
             _module.AddStatement(SpirvOp.SelectionMerge, mergeLabel, 0);
             _module.AddStatement(
                 SpirvOp.BranchConditional,
-                active,
+                condition,
                 activeLabel,
                 mergeLabel);
             _module.AddLabel(activeLabel);
@@ -2629,7 +2676,10 @@ internal static partial class Gen5SpirvTranslator
 
         private bool UsesSubgroupOperations() =>
             _stage == Gen5SpirvStage.Compute &&
-            (UsesSubgroupShuffle() || UsesWaveControl());
+            (UsesSubgroupShuffle() ||
+             UsesWaveControl() ||
+             _state.Program.Instructions.Any(static instruction =>
+                 instruction.Opcode is "VMbcntLoU32B32" or "VMbcntHiU32B32"));
 
         private static bool IsWaveMaskOperand(Gen5Operand operand) =>
             operand.Kind == Gen5OperandKind.ScalarRegister &&

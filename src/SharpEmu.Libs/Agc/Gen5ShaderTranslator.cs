@@ -924,9 +924,11 @@ internal static class Gen5ShaderTranslator
         name = isVop3B
             ? opcode switch
             {
+                0x128 => "VAddCoCiU32",
                 0x30F => "VAddCoU32",
                 0x310 => "VSubCoU32",
                 0x319 => "VSubrevCoU32",
+                0x176 => "VMadU64U32",
                 _ => $"Vop3bRaw{opcode:X3}",
             }
             : opcode switch
@@ -965,6 +967,11 @@ internal static class Gen5ShaderTranslator
             0x169 => "VMulLoU32",
             0x16A => "VMulHiU32",
             0x16B => "VMulLoI32",
+            0x16C => "VMulHiI32",
+            0x363 => "VBfmB32",
+            0x364 => "VBcntU32B32",
+            0x365 => "VMbcntLoU32B32",
+            0x366 => "VMbcntHiU32B32",
             0x360 => "VMadU32U16",
             0x361 => "VMulLoU32",
             0x362 => "VLdexpF32",
@@ -983,7 +990,7 @@ internal static class Gen5ShaderTranslator
     }
 
     private static bool IsVop3BOpcode(uint opcode) =>
-        opcode is 0x16D or 0x16E or 0x176 or 0x177 or 0x30F or 0x310 or 0x319;
+        opcode is 0x128 or 0x16D or 0x16E or 0x176 or 0x177 or 0x30F or 0x310 or 0x319;
 
     private static bool DecodeRaw2(
         uint word,
@@ -1083,6 +1090,10 @@ internal static class Gen5ShaderTranslator
             0x01 => "BufferLoadFormatXy",
             0x02 => "BufferLoadFormatXyz",
             0x03 => "BufferLoadFormatXyzw",
+            0x04 => "BufferStoreFormatX",
+            0x05 => "BufferStoreFormatXy",
+            0x06 => "BufferStoreFormatXyz",
+            0x07 => "BufferStoreFormatXyzw",
             0x0C => "BufferLoadDword",
             0x0D => "BufferLoadDwordx2",
             0x0E => "BufferLoadDwordx4",
@@ -1092,6 +1103,7 @@ internal static class Gen5ShaderTranslator
             0x1E => "BufferStoreDwordx4",
             0x1F => "BufferStoreDwordx3",
             0x32 => "BufferAtomicAdd",
+            0x38 => "BufferAtomicUMax",
             _ => $"MubufRaw{opcode:X2}",
         };
         sizeDwords = (extra >> 24) == 0xFF ? 3u : 2u;
@@ -1661,6 +1673,10 @@ internal static class Gen5ShaderTranslator
                     "BufferLoadFormatXy" => 2u,
                     "BufferLoadFormatXyz" => 3u,
                     "BufferLoadFormatXyzw" => 4u,
+                    "BufferStoreFormatX" => 1u,
+                    "BufferStoreFormatXy" => 2u,
+                    "BufferStoreFormatXyz" => 3u,
+                    "BufferStoreFormatXyzw" => 4u,
                     "BufferLoadDword" => 1u,
                     "BufferLoadDwordx2" => 2u,
                     "BufferLoadDwordx3" => 3u,
@@ -1670,6 +1686,7 @@ internal static class Gen5ShaderTranslator
                     "BufferStoreDwordx3" => 3u,
                     "BufferStoreDwordx4" => 4u,
                     "BufferAtomicAdd" => 1u,
+                    "BufferAtomicUMax" => 1u,
                     _ => 0u,
                 };
                 sources =
