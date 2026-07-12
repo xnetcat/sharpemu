@@ -164,6 +164,17 @@ public sealed partial class DirectExecutionBackend
 			Console.Error.WriteLine($"[LOADER][INFO]   Code: 0x{exceptionCode:X8}");
 			Console.Error.WriteLine($"[LOADER][INFO]   Exception Address: 0x{exceptionAddress:X16}");
 			Console.Error.WriteLine($"[LOADER][INFO]   RIP: 0x{rip:X16}");
+			Console.Error.WriteLine(
+				$"[LOADER][INFO]   Host thread: managed={Environment.CurrentManagedThreadId} " +
+				$"name='{Thread.CurrentThread.Name ?? "<unnamed>"}'");
+			if (_activeGuestThreadState is { } activeGuestThread)
+			{
+				Console.Error.WriteLine(
+					$"[LOADER][INFO]   Guest thread: handle=0x{activeGuestThread.ThreadHandle:X16} " +
+					$"name='{activeGuestThread.Name}' state={activeGuestThread.State} " +
+					$"last_import={activeGuestThread.LastImportNid ?? "<none>"} " +
+					$"last_ret=0x{activeGuestThread.LastReturnRip:X16}");
+			}
 			if (TryFormatNearestRuntimeSymbol(rip, out string symbol))
 			{
 				Console.Error.WriteLine("[LOADER][INFO]   RIP symbol: " + symbol);

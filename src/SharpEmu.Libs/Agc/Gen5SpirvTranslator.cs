@@ -405,7 +405,7 @@ internal static partial class Gen5SpirvTranslator
                     _module.AddCapability(SpirvCapability.GroupNonUniformVote);
                 }
 
-                if (UsesSubgroupBroadcast())
+                if (UsesSubgroupBroadcast() || UsesWaveControl())
                 {
                     _module.AddCapability(SpirvCapability.GroupNonUniformBallot);
                 }
@@ -2624,6 +2624,26 @@ internal static partial class Gen5SpirvTranslator
                 CurrentLaneBit(),
                 _module.Constant64(_ulongType, 0));
 
+        private uint BooleanToWaveMask(uint condition)
+        {
+            if (_subgroupInvocationIdInput == 0)
+            {
+                return BooleanToLaneMask(condition);
+            }
+
+            var ballot = _module.AddInstruction(
+                SpirvOp.GroupNonUniformBallot,
+                _uvec4Type,
+                UInt(3),
+                condition);
+            var low = _module.AddInstruction(
+                SpirvOp.CompositeExtract,
+                _uintType,
+                ballot,
+                0);
+            return _module.AddInstruction(SpirvOp.UConvert, _ulongType, low);
+        }
+
         private uint IsWaveMaskActive(uint mask) =>
             _subgroupInvocationIdInput == 0
                 ? IsNotZero64(mask)
@@ -2638,7 +2658,7 @@ internal static partial class Gen5SpirvTranslator
                     CurrentLaneBit()));
 
         private void StoreWaveMask(uint register, uint condition) =>
-            StoreS64(register, BooleanToLaneMask(condition));
+            StoreS64(register, BooleanToWaveMask(condition));
 
         private void EmitExecConditional(Action emit)
         {
