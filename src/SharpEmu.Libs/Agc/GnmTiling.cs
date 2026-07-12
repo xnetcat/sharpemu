@@ -58,6 +58,57 @@ internal static class GnmTiling
     public static bool NeedsDetile(uint swizzleMode) => ShouldDetile(swizzleMode);
 
     /// <summary>
+    /// Gets the physical byte span occupied by a tiled mip. GNM allocates whole
+    /// swizzle blocks even when the logical image is much smaller than a block;
+    /// reading only the logical texel count truncates most source offsets during
+    /// detiling (a 64x64 BC1 mode-9 image is 2 KiB logically but occupies one
+    /// 64 KiB swizzle block).
+    /// </summary>
+    public static bool TryGetTiledByteCount(
+        uint swizzleMode,
+        int elementsWide,
+        int elementsHigh,
+        int bytesPerElement,
+        out ulong byteCount)
+    {
+        byteCount = 0;
+        if (!ShouldDetile(swizzleMode) ||
+            elementsWide <= 0 ||
+            elementsHigh <= 0 ||
+            bytesPerElement <= 0 ||
+            !TryGetSwizzleKind(swizzleMode, out _, out var blockBytes))
+        {
+            return false;
+        }
+
+        var bppLog2 = BitLog2((uint)bytesPerElement);
+        if (bppLog2 < 0)
+        {
+            return false;
+        }
+
+        var blockElements = blockBytes >> bppLog2;
+        var (blockWidth, blockHeight) = SquareBlockDimensions(blockElements);
+        if (blockWidth == 0 || blockHeight == 0)
+        {
+            return false;
+        }
+
+        var blocksWide = ((ulong)elementsWide + (ulong)blockWidth - 1) / (ulong)blockWidth;
+        var blocksHigh = ((ulong)elementsHigh + (ulong)blockHeight - 1) / (ulong)blockHeight;
+        try
+        {
+            byteCount = checked(blocksWide * blocksHigh * (ulong)blockBytes);
+            return true;
+        }
+        catch (OverflowException)
+        {
+            byteCount = 0;
+            return false;
+        }
+    }
+
+    /// <summary>
     /// Deswizzles <paramref name="tiled"/> into linear row-major order.
     /// Elements are pixels for uncompressed formats and 4x4 blocks for
     /// block-compressed formats, so callers pass the element grid dimensions

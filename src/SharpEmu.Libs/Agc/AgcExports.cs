@@ -4791,16 +4791,13 @@ public static class AgcExports
     /// enabled and the format is understood; returns null to keep the raw
     /// bytes (linear surfaces, unknown modes, or non-power-of-two elements).
     /// </summary>
-    private static byte[]? TryDetileTextureSource(TextureDescriptor descriptor, uint sourceWidth, byte[] source)
+    private static bool TryGetTextureElementLayout(
+        TextureDescriptor descriptor,
+        uint sourceWidth,
+        out int elementsWide,
+        out int elementsHigh,
+        out int bytesPerElement)
     {
-        if (!GnmTiling.NeedsDetile(descriptor.TileMode))
-        {
-            return null;
-        }
-
-        int elementsWide;
-        int elementsHigh;
-        int bytesPerElement;
         var blockBytes = GetBlockCompressedBlockBytes(descriptor.Format);
         if (blockBytes != 0)
         {
@@ -4813,14 +4810,36 @@ public static class AgcExports
             bytesPerElement = (int)GetTextureBytesPerTexel(descriptor.Format);
             if (bytesPerElement == 0)
             {
-                return null;
+                elementsWide = 0;
+                elementsHigh = 0;
+                return false;
             }
 
             elementsWide = (int)sourceWidth;
             elementsHigh = (int)descriptor.Height;
         }
 
-        var linear = new byte[source.Length];
+        return true;
+    }
+
+    private static byte[]? TryDetileTextureSource(
+        TextureDescriptor descriptor,
+        uint sourceWidth,
+        int logicalByteCount,
+        byte[] source)
+    {
+        if (!GnmTiling.NeedsDetile(descriptor.TileMode) ||
+            !TryGetTextureElementLayout(
+                descriptor,
+                sourceWidth,
+                out var elementsWide,
+                out var elementsHigh,
+                out var bytesPerElement))
+        {
+            return null;
+        }
+
+        var linear = new byte[logicalByteCount];
         return GnmTiling.TryDetile(
             source,
             linear,
@@ -4864,6 +4883,31 @@ public static class AgcExports
         if (sourceByteCount == 0 ||
             sourceByteCount > MaxPresentedTextureBytes ||
             sourceByteCount > int.MaxValue)
+        {
+            texture = CreateFallbackGuestDrawTexture(isStorage, descriptor.Format, descriptor.NumberType);
+            return true;
+        }
+
+        var physicalSourceByteCount = sourceByteCount;
+        if (GnmTiling.NeedsDetile(descriptor.TileMode) &&
+            TryGetTextureElementLayout(
+                descriptor,
+                sourceWidth,
+                out var elementsWide,
+                out var elementsHigh,
+                out var bytesPerElement) &&
+            GnmTiling.TryGetTiledByteCount(
+                descriptor.TileMode,
+                elementsWide,
+                elementsHigh,
+                bytesPerElement,
+                out var tiledByteCount))
+        {
+            physicalSourceByteCount = tiledByteCount;
+        }
+
+        if (physicalSourceByteCount > MaxPresentedTextureBytes ||
+            physicalSourceByteCount > int.MaxValue)
         {
             texture = CreateFallbackGuestDrawTexture(isStorage, descriptor.Format, descriptor.NumberType);
             return true;
@@ -4967,7 +5011,7 @@ public static class AgcExports
             return true;
         }
 
-        var source = new byte[(int)sourceByteCount];
+        var source = new byte[(int)physicalSourceByteCount];
         if (!ctx.Memory.TryRead(descriptor.Address, source))
         {
             texture = CreateFallbackGuestDrawTexture(isStorage, descriptor.Format, descriptor.NumberType);
@@ -4994,11 +5038,15 @@ public static class AgcExports
                 $"fmt={descriptor.Format} num={descriptor.NumberType} tile={descriptor.TileMode} " +
                 $"size={descriptor.Width}x{descriptor.Height} pitch={descriptor.Pitch} " +
                 $"dst=0x{descriptor.DstSelect:X3} " +
-                $"bytes={source.Length} nonzero64={nonZero}");
+                $"bytes={source.Length} logical_bytes={sourceByteCount} nonzero64={nonZero}");
         }
         DumpTextureSourceIfRequested(descriptor, sourceWidth, source);
 
-        var rgba = TryDetileTextureSource(descriptor, sourceWidth, source) ?? source;
+        var rgba = TryDetileTextureSource(
+            descriptor,
+            sourceWidth,
+            checked((int)sourceByteCount),
+            source) ?? source.AsSpan(0, checked((int)sourceByteCount)).ToArray();
         texture = new VulkanGuestDrawTexture(
             descriptor.Address,
             descriptor.Width,
@@ -5925,13 +5973,7 @@ public static class AgcExports
             return checked((ulong)width * height * bytesPerTexel);
         }
 
-        var blockBytes = format switch
-        {
-            169 or 170 => 8UL,
-            171 or 172 or 173 or 174 or 175 or 176 or
-            177 or 178 or 179 or 180 or 181 or 182 => 16UL,
-            _ => 0UL,
-        };
+        var blockBytes = (ulong)GetBlockCompressedBlockBytes(format);
         return blockBytes == 0
             ? 0
             : checked(((ulong)width + 3) / 4 * (((ulong)height + 3) / 4) * blockBytes);
