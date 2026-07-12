@@ -271,6 +271,13 @@ internal static unsafe class VulkanVideoPresenter
 
     private static readonly object _gate = new();
     private static readonly Queue<object> _pendingGuestWork = new();
+    // A flip names an image that was rendered earlier in the command stream.
+    // Keep a small FIFO of those flips instead of replacing an incomplete one
+    // with the next frame: the guest can enqueue the next frame before the
+    // render thread reaches the previous image, which otherwise starves
+    // presentation indefinitely.
+    private static readonly Queue<Presentation> _pendingGuestImagePresentations = new();
+    private static readonly Dictionary<ulong, long> _guestImageWorkSequences = new();
     private static readonly Dictionary<ulong, uint> _availableGuestImages = new();
     private static readonly Dictionary<ulong, byte[]> _pendingGuestImageInitialData = new();
     private static readonly Dictionary<ulong, (uint Width, uint Height)> _guestImageExtents = new();
@@ -549,7 +556,7 @@ internal static unsafe class VulkanVideoPresenter
                 _availableGuestImages[target.Address] = guestTextureFormat;
             }
 
-            EnqueueGuestWorkLocked(
+            var workSequence = EnqueueGuestWorkLocked(
                 new VulkanOffscreenGuestDraw(
                     new VulkanTranslatedGuestDraw(
                         vertexSpirv ?? [],
@@ -565,6 +572,7 @@ internal static unsafe class VulkanVideoPresenter
                         renderState ?? VulkanGuestRenderState.Default),
                     target,
                     PublishTarget: true));
+            _guestImageWorkSequences[target.Address] = workSequence;
         }
     }
 
@@ -606,7 +614,8 @@ internal static unsafe class VulkanVideoPresenter
                 return;
             }
 
-            EnqueueGuestWorkLocked(new VulkanGuestImageWrite(address, null, fillValue));
+            _guestImageWorkSequences[address] = EnqueueGuestWorkLocked(
+                new VulkanGuestImageWrite(address, null, fillValue));
         }
     }
 
@@ -619,7 +628,8 @@ internal static unsafe class VulkanVideoPresenter
                 return;
             }
 
-            EnqueueGuestWorkLocked(new VulkanGuestImageWrite(address, pixels, 0));
+            _guestImageWorkSequences[address] = EnqueueGuestWorkLocked(
+                new VulkanGuestImageWrite(address, pixels, 0));
         }
     }
 
@@ -725,7 +735,7 @@ internal static unsafe class VulkanVideoPresenter
                 return;
             }
 
-            EnqueueGuestWorkLocked(
+            var workSequence = EnqueueGuestWorkLocked(
                 new VulkanComputeGuestDispatch(
                     shaderAddress,
                     computeSpirv,
@@ -735,6 +745,13 @@ internal static unsafe class VulkanVideoPresenter
                     groupCountY,
                     groupCountZ,
                     writesGlobalMemory));
+            foreach (var texture in textures)
+            {
+                if (texture.IsStorage && texture.Address != 0)
+                {
+                    _guestImageWorkSequences[texture.Address] = workSequence;
+                }
+            }
         }
     }
 
@@ -756,21 +773,31 @@ internal static unsafe class VulkanVideoPresenter
             traceSubmission =
                 _tracedGuestImageSubmissions.Add((address, width, height));
             var sequence = (_latestPresentation?.Sequence ?? 0) + 1;
-            _latestPresentation = new Presentation(
+            var requiredWorkSequence = _guestImageWorkSequences.TryGetValue(
+                address,
+                out var imageWorkSequence)
+                ? imageWorkSequence
+                : _completedGuestWorkSequence;
+            var presentation = new Presentation(
                 null,
                 width,
                 height,
                 sequence,
                 GuestDrawKind.None,
                 TranslatedDraw: null,
-                // The AGC flip can be emitted immediately after queuing the
-                // render work that creates this image. Do not present it until
-                // that work has run on the render thread; otherwise the image
-                // has not reached _guestImages yet and every frame is dropped
-                // as an uninitialized black buffer.
-                RequiredGuestWorkSequence: _enqueuedGuestWorkSequence,
+                // Wait only for the work that last wrote this image, not for
+                // every later command the guest has already queued. Requiring
+                // the global tail makes a fast guest permanently outrun the
+                // renderer and turns every flip into a dropped black frame.
+                RequiredGuestWorkSequence: requiredWorkSequence,
                 IsSplash: false,
                 GuestImageAddress: address);
+            _latestPresentation = presentation;
+            _pendingGuestImagePresentations.Enqueue(presentation);
+            while (_pendingGuestImagePresentations.Count > MaxPendingGuestWork)
+            {
+                _pendingGuestImagePresentations.Dequeue();
+            }
         }
 
         if (traceSubmission)
@@ -1139,6 +1166,29 @@ internal static unsafe class VulkanVideoPresenter
     {
         lock (_gate)
         {
+            // Guest flips are retained in submission order. The renderer is
+            // deliberately allowed to lag a frame or two behind the guest
+            // while it drains expensive work, so use the first completed flip
+            // rather than repeatedly asking only for the newest one.
+            while (_pendingGuestImagePresentations.Count > 0 &&
+                   _pendingGuestImagePresentations.Peek().Sequence <= presentedSequence)
+            {
+                _pendingGuestImagePresentations.Dequeue();
+            }
+
+            if (_pendingGuestImagePresentations.Count > 0)
+            {
+                var pending = _pendingGuestImagePresentations.Peek();
+                if (pending.RequiredGuestWorkSequence <= _completedGuestWorkSequence)
+                {
+                    presentation = _pendingGuestImagePresentations.Dequeue();
+                    return true;
+                }
+
+                presentation = default;
+                return false;
+            }
+
             if (_latestPresentation is not { } latest ||
                 latest.Sequence == presentedSequence ||
                 latest.RequiredGuestWorkSequence > _completedGuestWorkSequence)
@@ -1168,7 +1218,7 @@ internal static unsafe class VulkanVideoPresenter
 
     private static readonly HashSet<long> _tracedGuestImagePresentRejections = new();
 
-    private static void EnqueueGuestWorkLocked(object work)
+    private static long EnqueueGuestWorkLocked(object work)
     {
         while (!_closed &&
                _thread is not null &&
@@ -1179,11 +1229,11 @@ internal static unsafe class VulkanVideoPresenter
 
         if (_closed)
         {
-            return;
+            return 0;
         }
 
         _pendingGuestWork.Enqueue(work);
-        _enqueuedGuestWorkSequence++;
+        return ++_enqueuedGuestWorkSequence;
     }
 
     private static bool TryTakeGuestWork(out object work)
@@ -1315,8 +1365,11 @@ internal static unsafe class VulkanVideoPresenter
         private readonly HashSet<ulong> _tracedGuestImageContents = new();
         private readonly Dictionary<ulong, int> _tracedGuestWriteCounts = new();
         private int _tracedVertexBufferCount;
-        private readonly Dictionary<byte[], Pipeline> _computePipelines =
-            new(ReferenceEqualityComparer.Instance);
+        // Compute translation can produce an equivalent new byte array on a
+        // later submit. Reference identity turns that into an expensive new
+        // MoltenVK pipeline compilation every frame, so key the cache by the
+        // program content and descriptor-layout shape instead.
+        private readonly Dictionary<ComputePipelineKey, Pipeline> _computePipelines = new();
         private readonly Dictionary<GraphicsPipelineKey, Pipeline> _graphicsPipelines = new();
         private readonly Dictionary<VulkanGuestSampler, Sampler> _samplers = new();
         private readonly Dictionary<byte[], string> _shaderDigests =
@@ -1346,6 +1399,10 @@ internal static unsafe class VulkanVideoPresenter
 
         private readonly record struct DescriptorLayoutKey(
             ShaderStageFlags Stages,
+            string Resources);
+
+        private readonly record struct ComputePipelineKey(
+            string ShaderDigest,
             string Resources);
 
         private sealed record DescriptorLayoutBundle(
@@ -3937,7 +3994,10 @@ internal static unsafe class VulkanVideoPresenter
             TranslatedDrawResources resources,
             byte[] computeSpirv)
         {
-            if (_computePipelines.TryGetValue(computeSpirv, out var cachedPipeline))
+            var pipelineKey = new ComputePipelineKey(
+                GetShaderDigest(computeSpirv),
+                GetResourceLayoutKey(resources));
+            if (_computePipelines.TryGetValue(pipelineKey, out var cachedPipeline))
             {
                 resources.Pipeline = cachedPipeline;
                 resources.PipelineCached = true;
@@ -3978,7 +4038,7 @@ internal static unsafe class VulkanVideoPresenter
                     ObjectType.Pipeline,
                     pipeline.Handle,
                     $"SharpEmu compute cs={computeSpirv.Length}b");
-                _computePipelines.Add(computeSpirv, pipeline);
+                _computePipelines.Add(pipelineKey, pipeline);
             }
             finally
             {
