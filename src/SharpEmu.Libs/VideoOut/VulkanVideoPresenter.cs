@@ -192,7 +192,10 @@ internal sealed record VulkanComputeGuestDispatch(
     uint LocalSizeY,
     uint LocalSizeZ,
     bool IsIndirect,
-    bool WritesGlobalMemory);
+    bool WritesGlobalMemory,
+    uint ThreadCountX = uint.MaxValue,
+    uint ThreadCountY = uint.MaxValue,
+    uint ThreadCountZ = uint.MaxValue);
 
 internal sealed record VulkanOrderedGuestAction(
     Action Action,
@@ -743,7 +746,10 @@ internal static unsafe class VulkanVideoPresenter
         uint localSizeY,
         uint localSizeZ,
         bool isIndirect,
-        bool writesGlobalMemory)
+        bool writesGlobalMemory,
+        uint threadCountX = uint.MaxValue,
+        uint threadCountY = uint.MaxValue,
+        uint threadCountZ = uint.MaxValue)
     {
         if (computeSpirv.Length == 0 ||
             groupCountX == 0 ||
@@ -779,7 +785,10 @@ internal static unsafe class VulkanVideoPresenter
                     localSizeY,
                     localSizeZ,
                     isIndirect,
-                    writesGlobalMemory));
+                    writesGlobalMemory,
+                    threadCountX,
+                    threadCountY,
+                    threadCountZ));
             foreach (var texture in textures)
             {
                 if (texture.IsStorage && texture.Address != 0)
@@ -4344,6 +4353,18 @@ internal static unsafe class VulkanVideoPresenter
                 pipelineInfo.PSetLayouts = &descriptorSetLayout;
             }
 
+            var computePushConstantRange = new PushConstantRange
+            {
+                StageFlags = ShaderStageFlags.ComputeBit,
+                Offset = 0,
+                Size = 3 * sizeof(uint),
+            };
+            if ((stageFlags & ShaderStageFlags.ComputeBit) != 0)
+            {
+                pipelineInfo.PushConstantRangeCount = 1;
+                pipelineInfo.PPushConstantRanges = &computePushConstantRange;
+            }
+
             PipelineLayout pipelineLayout;
             Check(
                 _vk.CreatePipelineLayout(
@@ -6363,6 +6384,12 @@ internal static unsafe class VulkanVideoPresenter
                 var batchCount = Math.Max(
                     1u,
                     (uint)Math.Ceiling(work.GroupCountZ / (double)MaxComputeZSlicesPerSubmission));
+                var threadLimits = stackalloc uint[3]
+                {
+                    work.ThreadCountX,
+                    work.ThreadCountY,
+                    work.ThreadCountZ,
+                };
 
                 for (var batchIndex = 0u; batchIndex < batchCount; batchIndex++)
                 {
@@ -6441,6 +6468,14 @@ internal static unsafe class VulkanVideoPresenter
                             0,
                             null);
                     }
+
+                    _vk.CmdPushConstants(
+                        _commandBuffer,
+                        resources.PipelineLayout,
+                        ShaderStageFlags.ComputeBit,
+                        0,
+                        3 * sizeof(uint),
+                        threadLimits);
 
                     RecordChunkedComputeDispatch(_commandBuffer, work, zStart, zCount);
 

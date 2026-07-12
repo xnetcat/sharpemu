@@ -1717,14 +1717,7 @@ internal static class Gen5ShaderScalarEvaluator
             if (!TryReadUInt32(
                     ctx,
                     address + (ulong)(index * sizeof(uint)),
-                    out var value) &&
-                !TryReadUserDataScalarLoad(
-                    state,
-                    instruction,
-                    control,
-                    byteOffset,
-                    index,
-                    out value))
+                    out var value))
             {
                 if (isBufferLoad || !_strictScalarLoad)
                 {
@@ -1884,69 +1877,6 @@ internal static class Gen5ShaderScalarEvaluator
             : (ulong)stride * word2;
         descriptor = new BufferDescriptor(baseAddress, stride, word2, sizeBytes, numberFormat, dataFormat);
         return true;
-    }
-
-    private static bool TryReadUserDataScalarLoad(
-        Gen5ShaderState state,
-        Gen5ShaderInstruction instruction,
-        Gen5ScalarMemoryControl control,
-        ulong byteOffset,
-        int componentIndex,
-        out uint value)
-    {
-        value = 0;
-        if (!instruction.Opcode.StartsWith("SLoadDword", StringComparison.Ordinal) ||
-            state.Metadata is not { } metadata ||
-            (byteOffset & 3) != 0)
-        {
-            return false;
-        }
-
-        var baseDwordOffset = byteOffset >> 2;
-        if (baseDwordOffset > int.MaxValue)
-        {
-            return false;
-        }
-
-        var dwordOffset = (long)baseDwordOffset + componentIndex;
-        if (dwordOffset < 0 ||
-            dwordOffset >= state.UserData.Count ||
-            !IsShaderUserDataResourceOffset(metadata, (uint)dwordOffset))
-        {
-            return false;
-        }
-
-        value = state.UserData[(int)dwordOffset];
-        return true;
-    }
-
-    private static bool IsShaderUserDataResourceOffset(
-        Gen5ShaderMetadata metadata,
-        uint dwordOffset)
-    {
-        if (dwordOffset < metadata.ShaderResourceTableSizeDwords)
-        {
-            return true;
-        }
-
-        foreach (var resource in metadata.Resources)
-        {
-            var dwordCount = resource.Kind switch
-            {
-                Gen5ShaderResourceKind.ReadOnlyTexture or
-                    Gen5ShaderResourceKind.ReadWriteTexture => 8u,
-                Gen5ShaderResourceKind.Sampler or
-                    Gen5ShaderResourceKind.ConstantBuffer => 4u,
-                _ => 1u,
-            };
-            if (dwordOffset >= resource.OffsetDwords &&
-                dwordOffset < resource.OffsetDwords + dwordCount)
-            {
-                return true;
-            }
-        }
-
-        return metadata.DirectResources.Values.Any(offset => offset == dwordOffset);
     }
 
     private static string FormatScalarLoadError(

@@ -798,7 +798,13 @@ public sealed partial class DirectExecutionBackend
 			"H7uZqCoNuWk" or // sceAgcDcbPopMarker
 			"IxYiarKlXxM" or // sceAgcDmaDataPatchSetDstAddressOrOffset
 			"3KDcnM3lrcU" or // sceAgcWaitRegMemPatchAddress
+			"n485EBnIWmk" or // sceAgcWaitRegMemPatchCompareFunction
+			"7nOoijNPvEU" or // sceAgcWaitRegMemPatchReference
+			"hXAnLgDHCoI" or // sceAgcWaitRegMemPatchMask
 			"0fWWK5uG9rQ" or // sceAgcQueueEndOfPipeActionPatchAddress
+			"J8YCgfKAMQs" or // sceAgcQueueEndOfPipeActionPatchGcrCntl
+			"MlEw1feXcjg" or // sceAgcQueueEndOfPipeActionPatchData
+			"T9fjQIINoeE" or // sceAgcQueueEndOfPipeActionPatchType
 			"a8uLzYY--tM" or
 			"Qs1xtplKo0U" or
 			"GuchCTefuZw" or

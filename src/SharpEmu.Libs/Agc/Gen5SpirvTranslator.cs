@@ -215,6 +215,8 @@ internal static partial class Gen5SpirvTranslator
         private uint _localInvocationIdInput;
         private uint _localInvocationIndexInput;
         private uint _workGroupIdInput;
+        private uint _computeDispatchLimit;
+        private uint _pushConstantUintPointer;
         private uint _subgroupInvocationIdInput;
         private uint _waveMaskScratch;
         private uint _waveMaskScratchElementPointer;
@@ -574,6 +576,33 @@ internal static partial class Gen5SpirvTranslator
             DeclareLds();
             DeclareWave64Scratch();
             DeclareStageInterface();
+            DeclareComputeDispatchLimit();
+        }
+
+        private void DeclareComputeDispatchLimit()
+        {
+            if (_stage != Gen5SpirvStage.Compute)
+            {
+                return;
+            }
+
+            // RDNA DISPATCH_* can express exact thread dimensions, including
+            // a final partially populated workgroup. Vulkan dispatches whole
+            // workgroups, so the command path supplies the exact exclusive
+            // thread bounds through a small push-constant block and excess
+            // invocations are disabled before any guest instruction executes.
+            var block = _module.TypeStruct(_uvec3Type);
+            _module.AddDecoration(block, SpirvDecoration.Block);
+            _module.AddMemberDecoration(block, 0, SpirvDecoration.Offset, 0);
+            var blockPointer =
+                _module.TypePointer(SpirvStorageClass.PushConstant, block);
+            _pushConstantUintPointer =
+                _module.TypePointer(SpirvStorageClass.PushConstant, _uintType);
+            _computeDispatchLimit = _module.AddGlobalVariable(
+                blockPointer,
+                SpirvStorageClass.PushConstant);
+            _module.AddName(_computeDispatchLimit, "dispatchThreadLimit");
+            _interfaces.Add(_computeDispatchLimit);
         }
 
         private void DeclareWave64Scratch()
@@ -1110,19 +1139,57 @@ internal static partial class Gen5SpirvTranslator
             else
             {
                 var localId = Load(_uvec3Type, _localInvocationIdInput);
+                var workGroupId = Load(_uvec3Type, _workGroupIdInput);
+                var invocationInBounds = _module.ConstantBool(true);
                 for (uint component = 0; component < 3; component++)
                 {
-                    var value = _module.AddInstruction(
+                    var localComponent = _module.AddInstruction(
                         SpirvOp.CompositeExtract,
                         _uintType,
                         localId,
                         component);
-                    StoreV(component, value, guardWithExec: false);
+                    StoreV(component, localComponent, guardWithExec: false);
+
+                    var groupComponent = _module.AddInstruction(
+                        SpirvOp.CompositeExtract,
+                        _uintType,
+                        workGroupId,
+                        component);
+                    var localSize = component switch
+                    {
+                        0 => _localSizeX,
+                        1 => _localSizeY,
+                        _ => _localSizeZ,
+                    };
+                    var globalComponent = IAdd(
+                        _module.AddInstruction(
+                            SpirvOp.IMul,
+                            _uintType,
+                            groupComponent,
+                            UInt(localSize)),
+                        localComponent);
+                    var limitPointer = _module.AddInstruction(
+                        SpirvOp.AccessChain,
+                        _pushConstantUintPointer,
+                        _computeDispatchLimit,
+                        UInt(0),
+                        UInt(component));
+                    var componentInBounds = _module.AddInstruction(
+                        SpirvOp.ULessThan,
+                        _boolType,
+                        globalComponent,
+                        Load(_uintType, limitPointer));
+                    invocationInBounds = _module.AddInstruction(
+                        SpirvOp.LogicalAnd,
+                        _boolType,
+                        invocationInBounds,
+                        componentInBounds);
                 }
+
+                Store(_programActive, invocationInBounds);
 
                 if (_state.ComputeSystemRegisters is { } registers)
                 {
-                    var workGroupId = Load(_uvec3Type, _workGroupIdInput);
                     StoreComputeSystemRegister(
                         registers.WorkGroupXRegister,
                         workGroupId,

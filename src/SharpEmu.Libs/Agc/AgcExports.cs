@@ -17,6 +17,7 @@ public static class AgcExports
     {
         ValidateWriteDataControlDecoders();
         ValidateDispatchInitiators();
+        ValidateSubmittedQueueAndReleaseMemDecoders();
     }
 #endif
 
@@ -39,6 +40,7 @@ public static class AgcExports
     private const uint ItDispatchIndirect = 0x16;
     private const uint ItWaitRegMem = 0x3C;
     private const uint ItEventWrite = 0x46;
+    private const uint ItReleaseMem = 0x49;
     private const uint ItDmaData = 0x50;
     private const uint ItSetContextReg = 0x69;
     private const uint ItSetShReg = 0x76;
@@ -432,10 +434,19 @@ public static class AgcExports
         uint BaseGroupY,
         uint BaseGroupZ,
         uint WaveLaneCount,
-        bool IsIndirect);
+        bool IsIndirect,
+        uint ThreadCountX,
+        uint ThreadCountY,
+        uint ThreadCountZ);
 
     private sealed class SubmittedDcbState
     {
+        public readonly record struct PendingSubmission(
+            ulong CommandAddress,
+            uint DwordCount,
+            ulong SubmissionId,
+            bool TracePackets);
+
         public Dictionary<uint, uint> CxRegisters { get; } = new();
         public Dictionary<uint, uint> ShRegisters { get; } = new();
         public Dictionary<uint, uint> UcRegisters { get; } = new();
@@ -452,6 +463,9 @@ public static class AgcExports
         public uint DrawIndexOffset { get; set; }
         public string QueueName { get; set; } = "graphics";
         public ulong ActiveSubmissionId { get; set; }
+        public Queue<PendingSubmission> PendingSubmissions { get; } = new();
+        public bool HasActiveSubmission { get; set; }
+        public bool IsSuspended { get; set; }
     }
 
     private sealed class SubmittedGpuState
@@ -1909,6 +1923,92 @@ public static class AgcExports
     }
 
     [SysAbiExport(
+        Nid = "n485EBnIWmk",
+        ExportName = "sceAgcWaitRegMemPatchCompareFunction",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int WaitRegMemPatchCompareFunction(CpuContext ctx)
+    {
+        var commandAddress = ctx[CpuRegister.Rdi];
+        var compareFunction = (uint)ctx[CpuRegister.Rsi];
+        if (compareFunction > 7 ||
+            !TryGetPacketIdentity(ctx, commandAddress, out var op, out var register))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        var fieldOffset = op == ItWaitRegMem
+            ? 4UL
+            : op == ItNop && register == RWaitMem32
+                ? 16UL
+                : op == ItNop && register == RWaitMem64
+                    ? 28UL
+                    : 0;
+        return fieldOffset != 0 &&
+               TryPatchUInt32Bits(ctx, commandAddress + fieldOffset, 0x7u, compareFunction)
+            ? SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK)
+            : SetReturn(ctx, fieldOffset == 0
+                ? OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT
+                : OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    [SysAbiExport(
+        Nid = "7nOoijNPvEU",
+        ExportName = "sceAgcWaitRegMemPatchReference",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int WaitRegMemPatchReference(CpuContext ctx)
+    {
+        var commandAddress = ctx[CpuRegister.Rdi];
+        var reference = ctx[CpuRegister.Rsi];
+        if (!TryGetPacketIdentity(ctx, commandAddress, out var op, out var register))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        var wrote = op == ItWaitRegMem
+            ? TryWriteUInt32(ctx, commandAddress + 16, (uint)reference)
+            : op == ItNop && register == RWaitMem32
+                ? TryWriteUInt32(ctx, commandAddress + 20, (uint)reference)
+                : op == ItNop && register == RWaitMem64 &&
+                  ctx.TryWriteUInt64(commandAddress + 20, reference);
+        return wrote
+            ? SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK)
+            : SetReturn(ctx, op == ItWaitRegMem ||
+                             (op == ItNop && register is RWaitMem32 or RWaitMem64)
+                ? OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT
+                : OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+    }
+
+    [SysAbiExport(
+        Nid = "hXAnLgDHCoI",
+        ExportName = "sceAgcWaitRegMemPatchMask",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int WaitRegMemPatchMask(CpuContext ctx)
+    {
+        var commandAddress = ctx[CpuRegister.Rdi];
+        var mask = ctx[CpuRegister.Rsi];
+        if (!TryGetPacketIdentity(ctx, commandAddress, out var op, out var register))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        var wrote = op == ItWaitRegMem
+            ? TryWriteUInt32(ctx, commandAddress + 20, (uint)mask)
+            : op == ItNop && register == RWaitMem32
+                ? TryWriteUInt32(ctx, commandAddress + 12, (uint)mask)
+                : op == ItNop && register == RWaitMem64 &&
+                  ctx.TryWriteUInt64(commandAddress + 12, mask);
+        return wrote
+            ? SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK)
+            : SetReturn(ctx, op == ItWaitRegMem ||
+                             (op == ItNop && register is RWaitMem32 or RWaitMem64)
+                ? OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT
+                : OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+    }
+
+    [SysAbiExport(
         Nid = "0fWWK5uG9rQ",
         ExportName = "sceAgcQueueEndOfPipeActionPatchAddress",
         Target = Generation.Gen5,
@@ -1928,6 +2028,89 @@ public static class AgcExports
             ? SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK)
             : SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
     }
+
+    [SysAbiExport(
+        Nid = "J8YCgfKAMQs",
+        ExportName = "sceAgcQueueEndOfPipeActionPatchGcrCntl",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int QueueEndOfPipeActionPatchGcrCntl(CpuContext ctx)
+    {
+        var commandAddress = ctx[CpuRegister.Rdi];
+        if (!IsAgcReleaseMemPacket(ctx, commandAddress))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        return TryPatchUInt32Bits(
+                ctx,
+                commandAddress + 8,
+                0x0000_FFFFu,
+                (uint)ctx[CpuRegister.Rsi] & 0xFFFFu)
+            ? SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK)
+            : SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    [SysAbiExport(
+        Nid = "MlEw1feXcjg",
+        ExportName = "sceAgcQueueEndOfPipeActionPatchData",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int QueueEndOfPipeActionPatchData(CpuContext ctx)
+    {
+        var commandAddress = ctx[CpuRegister.Rdi];
+        if (!IsAgcReleaseMemPacket(ctx, commandAddress))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        return ctx.TryWriteUInt64(commandAddress + 20, ctx[CpuRegister.Rsi])
+            ? SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK)
+            : SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    [SysAbiExport(
+        Nid = "T9fjQIINoeE",
+        ExportName = "sceAgcQueueEndOfPipeActionPatchType",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int QueueEndOfPipeActionPatchType(CpuContext ctx)
+    {
+        var commandAddress = ctx[CpuRegister.Rdi];
+        var dataSelection = (uint)ctx[CpuRegister.Rsi];
+        TraceAgc(
+            $"agc.eop_patch_type cmd=0x{commandAddress:X16} value=0x{dataSelection:X8}");
+        if (dataSelection > 3 || !IsAgcReleaseMemPacket(ctx, commandAddress))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        return TryPatchUInt32Bits(
+                ctx,
+                commandAddress + 8,
+                0x00FF_0000u,
+                dataSelection << 16)
+            ? SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK)
+            : SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    private static bool IsAgcReleaseMemPacket(CpuContext ctx, ulong commandAddress) =>
+        TryGetPacketIdentity(ctx, commandAddress, out var op, out var register) &&
+        op == ItNop &&
+        register == RReleaseMem;
+
+    private static bool TryPatchUInt32Bits(
+        CpuContext ctx,
+        ulong address,
+        uint mask,
+        uint value)
+    {
+        return TryReadUInt32(ctx, address, out var current) &&
+               TryWriteUInt32(ctx, address, PatchUInt32Bits(current, mask, value));
+    }
+
+    private static uint PatchUInt32Bits(uint current, uint mask, uint value) =>
+        (current & ~mask) | (value & mask);
 
     [SysAbiExport(
         Nid = "l4fM9K-Lyks",
@@ -2129,8 +2312,14 @@ public static class AgcExports
         lock (gpuState.Gate)
         {
             gpuState.Graphics.QueueName = "dcb.graphics";
-            gpuState.Graphics.ActiveSubmissionId = ++gpuState.SubmissionSequence;
-            ParseSubmittedDcb(ctx, gpuState, gpuState.Graphics, commandAddress, dwordCount, tracePackets);
+            EnqueueSubmittedDcb(
+                ctx,
+                gpuState,
+                gpuState.Graphics,
+                commandAddress,
+                dwordCount,
+                ++gpuState.SubmissionSequence,
+                tracePackets);
             DrainResumableDcbs(ctx, gpuState, tracePackets);
         }
 
@@ -2181,8 +2370,14 @@ public static class AgcExports
             }
 
             queueState.QueueName = $"acb.compute[{ownerHandle}]";
-            queueState.ActiveSubmissionId = ++gpuState.SubmissionSequence;
-            ParseSubmittedDcb(ctx, gpuState, queueState, commandAddress, dwordCount, tracePackets);
+            EnqueueSubmittedDcb(
+                ctx,
+                gpuState,
+                queueState,
+                commandAddress,
+                dwordCount,
+                ++gpuState.SubmissionSequence,
+                tracePackets);
             DrainResumableDcbs(ctx, gpuState, tracePackets);
         }
 
@@ -2305,7 +2500,58 @@ public static class AgcExports
         return ReturnPointer(ctx, commandAddress);
     }
 
-    private static void ParseSubmittedDcb(
+    private static void EnqueueSubmittedDcb(
+        CpuContext ctx,
+        SubmittedGpuState gpuState,
+        SubmittedDcbState state,
+        ulong commandAddress,
+        uint dwordCount,
+        ulong submissionId,
+        bool tracePackets)
+    {
+        state.PendingSubmissions.Enqueue(new SubmittedDcbState.PendingSubmission(
+            commandAddress,
+            dwordCount,
+            submissionId,
+            tracePackets));
+        PumpSubmittedQueue(ctx, gpuState, state);
+    }
+
+    private static void PumpSubmittedQueue(
+        CpuContext ctx,
+        SubmittedGpuState gpuState,
+        SubmittedDcbState state)
+    {
+        if (state.IsSuspended)
+        {
+            return;
+        }
+
+        while (!state.HasActiveSubmission &&
+               state.PendingSubmissions.TryDequeue(out var submission))
+        {
+            state.HasActiveSubmission = true;
+            state.ActiveSubmissionId = submission.SubmissionId;
+            state.IsSuspended = ParseSubmittedDcb(
+                ctx,
+                gpuState,
+                state,
+                submission.CommandAddress,
+                submission.DwordCount,
+                submission.TracePackets);
+            if (state.IsSuspended)
+            {
+                return;
+            }
+
+            state.HasActiveSubmission = false;
+        }
+    }
+
+    // Returns true only when parsing stopped on an unsatisfied WAIT_REG_MEM.
+    // Malformed packets are dropped as completed so one bad submission cannot
+    // permanently wedge all later work on the same hardware queue.
+    private static bool ParseSubmittedDcb(
         CpuContext ctx,
         SubmittedGpuState gpuState,
         SubmittedDcbState state,
@@ -2315,7 +2561,7 @@ public static class AgcExports
     {
         if (commandAddress == 0 || dwordCount == 0 || dwordCount > 1_000_000)
         {
-            return;
+            return false;
         }
 
         var windowByteCount = checked((int)(dwordCount * sizeof(uint)));
@@ -2329,7 +2575,13 @@ public static class AgcExports
                 _dcbWindowByteLength = windowByteCount;
             }
 
-            ParseSubmittedDcbCore(ctx, gpuState, state, commandAddress, dwordCount, tracePackets);
+            return ParseSubmittedDcbCore(
+                ctx,
+                gpuState,
+                state,
+                commandAddress,
+                dwordCount,
+                tracePackets);
         }
         finally
         {
@@ -2339,7 +2591,7 @@ public static class AgcExports
         }
     }
 
-    private static void ParseSubmittedDcbCore(
+    private static bool ParseSubmittedDcbCore(
         CpuContext ctx,
         SubmittedGpuState gpuState,
         SubmittedDcbState state,
@@ -2353,7 +2605,7 @@ public static class AgcExports
             var currentAddress = commandAddress + ((ulong)offset * sizeof(uint));
             if (!TryReadUInt32(ctx, currentAddress, out var header))
             {
-                return;
+                return false;
             }
 
             var packetType = header >> 30;
@@ -2372,13 +2624,13 @@ public static class AgcExports
 
             if (packetType != 3)
             {
-                return;
+                return false;
             }
 
             var length = Pm4Length(header);
             if (length == 0 || offset + length > dwordCount)
             {
-                return;
+                return false;
             }
 
             var op = (header >> 8) & 0xFFu;
@@ -2437,6 +2689,16 @@ public static class AgcExports
             if (op == ItNop && register == RReleaseMem && length >= 7)
             {
                 ApplySubmittedReleaseMem(ctx, gpuState, state, currentAddress, tracePackets);
+            }
+
+            if (op == ItReleaseMem && length >= 8)
+            {
+                ApplySubmittedStandardReleaseMem(
+                    ctx,
+                    gpuState,
+                    state,
+                    currentAddress,
+                    tracePackets);
             }
 
             if (op == ItNop && register == RWriteData && length >= 4)
@@ -2512,7 +2774,7 @@ public static class AgcExports
                         dwordCount, is64Bit: register == RWaitMem64, isStandard: false,
                         tracePackets))
                 {
-                    return; // DCB suspended until the awaited label is written
+                    return true; // DCB suspended until the awaited label is written
                 }
             }
 
@@ -2522,7 +2784,7 @@ public static class AgcExports
                         ctx, state, commandAddress, currentAddress, offset, length,
                         dwordCount, is64Bit: false, isStandard: true, tracePackets))
                 {
-                    return; // DCB suspended until the awaited label is written
+                    return true; // DCB suspended until the awaited label is written
                 }
             }
 
@@ -2590,7 +2852,7 @@ public static class AgcExports
                     !TryReadUInt32(ctx, currentAddress + 16, out var flipArgLo) ||
                     !TryReadUInt32(ctx, currentAddress + 20, out var flipArgHi))
                 {
-                    return;
+                    return false;
                 }
 
                 var flipArg = unchecked((long)(((ulong)flipArgHi << 32) | flipArgLo));
@@ -2685,6 +2947,8 @@ public static class AgcExports
 
             offset += length;
         }
+
+        return false;
     }
 
     private static void TraceDisplayBuffer(
@@ -3330,6 +3594,27 @@ public static class AgcExports
         System.Diagnostics.Debug.Assert((initiator & (1u << 6)) != 0);
         System.Diagnostics.Debug.Assert(threadCount % localSize == 0);
         System.Diagnostics.Debug.Assert(threadCount / localSize == 0x0003_C004u);
+        System.Diagnostics.Debug.Assert(CeilDivide(20, 8) == 3);
+        System.Diagnostics.Debug.Assert(CeilDivide(12, 8) == 2);
+    }
+
+    private static void ValidateSubmittedQueueAndReleaseMemDecoders()
+    {
+        var queue = new SubmittedDcbState();
+        queue.PendingSubmissions.Enqueue(new(0x1000, 8, 11, false));
+        queue.PendingSubmissions.Enqueue(new(0x2000, 16, 12, true));
+        System.Diagnostics.Debug.Assert(
+            queue.PendingSubmissions.Dequeue().SubmissionId == 11);
+        System.Diagnostics.Debug.Assert(
+            queue.PendingSubmissions.Dequeue().SubmissionId == 12);
+
+        var control = (1u << 16) | (2u << 29);
+        var decoded = DecodeStandardReleaseMemControl(control);
+        System.Diagnostics.Debug.Assert(decoded.Destination == 1u);
+        System.Diagnostics.Debug.Assert(decoded.DataSelection == 2u);
+        System.Diagnostics.Debug.Assert(
+            PatchUInt32Bits(0xABCD_1234u, 0x00FF_0000u, 3u << 16) ==
+            0xAB03_1234u);
     }
 #endif
 
@@ -3728,9 +4013,13 @@ public static class AgcExports
         in GpuWaitRegistry.WaitingDcb waiter,
         bool tracePackets)
     {
+        var state = waiter.State as SubmittedDcbState ?? gpuState.Graphics;
         var remainingDwords = waiter.TotalDwords - waiter.ResumeOffset;
         if (remainingDwords == 0)
         {
+            state.IsSuspended = false;
+            state.HasActiveSubmission = false;
+            PumpSubmittedQueue(ctx, gpuState, state);
             return;
         }
 
@@ -3741,26 +4030,25 @@ public static class AgcExports
                 $"resume=0x{waiter.ResumeAddress:X16} dwords={remainingDwords} forced=False");
         }
 
-        var state = waiter.State as SubmittedDcbState ?? gpuState.Graphics;
-        var previousQueueName = state.QueueName;
-        var previousSubmissionId = state.ActiveSubmissionId;
-        try
-        {
-            state.QueueName = waiter.QueueName ?? previousQueueName;
-            state.ActiveSubmissionId = waiter.SubmissionId;
-            ParseSubmittedDcb(
+        System.Diagnostics.Debug.Assert(state.HasActiveSubmission);
+        System.Diagnostics.Debug.Assert(state.IsSuspended);
+        state.QueueName = waiter.QueueName ?? state.QueueName;
+        state.ActiveSubmissionId = waiter.SubmissionId;
+        state.IsSuspended = false;
+        if (ParseSubmittedDcb(
                 ctx,
                 gpuState,
                 state,
                 waiter.ResumeAddress,
                 remainingDwords,
-                tracePackets);
-        }
-        finally
+                tracePackets))
         {
-            state.QueueName = previousQueueName;
-            state.ActiveSubmissionId = previousSubmissionId;
+            state.IsSuspended = true;
+            return;
         }
+
+        state.HasActiveSubmission = false;
+        PumpSubmittedQueue(ctx, gpuState, state);
     }
 
     private static void TraceSubmittedWait(
@@ -3794,6 +4082,78 @@ public static class AgcExports
             $"value=0x{value:X16} mask=0x{mask:X16} ref=0x{reference:X16} " +
             $"compare={compareFunction} satisfied={satisfied}");
     }
+
+    private static void ApplySubmittedStandardReleaseMem(
+        CpuContext ctx,
+        SubmittedGpuState gpuState,
+        SubmittedDcbState state,
+        ulong packetAddress,
+        bool tracePacket)
+    {
+        if (!TryReadUInt32(ctx, packetAddress + 8, out var control) ||
+            !TryReadUInt32(ctx, packetAddress + 12, out var destinationLo) ||
+            !TryReadUInt32(ctx, packetAddress + 16, out var destinationHi) ||
+            !TryReadUInt32(ctx, packetAddress + 20, out var dataLo) ||
+            !TryReadUInt32(ctx, packetAddress + 24, out var dataHi))
+        {
+            return;
+        }
+
+        var (destination, dataSelection) = DecodeStandardReleaseMemControl(control);
+        var destinationAddress = ((ulong)destinationHi << 32) | destinationLo;
+        var data = ((ulong)dataHi << 32) | dataLo;
+        var writeLength = dataSelection switch
+        {
+            1 => (ulong)sizeof(uint),
+            2 or 3 or 4 => (ulong)sizeof(ulong),
+            _ => 0UL,
+        };
+        var writesGuestMemory = destination is 0 or 1 &&
+                                destinationAddress != 0 &&
+                                writeLength != 0;
+
+        SubmitOrderedGpuSideEffect(
+            ctx,
+            gpuState,
+            state,
+            () =>
+            {
+                if (writesGuestMemory)
+                {
+                    InvalidateDcbWindowIfOverlaps(destinationAddress, writeLength);
+                }
+
+                var wroteData = writesGuestMemory && (dataSelection switch
+                {
+                    1 => TryWriteUInt32(ctx, destinationAddress, dataLo),
+                    2 => ctx.TryWriteUInt64(destinationAddress, data),
+                    // Hardware counter writes are timing values sampled at the
+                    // release point, not the immediate payload in ordinal 6/7.
+                    3 or 4 => ctx.TryWriteUInt64(
+                        destinationAddress,
+                        unchecked((ulong)System.Diagnostics.Stopwatch.GetTimestamp())),
+                    _ => false,
+                });
+
+                if (tracePacket)
+                {
+                    TraceAgc(
+                        $"agc.dcb.release_mem_standard dst_sel={destination} " +
+                        $"dst=0x{destinationAddress:X16} data_sel={dataSelection} " +
+                        $"data=0x{data:X16} wrote={wroteData}");
+                }
+            },
+            $"release_mem_standard dst=0x{destinationAddress:X16} data=0x{data:X16}",
+            packetAddress,
+            writesGuestMemory ? destinationAddress : 0,
+            writesGuestMemory ? writeLength : 0);
+    }
+
+    private static (uint Destination, uint DataSelection)
+        DecodeStandardReleaseMemControl(uint control) =>
+        (
+            Destination: (control >> 16) & 0x3u,
+            DataSelection: (control >> 29) & 0x7u);
 
     private static void ApplySubmittedReleaseMem(
         CpuContext ctx,
@@ -6127,16 +6487,22 @@ public static class AgcExports
         uint groupCountX;
         uint groupCountY;
         uint groupCountZ;
+        var threadCountX = uint.MaxValue;
+        var threadCountY = uint.MaxValue;
+        var threadCountZ = uint.MaxValue;
         if ((initiator & useThreadDimensions) != 0)
         {
             // In thread-dimension mode the packet contains thread counts, not
-            // group end coordinates. Vulkan still dispatches whole workgroups.
-            // Exact multiples are losslessly representable; a remainder needs
-            // an invocation guard in the translated shader and must not be run
-            // as an oversized final group until that guard is available.
-            if (dispatchEndX % localSizeX != 0 ||
-                dispatchEndY % localSizeY != 0 ||
-                dispatchEndZ % localSizeZ != 0)
+            // group end coordinates. Vulkan still dispatches whole workgroups,
+            // so round up and pass the exact exclusive thread bounds to the
+            // translated shader. Its entry guard disables invocations in the
+            // partially populated final group before any guest instruction.
+            var startThreadX = (ulong)baseGroupX * localSizeX;
+            var startThreadY = (ulong)baseGroupY * localSizeY;
+            var startThreadZ = (ulong)baseGroupZ * localSizeZ;
+            if ((ulong)dispatchEndX <= startThreadX ||
+                (ulong)dispatchEndY <= startThreadY ||
+                (ulong)dispatchEndZ <= startThreadZ)
             {
                 return RejectComputeDispatch(
                     dimensionsAddress,
@@ -6145,13 +6511,16 @@ public static class AgcExports
                     dispatchEndX,
                     dispatchEndY,
                     dispatchEndZ,
-                    $"unrepresentable-thread-dimensions(local=" +
-                    $"{localSizeX}x{localSizeY}x{localSizeZ})");
+                    $"thread-end-not-after-base(" +
+                    $"{startThreadX}x{startThreadY}x{startThreadZ})");
             }
 
-            groupCountX = dispatchEndX / localSizeX;
-            groupCountY = dispatchEndY / localSizeY;
-            groupCountZ = dispatchEndZ / localSizeZ;
+            groupCountX = CeilDivide((ulong)dispatchEndX - startThreadX, localSizeX);
+            groupCountY = CeilDivide((ulong)dispatchEndY - startThreadY, localSizeY);
+            groupCountZ = CeilDivide((ulong)dispatchEndZ - startThreadZ, localSizeZ);
+            threadCountX = dispatchEndX;
+            threadCountY = dispatchEndY;
+            threadCountZ = dispatchEndZ;
         }
         else
         {
@@ -6243,9 +6612,15 @@ public static class AgcExports
             baseGroupY,
             baseGroupZ,
             waveLaneCount,
-            IsIndirect: opcode == ItDispatchIndirect);
+            IsIndirect: opcode == ItDispatchIndirect,
+            threadCountX,
+            threadCountY,
+            threadCountZ);
         return true;
     }
+
+    private static uint CeilDivide(ulong value, uint divisor) =>
+        checked((uint)((value + divisor - 1) / divisor));
 
     private static bool RejectComputeDispatch(
         ulong dimensionsAddress,
@@ -6458,7 +6833,10 @@ public static class AgcExports
                     localSizeY,
                     localSizeZ,
                     dispatch.IsIndirect,
-                    writesGlobalMemory);
+                    writesGlobalMemory,
+                    dispatch.ThreadCountX,
+                    dispatch.ThreadCountY,
+                    dispatch.ThreadCountZ);
                 gpuDispatch = true;
                 if (writesGlobalMemory &&
                     !VulkanVideoPresenter.WaitForGuestWork(workSequence))

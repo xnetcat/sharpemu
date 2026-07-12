@@ -82,8 +82,13 @@ internal static class Gen5ShaderTranslator
         register < 256 && (mask[register >> 6] & (1UL << (int)(register & 63))) != 0;
 
     private const int MaxInstructions = 4096;
-    private const int MinimumUserDataDwords = 16;
-    private const int MaximumUserDataDwords = 256;
+    private const uint PsUserDataRegister = 0x0C;
+    private const uint VsUserDataRegister = 0x4C;
+    private const uint GsUserDataRegister = 0x8C;
+    private const uint EsUserDataRegister = 0xCC;
+    private const uint ComputeUserDataRegister = 0x240;
+    private const uint ComputePgmRsrc2Register = 0x213;
+    private const int MaximumHardwareUserSgprs = 64;
     private static readonly ConditionalWeakTable<object, ShaderDecodeCache> _decodeCaches = new();
 
     private sealed class ShaderDecodeCache
@@ -195,6 +200,7 @@ internal static class Gen5ShaderTranslator
         Gen5ComputeSystemRegisters? computeSystemRegisters = null,
         uint userDataScalarRegisterBase = 0)
     {
+        ValidateUserSgprCountDecoding();
         state = default!;
         error = string.Empty;
         var cache = _decodeCaches.GetValue(ctx.Memory, static _ => new ShaderDecodeCache());
@@ -243,7 +249,20 @@ internal static class Gen5ShaderTranslator
             }
         }
 
-        var userData = new uint[GetUserDataDwordCount(metadata)];
+        if (!TryGetUserSgprCount(
+                shaderRegisters,
+                userDataBaseRegister,
+                out var userSgprCount,
+                out var rsrc2Register,
+                out _))
+        {
+            error =
+                $"missing-user-sgpr-count ud_reg=0x{userDataBaseRegister:X} " +
+                $"rsrc2_reg=0x{rsrc2Register:X}";
+            return false;
+        }
+
+        var userData = new uint[userSgprCount];
         for (uint index = 0; index < userData.Length; index++)
         {
             shaderRegisters.TryGetValue(userDataBaseRegister + index, out userData[index]);
@@ -258,35 +277,72 @@ internal static class Gen5ShaderTranslator
         return true;
     }
 
-    private static int GetUserDataDwordCount(Gen5ShaderMetadata? metadata)
+    private static bool TryGetUserSgprCount(
+        IReadOnlyDictionary<uint, uint> shaderRegisters,
+        uint userDataBaseRegister,
+        out int count,
+        out uint rsrc2Register,
+        out uint rsrc2)
     {
-        var count = MinimumUserDataDwords;
-        if (metadata is null)
+        rsrc2Register = userDataBaseRegister == ComputeUserDataRegister
+            ? ComputePgmRsrc2Register
+            : userDataBaseRegister - 1;
+        if (!shaderRegisters.TryGetValue(rsrc2Register, out rsrc2))
         {
+            count = 0;
+            return false;
+        }
+
+        count = checked((int)((rsrc2 >> 1) & 0x1Fu));
+        // GFX10 PS/VS/GS expose a sixth USER_SGPR bit. ES and compute do not.
+        // AGC's logical user-data layout (including its SRT pointer and back
+        // user data) describes memory reached through these SGPRs; it does not
+        // increase the hardware register window.
+        var hasUserSgprMsb = userDataBaseRegister is
+            PsUserDataRegister or VsUserDataRegister or GsUserDataRegister;
+        if (hasUserSgprMsb &&
+            (rsrc2 & (1u << 27)) != 0)
+        {
+            count |= 0x20;
+        }
+
+        if (userDataBaseRegister is not (PsUserDataRegister or
+                VsUserDataRegister or
+                GsUserDataRegister or
+                EsUserDataRegister or
+                ComputeUserDataRegister) ||
+            count > MaximumHardwareUserSgprs)
+        {
+            count = 0;
+            return false;
+        }
+
+        return true;
+    }
+
+    [Conditional("DEBUG")]
+    private static void ValidateUserSgprCountDecoding()
+    {
+        static int Decode(uint baseRegister, uint rsrc2)
+        {
+            var registers = new Dictionary<uint, uint>
+            {
+                [baseRegister == ComputeUserDataRegister
+                    ? ComputePgmRsrc2Register
+                    : baseRegister - 1] = rsrc2,
+            };
+            var decoded =
+                TryGetUserSgprCount(registers, baseRegister, out var count, out _, out _);
+            Debug.Assert(decoded);
             return count;
         }
 
-        count = Math.Max(count, checked((int)Math.Min(metadata.ExtendedUserDataSizeDwords, MaximumUserDataDwords)));
-        count = Math.Max(count, checked((int)Math.Min(metadata.ShaderResourceTableSizeDwords, MaximumUserDataDwords)));
-
-        foreach (var offset in metadata.DirectResources.Values)
-        {
-            count = Math.Max(count, checked((int)Math.Min(offset + 1u, MaximumUserDataDwords)));
-        }
-
-        foreach (var resource in metadata.Resources)
-        {
-            var size = resource.Kind switch
-            {
-                Gen5ShaderResourceKind.ReadOnlyTexture or Gen5ShaderResourceKind.ReadWriteTexture => 8u,
-                Gen5ShaderResourceKind.Sampler => 4u,
-                Gen5ShaderResourceKind.ConstantBuffer => 4u,
-                _ => 1u,
-            };
-            count = Math.Max(count, checked((int)Math.Min(resource.OffsetDwords + size, MaximumUserDataDwords)));
-        }
-
-        return count;
+        Debug.Assert(Decode(PsUserDataRegister, 2u << 1) == 2);
+        Debug.Assert(Decode(PsUserDataRegister, (3u << 1) | (1u << 27)) == 35);
+        Debug.Assert(Decode(VsUserDataRegister, (1u << 1) | (1u << 27)) == 33);
+        Debug.Assert(Decode(GsUserDataRegister, (4u << 1) | (1u << 27)) == 36);
+        Debug.Assert(Decode(EsUserDataRegister, (7u << 1) | (1u << 27)) == 7);
+        Debug.Assert(Decode(ComputeUserDataRegister, (11u << 1) | (1u << 27)) == 11);
     }
 
     public static string DescribeState(Gen5ShaderState state)
@@ -300,7 +356,8 @@ internal static class Gen5ShaderTranslator
         if (state.Metadata is not { } metadata)
         {
             return
-                $"ud_base=s{state.UserDataScalarRegisterBase} ud[{userData}]" +
+                $"ud_base=s{state.UserDataScalarRegisterBase} hw_ud={state.UserData.Count} " +
+                $"ud[{userData}]" +
                 $"{systemRegisters} metadata=missing";
         }
 
@@ -313,7 +370,8 @@ internal static class Gen5ShaderTranslator
                 $"{resource.Kind}[{resource.Slot}]@{resource.OffsetDwords}" +
                 (resource.SizeFlag ? "+" : string.Empty)));
         return
-            $"ud_base=s{state.UserDataScalarRegisterBase} ud[{userData}]" +
+            $"ud_base=s{state.UserDataScalarRegisterBase} hw_ud={state.UserData.Count} " +
+            $"ud[{userData}]" +
             $"{systemRegisters} metadata[eud={metadata.ExtendedUserDataSizeDwords}," +
             $"srt={metadata.ShaderResourceTableSizeDwords},direct={direct},resources={resources}]";
     }
