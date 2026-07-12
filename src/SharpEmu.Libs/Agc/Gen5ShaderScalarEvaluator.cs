@@ -606,7 +606,24 @@ internal static class Gen5ShaderScalarEvaluator
             return false;
         }
 
-        var rented = System.Buffers.ArrayPool<byte>.Shared.Rent((int)cappedSize);
+        var rented = System.Buffers.ArrayPool<byte>.Shared.Rent(
+            Math.Max((int)cappedSize, sizeof(uint)));
+        if (cappedSize < sizeof(uint))
+        {
+            rented.AsSpan(0, sizeof(uint)).Clear();
+            var exact = rented.AsSpan(0, (int)cappedSize);
+            if (ctx.Memory.TryRead(baseAddress, exact) ||
+                KernelMemoryCompatExports.TryReadTrackedLibcHeap(baseAddress, exact))
+            {
+                data = rented;
+                dataLength = sizeof(uint);
+                return true;
+            }
+
+            System.Buffers.ArrayPool<byte>.Shared.Return(rented);
+            return false;
+        }
+
         var candidateSize = (int)cappedSize;
         while (candidateSize >= sizeof(uint))
         {
