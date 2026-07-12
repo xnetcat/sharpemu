@@ -119,6 +119,16 @@ internal static partial class Gen5SpirvTranslator
                 ? maxSteps
                 : 100_000;
 
+        // Diagnostic coverage probe. When enabled, every selected MRT export
+        // writes opaque magenta while preserving the shader's control flow,
+        // EXEC mask, geometry and raster state. This separates missing
+        // rasterization from valid fragments whose translated values are zero.
+        private static readonly bool _forcePixelMagenta =
+            string.Equals(
+                Environment.GetEnvironmentVariable("SHARPEMU_FORCE_PIXEL_MAGENTA"),
+                "1",
+                StringComparison.Ordinal);
+
         // Which pixel-shader MRT export target (EXP_MRT0..7 == render-target
         // slot) is routed to the single fragment output. The offscreen draw
         // path renders one bound color target per pass, so a multi-render-target
@@ -1272,7 +1282,7 @@ internal static partial class Gen5SpirvTranslator
 
                     var address = GetRawSource(instruction, 0);
                     StoreLds(
-                        LdsPointer(address, EffectiveDsOffsetBytes(control.Offset0)),
+                        LdsPointer(address, control.Offset0),
                         GetRawSource(instruction, 1));
                     return true;
                 }
@@ -1285,7 +1295,7 @@ internal static partial class Gen5SpirvTranslator
                     }
 
                     var address = GetRawSource(instruction, 0);
-                    var offset = EffectiveDsOffsetBytes(control.Offset0);
+                    var offset = control.Offset0;
                     StoreLds(LdsPointer(address, offset), GetRawSource(instruction, 1));
                     StoreLds(
                         LdsPointer(address, offset + sizeof(uint)),
@@ -1305,7 +1315,7 @@ internal static partial class Gen5SpirvTranslator
                     }
 
                     var address = GetRawSource(instruction, 0);
-                    var offset = EffectiveDsOffsetBytes(control.Offset0);
+                    var offset = control.Offset0;
                     for (var dword = 0; dword < dwordCount; dword++)
                     {
                         StoreLds(
@@ -1329,12 +1339,12 @@ internal static partial class Gen5SpirvTranslator
                     StoreLds(
                         LdsPointer(
                             address,
-                            EffectiveDsOffsetBytes(control.Offset0, st64)),
+                            EffectiveDsPairOffsetBytes(control.Offset0, st64)),
                         GetRawSource(instruction, 1));
                     StoreLds(
                         LdsPointer(
                             address,
-                            EffectiveDsOffsetBytes(control.Offset1, st64)),
+                            EffectiveDsPairOffsetBytes(control.Offset1, st64)),
                         GetRawSource(instruction, 2));
                     return true;
                 }
@@ -1350,7 +1360,7 @@ internal static partial class Gen5SpirvTranslator
                     var address = GetRawSource(instruction, 0);
                     var value = Load(
                         _uintType,
-                        LdsPointer(address, EffectiveDsOffsetBytes(control.Offset0)));
+                        LdsPointer(address, control.Offset0));
                     StoreV(instruction.Destinations[0].Value, value);
                     return true;
                 }
@@ -1368,7 +1378,7 @@ internal static partial class Gen5SpirvTranslator
                     }
 
                     var address = GetRawSource(instruction, 0);
-                    var offset = EffectiveDsOffsetBytes(control.Offset0);
+                    var offset = control.Offset0;
                     for (var dword = 0; dword < dwordCount; dword++)
                     {
                         var value = Load(
@@ -1395,12 +1405,12 @@ internal static partial class Gen5SpirvTranslator
                         _uintType,
                         LdsPointer(
                             address,
-                            EffectiveDsOffsetBytes(control.Offset0, st64)));
+                            EffectiveDsPairOffsetBytes(control.Offset0, st64)));
                     var second = Load(
                         _uintType,
                         LdsPointer(
                             address,
-                            EffectiveDsOffsetBytes(control.Offset1, st64)));
+                            EffectiveDsPairOffsetBytes(control.Offset1, st64)));
                     StoreV(instruction.Destinations[0].Value, first);
                     StoreV(instruction.Destinations[1].Value, second);
                     return true;
@@ -1411,7 +1421,7 @@ internal static partial class Gen5SpirvTranslator
             }
         }
 
-        private static uint EffectiveDsOffsetBytes(uint offset, bool st64 = false) =>
+        private static uint EffectiveDsPairOffsetBytes(uint offset, bool st64 = false) =>
             offset * (st64 ? 256u : sizeof(uint));
 
         private uint LdsPointer(uint address, uint offsetBytes)
@@ -2326,6 +2336,36 @@ internal static partial class Gen5SpirvTranslator
                     SpirvOp.CompositeConstruct,
                     outputType,
                     values);
+                if (_forcePixelMagenta)
+                {
+                    vector = _outputKind switch
+                    {
+                        Gen5PixelOutputKind.Float =>
+                            _module.AddInstruction(
+                                SpirvOp.CompositeConstruct,
+                                outputType,
+                                Float(1f),
+                                Float(0f),
+                                Float(1f),
+                                Float(1f)),
+                        Gen5PixelOutputKind.Sint =>
+                            _module.AddInstruction(
+                                SpirvOp.CompositeConstruct,
+                                outputType,
+                                Bitcast(_intType, UInt(1)),
+                                Bitcast(_intType, UInt(0)),
+                                Bitcast(_intType, UInt(1)),
+                                Bitcast(_intType, UInt(1))),
+                        _ =>
+                            _module.AddInstruction(
+                                SpirvOp.CompositeConstruct,
+                                outputType,
+                                UInt(1),
+                                UInt(0),
+                                UInt(1),
+                                UInt(1)),
+                    };
+                }
                 vector = _module.AddInstruction(
                     SpirvOp.Select,
                     outputType,
@@ -2688,6 +2728,7 @@ internal static partial class Gen5SpirvTranslator
 
         private bool UsesSubgroupShuffle() =>
             _state.Program.Instructions.Any(instruction =>
+                instruction.Control is Gen5DppControl ||
                 instruction.Opcode is "VPermlane16B32" or "VPermlanex16B32");
 
         private bool UsesSubgroupBroadcast() =>

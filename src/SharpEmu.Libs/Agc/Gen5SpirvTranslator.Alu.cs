@@ -857,6 +857,16 @@ internal static partial class Gen5SpirvTranslator
                     return false;
             }
 
+            if (instruction.Control is Gen5DppControl dpp)
+            {
+                result = _module.AddInstruction(
+                    SpirvOp.Select,
+                    _uintType,
+                    IsDppWriteEnabled(dpp),
+                    result,
+                    LoadV(destination));
+            }
+
             StoreV(destination, result);
             return true;
         }
@@ -1930,6 +1940,16 @@ internal static partial class Gen5SpirvTranslator
                 _ => throw new InvalidOperationException($"unsupported source {operand}"),
             };
 
+            // DPP16 remaps src0 across lanes before the VALU operation. The IR
+            // has always preserved this control, but treating it as an ordinary
+            // local VGPR read breaks every wave reduction used by the XPR
+            // renderer (min/max/OR scans become value-with-self operations).
+            if (sourceIndex == 0 &&
+                instruction.Control is Gen5DppControl dpp)
+            {
+                value = ApplyDppSource(dpp, value);
+            }
+
             if (instruction.Control is Gen5SdwaControl sdwa)
             {
                 var selector = sourceIndex switch
@@ -1951,6 +1971,202 @@ internal static partial class Gen5SpirvTranslator
             }
 
             return value;
+        }
+
+        private uint ApplyDppSource(Gen5DppControl control, uint value)
+        {
+            GetDppSourceLane(control, out var targetLane, out var inRange);
+            var lane = Load(_uintType, _subgroupInvocationIdInput);
+            var safeTarget = _module.AddInstruction(
+                SpirvOp.Select,
+                _uintType,
+                inRange,
+                targetLane,
+                lane);
+            var shuffled = _module.AddInstruction(
+                SpirvOp.GroupNonUniformShuffle,
+                _uintType,
+                UInt(3),
+                value,
+                safeTarget);
+
+            var sourceAvailable = inRange;
+            if (!control.FetchInactive)
+            {
+                var activeWord = _module.AddInstruction(
+                    SpirvOp.Select,
+                    _uintType,
+                    Load(_boolType, _exec),
+                    UInt(1),
+                    UInt(0));
+                var shuffledActive = _module.AddInstruction(
+                    SpirvOp.GroupNonUniformShuffle,
+                    _uintType,
+                    UInt(3),
+                    activeWord,
+                    safeTarget);
+                sourceAvailable = _module.AddInstruction(
+                    SpirvOp.LogicalAnd,
+                    _boolType,
+                    sourceAvailable,
+                    IsNotZero(shuffledActive));
+            }
+
+            return _module.AddInstruction(
+                SpirvOp.Select,
+                _uintType,
+                sourceAvailable,
+                shuffled,
+                UInt(0));
+        }
+
+        private void GetDppSourceLane(
+            Gen5DppControl control,
+            out uint targetLane,
+            out uint inRange)
+        {
+            var lane = Load(_uintType, _subgroupInvocationIdInput);
+            var rowBase = BitwiseAnd(lane, UInt(0xFFFF_FFF0));
+            var rowLane = BitwiseAnd(lane, UInt(15));
+            var dpp = control.Control;
+            inRange = _module.ConstantBool(true);
+
+            if (dpp <= 0xFF)
+            {
+                var quadLane = BitwiseAnd(lane, UInt(3));
+                var selected = UInt(dpp & 3);
+                for (var index = 1u; index < 4; index++)
+                {
+                    selected = _module.AddInstruction(
+                        SpirvOp.Select,
+                        _uintType,
+                        _module.AddInstruction(
+                            SpirvOp.IEqual,
+                            _boolType,
+                            quadLane,
+                            UInt(index)),
+                        UInt((dpp >> checked((int)(index * 2))) & 3),
+                        selected);
+                }
+
+                targetLane = IAdd(BitwiseAnd(lane, UInt(0xFFFF_FFFC)), selected);
+                return;
+            }
+
+            if (dpp is >= 0x101 and <= 0x10F)
+            {
+                var shift = UInt(dpp & 15);
+                var shifted = IAdd(rowLane, shift);
+                inRange = _module.AddInstruction(
+                    SpirvOp.ULessThan,
+                    _boolType,
+                    shifted,
+                    UInt(16));
+                targetLane = IAdd(rowBase, BitwiseAnd(shifted, UInt(15)));
+                return;
+            }
+
+            if (dpp is >= 0x111 and <= 0x11F)
+            {
+                var shift = UInt(dpp & 15);
+                inRange = _module.AddInstruction(
+                    SpirvOp.UGreaterThanEqual,
+                    _boolType,
+                    rowLane,
+                    shift);
+                targetLane = IAdd(
+                    rowBase,
+                    BitwiseAnd(
+                        _module.AddInstruction(SpirvOp.ISub, _uintType, rowLane, shift),
+                        UInt(15)));
+                return;
+            }
+
+            if (dpp is >= 0x121 and <= 0x12F)
+            {
+                targetLane = IAdd(
+                    rowBase,
+                    BitwiseAnd(
+                        _module.AddInstruction(
+                            SpirvOp.ISub,
+                            _uintType,
+                            rowLane,
+                            UInt(dpp & 15)),
+                        UInt(15)));
+                return;
+            }
+
+            targetLane = dpp switch
+            {
+                0x140 => IAdd(rowBase, _module.AddInstruction(
+                    SpirvOp.ISub, _uintType, UInt(15), rowLane)),
+                0x141 => IAdd(
+                    BitwiseAnd(lane, UInt(0xFFFF_FFF8)),
+                    _module.AddInstruction(
+                        SpirvOp.ISub,
+                        _uintType,
+                        UInt(7),
+                        BitwiseAnd(lane, UInt(7)))),
+                >= 0x150 and <= 0x15F => IAdd(rowBase, UInt(dpp & 15)),
+                >= 0x160 and <= 0x16F => IAdd(
+                    rowBase,
+                    BitwiseXor(rowLane, UInt(dpp & 15))),
+                _ => lane,
+            };
+        }
+
+        private uint IsDppWriteEnabled(Gen5DppControl control)
+        {
+            GetDppSourceLane(control, out var targetLane, out var inRange);
+            var lane = Load(_uintType, _subgroupInvocationIdInput);
+            var row = ShiftRightLogical(lane, UInt(4));
+            var bank = BitwiseAnd(lane, UInt(3));
+            var rowEnabled = IsNotZero(BitwiseAnd(
+                UInt(control.RowMask),
+                ShiftLeftLogical(UInt(1), row)));
+            var bankEnabled = IsNotZero(BitwiseAnd(
+                UInt(control.BankMask),
+                ShiftLeftLogical(UInt(1), bank)));
+            var sourceAvailable = inRange;
+            if (!control.FetchInactive)
+            {
+                var safeTarget = _module.AddInstruction(
+                    SpirvOp.Select,
+                    _uintType,
+                    inRange,
+                    targetLane,
+                    lane);
+                var activeWord = _module.AddInstruction(
+                    SpirvOp.Select,
+                    _uintType,
+                    Load(_boolType, _exec),
+                    UInt(1),
+                    UInt(0));
+                var shuffledActive = _module.AddInstruction(
+                    SpirvOp.GroupNonUniformShuffle,
+                    _uintType,
+                    UInt(3),
+                    activeWord,
+                    safeTarget);
+                sourceAvailable = _module.AddInstruction(
+                    SpirvOp.LogicalAnd,
+                    _boolType,
+                    sourceAvailable,
+                    IsNotZero(shuffledActive));
+            }
+
+            var sourceAllowsWrite = control.BoundControl
+                ? _module.ConstantBool(true)
+                : sourceAvailable;
+            return _module.AddInstruction(
+                SpirvOp.LogicalAnd,
+                _boolType,
+                rowEnabled,
+                _module.AddInstruction(
+                    SpirvOp.LogicalAnd,
+                    _boolType,
+                    bankEnabled,
+                    sourceAllowsWrite));
         }
 
         private uint GetFloatSource(

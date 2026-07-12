@@ -417,11 +417,10 @@ public sealed class CpuDispatcher : ICpuDispatcher, IDisposable
             // The PS5 entry-parameter ABI exposes three inline argv pointers.
             // Two compatibility arguments are therefore safe without changing
             // the fixed 0x20-byte structure expected by existing titles.
-            var firstArgument = configuredArguments.Split(
+            var compatibilityArguments = configuredArguments.Split(
                 (char[]?)null,
-                2,
-                StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)[0];
-            arguments.Add(firstArgument);
+                StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            arguments.AddRange(compatibilityArguments.Take(2));
         }
 
         var cursor = context[CpuRegister.Rsp];
@@ -446,7 +445,9 @@ public sealed class CpuDispatcher : ICpuDispatcher, IDisposable
             !context.TryWriteUInt64(
                 entryParamsAddress + 0x10,
                 argumentAddresses.Length > 1 ? argumentAddresses[1] : 0) ||
-            !context.TryWriteUInt64(entryParamsAddress + 0x18, 0))
+            !context.TryWriteUInt64(
+                entryParamsAddress + 0x18,
+                argumentAddresses.Length > 2 ? argumentAddresses[2] : 0))
         {
             return false;
         }

@@ -10,11 +10,10 @@ namespace SharpEmu.Libs.Agc;
 /// bytes verbatim samples as garbage.
 ///
 /// The GFX10 addressing uses power-of-two swizzle blocks (256 B / 4 KiB /
-/// 64 KiB) whose internal element order follows the "standard" (S), rotated
-/// (R) or z-order/depth (Z) swizzle equations. This implements the standard
-/// and z-order 2D single-sample equations, which cover the overwhelming
-/// majority of color/UI textures; unknown modes are reported once and left
-/// linear so nothing regresses.
+/// 64 KiB) whose internal element order follows the standard (S), display (D),
+/// render (R), or z-order/depth (Z) equations. This implements the exact base
+/// S and Z 2D single-sample modes; approximate D/R and pipe/bank-XOR modes stay
+/// opt-in while their complete AddrLib equations are being ported.
 ///
 /// Enable with <c>SHARPEMU_DETILE=1</c> while it is validated; the intent is to
 /// make it the default once verified against reference titles.
@@ -43,7 +42,9 @@ internal static class GnmTiling
     /// so those stay behind SHARPEMU_DETILE=1 until validated per title.
     /// </summary>
     private static bool IsTrustedByDefault(uint swizzleMode) =>
-        swizzleMode is >= 1 and <= 12;
+        // Exact base S/Z modes. D/R use different GFX10 swizzle equations and
+        // the T/X modes additionally apply pipe/bank XOR between blocks.
+        swizzleMode is 1 or 4 or 5 or 8 or 9;
 
     // Detile a surface when it is verified-correct by default (trusted base mode),
     // or when the user opts the approximate modes in with SHARPEMU_DETILE=1.
@@ -216,12 +217,13 @@ internal static class GnmTiling
 
     private static bool TryGetSwizzleKind(uint swizzleMode, out SwizzleKind kind, out int blockBytes)
     {
-        // GFX10 SWIZZLE_MODE enumeration (subset that appears for textures):
-        //   1-4   = 256 B  Z/S/D/R
-        //   5-8   = 4 KiB  Z/S/D/R
-        //   9-12  = 64 KiB Z/S/D/R
-        //   13-16 = 64 KiB _T (bank-swizzled) variants
-        //   21-27 = 64 KiB _X (pipe-xor) variants
+        // GFX10 AddrLib SWIZZLE_MODE enumeration:
+        //   1-3   = 256 B S/D/R
+        //   4-7   = 4 KiB Z/S/D/R
+        //   8-11  = 64 KiB Z/S/D/R
+        //   16-19 = 64 KiB Z/S/D/R _T
+        //   20-23 = 4 KiB Z/S/D/R _X
+        //   24-27 = 64 KiB Z/S/D/R _X
         // The pipe/bank XOR (_T/_X) affects which block a given tile lands in,
         // but the *within-block* element order matches the base S/Z equation,
         // which is what dominates visible correctness. We model the block
@@ -230,12 +232,14 @@ internal static class GnmTiling
         blockBytes = 0;
         switch (swizzleMode)
         {
-            case 1: case 5: case 9: case 13: case 21:
+            case 4: case 8: case 16: case 20: case 24:
                 kind = SwizzleKind.ZOrder;
                 break;
-            case 2: case 6: case 10: case 14: case 22:
-            case 3: case 7: case 11: case 15: case 23:
-            case 4: case 8: case 12: case 16: case 24:
+            case 1: case 2: case 3:
+            case 5: case 6: case 7:
+            case 9: case 10: case 11:
+            case 17: case 18: case 19:
+            case 21: case 22: case 23:
             case 25: case 26: case 27:
                 kind = SwizzleKind.Standard;
                 break;
@@ -245,8 +249,9 @@ internal static class GnmTiling
 
         blockBytes = swizzleMode switch
         {
-            >= 1 and <= 4 => 256,
-            >= 5 and <= 8 => 4096,
+            >= 1 and <= 3 => 256,
+            >= 4 and <= 7 => 4096,
+            >= 20 and <= 23 => 4096,
             _ => 65536,
         };
         return true;
