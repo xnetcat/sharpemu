@@ -93,10 +93,15 @@ public readonly record struct GuestCpuContinuation(
     ulong Rdi,
     ulong R8,
     ulong R9,
+    ulong R10,
+    ulong R11,
     ulong R12,
     ulong R13,
     ulong R14,
-    ulong R15);
+    ulong R15,
+    ushort FpuControlWord,
+    uint Mxcsr,
+    bool RestoreFullFpuState);
 
 public static class GuestThreadExecution
 {
@@ -373,10 +378,15 @@ public static class GuestThreadExecution
             context[CpuRegister.Rdi],
             context[CpuRegister.R8],
             context[CpuRegister.R9],
+            context[CpuRegister.R10],
+            context[CpuRegister.R11],
             context[CpuRegister.R12],
             context[CpuRegister.R13],
             context[CpuRegister.R14],
-            context[CpuRegister.R15]);
+            context[CpuRegister.R15],
+            context.FpuControlWord,
+            context.Mxcsr,
+            RestoreFullFpuState: false);
         return true;
     }
 

@@ -240,7 +240,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private readonly List<nint> _importHandlerTrampolines = new List<nint>();
 
-	private const int GuestContextTransferFrameQwords = 15;
+	private const int GuestContextTransferFrameQwords = 20;
 
 	private readonly object _guestContextTransferStubGate = new();
 
@@ -1524,6 +1524,13 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			error = $"invalid guest context transfer target rip=0x{target.Rip:X16} rsp=0x{target.Rsp:X16}";
 			return false;
 		}
+		if (target.Rsp < sizeof(ulong) ||
+			ActiveCpuContext is not { } activeContext ||
+			!activeContext.TryWriteUInt64(target.Rsp - sizeof(ulong), target.Rip))
+		{
+			error = $"guest context transfer slot is not writable at 0x{target.Rsp - sizeof(ulong):X16}";
+			return false;
+		}
 
 		transferStub = GetOrCreateGuestContextTransferStub();
 		if (transferStub == 0)
@@ -1551,10 +1558,15 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		frame[8] = target.Rdi;
 		frame[9] = target.R8;
 		frame[10] = target.R9;
-		frame[11] = target.R12;
-		frame[12] = target.R13;
-		frame[13] = target.R14;
-		frame[14] = target.R15;
+		frame[11] = target.R10;
+		frame[12] = target.R11;
+		frame[13] = target.R12;
+		frame[14] = target.R13;
+		frame[15] = target.R14;
+		frame[16] = target.R15;
+		frame[17] = target.Mxcsr == 0 ? 0x1F80u : target.Mxcsr;
+		frame[18] = target.FpuControlWord == 0 ? 0x037Fu : target.FpuControlWord;
+		frame[19] = target.RestoreFullFpuState ? 1u : 0u;
 		return true;
 	}
 
@@ -1572,7 +1584,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				return _guestContextTransferStub;
 			}
 
-			const uint stubSize = 128;
+			const uint stubSize = 256;
 			var code = (byte*)VirtualAlloc(null, stubSize, 12288u, 64u);
 			if (code == null)
 			{
@@ -1588,10 +1600,47 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				Emit((byte)(0x40 | ((register & 7) << 3) | 0x03));
 				Emit(displacement);
 			}
+			void EmitLoadFromR11Disp32(int register, int displacement)
+			{
+				Emit((byte)(0x49 | (register >= 8 ? 0x04 : 0x00)));
+				Emit(0x8B);
+				Emit((byte)(0x80 | ((register & 7) << 3) | 0x03));
+				*(int*)(code + offset) = displacement;
+				offset += sizeof(int);
+			}
 
 			Emit(0x49); Emit(0x89); Emit(0xC3); // mov r11, rax
-			EmitLoadFromR11(10, 0);             // target RIP
-			EmitLoadFromR11(4, 8);              // rsp
+			// A new >=3.50 fiber receives the SDK-defined MXCSR verbatim. A
+			// resumed fiber follows _sceFiberLongJmp: preserve status bits 0-5
+			// while restoring the saved control bits.
+			Emit(0x49); Emit(0x83); Emit(0xBB);                         // cmp qword [r11+152],0
+			*(int*)(code + offset) = 152; offset += sizeof(int); Emit(0x00);
+			Emit(0x0F); Emit(0x84);                                     // je merge_status
+			var mergeBranch = offset; offset += sizeof(int);
+			Emit(0x41); Emit(0x0F); Emit(0xAE); Emit(0x93);             // ldmxcsr [r11+136]
+			*(int*)(code + offset) = 136; offset += sizeof(int);
+			Emit(0xE9);                                                  // jmp mxcsr_done
+			var doneBranch = offset; offset += sizeof(int);
+			var mergeLabel = offset;
+			Emit(0x48); Emit(0x83); Emit(0xEC); Emit(0x08);             // sub rsp,8
+			Emit(0x0F); Emit(0xAE); Emit(0x1C); Emit(0x24);             // stmxcsr [rsp]
+			Emit(0x41); Emit(0x8B); Emit(0x83);                         // mov eax,[r11+136]
+			*(int*)(code + offset) = 136; offset += sizeof(int);
+			Emit(0x25); *(uint*)(code + offset) = 0xFFFFFFC0u; offset += sizeof(uint); // and eax,~0x3f
+			Emit(0x8B); Emit(0x0C); Emit(0x24);                         // mov ecx,[rsp]
+			Emit(0x83); Emit(0xE1); Emit(0x3F);                         // and ecx,0x3f
+			Emit(0x09); Emit(0xC8);                                     // or eax,ecx
+			Emit(0x89); Emit(0x04); Emit(0x24);                         // mov [rsp],eax
+			Emit(0x0F); Emit(0xAE); Emit(0x14); Emit(0x24);             // ldmxcsr [rsp]
+			Emit(0x48); Emit(0x83); Emit(0xC4); Emit(0x08);             // add rsp,8
+			var mxcsrDoneLabel = offset;
+			*(int*)(code + mergeBranch) = mergeLabel - (mergeBranch + sizeof(int));
+			*(int*)(code + doneBranch) = mxcsrDoneLabel - (doneBranch + sizeof(int));
+			Emit(0x41); Emit(0xD9); Emit(0xAB);                         // fldcw [r11+144]
+			*(int*)(code + offset) = 144; offset += sizeof(int);
+
+			EmitLoadFromR11(4, 8);              // resume rsp
+			Emit(0x48); Emit(0x83); Emit(0xEC); Emit(0x08); // point at transfer return slot
 			EmitLoadFromR11(1, 24);             // rcx
 			EmitLoadFromR11(2, 32);             // rdx
 			EmitLoadFromR11(3, 40);             // rbx
@@ -1600,12 +1649,15 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			EmitLoadFromR11(7, 64);             // rdi
 			EmitLoadFromR11(8, 72);             // r8
 			EmitLoadFromR11(9, 80);             // r9
-			EmitLoadFromR11(12, 88);            // r12
-			EmitLoadFromR11(13, 96);            // r13
-			EmitLoadFromR11(14, 104);           // r14
-			EmitLoadFromR11(15, 112);           // r15
+			EmitLoadFromR11(10, 88);            // r10
+			EmitLoadFromR11(12, 104);           // r12
+			EmitLoadFromR11(13, 112);           // r13
+			EmitLoadFromR11(14, 120);           // r14
+			EmitLoadFromR11Disp32(15, 128);     // r15
 			EmitLoadFromR11(0, 16);             // rax
-			Emit(0x41); Emit(0xFF); Emit(0xE2); // jmp r10
+			EmitLoadFromR11(11, 96);            // r11 (last: frame pointer)
+			Emit(0xC3);                         // ret through [resume_rsp-8]
+			Debug.Assert(offset <= stubSize, "Guest context transfer stub exceeded its allocation.");
 
 			uint oldProtect = 0;
 			if (!VirtualProtect(code, stubSize, 32u, &oldProtect))
@@ -1622,7 +1674,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private unsafe nint CreateImportHandlerTrampoline(int importIndex)
 	{
-		void* ptr = VirtualAlloc(null, 256u, 12288u, 64u);
+		void* ptr = VirtualAlloc(null, 512u, 12288u, 64u);
 		if (ptr == null)
 		{
 			return 0;
@@ -1656,12 +1708,19 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			ptr2[num++] = 0x48;
 			ptr2[num++] = 0x81;
 			ptr2[num++] = 0xEC;
-			*(uint*)(ptr2 + num) = 0x90;
+			*(uint*)(ptr2 + num) = 0xB0;
 			num += 4;
 			ptr2[num++] = 0x48;
 			ptr2[num++] = 0x89;
 			ptr2[num++] = 0x04;
 			ptr2[num++] = 0x24;
+			// Preserve the remaining volatile guest machine context before any
+			// host call is made.  libSceFiber's setjmp/longjmp contract includes
+			// R10/R11 and the x87/MXCSR control state.
+			ptr2[num++] = 0x4C; ptr2[num++] = 0x89; ptr2[num++] = 0x54; ptr2[num++] = 0x24; ptr2[num++] = 0x08; // mov [rsp+8],r10
+			ptr2[num++] = 0x4C; ptr2[num++] = 0x89; ptr2[num++] = 0x5C; ptr2[num++] = 0x24; ptr2[num++] = 0x10; // mov [rsp+16],r11
+			ptr2[num++] = 0x0F; ptr2[num++] = 0xAE; ptr2[num++] = 0x5C; ptr2[num++] = 0x24; ptr2[num++] = 0x18; // stmxcsr [rsp+24]
+			ptr2[num++] = 0xD9; ptr2[num++] = 0x7C; ptr2[num++] = 0x24; ptr2[num++] = 0x1C; // fnstcw [rsp+28]
 			for (var xmm = 0; xmm < 8; xmm++)
 			{
 				ptr2[num++] = 0xF3;
@@ -1669,14 +1728,14 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				ptr2[num++] = 0x7F;
 				ptr2[num++] = (byte)(0x84 | (xmm << 3));
 				ptr2[num++] = 0x24;
-				*(uint*)(ptr2 + num) = (uint)(0x10 + (xmm * 0x10));
+				*(uint*)(ptr2 + num) = (uint)(0x30 + (xmm * 0x10));
 				num += 4;
 			}
 			ptr2[num++] = 0x4C;
 			ptr2[num++] = 0x8D;
 			ptr2[num++] = 0xA4;
 			ptr2[num++] = 0x24;
-			*(uint*)(ptr2 + num) = 0x90;
+			*(uint*)(ptr2 + num) = 0xB0;
 			num += 4;
 			ptr2[num++] = 72;
 			ptr2[num++] = 131;
@@ -1760,9 +1819,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			ptr2[num++] = 65;
 			ptr2[num++] = 95;
 			ptr2[num++] = 195;
+			Debug.Assert(num <= 512, "Import handler trampoline exceeded its allocation.");
 			uint num2 = default(uint);
-			VirtualProtect(ptr, 256u, 32u, &num2);
-			FlushInstructionCache(GetCurrentProcess(), ptr, 256u);
+			VirtualProtect(ptr, 512u, 32u, &num2);
+			FlushInstructionCache(GetCurrentProcess(), ptr, 512u);
 			return (nint)ptr;
 		}
 		catch
@@ -2997,6 +3057,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			Rflags = continuation.Rflags == 0 ? 0x202UL : continuation.Rflags,
 			FsBase = callerContext.FsBase != 0 ? callerContext.FsBase : (continuation.FsBase != 0 ? continuation.FsBase : fallbackTlsBase),
 			GsBase = callerContext.GsBase != 0 ? callerContext.GsBase : (continuation.GsBase != 0 ? continuation.GsBase : fallbackTlsBase),
+			FpuControlWord = continuation.FpuControlWord == 0 ? (ushort)0x037F : continuation.FpuControlWord,
+			Mxcsr = continuation.Mxcsr == 0 ? 0x1F80u : continuation.Mxcsr,
 		};
 
 		context[CpuRegister.Rax] = continuation.Rax;
@@ -3008,6 +3070,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		context[CpuRegister.Rdi] = continuation.Rdi;
 		context[CpuRegister.R8] = continuation.R8;
 		context[CpuRegister.R9] = continuation.R9;
+		context[CpuRegister.R10] = continuation.R10;
+		context[CpuRegister.R11] = continuation.R11;
 		context[CpuRegister.R12] = continuation.R12;
 		context[CpuRegister.R13] = continuation.R13;
 		context[CpuRegister.R14] = continuation.R14;
@@ -3618,6 +3682,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		context[CpuRegister.R14] = continuation.R14;
 		context[CpuRegister.R15] = continuation.R15;
 		context[CpuRegister.Rsp] = continuation.Rsp;
+		context.FpuControlWord = continuation.FpuControlWord == 0
+			? (ushort)0x037F
+			: continuation.FpuControlWord;
+		context.Mxcsr = continuation.Mxcsr == 0 ? 0x1F80u : continuation.Mxcsr;
 	}
 
 	private unsafe GuestNativeCallExitReason ExecuteGuestThreadEntry(CpuContext context, ulong entryPoint, string name, out string? reason)
@@ -3871,10 +3939,24 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			Emit(0x41); Emit(0x56); // push r14
 			Emit(0x41); Emit(0x57); // push r15
 			EmitHostNonvolatileXmmSave(ptr2, ref offset);
+			// Restore the fiber's floating-point control environment before
+			// abandoning the host stack. This path is used when a blocked guest
+			// continuation migrates to another managed worker.
+			Emit(0x48); Emit(0x83); Emit(0xEC); Emit(0x08); // sub rsp,8
+			Emit(0xC7); Emit(0x04); Emit(0x24);             // mov dword [rsp],imm32
+			*(uint*)(ptr2 + offset) = context.Mxcsr; offset += sizeof(uint);
+			Emit(0x0F); Emit(0xAE); Emit(0x14); Emit(0x24); // ldmxcsr [rsp]
+			Emit(0x66); Emit(0xC7); Emit(0x04); Emit(0x24); // mov word [rsp],imm16
+			*(ushort*)(ptr2 + offset) = context.FpuControlWord; offset += sizeof(ushort);
+			Emit(0xD9); Emit(0x2C); Emit(0x24);             // fldcw [rsp]
+			Emit(0x48); Emit(0x83); Emit(0xC4); Emit(0x08); // add rsp,8
 			EmitMovR64Imm(0x49, 0xBA, hostRspSlot); // mov r10, hostRspSlot
 			Emit(0x49); Emit(0x89); Emit(0x22); // mov [r10], rsp
 			EmitMovR64Imm(0x48, 0xB8, context[CpuRegister.Rsp]); // mov rax, guest rsp
 			Emit(0x48); Emit(0x89); Emit(0xC4); // mov rsp, rax
+			Emit(0x48); Emit(0x83); Emit(0xEC); Emit(0x08); // reserve transfer slot
+			EmitMovR64Imm(0x48, 0xB8, entryPoint); // mov rax, entryPoint
+			Emit(0x48); Emit(0x89); Emit(0x04); Emit(0x24); // mov [rsp],rax
 			EmitMovR64Imm(0x48, 0xBB, context[CpuRegister.Rbx]); // mov rbx, imm64
 			EmitMovR64Imm(0x48, 0xBD, context[CpuRegister.Rbp]); // mov rbp, imm64
 			EmitMovR64Imm(0x48, 0xBF, context[CpuRegister.Rdi]); // mov rdi, imm64
@@ -3883,13 +3965,14 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			EmitMovR64Imm(0x48, 0xB9, context[CpuRegister.Rcx]); // mov rcx, imm64
 			EmitMovR64Imm(0x49, 0xB8, context[CpuRegister.R8]); // mov r8, imm64
 			EmitMovR64Imm(0x49, 0xB9, context[CpuRegister.R9]); // mov r9, imm64
+			EmitMovR64Imm(0x49, 0xBA, context[CpuRegister.R10]); // mov r10, imm64
 			EmitMovR64Imm(0x49, 0xBC, context[CpuRegister.R12]); // mov r12, imm64
 			EmitMovR64Imm(0x49, 0xBD, context[CpuRegister.R13]); // mov r13, imm64
 			EmitMovR64Imm(0x49, 0xBE, context[CpuRegister.R14]); // mov r14, imm64
 			EmitMovR64Imm(0x49, 0xBF, context[CpuRegister.R15]); // mov r15, imm64
+			EmitMovR64Imm(0x49, 0xBB, context[CpuRegister.R11]); // mov r11, imm64
 			EmitMovR64Imm(0x48, 0xB8, context[CpuRegister.Rax]); // mov rax, imm64
-			EmitMovR64Imm(0x49, 0xBB, entryPoint); // mov r11, entryPoint
-			Emit(0x41); Emit(0xFF); Emit(0xE3); // jmp r11
+			Emit(0xC3); // ret through the synthetic transfer slot
 			ActiveEntryReturnSentinelRip = (ulong)_guestReturnStub;
 			if (returnSlotAddress == 0 || !context.TryWriteUInt64(returnSlotAddress, (ulong)_guestReturnStub))
 			{

@@ -19,7 +19,11 @@ public sealed partial class DirectExecutionBackend
 	// lets the managed gateway observe AL (the variadic vector-argument count)
 	// and all eight vector argument registers without changing the return-slot
 	// offsets used by the guest scheduler.
-	private const int ImportSavedRaxOffset = -144;
+	private const int ImportSavedRaxOffset = -176;
+	private const int ImportSavedR10Offset = -168;
+	private const int ImportSavedR11Offset = -160;
+	private const int ImportSavedMxcsrOffset = -152;
+	private const int ImportSavedFpuControlOffset = -148;
 	private const int ImportSavedXmmOffset = -128;
 	private const int ImportVectorRegisterCount = 8;
 
@@ -516,6 +520,10 @@ public sealed partial class DirectExecutionBackend
 	private unsafe static void LoadImportVolatileArguments(CpuContext cpuContext, nint argPackPtr)
 	{
 		cpuContext[CpuRegister.Rax] = *(ulong*)(argPackPtr + ImportSavedRaxOffset);
+		cpuContext[CpuRegister.R10] = *(ulong*)(argPackPtr + ImportSavedR10Offset);
+		cpuContext[CpuRegister.R11] = *(ulong*)(argPackPtr + ImportSavedR11Offset);
+		cpuContext.Mxcsr = *(uint*)(argPackPtr + ImportSavedMxcsrOffset);
+		cpuContext.FpuControlWord = *(ushort*)(argPackPtr + ImportSavedFpuControlOffset);
 		for (var registerIndex = 0; registerIndex < ImportVectorRegisterCount; registerIndex++)
 		{
 			var registerAddress = argPackPtr + ImportSavedXmmOffset + (registerIndex * 16);
