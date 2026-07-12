@@ -209,6 +209,11 @@ public static class AgcExports
     private static long _packetPayloadTraceCount;
     private static bool _tracedMissingPixelShaderBindings;
     private static long _unsatisfiedWaitTraceCount;
+    private static long _labelProducerSequence;
+    private static readonly object _labelProducerGate = new();
+    private static readonly List<LabelProducerTrace> _labelProducers = [];
+    private static readonly HashSet<(object Memory, ulong Address, ulong SubmissionId)>
+        _tracedProducerlessWaits = new();
     private static long _shaderTranslationMissTraceCount;
     private static long _translatedDrawTraceCount;
     private static long _standardDmaTraceCount;
@@ -438,6 +443,8 @@ public static class AgcExports
         public uint IndexSize { get; set; }
         public uint InstanceCount { get; set; } = 1;
         public uint DrawIndexOffset { get; set; }
+        public string QueueName { get; set; } = "graphics";
+        public ulong ActiveSubmissionId { get; set; }
     }
 
     private sealed class SubmittedGpuState
@@ -447,6 +454,20 @@ public static class AgcExports
         public Dictionary<uint, SubmittedDcbState> ComputeQueues { get; } = new();
         public Dictionary<ulong, ComputeImageWriter> ComputeImageWriters { get; } = new();
         public ulong WorkSequence { get; set; }
+        public ulong SubmissionSequence { get; set; }
+    }
+
+    private sealed class LabelProducerTrace
+    {
+        public long Sequence;
+        public required object Memory;
+        public ulong Address;
+        public ulong Length;
+        public ulong PacketAddress;
+        public ulong SubmissionId;
+        public required string QueueName;
+        public required string DebugName;
+        public bool Completed;
     }
 
     private readonly record struct RegisterDefaultValue(uint Offset, uint Value);
@@ -2092,6 +2113,8 @@ public static class AgcExports
         var gpuState = _submittedGpuStates.GetValue(ctx.Memory, static _ => new SubmittedGpuState());
         lock (gpuState.Gate)
         {
+            gpuState.Graphics.QueueName = "dcb.graphics";
+            gpuState.Graphics.ActiveSubmissionId = ++gpuState.SubmissionSequence;
             ParseSubmittedDcb(ctx, gpuState, gpuState.Graphics, commandAddress, dwordCount, tracePackets);
             DrainResumableDcbs(ctx, gpuState, tracePackets);
         }
@@ -2142,6 +2165,8 @@ public static class AgcExports
                 gpuState.ComputeQueues.Add(ownerHandle, queueState);
             }
 
+            queueState.QueueName = $"acb.compute[{ownerHandle}]";
+            queueState.ActiveSubmissionId = ++gpuState.SubmissionSequence;
             ParseSubmittedDcb(ctx, gpuState, queueState, commandAddress, dwordCount, tracePackets);
             DrainResumableDcbs(ctx, gpuState, tracePackets);
         }
@@ -2378,6 +2403,7 @@ public static class AgcExports
                 SubmitOrderedGpuSideEffect(
                     ctx,
                     gpuState,
+                    state,
                     () =>
                     {
                         var triggered = KernelEventQueueCompatExports.TriggerRegisteredEvents(
@@ -2389,12 +2415,13 @@ public static class AgcExports
                             TraceAgc($"agc.dcb.event type=0x{eventType:X2} queues={triggered}");
                         }
                     },
-                    $"event_write type=0x{eventType:X2}");
+                    $"event_write type=0x{eventType:X2}",
+                    currentAddress);
             }
 
             if (op == ItNop && register == RReleaseMem && length >= 7)
             {
-                ApplySubmittedReleaseMem(ctx, gpuState, currentAddress, tracePackets);
+                ApplySubmittedReleaseMem(ctx, gpuState, state, currentAddress, tracePackets);
             }
 
             if (op == ItNop && register == RWriteData && length >= 4)
@@ -2402,6 +2429,7 @@ public static class AgcExports
                 ApplySubmittedWriteData(
                     ctx,
                     gpuState,
+                    state,
                     currentAddress,
                     length,
                     standardPacket: false,
@@ -2413,6 +2441,7 @@ public static class AgcExports
                 ApplySubmittedWriteData(
                     ctx,
                     gpuState,
+                    state,
                     currentAddress,
                     length,
                     standardPacket: true,
@@ -2421,12 +2450,12 @@ public static class AgcExports
 
             if (op == ItNop && register == RDmaData && length >= 8)
             {
-                ApplySubmittedDmaData(ctx, gpuState, currentAddress, tracePackets);
+                ApplySubmittedDmaData(ctx, gpuState, state, currentAddress, tracePackets);
             }
 
             if (op == ItDmaData && length >= 7)
             {
-                ApplySubmittedStandardDmaData(ctx, gpuState, currentAddress);
+                ApplySubmittedStandardDmaData(ctx, gpuState, state, currentAddress);
             }
 
             if (op == ItIndexBase &&
@@ -2667,6 +2696,7 @@ public static class AgcExports
     private static void ApplySubmittedDmaData(
         CpuContext ctx,
         SubmittedGpuState gpuState,
+        SubmittedDcbState state,
         ulong packetAddress,
         bool tracePacket)
     {
@@ -2680,6 +2710,7 @@ public static class AgcExports
         SubmitOrderedGpuSideEffect(
             ctx,
             gpuState,
+            state,
             () =>
             {
                 InvalidateDcbWindowIfOverlaps(destinationAddress, byteCount);
@@ -2705,18 +2736,34 @@ public static class AgcExports
                         $"src=0x{sourceAddress:X16} bytes={byteCount} copied={copied}");
                 }
             },
-            $"agc_dma_data dst=0x{destinationAddress:X16} bytes={byteCount}");
+            $"agc_dma_data dst=0x{destinationAddress:X16} bytes={byteCount}",
+            packetAddress,
+            destinationAddress,
+            byteCount);
     }
 
     private static void SubmitOrderedGpuSideEffect(
         CpuContext ctx,
         SubmittedGpuState gpuState,
+        SubmittedDcbState state,
         Action action,
-        string debugName)
+        string debugName,
+        ulong packetAddress,
+        ulong producerAddress = 0,
+        ulong producerLength = 0)
     {
+        var producer = RegisterLabelProducer(
+            ctx.Memory,
+            state,
+            packetAddress,
+            producerAddress,
+            producerLength,
+            debugName);
+
         void ApplyAndWake()
         {
             action();
+            CompleteLabelProducer(producer);
             if (GpuWaitRegistry.Count == 0)
             {
                 return;
@@ -2743,6 +2790,154 @@ public static class AgcExports
             // against, so retaining the previous immediate behavior is exact.
             ApplyAndWake();
         }
+    }
+
+    private static LabelProducerTrace? RegisterLabelProducer(
+        object memory,
+        SubmittedDcbState state,
+        ulong packetAddress,
+        ulong address,
+        ulong length,
+        string debugName)
+    {
+        if (address == 0 || length == 0)
+        {
+            return null;
+        }
+
+        var producer = new LabelProducerTrace
+        {
+            Sequence = Interlocked.Increment(ref _labelProducerSequence),
+            Memory = memory,
+            Address = address,
+            Length = length,
+            PacketAddress = packetAddress,
+            SubmissionId = state.ActiveSubmissionId,
+            QueueName = state.QueueName,
+            DebugName = debugName,
+        };
+        lock (_labelProducerGate)
+        {
+            if (_labelProducers.Count >= 4096)
+            {
+                _labelProducers.RemoveRange(0, 1024);
+            }
+
+            _labelProducers.Add(producer);
+        }
+
+        foreach (var waiting in GpuWaitRegistry.SnapshotInRange(memory, address, length))
+        {
+            TraceAgc(
+                $"agc.wait_producer_scheduled label=0x{waiting.Address:X16} " +
+                $"waiters={waiting.Count} producer_seq={producer.Sequence} " +
+                $"queue={producer.QueueName} submission={producer.SubmissionId} " +
+                $"packet=0x{packetAddress:X16} action='{debugName}'");
+        }
+
+        return producer;
+    }
+
+    private static void CompleteLabelProducer(LabelProducerTrace? producer)
+    {
+        if (producer is null)
+        {
+            return;
+        }
+
+        lock (_labelProducerGate)
+        {
+            producer.Completed = true;
+        }
+
+        foreach (var waiting in GpuWaitRegistry.SnapshotInRange(
+                     producer.Memory,
+                     producer.Address,
+                     producer.Length))
+        {
+            TraceAgc(
+                $"agc.wait_producer_completed label=0x{waiting.Address:X16} " +
+                $"waiters={waiting.Count} producer_seq={producer.Sequence} " +
+                $"queue={producer.QueueName} submission={producer.SubmissionId} " +
+                $"action='{producer.DebugName}'");
+        }
+    }
+
+    private static void TraceWaitProducerState(
+        object memory,
+        in GpuWaitRegistry.WaitingDcb waiter,
+        ulong commandAddress,
+        ulong packetAddress,
+        bool stale)
+    {
+        LabelProducerTrace? producer = null;
+        lock (_labelProducerGate)
+        {
+            for (var index = _labelProducers.Count - 1; index >= 0; index--)
+            {
+                var candidate = _labelProducers[index];
+                if (!ReferenceEquals(candidate.Memory, memory) ||
+                    !RangesOverlap(
+                        candidate.Address,
+                        candidate.Length,
+                        waiter.WaitAddress,
+                        waiter.Is64Bit ? (ulong)sizeof(ulong) : sizeof(uint)))
+                {
+                    continue;
+                }
+
+                producer = candidate;
+                break;
+            }
+
+            if (_tracedProducerlessWaits.Count >= 4096)
+            {
+                _tracedProducerlessWaits.Clear();
+            }
+
+            if (!stale && producer is null &&
+                !_tracedProducerlessWaits.Add(
+                    (memory, waiter.WaitAddress, waiter.SubmissionId)))
+            {
+                return;
+            }
+        }
+
+        var prefix = stale ? "agc.wait_stale" : "agc.wait_suspended";
+        if (producer is null)
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][WARN] {prefix} label=0x{waiter.WaitAddress:X16} " +
+                $"queue={waiter.QueueName} submission={waiter.SubmissionId} " +
+                $"command=0x{commandAddress:X16} packet=0x{packetAddress:X16} " +
+                "producer=none-observed; remaining-suspended");
+            return;
+        }
+
+        TraceAgc(
+            $"{prefix} label=0x{waiter.WaitAddress:X16} " +
+            $"queue={waiter.QueueName} submission={waiter.SubmissionId} " +
+            $"producer_seq={producer.Sequence} producer_state=" +
+            $"{(producer.Completed ? "completed" : "queued")} " +
+            $"producer_queue={producer.QueueName} " +
+            $"producer_submission={producer.SubmissionId} " +
+            $"producer_packet=0x{producer.PacketAddress:X16} " +
+            $"action='{producer.DebugName}'");
+    }
+
+    private static bool RangesOverlap(
+        ulong leftAddress,
+        ulong leftLength,
+        ulong rightAddress,
+        ulong rightLength)
+    {
+        var leftEnd = leftAddress > ulong.MaxValue - leftLength
+            ? ulong.MaxValue
+            : leftAddress + leftLength;
+        var rightEnd = rightAddress > ulong.MaxValue - rightLength
+            ? ulong.MaxValue
+            : rightAddress + rightLength;
+        return leftAddress < rightEnd && rightAddress < leftEnd;
     }
 
     /// <summary>
@@ -2865,6 +3060,7 @@ public static class AgcExports
     private static void ApplySubmittedStandardDmaData(
         CpuContext ctx,
         SubmittedGpuState gpuState,
+        SubmittedDcbState state,
         ulong packetAddress)
     {
         if (!TryReadUInt32(ctx, packetAddress + 4, out var control) ||
@@ -2877,9 +3073,21 @@ public static class AgcExports
             return;
         }
 
+        var byteCount = command & 0x1F_FFFFu;
+        var destinationSelect = (control >> 20) & 0x3u;
+        var destinationSwap = (command >> 24) & 0x3u;
+        var destinationAddressSpace = (command >> 27) & 0x1u;
+        var destinationAddress = destinationLow | ((ulong)destinationHigh << 32);
+        var writesGuestMemory =
+            byteCount != 0 &&
+            destinationSwap == 0 &&
+            destinationSelect is 0 or 3 &&
+            (destinationSelect == 3 || destinationAddressSpace == 0);
+
         SubmitOrderedGpuSideEffect(
             ctx,
             gpuState,
+            state,
             () => ApplySubmittedStandardDmaDataSnapshot(
                 ctx,
                 control,
@@ -2888,8 +3096,10 @@ public static class AgcExports
                 destinationLow,
                 destinationHigh,
                 command),
-            $"dma_data dst=0x{destinationHigh:X8}{destinationLow:X8} " +
-            $"bytes={command & 0x1F_FFFFu}");
+            $"dma_data dst=0x{destinationHigh:X8}{destinationLow:X8} bytes={byteCount}",
+            packetAddress,
+            writesGuestMemory ? destinationAddress : 0,
+            writesGuestMemory ? byteCount : 0);
     }
 
     private static void ApplySubmittedStandardDmaDataSnapshot(
@@ -2983,6 +3193,7 @@ public static class AgcExports
     private static void ApplySubmittedWriteData(
         CpuContext ctx,
         SubmittedGpuState gpuState,
+        SubmittedDcbState state,
         ulong packetAddress,
         uint packetLength,
         bool standardPacket,
@@ -3011,6 +3222,7 @@ public static class AgcExports
         SubmitOrderedGpuSideEffect(
             ctx,
             gpuState,
+            state,
             () =>
             {
                 InvalidateDcbWindowIfOverlaps(
@@ -3033,7 +3245,12 @@ public static class AgcExports
                         $"cache={cachePolicy} standard={standardPacket} wrote={wroteData}");
                 }
             },
-            $"write_data dst=0x{destinationAddress:X16} count={dwordCount}");
+            $"write_data dst=0x{destinationAddress:X16} count={dwordCount}",
+            packetAddress,
+            destination is 1 or 2 or 4 or 5 ? destinationAddress : 0,
+            destination is 1 or 2 or 4 or 5
+                ? incrementAddress ? (ulong)dwordCount * sizeof(uint) : sizeof(uint)
+                : 0);
     }
 
     private static (uint Destination, bool IncrementAddress, bool WriteConfirm, uint CachePolicy)
@@ -3090,16 +3307,17 @@ public static class AgcExports
         "force",
         StringComparison.OrdinalIgnoreCase);
 
-    // Safety valve: a completion label the guest expects but that we never
-    // write (work we do not model) would otherwise suspend its DCB forever.
-    // Force-satisfy + resume waiters older than this. SHARPEMU_GPU_WAIT_FALLBACK_MS
-    // overrides (0 disables the valve); default 3s.
+    // Optional age for one-shot missing-producer diagnostics. Stale waits are
+    // never removed or force-satisfied in the default suspend mode: doing so
+    // advances a queue without its real cross-queue producer and can publish
+    // incomplete CPU/GPU state. Only SHARPEMU_GPU_WAIT_MODE=force retains the
+    // explicit legacy mutation path above. Default 0 disables age diagnostics.
     private static readonly long _gpuWaitStaleTicks =
         (long.TryParse(
              Environment.GetEnvironmentVariable("SHARPEMU_GPU_WAIT_FALLBACK_MS"),
              out var fallbackMs) && fallbackMs >= 0
             ? fallbackMs
-            : 3000L) * System.Diagnostics.Stopwatch.Frequency / 1000L;
+            : 0L) * System.Diagnostics.Stopwatch.Frequency / 1000L;
 
     // Reads the WAIT_REG_MEM watched address, reference, mask, and 3-bit compare
     // function for both the AGC NOP-encapsulated (RWaitMem32/64) and the standard
@@ -3180,6 +3398,36 @@ public static class AgcExports
             return false;
         }
 
+        // COMPARE_FUNC=0 is the hardware "always" condition. Reserved 7 is
+        // also fail-open; neither condition may register a waiter. Validate
+        // the watched memory before any read so null/malformed packets cannot
+        // become permanent entries keyed by address zero.
+        if (compareFunction is 0 or 7)
+        {
+            TraceSubmittedWait(
+                waitAddress,
+                0,
+                mask,
+                reference,
+                compareFunction,
+                is64Bit ? 64 : 32,
+                tracePacket);
+            return false;
+        }
+
+        var requiredAlignment = is64Bit ? sizeof(ulong) : sizeof(uint);
+        if (waitAddress == 0 ||
+            mask == 0 ||
+            waitAddress % (ulong)requiredAlignment != 0)
+        {
+            TraceAgc(
+                $"agc.dcb.wait_reject addr=0x{waitAddress:X16} " +
+                $"mask=0x{mask:X16} compare={compareFunction} bits=" +
+                $"{(is64Bit ? 64 : 32)} standard={isStandard} " +
+                $"packet=0x{packetAddress:X16} reason=invalid-address-or-mask");
+            return false;
+        }
+
         ulong currentValue = 0;
         bool hasCurrent;
         if (is64Bit)
@@ -3210,6 +3458,10 @@ public static class AgcExports
             Mask = mask,
             CompareFunction = compareFunction,
             Is64Bit = is64Bit,
+            WaitAddress = waitAddress,
+            Memory = ctx.Memory,
+            QueueName = state.QueueName,
+            SubmissionId = state.ActiveSubmissionId,
             RegisteredTicks = System.Diagnostics.Stopwatch.GetTimestamp(),
             State = state,
         };
@@ -3235,6 +3487,12 @@ public static class AgcExports
         }
 
         GpuWaitRegistry.Register(waitAddress, waiter);
+        TraceWaitProducerState(
+            ctx.Memory,
+            waiter,
+            commandAddress,
+            packetAddress,
+            stale: false);
         if (tracePacket)
         {
             TraceAgc(
@@ -3246,9 +3504,9 @@ public static class AgcExports
     }
 
     /// <summary>
-    /// Writes a value that satisfies the waiter's comparison so a wait whose
-    /// completion label is never written cannot deadlock. Used only by the
-    /// legacy force mode and the stale-waiter safety valve.
+    /// Writes a value that satisfies the waiter's comparison. This deliberately
+    /// exists only behind SHARPEMU_GPU_WAIT_MODE=force for legacy A/B testing;
+    /// normal and stale waits must never mutate their watched label.
     /// </summary>
     private static void ForceSatisfyGpuWait(
         CpuContext ctx,
@@ -3307,7 +3565,7 @@ public static class AgcExports
 
         for (var pass = 0; pass < 256; pass++)
         {
-            var woken = GpuWaitRegistry.CollectSatisfied((address, is64Bit) =>
+            var woken = GpuWaitRegistry.CollectSatisfied(ctx.Memory, (address, is64Bit) =>
                 is64Bit
                     ? TryReadUInt64(ctx, address, out var value64) ? value64 : (ulong?)null
                     : TryReadUInt32(ctx, address, out var value32) ? value32 : (ulong?)null);
@@ -3315,16 +3573,20 @@ public static class AgcExports
             if (woken is null)
             {
                 if (_gpuWaitStaleTicks > 0 &&
-                    GpuWaitRegistry.CollectStale(
+                    GpuWaitRegistry.CollectUnreportedStale(
+                        ctx.Memory,
                         System.Diagnostics.Stopwatch.GetTimestamp(),
                         _gpuWaitStaleTicks) is { } stale)
                 {
                     foreach (var waiter in stale)
                     {
-                        ResumeSuspendedDcb(ctx, gpuState, waiter, tracePackets, forced: true);
+                        TraceWaitProducerState(
+                            ctx.Memory,
+                            waiter,
+                            waiter.CommandBufferAddress,
+                            waiter.ResumeAddress,
+                            stale: true);
                     }
-
-                    continue;
                 }
 
                 return;
@@ -3332,7 +3594,7 @@ public static class AgcExports
 
             foreach (var waiter in woken)
             {
-                ResumeSuspendedDcb(ctx, gpuState, waiter, tracePackets, forced: false);
+                ResumeSuspendedDcb(ctx, gpuState, waiter, tracePackets);
             }
         }
     }
@@ -3341,24 +3603,8 @@ public static class AgcExports
         CpuContext ctx,
         SubmittedGpuState gpuState,
         in GpuWaitRegistry.WaitingDcb waiter,
-        bool tracePackets,
-        bool forced)
+        bool tracePackets)
     {
-        if (forced)
-        {
-            ulong value = 0;
-            if (waiter.Is64Bit)
-            {
-                TryReadUInt64(ctx, waiter.WaitAddress, out value);
-            }
-            else if (TryReadUInt32(ctx, waiter.WaitAddress, out var value32))
-            {
-                value = value32;
-            }
-
-            ForceSatisfyGpuWait(ctx, waiter, value);
-        }
-
         var remainingDwords = waiter.TotalDwords - waiter.ResumeOffset;
         if (remainingDwords == 0)
         {
@@ -3369,11 +3615,29 @@ public static class AgcExports
         {
             TraceAgc(
                 $"agc.dcb.resumed addr=0x{waiter.WaitAddress:X16} " +
-                $"resume=0x{waiter.ResumeAddress:X16} dwords={remainingDwords} forced={forced}");
+                $"resume=0x{waiter.ResumeAddress:X16} dwords={remainingDwords} forced=False");
         }
 
         var state = waiter.State as SubmittedDcbState ?? gpuState.Graphics;
-        ParseSubmittedDcb(ctx, gpuState, state, waiter.ResumeAddress, remainingDwords, tracePackets);
+        var previousQueueName = state.QueueName;
+        var previousSubmissionId = state.ActiveSubmissionId;
+        try
+        {
+            state.QueueName = waiter.QueueName ?? previousQueueName;
+            state.ActiveSubmissionId = waiter.SubmissionId;
+            ParseSubmittedDcb(
+                ctx,
+                gpuState,
+                state,
+                waiter.ResumeAddress,
+                remainingDwords,
+                tracePackets);
+        }
+        finally
+        {
+            state.QueueName = previousQueueName;
+            state.ActiveSubmissionId = previousSubmissionId;
+        }
     }
 
     private static void TraceSubmittedWait(
@@ -3388,7 +3652,7 @@ public static class AgcExports
         var maskedValue = value & mask;
         var satisfied = compareFunction switch
         {
-            0 => false,
+            0 => true,
             1 => maskedValue < reference,
             2 => maskedValue <= reference,
             3 => maskedValue == reference,
@@ -3411,6 +3675,7 @@ public static class AgcExports
     private static void ApplySubmittedReleaseMem(
         CpuContext ctx,
         SubmittedGpuState gpuState,
+        SubmittedDcbState state,
         ulong packetAddress,
         bool tracePacket)
     {
@@ -3429,6 +3694,7 @@ public static class AgcExports
         SubmitOrderedGpuSideEffect(
             ctx,
             gpuState,
+            state,
             () =>
             {
                 InvalidateDcbWindowIfOverlaps(destinationAddress, sizeof(ulong));
@@ -3446,7 +3712,11 @@ public static class AgcExports
                         $"data_sel={dataSelection} data=0x{data:X16} wrote={wroteData}");
                 }
             },
-            $"release_mem dst=0x{destinationAddress:X16} data=0x{data:X16}");
+            $"release_mem dst=0x{destinationAddress:X16} data=0x{data:X16}",
+            packetAddress,
+            dataSelection is 1 or 2 or 3 ? destinationAddress : 0,
+            dataSelection == 3 ? (ulong)sizeof(ulong) :
+                dataSelection is 1 or 2 ? sizeof(uint) : 0UL);
     }
 
     private static void ApplySubmittedRegisters(

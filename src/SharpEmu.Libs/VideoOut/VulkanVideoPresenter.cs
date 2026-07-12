@@ -1471,6 +1471,7 @@ internal static unsafe class VulkanVideoPresenter
         private readonly HashSet<(ulong Shader, uint X, uint Y, uint Z, string Reason)>
             _rejectedComputeDispatches = new();
         private int _tracedSmallGlobalWritebackEvents;
+        private int _tracedLargeGlobalWritebackEvents;
         private readonly HashSet<ulong> _tracedGuestImageContents = new();
         private readonly Dictionary<ulong, int> _tracedGuestWriteCounts = new();
         private int _tracedVertexBufferCount;
@@ -6576,20 +6577,208 @@ internal static unsafe class VulkanVideoPresenter
                         continue;
                     }
 
-                    var bytes = new ReadOnlySpan<byte>(
+                    var mappedBytes = new ReadOnlySpan<byte>(
                         (void*)(allocation.Mapped + checked((nint)range.Offset)),
                         checked((int)range.Length));
+                    var shadowBytes = allocation.Shadow.AsSpan(
+                        checked((int)range.Offset),
+                        mappedBytes.Length);
                     var guestAddress = allocation.BaseAddress + range.Offset;
-                    var wrote = memory.TryWrite(guestAddress, bytes);
-                    if (wrote)
+                    var changedBytes = 0UL;
+                    var changedRuns = 0;
+                    var changedPages = 0;
+                    var writtenRuns = 0;
+                    var writtenPages = 0;
+                    var failedRuns = 0;
+                    var unreadablePages = 0;
+                    var fallbackWrites = 0;
+                    var firstChangedOffset = -1;
+                    allocation.DirtyRanges.RemoveAt(index);
+
+                    // A writable descriptor only identifies a potential write
+                    // range. Publishing the entire mapped view would overwrite
+                    // unrelated live CPU data with its old snapshot. Compare
+                    // against the last synchronized image. For each changed
+                    // page, start with current guest bytes and overlay only the
+                    // shader changes before one bounded write. This preserves
+                    // live CPU changes in unchanged bytes without degenerating
+                    // into millions of writes for alternating output patterns.
+                    const int pageSize = 4096;
+                    const int unreadableMergeGap = 16;
+                    var livePageBuffer = System.Buffers.ArrayPool<byte>.Shared.Rent(pageSize);
+                    var pageRuns = new List<(int Start, int Length)>(64);
+                    try
                     {
-                        bytes.CopyTo(allocation.Shadow.AsSpan(
-                            checked((int)range.Offset),
-                            bytes.Length));
-                        allocation.DirtyRanges.RemoveAt(index);
+                        for (var pageStart = 0;
+                             pageStart < mappedBytes.Length;
+                             pageStart += pageSize)
+                        {
+                            var pageEnd = Math.Min(pageStart + pageSize, mappedBytes.Length);
+                            pageRuns.Clear();
+                            var cursor = pageStart;
+                            while (cursor < pageEnd)
+                            {
+                                while (cursor < pageEnd &&
+                                       mappedBytes[cursor] == shadowBytes[cursor])
+                                {
+                                    cursor++;
+                                }
+
+                                if (cursor == pageEnd)
+                                {
+                                    break;
+                                }
+
+                                var runStart = cursor;
+                                while (cursor < pageEnd &&
+                                       mappedBytes[cursor] != shadowBytes[cursor])
+                                {
+                                    cursor++;
+                                }
+
+                                var runLength = cursor - runStart;
+                                pageRuns.Add((runStart, runLength));
+                                changedRuns++;
+                                changedBytes += (ulong)runLength;
+                                if (firstChangedOffset < 0)
+                                {
+                                    firstChangedOffset = runStart;
+                                }
+                            }
+
+                            if (pageRuns.Count == 0)
+                            {
+                                continue;
+                            }
+
+                            changedPages++;
+                            var pageLength = pageEnd - pageStart;
+                            var livePage = livePageBuffer.AsSpan(0, pageLength);
+                            if (memory.TryRead(guestAddress + (ulong)pageStart, livePage))
+                            {
+                                foreach (var run in pageRuns)
+                                {
+                                    mappedBytes.Slice(run.Start, run.Length).CopyTo(
+                                        livePage.Slice(run.Start - pageStart, run.Length));
+                                }
+
+                                if (memory.TryWrite(guestAddress + (ulong)pageStart, livePage))
+                                {
+                                    foreach (var run in pageRuns)
+                                    {
+                                        mappedBytes.Slice(run.Start, run.Length).CopyTo(
+                                            shadowBytes.Slice(run.Start, run.Length));
+                                    }
+
+                                    writtenPages++;
+                                    writtenRuns += pageRuns.Count;
+                                    continue;
+                                }
+
+                                foreach (var run in pageRuns)
+                                {
+                                    failedRuns++;
+                                    MarkGuestBufferDirty(
+                                        allocation,
+                                        range.Offset + (ulong)run.Start,
+                                        (ulong)run.Length);
+                                }
+
+                                continue;
+                            }
+
+                            // A partial/unreadable edge cannot be safely
+                            // reconstructed as a page. Fall back to bounded
+                            // changed spans, coalescing only tiny gaps.
+                            unreadablePages++;
+                            for (var runIndex = 0; runIndex < pageRuns.Count; runIndex++)
+                            {
+                                var firstRunIndex = runIndex;
+                                var mergedStart = pageRuns[runIndex].Start;
+                                var mergedEnd = mergedStart + pageRuns[runIndex].Length;
+                                while (runIndex + 1 < pageRuns.Count &&
+                                       pageRuns[runIndex + 1].Start - mergedEnd <=
+                                       unreadableMergeGap)
+                                {
+                                    runIndex++;
+                                    mergedEnd = pageRuns[runIndex].Start +
+                                        pageRuns[runIndex].Length;
+                                }
+
+                                var lastRunIndex = runIndex;
+                                var mergedLength = mergedEnd - mergedStart;
+                                var mergedLive = livePageBuffer.AsSpan(0, mergedLength);
+                                if (memory.TryRead(
+                                        guestAddress + (ulong)mergedStart,
+                                        mergedLive))
+                                {
+                                    for (var overlayIndex = firstRunIndex;
+                                         overlayIndex <= lastRunIndex;
+                                         overlayIndex++)
+                                    {
+                                        var run = pageRuns[overlayIndex];
+                                        mappedBytes.Slice(run.Start, run.Length).CopyTo(
+                                            mergedLive.Slice(
+                                                run.Start - mergedStart,
+                                                run.Length));
+                                    }
+
+                                    fallbackWrites++;
+                                    if (memory.TryWrite(
+                                            guestAddress + (ulong)mergedStart,
+                                            mergedLive))
+                                    {
+                                        for (var overlayIndex = firstRunIndex;
+                                             overlayIndex <= lastRunIndex;
+                                             overlayIndex++)
+                                        {
+                                            var run = pageRuns[overlayIndex];
+                                            mappedBytes.Slice(run.Start, run.Length).CopyTo(
+                                                shadowBytes.Slice(run.Start, run.Length));
+                                        }
+
+                                        writtenRuns += lastRunIndex - firstRunIndex + 1;
+                                        continue;
+                                    }
+                                }
+
+                                // Even the merged span crosses an unreadable
+                                // edge. Exact changed runs remain safe because
+                                // they never carry stale gap bytes.
+                                for (var exactIndex = firstRunIndex;
+                                     exactIndex <= lastRunIndex;
+                                     exactIndex++)
+                                {
+                                    var run = pageRuns[exactIndex];
+                                    var changed = mappedBytes.Slice(run.Start, run.Length);
+                                    fallbackWrites++;
+                                    if (memory.TryWrite(
+                                            guestAddress + (ulong)run.Start,
+                                            changed))
+                                    {
+                                        changed.CopyTo(shadowBytes.Slice(
+                                            run.Start,
+                                            run.Length));
+                                        writtenRuns++;
+                                    }
+                                    else
+                                    {
+                                        failedRuns++;
+                                        MarkGuestBufferDirty(
+                                            allocation,
+                                            range.Offset + (ulong)run.Start,
+                                            (ulong)run.Length);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        System.Buffers.ArrayPool<byte>.Shared.Return(livePageBuffer);
                     }
 
-                    var probe = bytes[..Math.Min(bytes.Length, 256)];
+                    var probe = mappedBytes[..Math.Min(mappedBytes.Length, 256)];
                     var nonzero = 0;
                     foreach (var value in probe)
                     {
@@ -6600,13 +6789,24 @@ internal static unsafe class VulkanVideoPresenter
                         _tracedGlobalWritebacks.Add((guestAddress, range.Length));
                     var traceSmallMutation = range.Length <= 4096 &&
                         _tracedSmallGlobalWritebackEvents++ < 1024;
-                    if (firstForRange || traceSmallMutation)
+                    var traceLargeMutation = range.Length >= 1024 * 1024 &&
+                        _tracedLargeGlobalWritebackEvents++ < 256;
+                    if (firstForRange || traceSmallMutation || traceLargeMutation)
                     {
+                        var head = firstChangedOffset >= 0
+                            ? mappedBytes.Slice(
+                                firstChangedOffset,
+                                Math.Min(mappedBytes.Length - firstChangedOffset, 32))
+                            : ReadOnlySpan<byte>.Empty;
                         TraceVulkanShader(
                             $"vk.global_writeback base=0x{guestAddress:X16} " +
-                            $"bytes={bytes.Length} probe_nonzero={nonzero}/{probe.Length} " +
-                            $"head={Convert.ToHexString(bytes[..Math.Min(bytes.Length, 32)])} " +
-                            $"wrote={wrote}");
+                            $"potential_bytes={mappedBytes.Length} changed_bytes={changedBytes} " +
+                            $"changed_runs={changedRuns} changed_pages={changedPages} " +
+                            $"written_pages={writtenPages} written_runs={writtenRuns} " +
+                            $"unreadable_pages={unreadablePages} " +
+                            $"fallback_writes={fallbackWrites} failed_runs={failedRuns} " +
+                            $"probe_nonzero={nonzero}/{probe.Length} " +
+                            $"changed_head={Convert.ToHexString(head)}");
                     }
                 }
             }

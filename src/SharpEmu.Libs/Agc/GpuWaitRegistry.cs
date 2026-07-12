@@ -27,10 +27,13 @@ internal static class GpuWaitRegistry
         public ulong Mask;
         public uint CompareFunction;
         public bool Is64Bit;
-        // Stopwatch timestamp captured at registration; used only by the
-        // stale-waiter safety valve so a label that is never written cannot
-        // suspend its DCB forever.
+        public object? Memory;
+        public string? QueueName;
+        public ulong SubmissionId;
+        // Stopwatch timestamp captured at registration. Stale waiters remain
+        // registered; this only controls one-shot diagnostics.
         public long RegisteredTicks;
+        public bool StaleReported;
         public object? State;
     }
 
@@ -75,7 +78,9 @@ internal static class GpuWaitRegistry
     /// unreadable; such waiters are kept registered. Returns the waiters whose
     /// condition is now satisfied (removed from the registry), or null.
     /// </summary>
-    public static List<WaitingDcb>? CollectSatisfied(Func<ulong, bool, ulong?> readValue)
+    public static List<WaitingDcb>? CollectSatisfied(
+        object memory,
+        Func<ulong, bool, ulong?> readValue)
     {
         List<WaitingDcb>? woken = null;
         lock (_gate)
@@ -85,6 +90,11 @@ internal static class GpuWaitRegistry
             {
                 for (var i = list.Count - 1; i >= 0; i--)
                 {
+                    if (!ReferenceEquals(list[i].Memory, memory))
+                    {
+                        continue;
+                    }
+
                     var value = readValue(address, list[i].Is64Bit);
                     if (value is null || !Compare(list[i], value.Value))
                     {
@@ -116,48 +126,95 @@ internal static class GpuWaitRegistry
     }
 
     /// <summary>
-    /// Safety valve: removes and returns waiters that have been suspended for
-    /// longer than <paramref name="maxAgeTicks"/> so a completion label that is
-    /// never written (e.g. one the guest expects from work we do not model)
-    /// cannot deadlock its DCB. The caller force-satisfies + resumes them.
+    /// Returns waiters that have remained unsatisfied longer than
+    /// <paramref name="maxAgeTicks"/> exactly once, without removing them or
+    /// changing their labels. Missing GPU work must fail closed: advancing a
+    /// command buffer without its real producer corrupts cross-queue ordering.
     /// </summary>
-    public static List<WaitingDcb>? CollectStale(long nowTicks, long maxAgeTicks)
+    public static List<WaitingDcb>? CollectUnreportedStale(
+        object memory,
+        long nowTicks,
+        long maxAgeTicks)
     {
         List<WaitingDcb>? stale = null;
         lock (_gate)
         {
-            List<ulong>? emptied = null;
-            foreach (var (address, list) in _waiters)
+            foreach (var (_, list) in _waiters)
             {
                 for (var i = list.Count - 1; i >= 0; i--)
                 {
-                    if (nowTicks - list[i].RegisteredTicks < maxAgeTicks)
+                    var waiter = list[i];
+                    if (!ReferenceEquals(waiter.Memory, memory) ||
+                        waiter.StaleReported ||
+                        nowTicks - waiter.RegisteredTicks < maxAgeTicks)
                     {
                         continue;
                     }
 
                     stale ??= new List<WaitingDcb>();
-                    stale.Add(list[i]);
-                    list.RemoveAt(i);
-                }
-
-                if (list.Count == 0)
-                {
-                    emptied ??= new List<ulong>();
-                    emptied.Add(address);
-                }
-            }
-
-            if (emptied is not null)
-            {
-                foreach (var address in emptied)
-                {
-                    _waiters.Remove(address);
+                    waiter.StaleReported = true;
+                    list[i] = waiter;
+                    stale.Add(waiter);
                 }
             }
         }
 
         return stale;
+    }
+
+    /// <summary>
+    /// Returns watched labels overlapped by a newly discovered producer. Used
+    /// only for diagnostics; producer completion still wakes through the
+    /// normal CollectSatisfied path after the ordered memory write executes.
+    /// </summary>
+    public static List<(ulong Address, int Count)> SnapshotInRange(
+        object memory,
+        ulong start,
+        ulong length)
+    {
+        var matches = new List<(ulong Address, int Count)>();
+        if (length == 0)
+        {
+            return matches;
+        }
+
+        var end = start > ulong.MaxValue - length ? ulong.MaxValue : start + length;
+        lock (_gate)
+        {
+            foreach (var (address, list) in _waiters)
+            {
+                var matchingCount = 0;
+                var any64Bit = false;
+                foreach (var waiter in list)
+                {
+                    if (!ReferenceEquals(waiter.Memory, memory))
+                    {
+                        continue;
+                    }
+
+                    matchingCount++;
+                    any64Bit |= waiter.Is64Bit;
+                }
+
+                if (matchingCount == 0)
+                {
+                    continue;
+                }
+
+                var width = any64Bit
+                    ? sizeof(ulong)
+                    : sizeof(uint);
+                var waitEnd = address > ulong.MaxValue - (ulong)width
+                    ? ulong.MaxValue
+                    : address + (ulong)width;
+                if (start < waitEnd && address < end)
+                {
+                    matches.Add((address, matchingCount));
+                }
+            }
+        }
+
+        return matches;
     }
 
     public static bool Compare(in WaitingDcb waiter, ulong value)
@@ -166,14 +223,15 @@ internal static class GpuWaitRegistry
         var reference = waiter.ReferenceValue & waiter.Mask;
         return waiter.CompareFunction switch
         {
+            0 => true,
             1 => masked < reference,
             2 => masked <= reference,
             3 => masked == reference,
             4 => masked != reference,
             5 => masked >= reference,
             6 => masked > reference,
-            // 0 is "always" in the PM4 encoding and 7 is reserved; treating both
-            // as satisfied keeps a malformed packet from suspending forever.
+            // 7 is reserved; treating it as satisfied keeps a malformed packet
+            // from suspending forever.
             _ => true,
         };
     }
