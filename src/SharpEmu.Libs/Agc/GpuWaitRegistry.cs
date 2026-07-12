@@ -26,7 +26,9 @@ internal static class GpuWaitRegistry
         public ulong ReferenceValue;
         public ulong Mask;
         public uint CompareFunction;
+        public uint ControlValue;
         public bool Is64Bit;
+        public bool IsStandard;
         public object? Memory;
         public string? QueueName;
         public ulong SubmissionId;
@@ -54,6 +56,23 @@ internal static class GpuWaitRegistry
 
                 return total;
             }
+        }
+    }
+
+    public static int CountForMemory(object memory)
+    {
+        lock (_gate)
+        {
+            var total = 0;
+            foreach (var (_, list) in _waiters)
+            {
+                foreach (var waiter in list)
+                {
+                    total += ReferenceEquals(waiter.Memory, memory) ? 1 : 0;
+                }
+            }
+
+            return total;
         }
     }
 

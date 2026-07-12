@@ -4,6 +4,7 @@
 using SharpEmu.HLE;
 using SharpEmu.Libs.Kernel;
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Numerics;
 
 namespace SharpEmu.Libs.Agc;
@@ -50,6 +51,11 @@ internal static class Gen5ShaderScalarEvaluator
     private const int SamplerDescriptorDwords = 4;
     private const int MaxGlobalMemoryBindingBytes = 16 * 1024 * 1024;
     private const ulong RdnaWaveMask = 0xFFFF_FFFFUL;
+
+    static Gen5ShaderScalarEvaluator()
+    {
+        RunScalarLoadSelfChecks();
+    }
 
     private readonly record struct BufferDescriptor(
         ulong BaseAddress,
@@ -1575,6 +1581,10 @@ internal static class Gen5ShaderScalarEvaluator
               scalarBase.Value + 3 < ScalarRegisterCount &&
               scalarRegisters[scalarBase.Value + 2] == 0 &&
               scalarRegisters[scalarBase.Value + 3] == 0));
+        var scalarPointerUnbound = ShouldTreatScalarPointerAsUnbound(
+            isBufferLoad,
+            address,
+            _strictScalarLoad);
         var bufferSize = ulong.MaxValue;
         if (recordBinding && isBufferLoad)
         {
@@ -1648,7 +1658,7 @@ internal static class Gen5ShaderScalarEvaluator
             }
         }
 
-        if (!bufferUnbound && address == 0)
+        if (!bufferUnbound && !scalarPointerUnbound && address == 0)
         {
             error = FormatScalarLoadError(
                 "invalid-load-address",
@@ -1682,6 +1692,7 @@ internal static class Gen5ShaderScalarEvaluator
 
             var componentOffset = unchecked(byteOffset + (ulong)(index * sizeof(uint)));
             if (bufferUnbound ||
+                scalarPointerUnbound ||
                 isBufferLoad &&
                 (componentOffset >= bufferSize ||
                  bufferSize - componentOffset < sizeof(uint)))
@@ -1724,6 +1735,41 @@ internal static class Gen5ShaderScalarEvaluator
         }
 
         return true;
+    }
+
+    private static bool ShouldTreatScalarPointerAsUnbound(
+        bool isBufferLoad,
+        ulong address,
+        bool strictScalarLoad) =>
+        !isBufferLoad && address == 0 && !strictScalarLoad;
+
+    [Conditional("DEBUG")]
+    private static void RunScalarLoadSelfChecks()
+    {
+        Debug.Assert(
+            ShouldTreatScalarPointerAsUnbound(
+                isBufferLoad: false,
+                address: 0,
+                strictScalarLoad: false),
+            "A null non-strict scalar pointer must read as zero instead of dropping the shader pass.");
+        Debug.Assert(
+            !ShouldTreatScalarPointerAsUnbound(
+                isBufferLoad: false,
+                address: 0,
+                strictScalarLoad: true),
+            "Strict scalar-load diagnostics must continue rejecting null pointers.");
+        Debug.Assert(
+            !ShouldTreatScalarPointerAsUnbound(
+                isBufferLoad: true,
+                address: 0,
+                strictScalarLoad: false),
+            "Buffer descriptor null handling must remain on the buffer-unbound path.");
+        Debug.Assert(
+            !ShouldTreatScalarPointerAsUnbound(
+                isBufferLoad: false,
+                address: 0x1000,
+                strictScalarLoad: false),
+            "A valid scalar pointer must not be treated as an unbound resource.");
     }
 
     private static bool TryDecodeBufferDescriptor(

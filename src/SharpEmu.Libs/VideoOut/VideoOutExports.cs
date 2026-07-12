@@ -33,11 +33,20 @@ public static class VideoOutExports
     private const int VideoOutOutputStatusSize = 0x30;
     private const ulong SceVideoOutPixelFormatA8R8G8B8Srgb = 0x80000000;
     private const ulong SceVideoOutPixelFormatA8B8G8R8Srgb = 0x80002200;
-    private const ulong SceVideoOutPixelFormatB8G8R8A8Unorm = 0x8100000000000000;
-    private const ulong SceVideoOutPixelFormatR8G8B8A8Unorm = 0x8100000022000000;
     private const ulong SceVideoOutPixelFormatA2R10G10B10 = 0x88060000;
     private const ulong SceVideoOutPixelFormatA2R10G10B10Srgb = 0x88000000;
     private const ulong SceVideoOutPixelFormatA2R10G10B10Bt2020Pq = 0x88740000;
+    // Prospero/PS5 format2 values are 64-bit encodings. The 0x22000000 field
+    // selects R-first component order; notably, the 0x81000000... family is
+    // packed 10:10:10:2 and must not be mistaken for an 8-bit RGBA format.
+    private const ulong SceVideoOutPixelFormat2R8G8B8A8Srgb = 0x8000000022000000;
+    private const ulong SceVideoOutPixelFormat2B8G8R8A8Srgb = 0x8000000000000000;
+    private const ulong SceVideoOutPixelFormat2R10G10B10A2 = 0x8100000622000000;
+    private const ulong SceVideoOutPixelFormat2B10G10R10A2 = 0x8100000600000000;
+    private const ulong SceVideoOutPixelFormat2R10G10B10A2Srgb = 0x8100000022000000;
+    private const ulong SceVideoOutPixelFormat2B10G10R10A2Srgb = 0x8100000000000000;
+    private const ulong SceVideoOutPixelFormat2R10G10B10A2Bt2100Pq = 0x8100070422000000;
+    private const ulong SceVideoOutPixelFormat2B10G10R10A2Bt2100Pq = 0x8100070400000000;
     private const ulong SceVideoOutInternalEventFlip = 0x6;
     // Distinct internal ident for vblank events. Games interpret events through
     // sceVideoOutGetEventId (mapped below), so the exact value is internal; only
@@ -60,6 +69,11 @@ public static class VideoOutExports
     private static long _frameRateWindowStart = Stopwatch.GetTimestamp();
     private static long _submittedFrameCount;
     private static long _presentedFrameCount;
+
+    static VideoOutExports()
+    {
+        RunPixelFormatSelfChecks();
+    }
 
     public static void ConfigureApplicationInfo(string? title, string? titleId, string? version)
     {
@@ -1344,13 +1358,115 @@ public static class VideoOutExports
     private static uint GetBytesPerPixel(ulong pixelFormat) =>
         pixelFormat is SceVideoOutPixelFormatA8R8G8B8Srgb or
             SceVideoOutPixelFormatA8B8G8R8Srgb or
-            SceVideoOutPixelFormatB8G8R8A8Unorm or
-            SceVideoOutPixelFormatR8G8B8A8Unorm or
             SceVideoOutPixelFormatA2R10G10B10 or
             SceVideoOutPixelFormatA2R10G10B10Srgb or
-            SceVideoOutPixelFormatA2R10G10B10Bt2020Pq
+            SceVideoOutPixelFormatA2R10G10B10Bt2020Pq or
+            SceVideoOutPixelFormat2R8G8B8A8Srgb or
+            SceVideoOutPixelFormat2B8G8R8A8Srgb or
+            SceVideoOutPixelFormat2R10G10B10A2 or
+            SceVideoOutPixelFormat2B10G10R10A2 or
+            SceVideoOutPixelFormat2R10G10B10A2Srgb or
+            SceVideoOutPixelFormat2B10G10R10A2Srgb or
+            SceVideoOutPixelFormat2R10G10B10A2Bt2100Pq or
+            SceVideoOutPixelFormat2B10G10R10A2Bt2100Pq
             ? 4u
             : 0u;
+
+    internal static bool IsPacked10BitPixelFormat(ulong pixelFormat) =>
+        IsPacked10BitPixelFormatNormalized(NormalizePixelFormat(pixelFormat));
+
+    private static bool IsPacked10BitPixelFormatNormalized(ulong pixelFormat) =>
+        pixelFormat is
+            SceVideoOutPixelFormatA2R10G10B10 or
+            SceVideoOutPixelFormatA2R10G10B10Srgb or
+            SceVideoOutPixelFormatA2R10G10B10Bt2020Pq or
+            SceVideoOutPixelFormat2R10G10B10A2 or
+            SceVideoOutPixelFormat2B10G10R10A2 or
+            SceVideoOutPixelFormat2R10G10B10A2Srgb or
+            SceVideoOutPixelFormat2B10G10R10A2Srgb or
+            SceVideoOutPixelFormat2R10G10B10A2Bt2100Pq or
+            SceVideoOutPixelFormat2B10G10R10A2Bt2100Pq;
+
+    internal static bool TryPackRgba8Pixel(
+        ulong pixelFormat,
+        byte red,
+        byte green,
+        byte blue,
+        byte alpha,
+        out uint packed)
+    {
+        pixelFormat = NormalizePixelFormat(pixelFormat);
+        if (!IsPacked10BitPixelFormatNormalized(pixelFormat))
+        {
+            packed = 0;
+            return false;
+        }
+
+        packed = PackRgba8PixelNormalized(pixelFormat, red, green, blue, alpha);
+        return true;
+    }
+
+    private static uint PackRgba8PixelNormalized(
+        ulong pixelFormat,
+        byte red,
+        byte green,
+        byte blue,
+        byte alpha)
+    {
+        var red10 = ExpandUnorm8To10(red);
+        var green10 = ExpandUnorm8To10(green);
+        var blue10 = ExpandUnorm8To10(blue);
+        var alpha2 = ((uint)alpha * 3u + 127u) / 255u;
+        return HasRedInLeastSignificantBits(pixelFormat)
+            ? red10 | (green10 << 10) | (blue10 << 20) | (alpha2 << 30)
+            : blue10 | (green10 << 10) | (red10 << 20) | (alpha2 << 30);
+    }
+
+    internal static bool TryConvertPacked10ToRgba8(
+        uint packed,
+        ulong pixelFormat,
+        Span<byte> rgba)
+    {
+        pixelFormat = NormalizePixelFormat(pixelFormat);
+        if (rgba.Length < 4 || !IsPacked10BitPixelFormatNormalized(pixelFormat))
+        {
+            return false;
+        }
+
+        ConvertPacked10ToRgba8Normalized(packed, pixelFormat, rgba);
+        return true;
+    }
+
+    private static void ConvertPacked10ToRgba8Normalized(
+        uint packed,
+        ulong pixelFormat,
+        Span<byte> rgba)
+    {
+        var least = packed & 0x3FFu;
+        var green = (packed >> 10) & 0x3FFu;
+        var most = (packed >> 20) & 0x3FFu;
+        var redIsLeast = HasRedInLeastSignificantBits(pixelFormat);
+        var red = redIsLeast ? least : most;
+        var blue = redIsLeast ? most : least;
+        rgba[0] = ReduceUnorm10To8(red);
+        rgba[1] = ReduceUnorm10To8(green);
+        rgba[2] = ReduceUnorm10To8(blue);
+        rgba[3] = (byte)((((packed >> 30) & 0x3u) * 255u + 1u) / 3u);
+    }
+
+    private static bool HasRedInLeastSignificantBits(ulong pixelFormat) =>
+        pixelFormat is
+            SceVideoOutPixelFormat2R10G10B10A2 or
+            SceVideoOutPixelFormat2R10G10B10A2Srgb or
+            SceVideoOutPixelFormat2R10G10B10A2Bt2100Pq;
+
+    private static uint ExpandUnorm8To10(byte value) =>
+        ((uint)value * 1023u + 127u) / 255u;
+
+    // Preserve both UNORM endpoints and round to nearest. A plain >> 2 is a
+    // biased truncation because the 10-bit maximum is 1023, not 1020.
+    private static byte ReduceUnorm10To8(uint value) =>
+        (byte)((value * 255u + 511u) / 1023u);
 
     private static ulong NormalizePixelFormat(ulong pixelFormat)
     {
@@ -1377,21 +1493,27 @@ public static class VideoOutExports
 
     private static void ConvertRowToRgb(ReadOnlySpan<byte> source, Span<byte> destination, ulong pixelFormat)
     {
+        pixelFormat = NormalizePixelFormat(pixelFormat);
         var dst = 0;
+        Span<byte> rgba = stackalloc byte[4];
+        var packed10 = IsPacked10BitPixelFormatNormalized(pixelFormat);
         for (var src = 0; src + 3 < source.Length; src += 4)
         {
-            if (pixelFormat is SceVideoOutPixelFormatA8B8G8R8Srgb or SceVideoOutPixelFormatR8G8B8A8Unorm)
+            if (packed10)
+            {
+                var packed = BinaryPrimitives.ReadUInt32LittleEndian(source[src..(src + 4)]);
+                ConvertPacked10ToRgba8Normalized(packed, pixelFormat, rgba);
+                destination[dst++] = rgba[0];
+                destination[dst++] = rgba[1];
+                destination[dst++] = rgba[2];
+            }
+            else if (pixelFormat is
+                     SceVideoOutPixelFormatA8B8G8R8Srgb or
+                     SceVideoOutPixelFormat2R8G8B8A8Srgb)
             {
                 destination[dst++] = source[src + 0];
                 destination[dst++] = source[src + 1];
                 destination[dst++] = source[src + 2];
-            }
-            else if (pixelFormat is SceVideoOutPixelFormatA2R10G10B10 or SceVideoOutPixelFormatA2R10G10B10Srgb or SceVideoOutPixelFormatA2R10G10B10Bt2020Pq)
-            {
-                var value = BinaryPrimitives.ReadUInt32LittleEndian(source[src..(src + 4)]);
-                destination[dst++] = (byte)(((value >> 20) & 0x3FF) >> 2);
-                destination[dst++] = (byte)(((value >> 10) & 0x3FF) >> 2);
-                destination[dst++] = (byte)((value & 0x3FF) >> 2);
             }
             else
             {
@@ -1400,6 +1522,36 @@ public static class VideoOutExports
                 destination[dst++] = source[src + 0];
             }
         }
+    }
+
+    [Conditional("DEBUG")]
+    private static void RunPixelFormatSelfChecks()
+    {
+        Span<byte> rgba = stackalloc byte[4];
+        Debug.Assert(TryPackRgba8Pixel(
+            SceVideoOutPixelFormat2R10G10B10A2Srgb,
+            255, 0, 0, 255,
+            out var rFirst));
+        Debug.Assert(rFirst == 0xC00003FFu);
+        Debug.Assert(TryConvertPacked10ToRgba8(
+            rFirst,
+            SceVideoOutPixelFormat2R10G10B10A2Srgb,
+            rgba));
+        Debug.Assert(rgba.SequenceEqual(new byte[] { 255, 0, 0, 255 }));
+
+        Debug.Assert(TryPackRgba8Pixel(
+            SceVideoOutPixelFormat2B10G10R10A2Srgb,
+            255, 0, 0, 255,
+            out var bFirst));
+        Debug.Assert(bFirst == 0xFFF00000u);
+        Debug.Assert(TryConvertPacked10ToRgba8(
+            bFirst,
+            SceVideoOutPixelFormat2B10G10R10A2Srgb,
+            rgba));
+        Debug.Assert(rgba.SequenceEqual(new byte[] { 255, 0, 0, 255 }));
+        Debug.Assert(ReduceUnorm10To8(0) == 0);
+        Debug.Assert(ReduceUnorm10To8(512) == 128);
+        Debug.Assert(ReduceUnorm10To8(1023) == 255);
     }
 
     private static string GetFrameDumpBasePath(long frameIndex, int handle, int bufferIndex)

@@ -121,8 +121,14 @@ public static class AgcExports
     private const ulong MaxPresentedTextureBytes = 128UL * 1024UL * 1024UL;
     private const ulong VideoOutPixelFormatA8R8G8B8Srgb = 0x80000000;
     private const ulong VideoOutPixelFormatA8B8G8R8Srgb = 0x80002200;
-    private const ulong VideoOutPixelFormatB8G8R8A8Unorm = 0x8100000000000000;
-    private const ulong VideoOutPixelFormatR8G8B8A8Unorm = 0x8100000022000000;
+    private const ulong VideoOutPixelFormat2R8G8B8A8Srgb = 0x8000000022000000;
+    private const ulong VideoOutPixelFormat2B8G8R8A8Srgb = 0x8000000000000000;
+    private const ulong VideoOutPixelFormat2R10G10B10A2 = 0x8100000622000000;
+    private const ulong VideoOutPixelFormat2B10G10R10A2 = 0x8100000600000000;
+    private const ulong VideoOutPixelFormat2R10G10B10A2Srgb = 0x8100000022000000;
+    private const ulong VideoOutPixelFormat2B10G10R10A2Srgb = 0x8100000000000000;
+    private const ulong VideoOutPixelFormat2R10G10B10A2Bt2100Pq = 0x8100070422000000;
+    private const ulong VideoOutPixelFormat2B10G10R10A2Bt2100Pq = 0x8100070400000000;
     private const uint RegisterDefaultsVersion7 = 7;
     private const uint RegisterDefaultsVersion8 = 8;
     private const uint RegisterDefaultsVersion10 = 10;
@@ -455,6 +461,7 @@ public static class AgcExports
         public Dictionary<ulong, ComputeImageWriter> ComputeImageWriters { get; } = new();
         public ulong WorkSequence { get; set; }
         public ulong SubmissionSequence { get; set; }
+        public bool WaitMonitorRunning { get; set; }
     }
 
     private sealed class LabelProducerTrace
@@ -2868,7 +2875,8 @@ public static class AgcExports
         in GpuWaitRegistry.WaitingDcb waiter,
         ulong commandAddress,
         ulong packetAddress,
-        bool stale)
+        bool stale,
+        ulong? currentValue = null)
     {
         LabelProducerTrace? producer = null;
         lock (_labelProducerGate)
@@ -2904,12 +2912,21 @@ public static class AgcExports
         }
 
         var prefix = stale ? "agc.wait_stale" : "agc.wait_suspended";
+        var current = currentValue.HasValue
+            ? $"0x{currentValue.Value:X16}"
+            : "unreadable";
+        var condition =
+            $"value={current} mask=0x{waiter.Mask:X16} " +
+            $"ref=0x{waiter.ReferenceValue:X16} cmp={waiter.CompareFunction} " +
+            $"control=0x{waiter.ControlValue:X8} bits={(waiter.Is64Bit ? 64 : 32)} " +
+            $"form={(waiter.IsStandard ? "standard" : "agc-nop")}";
         if (producer is null)
         {
             Console.Error.WriteLine(
                 $"[LOADER][WARN] {prefix} label=0x{waiter.WaitAddress:X16} " +
                 $"queue={waiter.QueueName} submission={waiter.SubmissionId} " +
                 $"command=0x{commandAddress:X16} packet=0x{packetAddress:X16} " +
+                condition + " " +
                 "producer=none-observed; remaining-suspended");
             return;
         }
@@ -2917,6 +2934,7 @@ public static class AgcExports
         TraceAgc(
             $"{prefix} label=0x{waiter.WaitAddress:X16} " +
             $"queue={waiter.QueueName} submission={waiter.SubmissionId} " +
+            condition + " " +
             $"producer_seq={producer.Sequence} producer_state=" +
             $"{(producer.Completed ? "completed" : "queued")} " +
             $"producer_queue={producer.QueueName} " +
@@ -3330,12 +3348,14 @@ public static class AgcExports
         out ulong waitAddress,
         out ulong reference,
         out ulong mask,
-        out uint compareFunction)
+        out uint compareFunction,
+        out uint controlValue)
     {
         waitAddress = 0;
         reference = 0;
         mask = 0;
         compareFunction = 0;
+        controlValue = 0;
         if (isStandard)
         {
             if (!TryReadUInt32(ctx, packetAddress + 4, out var stdControl) ||
@@ -3347,6 +3367,7 @@ public static class AgcExports
             }
 
             compareFunction = stdControl & 0x7u;
+            controlValue = stdControl;
             reference = stdRef;
             mask = stdMask;
             return true;
@@ -3359,6 +3380,7 @@ public static class AgcExports
         }
 
         compareFunction = control & 0x7u;
+        controlValue = control;
         if (is64Bit)
         {
             return TryReadUInt64(ctx, packetAddress + 12, out mask) &&
@@ -3393,7 +3415,8 @@ public static class AgcExports
     {
         if (!TryParseSubmittedWait(
                 ctx, packetAddress, is64Bit, isStandard,
-                out var waitAddress, out var reference, out var mask, out var compareFunction))
+                out var waitAddress, out var reference, out var mask, out var compareFunction,
+                out var controlValue))
         {
             return false;
         }
@@ -3457,7 +3480,9 @@ public static class AgcExports
             ReferenceValue = reference,
             Mask = mask,
             CompareFunction = compareFunction,
+            ControlValue = controlValue,
             Is64Bit = is64Bit,
+            IsStandard = isStandard,
             WaitAddress = waitAddress,
             Memory = ctx.Memory,
             QueueName = state.QueueName,
@@ -3487,12 +3512,17 @@ public static class AgcExports
         }
 
         GpuWaitRegistry.Register(waitAddress, waiter);
+        var gpuState = _submittedGpuStates.GetValue(
+            ctx.Memory,
+            static _ => new SubmittedGpuState());
+        EnsureGpuWaitMonitor(ctx, gpuState);
         TraceWaitProducerState(
             ctx.Memory,
             waiter,
             commandAddress,
             packetAddress,
-            stale: false);
+            stale: false,
+            currentValue);
         if (tracePacket)
         {
             TraceAgc(
@@ -3501,6 +3531,72 @@ public static class AgcExports
         }
 
         return true;
+    }
+
+    /// <summary>
+    /// Direct guest CPU stores can satisfy a GPU wait without crossing another
+    /// AGC import. Keep one low-frequency monitor per guest memory while waits
+    /// exist so those real stores wake their queues. The monitor never changes
+    /// a label: it uses the same masked comparison as submission-time parsing
+    /// and resumes only after the guest value genuinely satisfies the packet.
+    /// </summary>
+    private static void EnsureGpuWaitMonitor(
+        CpuContext submitContext,
+        SubmittedGpuState gpuState)
+    {
+        if (gpuState.WaitMonitorRunning)
+        {
+            return;
+        }
+
+        gpuState.WaitMonitorRunning = true;
+        var monitorContext = new CpuContext(
+            submitContext.Memory,
+            submitContext.TargetGeneration);
+        ThreadPool.UnsafeQueueUserWorkItem(
+            static state => MonitorGpuWaits(state.Context, state.GpuState),
+            (Context: monitorContext, GpuState: gpuState),
+            preferLocal: false);
+    }
+
+    private static void MonitorGpuWaits(
+        CpuContext ctx,
+        SubmittedGpuState gpuState)
+    {
+        var delayMilliseconds = 1;
+        while (true)
+        {
+            var madeProgress = false;
+            lock (gpuState.Gate)
+            {
+                var before = GpuWaitRegistry.CountForMemory(ctx.Memory);
+                if (before == 0)
+                {
+                    gpuState.WaitMonitorRunning = false;
+                    return;
+                }
+
+                DrainResumableDcbs(ctx, gpuState, tracePackets: false);
+                var after = GpuWaitRegistry.CountForMemory(ctx.Memory);
+                madeProgress = after < before;
+                if (madeProgress)
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] agc.wait_monitor_resumed count={before - after} " +
+                        $"remaining={after}");
+                }
+                if (after == 0)
+                {
+                    gpuState.WaitMonitorRunning = false;
+                    return;
+                }
+            }
+
+            delayMilliseconds = madeProgress
+                ? 1
+                : Math.Min(delayMilliseconds * 2, 16);
+            Thread.Sleep(delayMilliseconds);
+        }
     }
 
     /// <summary>
@@ -3580,12 +3676,20 @@ public static class AgcExports
                 {
                     foreach (var waiter in stale)
                     {
+                        ulong? currentValue = waiter.Is64Bit
+                            ? TryReadUInt64(ctx, waiter.WaitAddress, out var value64)
+                                ? value64
+                                : null
+                            : TryReadUInt32(ctx, waiter.WaitAddress, out var value32)
+                                ? value32
+                                : null;
                         TraceWaitProducerState(
                             ctx.Memory,
                             waiter,
                             waiter.CommandBufferAddress,
                             waiter.ResumeAddress,
-                            stale: true);
+                            stale: true,
+                            currentValue);
                     }
                 }
 
@@ -7191,8 +7295,14 @@ public static class AgcExports
             destination.PixelFormat is not (
                 VideoOutPixelFormatA8R8G8B8Srgb or
                 VideoOutPixelFormatA8B8G8R8Srgb or
-                VideoOutPixelFormatB8G8R8A8Unorm or
-                VideoOutPixelFormatR8G8B8A8Unorm))
+                VideoOutPixelFormat2R8G8B8A8Srgb or
+                VideoOutPixelFormat2B8G8R8A8Srgb or
+                VideoOutPixelFormat2R10G10B10A2 or
+                VideoOutPixelFormat2B10G10R10A2 or
+                VideoOutPixelFormat2R10G10B10A2Srgb or
+                VideoOutPixelFormat2B10G10R10A2Srgb or
+                VideoOutPixelFormat2R10G10B10A2Bt2100Pq or
+                VideoOutPixelFormat2B10G10R10A2Bt2100Pq))
         {
             return false;
         }
@@ -7231,7 +7341,9 @@ public static class AgcExports
         var destinationRow = new byte[checked((int)destinationPitch * 4)];
         var rgbaDestination = destination.PixelFormat is
             VideoOutPixelFormatA8B8G8R8Srgb or
-            VideoOutPixelFormatR8G8B8A8Unorm;
+            VideoOutPixelFormat2R8G8B8A8Srgb;
+        var packed10Destination =
+            VideoOutExports.IsPacked10BitPixelFormat(destination.PixelFormat);
         for (uint y = 0; y < destination.Height; y++)
         {
             var sourceY = (uint)(((ulong)y * source.Height) / destination.Height);
@@ -7240,7 +7352,24 @@ public static class AgcExports
                 var sourceX = (uint)(((ulong)x * source.Width) / destination.Width);
                 var sourceOffset = checked((int)(((ulong)sourceY * source.Width + sourceX) * 4));
                 var destinationOffset = checked((int)x * 4);
-                if (rgbaDestination)
+                if (packed10Destination)
+                {
+                    if (!VideoOutExports.TryPackRgba8Pixel(
+                            destination.PixelFormat,
+                            sourceBytes[sourceOffset + 0],
+                            sourceBytes[sourceOffset + 1],
+                            sourceBytes[sourceOffset + 2],
+                            sourceBytes[sourceOffset + 3],
+                            out var packed))
+                    {
+                        return false;
+                    }
+
+                    BinaryPrimitives.WriteUInt32LittleEndian(
+                        destinationRow.AsSpan(destinationOffset, sizeof(uint)),
+                        packed);
+                }
+                else if (rgbaDestination)
                 {
                     destinationRow[destinationOffset + 0] = sourceBytes[sourceOffset + 0];
                     destinationRow[destinationOffset + 1] = sourceBytes[sourceOffset + 1];
@@ -7253,7 +7382,10 @@ public static class AgcExports
                     destinationRow[destinationOffset + 2] = sourceBytes[sourceOffset + 0];
                 }
 
-                destinationRow[destinationOffset + 3] = sourceBytes[sourceOffset + 3];
+                if (!packed10Destination)
+                {
+                    destinationRow[destinationOffset + 3] = sourceBytes[sourceOffset + 3];
+                }
             }
 
             var destinationAddress = destination.Address + ((ulong)y * destinationPitch * 4);
