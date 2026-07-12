@@ -281,7 +281,8 @@ internal static unsafe class VulkanVideoPresenter
     private static readonly Dictionary<ulong, long> _guestImageWorkSequences = new();
     private static readonly Dictionary<ulong, uint> _availableGuestImages = new();
     private static readonly Dictionary<ulong, byte[]> _pendingGuestImageInitialData = new();
-    private static readonly Dictionary<ulong, (uint Width, uint Height)> _guestImageExtents = new();
+    private static readonly Dictionary<ulong, (uint Width, uint Height, ulong ByteCount)>
+        _guestImageExtents = new();
     private static readonly bool _traceGuestImageEvents = string.Equals(
         Environment.GetEnvironmentVariable("SHARPEMU_TRACE_DRAWS"),
         "1",
@@ -590,19 +591,21 @@ internal static unsafe class VulkanVideoPresenter
     internal static bool TryGetGuestImageExtent(
         ulong address,
         out uint width,
-        out uint height)
+        out uint height,
+        out ulong byteCount)
     {
         lock (_gate)
         {
             if (_guestImageExtents.TryGetValue(address, out var extent))
             {
-                (width, height) = extent;
+                (width, height, byteCount) = extent;
                 return true;
             }
         }
 
         width = 0;
         height = 0;
+        byteCount = 0;
         return false;
     }
 
@@ -652,12 +655,16 @@ internal static unsafe class VulkanVideoPresenter
     internal static void CountSpirvCompilation() =>
         Interlocked.Increment(ref _perfSpirvCompilations);
 
-    internal static IReadOnlyList<(ulong Address, uint Width, uint Height)> GetGuestImageExtents()
+    internal static IReadOnlyList<(ulong Address, uint Width, uint Height, ulong ByteCount)> GetGuestImageExtents()
     {
         lock (_gate)
         {
             return _guestImageExtents
-                .Select(entry => (entry.Key, entry.Value.Width, entry.Value.Height))
+                .Select(entry => (
+                    entry.Key,
+                    entry.Value.Width,
+                    entry.Value.Height,
+                    entry.Value.ByteCount))
                 .ToArray();
         }
     }
@@ -4650,7 +4657,10 @@ internal static unsafe class VulkanVideoPresenter
                 _guestImages.Add(texture.Address, guestImage);
                 lock (_gate)
                 {
-                    _guestImageExtents[texture.Address] = (width, height);
+                    _guestImageExtents[texture.Address] = (
+                        width,
+                        height,
+                        GetTextureByteCount(texture.Format, width, height));
                 }
 
                 if (_traceGuestImageEvents)
@@ -6115,7 +6125,7 @@ internal static unsafe class VulkanVideoPresenter
 
             if (work.Pixels is { } pixels)
             {
-                if ((ulong)pixels.Length == (ulong)target.Width * target.Height * 4)
+                if (pixels.Length > 0)
                 {
                     UploadGuestImageInitialData(target, pixels);
                 }
@@ -6477,14 +6487,17 @@ internal static unsafe class VulkanVideoPresenter
             _guestImages.Add(target.Address, resource);
             lock (_gate)
             {
-                _guestImageExtents[target.Address] = (target.Width, target.Height);
+                _guestImageExtents[target.Address] = (
+                    target.Width,
+                    target.Height,
+                    GetTextureByteCount(target.Format, target.Width, target.Height));
             }
 
             if (target.Width <= 1920 && target.Height <= 1080)
             {
                 SharpEmu.HLE.GuestImageWriteTracker.Track(
                     target.Address,
-                    (ulong)target.Width * target.Height * 4);
+                    (ulong)target.Width * target.Height * GetTextureBytesPerPixel(target.Format));
             }
 
             if (_traceGuestImageEvents)

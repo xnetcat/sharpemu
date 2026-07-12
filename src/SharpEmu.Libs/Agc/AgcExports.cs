@@ -2665,14 +2665,13 @@ public static class AgcExports
             return;
         }
 
-        foreach (var (address, width, height) in VulkanVideoPresenter.GetGuestImageExtents())
+        foreach (var (address, width, height, byteCount) in VulkanVideoPresenter.GetGuestImageExtents())
         {
             if (!SharpEmu.HLE.GuestImageWriteTracker.ConsumeDirty(address))
             {
                 continue;
             }
 
-            var byteCount = (ulong)width * height * 4;
             if (byteCount == 0 || byteCount > MaxPresentedTextureBytes)
             {
                 continue;
@@ -2727,7 +2726,8 @@ public static class AgcExports
         var hasImage = VulkanVideoPresenter.TryGetGuestImageExtent(
             destinationAddress,
             out var width,
-            out var height);
+            out var height,
+            out var imageBytes);
         if (_traceDraws && Interlocked.Increment(ref _dmaMirrorTraceCount) <= 400)
         {
             Console.Error.WriteLine(
@@ -2740,7 +2740,6 @@ public static class AgcExports
             return;
         }
 
-        var imageBytes = (ulong)width * height * 4;
         if (imageBytes == 0 || byteCount < imageBytes)
         {
             return;
