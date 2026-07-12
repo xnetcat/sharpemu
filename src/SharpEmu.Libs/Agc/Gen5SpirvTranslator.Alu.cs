@@ -35,6 +35,12 @@ internal static partial class Gen5SpirvTranslator
                 var value = GetRawSource(instruction, 0);
                 if (_subgroupInvocationIdInput != 0)
                 {
+                    if (_emulateWave64)
+                    {
+                        value = BroadcastFirstWave64Active(value);
+                    }
+                    else
+                    {
                     // SPIR-V's BroadcastFirst uses the first host-active
                     // invocation. Guest EXEC is modeled as data, so obtain the
                     // guest-active mask explicitly and broadcast from its first
@@ -58,6 +64,7 @@ internal static partial class Gen5SpirvTranslator
                         UInt(3),
                         value,
                         firstActiveLane);
+                    }
                 }
 
                 StoreS(instruction.Destinations[0].Value, value);
@@ -454,14 +461,21 @@ internal static partial class Gen5SpirvTranslator
                     break;
                 case "VMbcntHiU32B32":
                 {
+                    var guestLane = GuestWaveLane();
+                    var lane = BitwiseAnd(guestLane, UInt(31));
+                    var partialMask = _module.AddInstruction(
+                        SpirvOp.ISub,
+                        _uintType,
+                        ShiftLeftLogical(UInt(1), lane),
+                        UInt(1));
                     var countedBits = _module.AddInstruction(
                         SpirvOp.BitCount,
                         _uintType,
-                        GetRawSource(instruction, 0));
+                        BitwiseAnd(GetRawSource(instruction, 0), partialMask));
                     var isUpperHalf = _module.AddInstruction(
                         SpirvOp.UGreaterThanEqual,
                         _boolType,
-                        Load(_uintType, _subgroupInvocationIdInput),
+                        guestLane,
                         UInt(32));
                     result = IAdd(
                         GetRawSource(instruction, 1),
@@ -475,14 +489,23 @@ internal static partial class Gen5SpirvTranslator
                 }
                 case "VMbcntLoU32B32":
                 {
-                    var lane = BitwiseAnd(
-                        Load(_uintType, _subgroupInvocationIdInput),
-                        UInt(31));
-                    var lowBitsMask = _module.AddInstruction(
+                    var guestLane = GuestWaveLane();
+                    var lane = BitwiseAnd(guestLane, UInt(31));
+                    var partialMask = _module.AddInstruction(
                         SpirvOp.ISub,
                         _uintType,
                         ShiftLeftLogical(UInt(1), lane),
                         UInt(1));
+                    var lowBitsMask = _module.AddInstruction(
+                        SpirvOp.Select,
+                        _uintType,
+                        _module.AddInstruction(
+                            SpirvOp.UGreaterThanEqual,
+                            _boolType,
+                            guestLane,
+                            UInt(32)),
+                        UInt(uint.MaxValue),
+                        partialMask);
                     result = IAdd(
                         GetRawSource(instruction, 1),
                         _module.AddInstruction(
@@ -1824,9 +1847,35 @@ internal static partial class Gen5SpirvTranslator
             }
 
             uint value;
-            if (instruction.Opcode is "SMovB64" or "SWqmB64")
+            if (instruction.Opcode == "SMovB64")
             {
                 value = left;
+            }
+            else if (instruction.Opcode == "SWqmB64")
+            {
+                var quadAny = _module.AddInstruction(
+                    SpirvOp.BitwiseOr,
+                    _ulongType,
+                    left,
+                    _module.AddInstruction(
+                        SpirvOp.BitwiseOr,
+                        _ulongType,
+                        ShiftRightLogical64(left, _module.Constant64(_ulongType, 1)),
+                        _module.AddInstruction(
+                            SpirvOp.BitwiseOr,
+                            _ulongType,
+                            ShiftRightLogical64(left, _module.Constant64(_ulongType, 2)),
+                            ShiftRightLogical64(left, _module.Constant64(_ulongType, 3)))));
+                quadAny = _module.AddInstruction(
+                    SpirvOp.BitwiseAnd,
+                    _ulongType,
+                    quadAny,
+                    _module.Constant64(_ulongType, 0x1111_1111_1111_1111UL));
+                value = _module.AddInstruction(
+                    SpirvOp.IMul,
+                    _ulongType,
+                    quadAny,
+                    _module.Constant64(_ulongType, 0xFUL));
             }
             else if (instruction.Opcode == "SNotB64")
             {
@@ -1976,13 +2025,14 @@ internal static partial class Gen5SpirvTranslator
         private uint ApplyDppSource(Gen5DppControl control, uint value)
         {
             GetDppSourceLane(control, out var targetLane, out var inRange);
-            var lane = Load(_uintType, _subgroupInvocationIdInput);
+            var lane = GuestWaveLane();
             var safeTarget = _module.AddInstruction(
                 SpirvOp.Select,
                 _uintType,
                 inRange,
                 targetLane,
                 lane);
+            safeTarget = BitwiseAnd(safeTarget, UInt(31));
             var shuffled = _module.AddInstruction(
                 SpirvOp.GroupNonUniformShuffle,
                 _uintType,
@@ -2025,7 +2075,7 @@ internal static partial class Gen5SpirvTranslator
             out uint targetLane,
             out uint inRange)
         {
-            var lane = Load(_uintType, _subgroupInvocationIdInput);
+            var lane = GuestWaveLane();
             var rowBase = BitwiseAnd(lane, UInt(0xFFFF_FFF0));
             var rowLane = BitwiseAnd(lane, UInt(15));
             var dpp = control.Control;
@@ -2118,7 +2168,7 @@ internal static partial class Gen5SpirvTranslator
         private uint IsDppWriteEnabled(Gen5DppControl control)
         {
             GetDppSourceLane(control, out var targetLane, out var inRange);
-            var lane = Load(_uintType, _subgroupInvocationIdInput);
+            var lane = GuestWaveLane();
             var row = ShiftRightLogical(lane, UInt(4));
             var bank = BitwiseAnd(lane, UInt(3));
             var rowEnabled = IsNotZero(BitwiseAnd(
@@ -2136,6 +2186,7 @@ internal static partial class Gen5SpirvTranslator
                     inRange,
                     targetLane,
                     lane);
+                safeTarget = BitwiseAnd(safeTarget, UInt(31));
                 var activeWord = _module.AddInstruction(
                     SpirvOp.Select,
                     _uintType,
@@ -2249,6 +2300,15 @@ internal static partial class Gen5SpirvTranslator
                     _ulongType,
                     vectorLow,
                     high);
+            }
+
+            // Scalar inline negative constants are signed immediates. B64
+            // consumers sign-extend them, so -1 denotes a full 64-bit mask.
+            if (operand.Kind == Gen5OperandKind.EncodedConstant &&
+                operand.Value is >= 193 and <= 208)
+            {
+                var signed = -(long)(operand.Value - 192);
+                return _module.Constant64(_ulongType, unchecked((ulong)signed));
             }
 
             var low = GetRawSource(instruction, sourceIndex);
@@ -2547,10 +2607,13 @@ internal static partial class Gen5SpirvTranslator
         {
             var left = GetRawSource(instruction, 0);
             var right = GetRawSource(instruction, 1);
+            var carryMask = instruction.Sources.Count > 2
+                ? IsCurrentLaneSet(GetRawSource64(instruction, 2))
+                : Load(_boolType, _vcc);
             var carryIn = _module.AddInstruction(
                 SpirvOp.Select,
                 _uintType,
-                Load(_boolType, _vcc),
+                carryMask,
                 UInt(1),
                 UInt(0));
             var partial = IAdd(left, right);
@@ -2607,6 +2670,66 @@ internal static partial class Gen5SpirvTranslator
             return result;
         }
 
+        private uint BroadcastFirstWave64Active(uint value)
+        {
+            var lane = GuestWaveLane();
+            EmitConditional(
+                _module.AddInstruction(
+                    SpirvOp.IEqual,
+                    _boolType,
+                    lane,
+                    UInt(0)),
+                () => Store(WaveBroadcastScratchPointer(), UInt(0)));
+            EmitWave64Barrier();
+
+            var activeMask = BooleanToWaveMask(Load(_boolType, _exec));
+            var lowMask = _module.AddInstruction(
+                SpirvOp.UConvert,
+                _uintType,
+                activeMask);
+            var highMask = _module.AddInstruction(
+                SpirvOp.UConvert,
+                _uintType,
+                ShiftRightLogical64(
+                    activeMask,
+                    _module.Constant64(_ulongType, 32)));
+            var hasLow = IsNotZero(lowMask);
+            var hasHigh = IsNotZero(highMask);
+            var firstLow = Ext(73, _uintType, lowMask);
+            var firstHigh = IAdd(UInt(32), Ext(73, _uintType, highMask));
+            var firstLane = _module.AddInstruction(
+                SpirvOp.Select,
+                _uintType,
+                hasLow,
+                firstLow,
+                _module.AddInstruction(
+                    SpirvOp.Select,
+                    _uintType,
+                    hasHigh,
+                    firstHigh,
+                    UInt(0)));
+            var isFirst = _module.AddInstruction(
+                SpirvOp.IEqual,
+                _boolType,
+                lane,
+                firstLane);
+            EmitConditional(
+                _module.AddInstruction(
+                    SpirvOp.LogicalAnd,
+                    _boolType,
+                    isFirst,
+                    _module.AddInstruction(
+                        SpirvOp.LogicalOr,
+                        _boolType,
+                        hasLow,
+                        hasHigh)),
+                () => Store(WaveBroadcastScratchPointer(), value));
+            EmitWave64Barrier();
+            var result = Load(_uintType, WaveBroadcastScratchPointer());
+            EmitWave64Barrier();
+            return result;
+        }
+
         private void StoreCarryOut(
             Gen5ShaderInstruction instruction,
             uint carry)
@@ -2632,7 +2755,7 @@ internal static partial class Gen5SpirvTranslator
             var value = GetRawSource(instruction, 0);
             var selectorLow = GetRawSource(instruction, 1);
             var selectorHigh = GetRawSource(instruction, 2);
-            var lane = Load(_uintType, _subgroupInvocationIdInput);
+            var lane = GuestWaveLane();
             var localLane = BitwiseAnd(lane, UInt(15));
             var lowHalf = _module.AddInstruction(
                 SpirvOp.ULessThan,
@@ -2670,7 +2793,7 @@ internal static partial class Gen5SpirvTranslator
                 _uintType,
                 UInt(3),
                 value,
-                targetLane);
+                BitwiseAnd(targetLane, UInt(31)));
         }
 
         private uint EmitFloatResult(

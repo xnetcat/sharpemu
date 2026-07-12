@@ -917,6 +917,13 @@ internal static class Gen5ShaderScalarEvaluator
                 value = ~value;
                 scalarConditionCode = value != 0;
             }
+            else if (instruction.Opcode == "SWqmB64")
+            {
+                var quadAny = (value | (value >> 1) | (value >> 2) | (value >> 3)) &
+                    0x1111_1111_1111_1111UL;
+                value = quadAny * 0xFUL;
+                scalarConditionCode = value != 0;
+            }
 
             WriteScalarPair(registers, destination.Value, value, ref execMask);
             return true;

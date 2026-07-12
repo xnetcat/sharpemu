@@ -12,6 +12,13 @@ namespace SharpEmu.Libs.Agc;
 
 public static class AgcExports
 {
+#if DEBUG
+    static AgcExports()
+    {
+        ValidateWriteDataControlDecoders();
+    }
+#endif
+
     private const uint ShaderFileHeader = 0x34333231;
     private const uint ShaderVersion = 0x18;
     private const uint ItNop = 0x10;
@@ -164,7 +171,7 @@ public static class AgcExports
         (ulong Ps, ulong PsState, Gen5PixelOutputKind Output, uint Slot), byte[]>
         _pixelTargetSpirvCache = new();
     private static readonly Dictionary<
-        (ulong Cs, ulong State, uint LocalX, uint LocalY, uint LocalZ),
+        (ulong Cs, ulong State, uint LocalX, uint LocalY, uint LocalZ, uint Wave),
         byte[]> _computeSpirvCache = new();
     private static readonly Dictionary<ulong, ulong> _shaderHeadersByCode = new();
     private static readonly bool _traceAgc = string.Equals(
@@ -392,7 +399,8 @@ public static class AgcExports
         uint GroupCountZ,
         uint BaseGroupX,
         uint BaseGroupY,
-        uint BaseGroupZ);
+        uint BaseGroupZ,
+        uint WaveLaneCount);
 
     private sealed class SubmittedDcbState
     {
@@ -2364,12 +2372,22 @@ public static class AgcExports
 
             if (op == ItNop && register == RWriteData && length >= 4)
             {
-                ApplySubmittedWriteData(ctx, currentAddress, length, tracePackets);
+                ApplySubmittedWriteData(
+                    ctx,
+                    currentAddress,
+                    length,
+                    standardPacket: false,
+                    tracePacket: tracePackets);
             }
 
             if (op == ItWriteData && length >= 4)
             {
-                ApplySubmittedWriteData(ctx, currentAddress, length, tracePackets);
+                ApplySubmittedWriteData(
+                    ctx,
+                    currentAddress,
+                    length,
+                    standardPacket: true,
+                    tracePacket: tracePackets);
             }
 
             if (op == ItNop && register == RDmaData && length >= 8)
@@ -2863,6 +2881,7 @@ public static class AgcExports
         CpuContext ctx,
         ulong packetAddress,
         uint packetLength,
+        bool standardPacket,
         bool tracePacket)
     {
         if (!TryReadUInt32(ctx, packetAddress + 4, out var control) ||
@@ -2871,18 +2890,19 @@ public static class AgcExports
             return;
         }
 
-        var destination = control & 0xFFu;
-        var increment = (control >> 16) & 0xFFu;
+        var (destination, incrementAddress, writeConfirm, cachePolicy) = standardPacket
+            ? DecodeStandardWriteDataControl(control)
+            : DecodeAgcWriteDataControl(control);
         var dwordCount = packetLength - 4;
         InvalidateDcbWindowIfOverlaps(
             destinationAddress,
-            increment == 0 ? (ulong)dwordCount * sizeof(uint) : sizeof(uint));
+            incrementAddress ? (ulong)dwordCount * sizeof(uint) : sizeof(uint));
         var wroteData = destination is 1 or 2 or 4 or 5;
         for (uint index = 0; wroteData && index < dwordCount; index++)
         {
             var sourceAddress = packetAddress + 16 + ((ulong)index * sizeof(uint));
             var targetAddress = destinationAddress +
-                (increment == 0 ? (ulong)index * sizeof(uint) : 0);
+                (incrementAddress ? (ulong)index * sizeof(uint) : 0);
             wroteData =
                 TryReadUInt32(ctx, sourceAddress, out var value) &&
                 TryWriteUInt32(ctx, targetAddress, value);
@@ -2892,9 +2912,53 @@ public static class AgcExports
         {
             TraceAgc(
                 $"agc.dcb.write_data dst={destination} addr=0x{destinationAddress:X16} " +
-                $"count={dwordCount} increment={increment} wrote={wroteData}");
+                $"count={dwordCount} increment={incrementAddress} confirm={writeConfirm} " +
+                $"cache={cachePolicy} standard={standardPacket} wrote={wroteData}");
         }
     }
+
+    private static (uint Destination, bool IncrementAddress, bool WriteConfirm, uint CachePolicy)
+        DecodeStandardWriteDataControl(uint control)
+    {
+        // GFX10 PKT3_WRITE_DATA is not byte-packed like sceAgcDcbWriteData's
+        // NOP wrapper: DST_SEL is 11:8, ADDR_INCR is bit 16 (0 increments),
+        // WR_CONFIRM is bit 20, and CACHE_POLICY is 26:25. In particular, the
+        // low byte is reserved and must never be interpreted as DST_SEL.
+        return (
+            Destination: (control >> 8) & 0xFu,
+            IncrementAddress: (control & (1u << 16)) == 0,
+            WriteConfirm: (control & (1u << 20)) != 0,
+            CachePolicy: (control >> 25) & 0x3u);
+    }
+
+    private static (uint Destination, bool IncrementAddress, bool WriteConfirm, uint CachePolicy)
+        DecodeAgcWriteDataControl(uint control) =>
+        (
+            Destination: control & 0xFFu,
+            IncrementAddress: ((control >> 16) & 0xFFu) == 0,
+            WriteConfirm: ((control >> 24) & 0xFFu) != 0,
+            CachePolicy: (control >> 8) & 0xFFu);
+
+#if DEBUG
+    private static void ValidateWriteDataControlDecoders()
+    {
+        // Regression vector: reserved low-byte noise previously decoded 0xA5
+        // as DST_SEL, causing a valid standard memory write to be discarded.
+        const uint standardControl = 0xA5u | (5u << 8) | (1u << 16) | (1u << 20) | (2u << 25);
+        var standard = DecodeStandardWriteDataControl(standardControl);
+        System.Diagnostics.Debug.Assert(standard.Destination == 5u);
+        System.Diagnostics.Debug.Assert(!standard.IncrementAddress);
+        System.Diagnostics.Debug.Assert(standard.WriteConfirm);
+        System.Diagnostics.Debug.Assert(standard.CachePolicy == 2u);
+
+        const uint agcControl = 4u | (3u << 8) | (1u << 24);
+        var agc = DecodeAgcWriteDataControl(agcControl);
+        System.Diagnostics.Debug.Assert(agc.Destination == 4u);
+        System.Diagnostics.Debug.Assert(agc.IncrementAddress);
+        System.Diagnostics.Debug.Assert(agc.WriteConfirm);
+        System.Diagnostics.Debug.Assert(agc.CachePolicy == 3u);
+    }
+#endif
 
     // SHARPEMU_GPU_WAIT_MODE=force reverts to the legacy behaviour of faking a
     // satisfying value at parse time. Default (suspend) properly suspends the
@@ -4976,11 +5040,26 @@ public static class AgcExports
             var initialPixels = Array.Empty<byte>();
             if (descriptor.Address != 0)
             {
-                var storageSource = new byte[(int)sourceByteCount];
-                if (ctx.Memory.TryRead(descriptor.Address, storageSource) &&
-                    storageSource.AsSpan().IndexOfAnyExcept((byte)0) >= 0)
+                // Storage images can be pre-populated in tiled guest memory
+                // just like sampled images. Reading only the logical linear
+                // byte count both truncates 64 KiB swizzle blocks and uploads
+                // tiled bytes as scanlines. Read the full physical footprint
+                // and run the same AddrLib-derived detile path used below for
+                // sampled textures before seeding the Vulkan image.
+                var storageSource = new byte[(int)physicalSourceByteCount];
+                if (ctx.Memory.TryRead(descriptor.Address, storageSource))
                 {
-                    initialPixels = storageSource;
+                    var linearStorage = TryDetileTextureSource(
+                        descriptor,
+                        sourceWidth,
+                        checked((int)sourceByteCount),
+                        storageSource) ?? storageSource
+                            .AsSpan(0, checked((int)sourceByteCount))
+                            .ToArray();
+                    if (linearStorage.AsSpan().IndexOfAnyExcept((byte)0) >= 0)
+                    {
+                        initialPixels = linearStorage;
+                    }
                 }
             }
 
@@ -5509,6 +5588,7 @@ public static class AgcExports
         var groupCountX = dispatchEndX - baseGroupX;
         var groupCountY = dispatchEndY - baseGroupY;
         var groupCountZ = dispatchEndZ - baseGroupZ;
+        var waveLaneCount = (initiator & (1u << 15)) != 0 ? 32u : 64u;
 
         if (_traceAgcShader &&
             ((ulong)groupCountX * groupCountY * groupCountZ >= 1_000_000UL ||
@@ -5526,6 +5606,7 @@ public static class AgcExports
                         $"raw={dispatchEndX:X8}/{dispatchEndY:X8}/{dispatchEndZ:X8} " +
                         $"base={baseGroupX:X8}/{baseGroupY:X8}/{baseGroupZ:X8} " +
                         $"count={groupCountX:X8}/{groupCountY:X8}/{groupCountZ:X8} " +
+                        $"wave={waveLaneCount} " +
                         $"initiator=0x{initiator:X8} " +
                         $"indirect_base=0x{state.IndirectArgsAddress:X16}");
                 }
@@ -5538,7 +5619,8 @@ public static class AgcExports
             groupCountZ,
             baseGroupX,
             baseGroupY,
-            baseGroupZ);
+            baseGroupZ,
+            waveLaneCount);
         return true;
     }
 
@@ -5651,7 +5733,8 @@ public static class AgcExports
                     : ComputeShaderStructuralFingerprint(evaluation),
                 localSizeX,
                 localSizeY,
-                localSizeZ);
+                localSizeZ,
+                dispatch.WaveLaneCount);
             var guestGlobalBufferCount = evaluation.GlobalMemoryBindings.Count;
             var totalGlobalBufferCount = _bakeScalars
                 ? guestGlobalBufferCount
@@ -5675,7 +5758,8 @@ public static class AgcExports
                         totalGlobalBufferCount,
                         initialScalarBufferIndex: _bakeScalars
                             ? -1
-                            : guestGlobalBufferCount))
+                            : guestGlobalBufferCount,
+                        waveLaneCount: dispatch.WaveLaneCount))
                 {
                     computeSpirv = compiledCompute.Spirv;
                     DumpSpirv(
@@ -5740,6 +5824,28 @@ public static class AgcExports
                     ? string.Empty
                     : $" global_buffers=[{string.Join(',', evaluation.GlobalMemoryBindings.Select(
                         binding => $"0x{binding.BaseAddress:X16}:{binding.DataLength}"))}]";
+                var scalarProbe = string.Join(
+                    ',',
+                    evaluation.InitialScalarRegisters
+                        .Take(16)
+                        .Select((value, index) => $"s{index}={value:X8}"));
+                var globalProbes = evaluation.GlobalMemoryBindings.Count == 0
+                    ? string.Empty
+                    : $" global_heads=[{string.Join(',', evaluation.GlobalMemoryBindings.Select(
+                        binding =>
+                            $"0x{binding.BaseAddress:X16}:" +
+                            Convert.ToHexString(binding.Data.AsSpan(
+                                0,
+                                Math.Min(binding.DataLength, 16)))))}]";
+                var globalDescriptors = evaluation.GlobalMemoryBindings.Count == 0
+                    ? string.Empty
+                    : $" global_descriptors=[{string.Join(',', evaluation.GlobalMemoryBindings.Select(
+                        binding =>
+                            $"s{binding.ScalarAddress}=" +
+                            string.Join(':', evaluation.ScalarRegisters
+                                .Skip(checked((int)binding.ScalarAddress))
+                                .Take(4)
+                                .Select(value => $"{value:X8}"))))}]";
                 var opcodes = string.Join(
                     ',',
                     shaderState.Program.Instructions
@@ -5750,12 +5856,16 @@ public static class AgcExports
                     $"agc.compute_shader cs=0x{shaderAddress:X16} " +
                     $"groups={dispatch.GroupCountX}x{dispatch.GroupCountY}x{dispatch.GroupCountZ} " +
                     $"base={dispatch.BaseGroupX}x{dispatch.BaseGroupY}x{dispatch.BaseGroupZ} " +
+                    $"wave={dispatch.WaveLaneCount} " +
                     $"local={localSizeX}x{localSizeY}x{localSizeZ} " +
                     $"sys={DescribeComputeSystemRegisters(computeSystemRegisters)} " +
                     $"gpu={gpuDispatch} blits={blitCount} globals={evaluation.GlobalMemoryBindings.Count} " +
                     $"global_writes={writesGlobalMemory}" +
                     (computeError.Length == 0 ? string.Empty : $" error={computeError}") +
+                    $" sgprs=[{scalarProbe}]" +
                     globalBuffers +
+                    globalProbes +
+                    globalDescriptors +
                     $" opcodes=[{opcodes}]" +
                     $" bindings=[{string.Join(',', descriptions)}]");
             }

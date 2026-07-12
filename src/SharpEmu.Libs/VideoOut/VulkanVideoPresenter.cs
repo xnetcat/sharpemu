@@ -1423,6 +1423,7 @@ internal static unsafe class VulkanVideoPresenter
         private readonly HashSet<(ulong Address, uint Width, uint Height, uint Format)> _dumpedTextures = new();
         private readonly HashSet<(ulong Address, int Size)> _tracedGlobalBuffers = new();
         private readonly HashSet<(ulong Address, ulong Size)> _tracedGlobalWritebacks = new();
+        private int _tracedSmallGlobalWritebackEvents;
         private readonly HashSet<ulong> _tracedGuestImageContents = new();
         private readonly Dictionary<ulong, int> _tracedGuestWriteCounts = new();
         private int _tracedVertexBufferCount;
@@ -5796,6 +5797,14 @@ internal static unsafe class VulkanVideoPresenter
         }
 
         private const uint MaxComputeZSlicesPerSubmission = 8;
+        // A single guest dispatch above this size is not credible frame work
+        // (at the minimum 64-thread group used by the captured title this is
+        // already over one billion invocations).  Treat it as poisoned
+        // indirect-command data and quarantine it instead of feeding a host
+        // API a multi-billion-workgroup command.  This is validation, not a
+        // clamp: the raw dimensions remain visible in the trace so the
+        // producer can be fixed without changing the guest value.
+        private const ulong MaxCredibleGuestWorkgroupsPerDispatch = 16UL * 1024 * 1024;
 
         private void ExecuteComputeDispatch(VulkanComputeGuestDispatch work)
         {
@@ -5813,6 +5822,17 @@ internal static unsafe class VulkanVideoPresenter
                     $"vk.compute_skip cs=0x{work.ShaderAddress:X16} " +
                     $"groups={work.GroupCountX}x{work.GroupCountY}x{work.GroupCountZ} " +
                     $"textures={work.Textures.Count}");
+                return;
+            }
+
+            var totalWorkgroups =
+                (ulong)work.GroupCountX * work.GroupCountY * work.GroupCountZ;
+            if (totalWorkgroups > MaxCredibleGuestWorkgroupsPerDispatch)
+            {
+                TraceVulkanShader(
+                    $"vk.compute_reject_poisoned_indirect cs=0x{work.ShaderAddress:X16} " +
+                    $"groups={work.GroupCountX}x{work.GroupCountY}x{work.GroupCountZ} " +
+                    $"total={totalWorkgroups} textures={work.Textures.Count}");
                 return;
             }
 
@@ -6021,12 +6041,17 @@ internal static unsafe class VulkanVideoPresenter
                     nonzero += value == 0 ? 0 : 1;
                 }
 
-                if (_tracedGlobalWritebacks.Count < 256 &&
-                    _tracedGlobalWritebacks.Add((globalBuffer.BaseAddress, globalBuffer.Size)))
+                var firstForRange = _tracedGlobalWritebacks.Count < 256 &&
+                    _tracedGlobalWritebacks.Add((globalBuffer.BaseAddress, globalBuffer.Size));
+                var traceSmallMutation = globalBuffer.Size <= 4096 &&
+                    _tracedSmallGlobalWritebackEvents++ < 1024;
+                if (firstForRange || traceSmallMutation)
                 {
                     TraceVulkanShader(
                         $"vk.global_writeback base=0x{globalBuffer.BaseAddress:X16} " +
-                        $"bytes={bytes.Length} probe_nonzero={nonzero}/{probe.Length} wrote={wrote}");
+                        $"bytes={bytes.Length} probe_nonzero={nonzero}/{probe.Length} " +
+                        $"head={Convert.ToHexString(bytes[..Math.Min(bytes.Length, 32)])} " +
+                        $"wrote={wrote}");
                 }
             }
         }
