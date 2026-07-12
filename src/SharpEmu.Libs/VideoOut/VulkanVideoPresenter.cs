@@ -2528,24 +2528,28 @@ internal static unsafe class VulkanVideoPresenter
             const int margin = 12;
             var panelWidth = (int)Math.Min(PerfOverlay.PanelWidth, _extent.Width - margin);
             var panelHeight = (int)Math.Min(PerfOverlay.PanelHeight, _extent.Height - margin);
-            var blit = new ImageBlit
+            // Source and destination are both B8G8R8A8 and the panel is not
+            // scaled. MoltenVK has corrupted pixels outside the blit region
+            // for this transfer-on-swapchain path (horizontal red/yellow
+            // scanlines across the entire window). An exact image copy has
+            // the required semantics and avoids the driver's blit conversion
+            // path altogether.
+            var copy = new ImageCopy
             {
                 SrcSubresource = new ImageSubresourceLayers(ImageAspectFlags.ColorBit, 0, 0, 1),
                 DstSubresource = new ImageSubresourceLayers(ImageAspectFlags.ColorBit, 0, 0, 1),
+                SrcOffset = new Offset3D(0, 0, 0),
+                DstOffset = new Offset3D(margin, margin, 0),
+                Extent = new Extent3D((uint)panelWidth, (uint)panelHeight, 1),
             };
-            blit.SrcOffsets[0] = new Offset3D(0, 0, 0);
-            blit.SrcOffsets[1] = new Offset3D(panelWidth, panelHeight, 1);
-            blit.DstOffsets[0] = new Offset3D(margin, margin, 0);
-            blit.DstOffsets[1] = new Offset3D(margin + panelWidth, margin + panelHeight, 1);
-            _vk.CmdBlitImage(
+            _vk.CmdCopyImage(
                 _commandBuffer,
                 _overlayImage,
                 ImageLayout.TransferSrcOptimal,
                 _swapchainImages[imageIndex],
                 ImageLayout.TransferDstOptimal,
                 1,
-                &blit,
-                Filter.Nearest);
+                &copy);
 
             var swapchainToPresent = new ImageMemoryBarrier
             {

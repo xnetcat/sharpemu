@@ -813,6 +813,7 @@ internal static class Gen5ShaderTranslator
             0x1B => "VAndB32",
             0x1C => "VOrB32",
             0x1D => "VXorB32",
+            0x1E => "VXnorB32",
             0x1F => "VMacF32",
             0x20 => "VMadMkF32",
             0x21 => "VMadAkF32",
