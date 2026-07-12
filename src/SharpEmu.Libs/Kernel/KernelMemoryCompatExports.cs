@@ -3,6 +3,7 @@
 
 using SharpEmu.HLE;
 using SharpEmu.Libs.Ampr;
+using SharpEmu.Libs.Bink;
 using System.Buffers;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
@@ -1376,6 +1377,12 @@ public static partial class KernelMemoryCompatExports
             {
                 _openFiles[fd] = stream;
             }
+
+            // Bink is linked directly into some games, so there is no media
+            // import for the HLE codec layer to intercept. The successful
+            // guest file open is the stable boundary at which the optional
+            // host Bink bridge can attach to the same movie.
+            Bink2MovieBridge.ObserveGuestMovie(hostPath);
 
             if (IsMutatingOpen(flags))
             {

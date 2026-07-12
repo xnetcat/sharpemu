@@ -6,6 +6,7 @@ using Silk.NET.Core.Native;
 using Silk.NET.Maths;
 using SharpEmu.HLE;
 using SharpEmu.Libs.Agc;
+using SharpEmu.Libs.Bink;
 using Silk.NET.Input;
 using Silk.NET.Vulkan;
 using Silk.NET.Vulkan.Extensions.KHR;
@@ -1182,6 +1183,7 @@ internal static unsafe class VulkanVideoPresenter
                 if (pending.RequiredGuestWorkSequence <= _completedGuestWorkSequence)
                 {
                     presentation = _pendingGuestImagePresentations.Dequeue();
+                    TryReplaceWithBinkFrame(ref presentation);
                     return true;
                 }
 
@@ -1212,8 +1214,27 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             presentation = latest;
+            TryReplaceWithBinkFrame(ref presentation);
             return true;
         }
+    }
+
+    private static void TryReplaceWithBinkFrame(ref Presentation presentation)
+    {
+        if (!Bink2MovieBridge.TryDecodeNextFrame(out var pixels, out var width, out var height))
+        {
+            return;
+        }
+
+        presentation = new Presentation(
+            pixels,
+            width,
+            height,
+            presentation.Sequence,
+            GuestDrawKind.None,
+            TranslatedDraw: null,
+            presentation.RequiredGuestWorkSequence,
+            IsSplash: false);
     }
 
     private static readonly HashSet<long> _tracedGuestImagePresentRejections = new();
