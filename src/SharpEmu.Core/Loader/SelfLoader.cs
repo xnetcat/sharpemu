@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -54,13 +55,22 @@ public sealed class SelfLoader : ISelfLoader
     private const long DtSceSymTab = 0x61000039;
     private const long DtSceSymTabSize = 0x6100003F;
 
+    private const uint RelocationTypeNone = 0;
     private const uint RelocationTypeAbsolute64 = 1;
+    private const uint RelocationTypePc32 = 2;
+    private const uint RelocationTypePlt32 = 4;
     private const uint RelocationTypeGlobalData = 6;
     private const uint RelocationTypeJumpSlot = 7;
     private const uint RelocationTypeRelative = 8;
+    private const uint RelocationTypeUnsigned32 = 10;
+    private const uint RelocationTypeSigned32 = 11;
     private const uint RelocationTypeTlsModuleId = 16;   // R_X86_64_DTPMOD64
     private const uint RelocationTypeTlsDtpOff64 = 17;    // R_X86_64_DTPOFF64
     private const uint RelocationTypeTlsTpOff64 = 18;     // R_X86_64_TPOFF64
+    private const uint RelocationTypePc64 = 24;
+    private const uint RelocationTypeSize32 = 32;
+    private const uint RelocationTypeSize64 = 33;
+    private const uint RelocationTypeRelative64 = 38;
     private const ulong Ps5MainImageBase = 0x0000000800000000UL;
     private const ulong Ps4MainImageBase = 0x0000000000400000UL;
     private const ulong Ps5ModuleSearchStart = 0x0000000804000000UL;
@@ -85,6 +95,11 @@ public sealed class SelfLoader : ISelfLoader
     private static readonly int SelfHeaderSize = Unsafe.SizeOf<SelfHeader>();
     private static readonly int SelfSegmentSize = Unsafe.SizeOf<SelfSegment>();
     private static readonly int ProgramHeaderSize = Unsafe.SizeOf<ProgramHeader>();
+
+    static SelfLoader()
+    {
+        RunRelocationSelfChecks();
+    }
 
     public SelfImage Load(ReadOnlySpan<byte> imageData, IVirtualMemory virtualMemory)
     {
@@ -154,16 +169,22 @@ public sealed class SelfLoader : ISelfLoader
         {
             virtualMemory.Clear();
             _nextTlsModuleId = 1;
+            GuestTlsTemplate.Reset();
         }
-
-        var tlsModuleId = _nextTlsModuleId == 0 ? 1u : _nextTlsModuleId;
-        Console.Error.WriteLine($"[LOADER][TLS] load_start clear={clearVirtualMemory} next={_nextTlsModuleId} assigned={tlsModuleId}");
 
         var loadContext = ParseLayout(imageData);
         var elfHeader = ReadUnmanaged<ElfHeader>(imageData, loadContext.ElfOffset);
         ValidateElfHeader(elfHeader);
 
         var programHeaders = ParseProgramHeaders(imageData, loadContext, elfHeader);
+        var hasTlsSegment = TryGetProgramHeader(programHeaders, ProgramHeaderType.Tls, out var processTlsHeader, out _) &&
+            processTlsHeader.MemorySize != 0;
+        var tlsModuleId = hasTlsSegment
+            ? (_nextTlsModuleId == 0 ? 1u : _nextTlsModuleId)
+            : 0u;
+        Console.Error.WriteLine(
+            $"[LOADER][TLS] load_start clear={clearVirtualMemory} next={_nextTlsModuleId} " +
+            $"assigned={tlsModuleId} has_pt_tls={hasTlsSegment}");
 
         var totalImageSize = CalculateTotalImageSize(programHeaders);
         Console.WriteLine($"Total image size needed: 0x{totalImageSize:X} ({totalImageSize} bytes)");
@@ -196,12 +217,13 @@ public sealed class SelfLoader : ISelfLoader
         }
 
         MapLoadSegments(imageData, loadContext, programHeaders, virtualMemory, imageBase);
-        if (clearVirtualMemory)
-        {
-            // The main module owns the static TLS template; capture it before
-            // relocations so TPOFF64 offsets can be computed against its size.
-            RecordMainModuleTlsTemplate(programHeaders, virtualMemory, imageBase);
-        }
+        // Register every module before relocations so DTPMOD/DTPOFF/TPOFF use
+        // the module's real PT_TLS identity and Variant II static offset.
+        var tlsInfo = RegisterModuleTlsTemplate(
+            programHeaders,
+            virtualMemory,
+            imageBase,
+            tlsModuleId);
         var importStubs = ResolveAndPatchImportStubs(
             imageData,
             loadContext,
@@ -259,7 +281,7 @@ public sealed class SelfLoader : ISelfLoader
             Console.WriteLine($"[LOADER] PH[{i}]: type={ph.HeaderType}, vaddr=0x{ph.VirtualAddress:X16} -> 0x{ph.VirtualAddress + imageBase:X16}, memsz=0x{ph.MemorySize:X}");
         }
 
-        if (_nextTlsModuleId == tlsModuleId && _nextTlsModuleId < uint.MaxValue)
+        if (tlsModuleId != 0 && _nextTlsModuleId == tlsModuleId && _nextTlsModuleId < uint.MaxValue)
         {
             _nextTlsModuleId++;
         }
@@ -280,7 +302,10 @@ public sealed class SelfLoader : ISelfLoader
             procParamAddress,
             applicationInfo.Title,
             applicationInfo.TitleId,
-            applicationInfo.Version);
+            applicationInfo.Version,
+            tlsModuleId,
+            tlsInfo.MemorySize,
+            tlsInfo.StaticOffset);
     }
 
     private static (string? Title, string? TitleId, string? Version) TryLoadParamJson(
@@ -477,16 +502,16 @@ public sealed class SelfLoader : ISelfLoader
         return 0;
     }
 
-    private static void RecordMainModuleTlsTemplate(
+    private static ModuleTlsInfo RegisterModuleTlsTemplate(
         IReadOnlyList<ProgramHeader> programHeaders,
         IVirtualMemory virtualMemory,
-        ulong imageBase)
+        ulong imageBase,
+        uint tlsModuleId)
     {
-        SharpEmu.HLE.GuestTlsTemplate.Reset();
         if (!TryGetProgramHeader(programHeaders, ProgramHeaderType.Tls, out var tlsHeader, out _) ||
             tlsHeader.MemorySize == 0)
         {
-            return;
+            return default;
         }
 
         // tdata (initialized) bytes come from the mapped segment; tbss is the
@@ -501,11 +526,17 @@ public sealed class SelfLoader : ISelfLoader
             initImage = [];
         }
 
-        SharpEmu.HLE.GuestTlsTemplate.Set(initImage, tlsHeader.MemorySize, tlsHeader.Alignment);
+        var staticOffset = GuestTlsTemplate.RegisterModule(
+            tlsModuleId,
+            initImage,
+            tlsHeader.MemorySize,
+            tlsHeader.Alignment,
+            tlsHeader.VirtualAddress);
         Console.Error.WriteLine(
-            $"[LOADER][TLS] Main module TLS template: memsz=0x{tlsHeader.MemorySize:X} " +
+            $"[LOADER][TLS] Module {tlsModuleId} TLS template: memsz=0x{tlsHeader.MemorySize:X} " +
             $"filesz=0x{tlsHeader.FileSize:X} align=0x{tlsHeader.Alignment:X} " +
-            $"block=0x{SharpEmu.HLE.GuestTlsTemplate.BlockSize:X}");
+            $"static_offset=0x{staticOffset:X} total_static=0x{GuestTlsTemplate.StaticTlsSize:X}");
+        return new ModuleTlsInfo(tlsHeader.MemorySize, staticOffset);
     }
 
     private static IReadOnlyDictionary<ulong, string> ResolveAndPatchImportStubs(
@@ -587,12 +618,17 @@ public sealed class SelfLoader : ISelfLoader
         uint maxSymbolIndex = 0;
         foreach (var relocation in relocations)
         {
+            if (relocation.Type == RelocationTypeNone)
+            {
+                continue;
+            }
+
             if (!IsSupportedRelocationType(relocation.Type))
             {
                 continue;
             }
 
-            if (relocation.Type is RelocationTypeRelative or RelocationTypeTlsModuleId)
+            if (relocation.Type is RelocationTypeNone or RelocationTypeRelative or RelocationTypeRelative64 or RelocationTypeTlsModuleId)
             {
                 continue;
             }
@@ -676,13 +712,16 @@ public sealed class SelfLoader : ISelfLoader
 
         importedRelocations = BuildImportedRelocations(descriptors);
 
-        var stubsByAddress = CreateImportStubMapping(virtualMemory, orderedImportNids);
+        var stubImportNids = orderedImportNids
+            .Where(nid => ShouldCreateImportStub(nid, descriptors, moduleManager))
+            .ToArray();
+        var stubsByAddress = CreateImportStubMapping(virtualMemory, stubImportNids);
         Console.WriteLine($"[LOADER] Created {stubsByAddress.Count} import stubs");
 
-        int printCount = Math.Min(10, orderedImportNids.Count);
+        int printCount = Math.Min(10, stubImportNids.Length);
         for (int i = 0; i < printCount; i++)
         {
-            var nid = orderedImportNids[i];
+            var nid = stubImportNids[i];
             var addr = stubsByAddress.First(x => x.Value == nid).Key;
         }
 
@@ -706,27 +745,41 @@ public sealed class SelfLoader : ISelfLoader
 
         foreach (var descriptor in descriptors)
         {
-            ulong targetValue;
+            ulong symbolValue;
             if (descriptor.ImportNid is null)
             {
-                targetValue = AddSigned(descriptor.SymbolValue, descriptor.Addend);
+                symbolValue = descriptor.SymbolValue;
             }
             else
             {
-                if (!addressesByNid.TryGetValue(descriptor.ImportNid, out var stubAddress))
+                if (addressesByNid.TryGetValue(descriptor.ImportNid, out var stubAddress))
+                {
+                    symbolValue = stubAddress;
+                }
+                else if (descriptor.IsWeak)
+                {
+                    // ELF unresolved weak definitions use S=0. They must not
+                    // receive a trap import stub, which would turn a permitted
+                    // null test into a call to an unresolved-import handler.
+                    symbolValue = 0;
+                }
+                else
                 {
                     throw new InvalidOperationException($"Import stub not found for NID '{descriptor.ImportNid}'.");
                 }
-
-                targetValue = AddSigned(stubAddress, descriptor.Addend);
             }
 
-            if (targetValue < 0x1000 && descriptor.ValueKind == RelocationValueKind.TlsOffset)
+            var targetValue = ComputeRelocationValue(descriptor, symbolValue);
+
+            if (targetValue < 0x1000 && descriptor.ValueKind is
+                RelocationValueKind.TlsOffset or
+                RelocationValueKind.PcRelative or
+                RelocationValueKind.SymbolSize)
             {
                 // A TLS offset (TPOFF64/DTPOFF64) is a signed displacement, not a
                 // mapped address, so a small or negative value here is expected.
             }
-            else if (targetValue < 0x1000)
+            else if (targetValue < 0x1000 && !descriptor.IsWeak)
             {
                 if (descriptor.ValueKind == RelocationValueKind.TlsModuleId)
                 {
@@ -740,9 +793,10 @@ public sealed class SelfLoader : ISelfLoader
                 }
             }
 
-            if (!TryWriteUInt64(virtualMemory, descriptor.TargetAddress, targetValue))
+            if (!TryWriteRelocationValue(virtualMemory, descriptor, targetValue, out var writeError))
             {
-                throw new InvalidDataException($"Failed to patch relocation at 0x{descriptor.TargetAddress:X16}.");
+                throw new InvalidDataException(
+                    $"Failed to patch relocation at 0x{descriptor.TargetAddress:X16}: {writeError}");
             }
 
             if (descriptor.TargetAddress >= 0x00000008030FC300UL &&
@@ -853,10 +907,16 @@ public sealed class SelfLoader : ISelfLoader
                 // IRELATIVE/ifunc (37) leave their targets unrelocated, which
                 // manifests later as reads of zero or calls into address 0.
                 ReportUnsupportedRelocation(relocation.Type, relocation.Offset, imageBase);
+                if (relocation.Type is 5 or 37)
+                {
+                    throw new NotSupportedException(
+                        $"Relocation type {relocation.Type} requires deferred runtime-linker processing.");
+                }
                 continue;
             }
 
-            if (!TryResolveMappedAddress(virtualMemory, relocation.Offset, imageBase, sizeof(ulong), out var targetAddress))
+            var relocationWriteSize = GetRelocationWriteSize(relocation.Type);
+            if (!TryResolveMappedAddress(virtualMemory, relocation.Offset, imageBase, relocationWriteSize, out var targetAddress))
             {
                 if (IsFocusRelocationOffset(relocation.Offset, imageBase))
                 {
@@ -865,7 +925,7 @@ public sealed class SelfLoader : ISelfLoader
                 continue;
             }
 
-            if (relocation.Type == RelocationTypeRelative)
+            if (relocation.Type is RelocationTypeRelative or RelocationTypeRelative64)
             {
                 descriptors.Add(new RelocationDescriptor(
                     targetAddress,
@@ -879,7 +939,12 @@ public sealed class SelfLoader : ISelfLoader
 
             if (relocation.Type == RelocationTypeTlsModuleId)
             {
-                var dtpmodValue = tlsModuleId == 0 ? 1u : tlsModuleId;
+                if (tlsModuleId == 0)
+                {
+                    throw new InvalidDataException(
+                        $"R_X86_64_DTPMOD64 at 0x{targetAddress:X16} references a module without PT_TLS.");
+                }
+                var dtpmodValue = tlsModuleId;
                 descriptors.Add(new RelocationDescriptor(
                     targetAddress,
                     0,
@@ -912,8 +977,15 @@ public sealed class SelfLoader : ISelfLoader
                 // (st_value + addend); TPOFF64 is that offset expressed relative
                 // to the thread pointer, i.e. minus the aligned block size.
                 var tlsSymbolOffset = AddSigned(symbol.Value, relocation.Addend);
+                if (!GuestTlsTemplate.TryGetStaticOffset(tlsModuleId, out var moduleStaticOffset))
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][TLS] Missing PT_TLS registration for module {tlsModuleId}; " +
+                        $"cannot apply relocation {relocation.Type} at 0x{targetAddress:X16}.");
+                    continue;
+                }
                 var tlsValue = relocation.Type == RelocationTypeTlsTpOff64
-                    ? unchecked(tlsSymbolOffset - SharpEmu.HLE.GuestTlsTemplate.BlockSize)
+                    ? unchecked(tlsSymbolOffset - moduleStaticOffset)
                     : tlsSymbolOffset;
                 descriptors.Add(new RelocationDescriptor(
                     targetAddress,
@@ -925,47 +997,68 @@ public sealed class SelfLoader : ISelfLoader
                 continue;
             }
 
-            var addend = relocation.Type is RelocationTypeGlobalData or RelocationTypeJumpSlot ? 0 : relocation.Addend;
             var symbolBind = GetSymbolBind(symbol.Info);
+            if (symbolIndex == 0)
+            {
+                descriptors.Add(CreateSymbolRelocationDescriptor(
+                    relocation,
+                    targetAddress,
+                    symbol,
+                    symbolAddress: 0,
+                    importNid: null,
+                    isWeak: false));
+                continue;
+            }
+
             if (symbolBind == SymbolBindLocal)
             {
-                var symbolAddress = ResolveMappedAddressOrFallback(virtualMemory, symbol.Value, imageBase);
+                var symbolAddress = relocation.Type is RelocationTypeSize32 or RelocationTypeSize64
+                    ? 0
+                    : ResolveMappedAddressOrFallback(virtualMemory, symbol.Value, imageBase);
                 if (symbolAddress == 0)
                 {
-                    Console.Error.WriteLine(
-                        $"[LOADER] Skipping local relocation with invalid symbol value 0x{symbol.Value:X} " +
-                        $"at target 0x{targetAddress:X16}, type={relocation.Type}, sym={symbolIndex}");
-                    continue;
+                    if (relocation.Type is not (RelocationTypeSize32 or RelocationTypeSize64))
+                    {
+                        Console.Error.WriteLine(
+                            $"[LOADER] Skipping local relocation with invalid symbol value 0x{symbol.Value:X} " +
+                            $"at target 0x{targetAddress:X16}, type={relocation.Type}, sym={symbolIndex}");
+                        continue;
+                    }
                 }
 
-                descriptors.Add(new RelocationDescriptor(
+                descriptors.Add(CreateSymbolRelocationDescriptor(
+                    relocation,
                     targetAddress,
-                    addend,
-                    null,
+                    symbol,
                     symbolAddress,
-                    RelocationValueKind.Pointer,
-                    IsDataImport: false));
+                    importNid: null,
+                    isWeak: false));
                 continue;
             }
 
             if (symbol.Value != 0)
             {
-                var symbolAddress = ResolveMappedAddressOrFallback(virtualMemory, symbol.Value, imageBase);
+                var symbolAddress = relocation.Type is RelocationTypeSize32 or RelocationTypeSize64
+                    ? 0
+                    : ResolveMappedAddressOrFallback(virtualMemory, symbol.Value, imageBase);
                 if (symbolAddress == 0)
                 {
-                    Console.Error.WriteLine(
-                        $"[LOADER] Skipping relocation with invalid symbol value 0x{symbol.Value:X} " +
-                        $"at target 0x{targetAddress:X16}, type={relocation.Type}, sym={symbolIndex}");
-                    continue;
+                    if (relocation.Type is not (RelocationTypeSize32 or RelocationTypeSize64))
+                    {
+                        Console.Error.WriteLine(
+                            $"[LOADER] Skipping relocation with invalid symbol value 0x{symbol.Value:X} " +
+                            $"at target 0x{targetAddress:X16}, type={relocation.Type}, sym={symbolIndex}");
+                        continue;
+                    }
                 }
 
-                descriptors.Add(new RelocationDescriptor(
+                descriptors.Add(CreateSymbolRelocationDescriptor(
+                    relocation,
                     targetAddress,
-                    addend,
-                    null,
+                    symbol,
                     symbolAddress,
-                    RelocationValueKind.Pointer,
-                    IsDataImport: false));
+                    importNid: null,
+                    isWeak: false));
                 continue;
             }
 
@@ -980,6 +1073,16 @@ public sealed class SelfLoader : ISelfLoader
 
             if (!TryReadNullTerminatedAscii(stringTable, symbol.NameOffset, out var symbolName))
             {
+                if (symbolBind == SymbolBindWeak)
+                {
+                    descriptors.Add(CreateSymbolRelocationDescriptor(
+                        relocation,
+                        targetAddress,
+                        symbol,
+                        symbolAddress: 0,
+                        importNid: null,
+                        isWeak: true));
+                }
                 if (targetAddress >= FocusRelocGuestStart && targetAddress <= FocusRelocGuestEnd)
                 {
                     Console.Error.WriteLine($"[LOADER][FOCUS][SKIP] symbol name read failed offset={symbol.NameOffset}");
@@ -990,6 +1093,16 @@ public sealed class SelfLoader : ISelfLoader
             var nid = ExtractNid(symbolName);
             if (string.IsNullOrWhiteSpace(nid))
             {
+                if (symbolBind == SymbolBindWeak)
+                {
+                    descriptors.Add(CreateSymbolRelocationDescriptor(
+                        relocation,
+                        targetAddress,
+                        symbol,
+                        symbolAddress: 0,
+                        importNid: null,
+                        isWeak: true));
+                }
                 continue;
             }
 
@@ -998,14 +1111,72 @@ public sealed class SelfLoader : ISelfLoader
                 orderedImportNids.Add(nid);
             }
 
-            descriptors.Add(new RelocationDescriptor(
+            descriptors.Add(CreateSymbolRelocationDescriptor(
+                relocation,
                 targetAddress,
-                addend,
-                nid,
-                0,
-                RelocationValueKind.Pointer,
-                IsDataImport: GetSymbolType(symbol.Info) == SymbolTypeObject));
+                symbol,
+                symbolAddress: 0,
+                importNid: nid,
+                isWeak: symbolBind == SymbolBindWeak));
         }
+    }
+
+    private static RelocationDescriptor CreateSymbolRelocationDescriptor(
+        ElfRelocation relocation,
+        ulong targetAddress,
+        ElfSymbol symbol,
+        ulong symbolAddress,
+        string? importNid,
+        bool isWeak)
+    {
+        var valueKind = relocation.Type switch
+        {
+            RelocationTypePc32 or RelocationTypePlt32 or RelocationTypePc64 => RelocationValueKind.PcRelative,
+            RelocationTypeSize32 or RelocationTypeSize64 => RelocationValueKind.SymbolSize,
+            _ => RelocationValueKind.Pointer,
+        };
+        var writeKind = relocation.Type switch
+        {
+            RelocationTypePc32 or RelocationTypePlt32 or RelocationTypeSigned32 => RelocationWriteKind.Int32,
+            RelocationTypeUnsigned32 or RelocationTypeSize32 => RelocationWriteKind.UInt32,
+            _ => RelocationWriteKind.UInt64,
+        };
+        var symbolValue = valueKind == RelocationValueKind.SymbolSize
+            ? symbol.Size
+            : symbolAddress;
+        var addend = relocation.Type is RelocationTypeGlobalData or RelocationTypeJumpSlot
+            ? 0
+            : relocation.Addend;
+        return new RelocationDescriptor(
+            targetAddress,
+            addend,
+            importNid,
+            symbolValue,
+            valueKind,
+            IsDataImport: GetSymbolType(symbol.Info) == SymbolTypeObject,
+            writeKind,
+            isWeak);
+    }
+
+    private static bool ShouldCreateImportStub(
+        string nid,
+        IReadOnlyList<RelocationDescriptor> descriptors,
+        IModuleManager? moduleManager)
+    {
+        for (var i = 0; i < descriptors.Count; i++)
+        {
+            var descriptor = descriptors[i];
+            if (!string.Equals(descriptor.ImportNid, nid, StringComparison.Ordinal))
+            {
+                continue;
+            }
+            if (!descriptor.IsWeak || moduleManager?.TryGetExport(nid, out _) == true)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static void RegisterRuntimeSymbolsAndHooks(
@@ -1762,13 +1933,22 @@ public sealed class SelfLoader : ISelfLoader
     private static bool IsSupportedRelocationType(uint relocationType)
     {
         return relocationType is
+            RelocationTypeNone or
             RelocationTypeAbsolute64 or
+            RelocationTypePc32 or
+            RelocationTypePlt32 or
             RelocationTypeGlobalData or
             RelocationTypeJumpSlot or
             RelocationTypeRelative or
+            RelocationTypeUnsigned32 or
+            RelocationTypeSigned32 or
             RelocationTypeTlsModuleId or
             RelocationTypeTlsDtpOff64 or
-            RelocationTypeTlsTpOff64;
+            RelocationTypeTlsTpOff64 or
+            RelocationTypePc64 or
+            RelocationTypeSize32 or
+            RelocationTypeSize64 or
+            RelocationTypeRelative64;
     }
 
     private static readonly HashSet<uint> _reportedUnsupportedRelocationTypes = new();
@@ -1792,14 +1972,12 @@ public sealed class SelfLoader : ISelfLoader
         var name = relocationType switch
         {
             5 => "R_X86_64_COPY",
-            17 => "R_X86_64_DTPOFF64",
-            18 => "R_X86_64_TPOFF64",
             37 => "R_X86_64_IRELATIVE (ifunc)",
             _ => "unknown",
         };
         Console.Error.WriteLine(
-            $"[LOADER][WARN] Unsupported relocation type {relocationType} ({name}) left unrelocated " +
-            $"(first at off=0x{offset:X16}); dependent reads/calls may be invalid.");
+            $"[LOADER][ERROR] Unsupported relocation type {relocationType} ({name}) rejected " +
+            $"(first at off=0x{offset:X16}); COPY requires dependency symbol storage and IRELATIVE requires resolver execution.");
     }
 
     private static ulong DetermineRequestedImageBase(
@@ -2153,6 +2331,106 @@ public sealed class SelfLoader : ISelfLoader
         return virtualMemory.TryWrite(address, buffer);
     }
 
+    private static ulong ComputeRelocationValue(RelocationDescriptor descriptor, ulong resolvedSymbolValue)
+    {
+        var baseValue = descriptor.ValueKind == RelocationValueKind.SymbolSize
+            ? descriptor.SymbolValue
+            : resolvedSymbolValue;
+        var value = AddSigned(baseValue, descriptor.Addend);
+        return descriptor.ValueKind == RelocationValueKind.PcRelative
+            ? unchecked(value - descriptor.TargetAddress)
+            : value;
+    }
+
+    private static bool TryWriteRelocationValue(
+        IVirtualMemory virtualMemory,
+        RelocationDescriptor descriptor,
+        ulong value,
+        out string? error)
+    {
+        Span<byte> buffer = stackalloc byte[sizeof(ulong)];
+        var length = sizeof(ulong);
+        switch (descriptor.WriteKind)
+        {
+            case RelocationWriteKind.UInt64:
+                BinaryPrimitives.WriteUInt64LittleEndian(buffer, value);
+                break;
+
+            case RelocationWriteKind.UInt32:
+                if (value > uint.MaxValue)
+                {
+                    error = $"value 0x{value:X16} overflows an unsigned 32-bit relocation";
+                    return false;
+                }
+                BinaryPrimitives.WriteUInt32LittleEndian(buffer, (uint)value);
+                length = sizeof(uint);
+                break;
+
+            case RelocationWriteKind.Int32:
+                var signedValue = unchecked((long)value);
+                if (signedValue is < int.MinValue or > int.MaxValue)
+                {
+                    error = $"value {signedValue} overflows a signed 32-bit relocation";
+                    return false;
+                }
+                BinaryPrimitives.WriteInt32LittleEndian(buffer, (int)signedValue);
+                length = sizeof(int);
+                break;
+
+            default:
+                error = $"unknown relocation write kind {descriptor.WriteKind}";
+                return false;
+        }
+
+        error = virtualMemory.TryWrite(descriptor.TargetAddress, buffer[..length])
+            ? null
+            : "target memory is not writable";
+        return error is null;
+    }
+
+    private static int GetRelocationWriteSize(uint relocationType)
+    {
+        return relocationType is
+            RelocationTypePc32 or
+            RelocationTypePlt32 or
+            RelocationTypeUnsigned32 or
+            RelocationTypeSigned32 or
+            RelocationTypeSize32
+                ? sizeof(uint)
+                : sizeof(ulong);
+    }
+
+    [Conditional("DEBUG")]
+    private static void RunRelocationSelfChecks()
+    {
+        var pc32 = new RelocationDescriptor(
+            TargetAddress: 0x1000,
+            Addend: -4,
+            ImportNid: null,
+            SymbolValue: 0x1800,
+            RelocationValueKind.PcRelative,
+            IsDataImport: false,
+            RelocationWriteKind.Int32);
+        Debug.Assert(
+            unchecked((long)ComputeRelocationValue(pc32, pc32.SymbolValue)) == 0x7FC,
+            "R_X86_64_PC32 did not apply S + A - P.");
+
+        var weak = new RelocationDescriptor(
+            TargetAddress: 0x2000,
+            Addend: 7,
+            ImportNid: "weak",
+            SymbolValue: 0,
+            RelocationValueKind.Pointer,
+            IsDataImport: false,
+            IsWeak: true);
+        Debug.Assert(
+            ComputeRelocationValue(weak, resolvedSymbolValue: 0) == 7,
+            "An unresolved weak relocation did not use S=0.");
+        Debug.Assert(
+            !ShouldCreateImportStub("weak", [weak], moduleManager: null),
+            "An unresolved weak symbol incorrectly received a trap import stub.");
+    }
+
     private static ulong AlignUp(ulong value, ulong alignment)
     {
         var mask = alignment - 1;
@@ -2451,6 +2729,8 @@ public sealed class SelfLoader : ISelfLoader
         public uint Type => (uint)(Info & uint.MaxValue);
     }
 
+    private readonly record struct ModuleTlsInfo(ulong MemorySize, ulong StaticOffset);
+
     private enum RelocationValueKind : byte
     {
         Pointer = 0,
@@ -2458,7 +2738,16 @@ public sealed class SelfLoader : ISelfLoader
         // A pre-computed TLS offset written verbatim (TPOFF64/DTPOFF64). Unlike
         // Pointer it is a signed displacement, not a mapped address, so it is
         // patched as-is without the low-address validity warning.
-        TlsOffset = 2
+        TlsOffset = 2,
+        PcRelative = 3,
+        SymbolSize = 4,
+    }
+
+    private enum RelocationWriteKind : byte
+    {
+        UInt64 = 0,
+        UInt32 = 1,
+        Int32 = 2,
     }
 
     private readonly record struct RelocationDescriptor(
@@ -2467,7 +2756,9 @@ public sealed class SelfLoader : ISelfLoader
         string? ImportNid,
         ulong SymbolValue,
         RelocationValueKind ValueKind,
-        bool IsDataImport);
+        bool IsDataImport,
+        RelocationWriteKind WriteKind = RelocationWriteKind.UInt64,
+        bool IsWeak = false);
 
     private enum SelfSegmentResolveStatus
     {

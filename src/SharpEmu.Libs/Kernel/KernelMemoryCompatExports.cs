@@ -20,7 +20,6 @@ public static partial class KernelMemoryCompatExports
     private const int MaxGuestStringLength = 4096;
     private const int WideCharSize = sizeof(ushort);
     private const int MemsetChunkSize = 16 * 1024;
-    private const int TlsModuleBlockSize = 0x10000;
     private const int O_WRONLY = 0x1;
     private const int O_RDWR = 0x2;
     private const int O_APPEND = 0x8;
@@ -97,7 +96,6 @@ public static partial class KernelMemoryCompatExports
     private static readonly Dictionary<int, OpenDirectory> _openDirectories = new();
     private static readonly object _libcAllocGate = new();
     private static readonly object _memoryGate = new();
-    private static readonly object _tlsGate = new();
     private static readonly object _ioTraceGate = new();
     private static readonly object _statCacheGate = new();
     private static readonly object _guestMountGate = new();
@@ -105,7 +103,6 @@ public static partial class KernelMemoryCompatExports
     private static readonly Dictionary<ulong, LibcHeapAllocation> _libcAllocations = new();
     private static readonly Dictionary<ulong, MappedRegion> _mappedRegions = new();
     private static readonly Dictionary<ulong, string> _mappedRegionNames = new();
-    private static readonly Dictionary<ulong, ulong> _tlsModuleBlocks = new();
     private static readonly Dictionary<string, string> _guestMounts = new(StringComparer.OrdinalIgnoreCase);
     private static readonly HashSet<string> _tracedStatResults = new(StringComparer.Ordinal);
     private static readonly HashSet<string> _negativeStatCache = new(StringComparer.OrdinalIgnoreCase);
@@ -2203,36 +2200,7 @@ public static partial class KernelMemoryCompatExports
 
     private static ulong ResolveTlsAddress(CpuContext ctx, ulong moduleId, ulong offset)
     {
-        if (ctx.FsBase == 0)
-        {
-            return 0;
-        }
-
-        if (moduleId <= 1)
-        {
-            // Variant II: the main module's static TLS block sits below the
-            // thread pointer at [FsBase - blockSize, FsBase). When the module
-            // declares no TLS (blockSize == 0) this degrades to the previous
-            // FsBase-relative behavior.
-            var blockSize = SharpEmu.HLE.GuestTlsTemplate.BlockSize;
-            return unchecked(ctx.FsBase - blockSize + offset);
-        }
-
-        var key = (ctx.FsBase << 16) ^ (moduleId & 0xFFFFUL);
-        ulong moduleBase;
-        lock (_tlsGate)
-        {
-            if (!_tlsModuleBlocks.TryGetValue(key, out moduleBase))
-            {
-                var block = Marshal.AllocHGlobal(TlsModuleBlockSize);
-                Marshal.Copy(new byte[TlsModuleBlockSize], 0, block, TlsModuleBlockSize);
-
-                moduleBase = unchecked((ulong)block);
-                _tlsModuleBlocks[key] = moduleBase;
-            }
-        }
-
-        return unchecked(moduleBase + offset);
+        return SharpEmu.HLE.GuestTlsTemplate.ResolveAddress(ctx, moduleId, offset);
     }
 
     [SysAbiExport(
