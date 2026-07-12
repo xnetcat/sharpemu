@@ -404,6 +404,11 @@ internal static partial class Gen5SpirvTranslator
                 {
                     _module.AddCapability(SpirvCapability.GroupNonUniformVote);
                 }
+
+                if (UsesSubgroupBroadcast())
+                {
+                    _module.AddCapability(SpirvCapability.GroupNonUniformBallot);
+                }
             }
 
             _glsl = _module.ImportExtInst("GLSL.std.450");
@@ -2665,6 +2670,10 @@ internal static partial class Gen5SpirvTranslator
             _state.Program.Instructions.Any(instruction =>
                 instruction.Opcode is "VPermlane16B32" or "VPermlanex16B32");
 
+        private bool UsesSubgroupBroadcast() =>
+            _state.Program.Instructions.Any(instruction =>
+                instruction.Opcode == "VReadfirstlaneB32");
+
         private bool UsesWaveControl() =>
             _state.Program.Instructions.Any(instruction =>
                 instruction.Opcode.Contains("Saveexec", StringComparison.Ordinal) ||
@@ -2677,6 +2686,7 @@ internal static partial class Gen5SpirvTranslator
         private bool UsesSubgroupOperations() =>
             _stage == Gen5SpirvStage.Compute &&
             (UsesSubgroupShuffle() ||
+             UsesSubgroupBroadcast() ||
              UsesWaveControl() ||
              _state.Program.Instructions.Any(static instruction =>
                  instruction.Opcode is "VMbcntLoU32B32" or "VMbcntHiU32B32"));

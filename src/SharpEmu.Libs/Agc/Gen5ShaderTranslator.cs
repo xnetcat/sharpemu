@@ -1431,7 +1431,14 @@ internal static class Gen5ShaderTranslator
                     sources = [Gen5Operand.Source(word & 0x1FF, literal)];
                 }
 
-                destinations = [Gen5Operand.Vector((word >> 17) & 0xFF)];
+                // V_READFIRSTLANE_B32 is encoded as VOP1, but its destination
+                // field names an SGPR rather than a VGPR. Treating it like an
+                // ordinary vector destination leaves every invocation with a
+                // different value and corrupts scalar addresses derived from
+                // lane data.
+                destinations = opcode == "VReadfirstlaneB32"
+                    ? [Gen5Operand.Scalar((word >> 17) & 0x7F)]
+                    : [Gen5Operand.Vector((word >> 17) & 0xFF)];
                 break;
             case Gen5ShaderEncoding.Vop2:
                 if (isDpp)

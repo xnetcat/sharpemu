@@ -1407,6 +1407,7 @@ internal static unsafe class VulkanVideoPresenter
         private DeviceMemory[] _overlayStagingMemory = [];
         private nint[] _overlayStagingMapped = [];
         private long _presentedSequence;
+        private long _presentNotTakenLoggedSequence = long.MinValue;
         private bool _vulkanReady;
         private bool _firstFramePresented;
         private bool _firstGuestDrawPresented;
@@ -7040,8 +7041,10 @@ internal static unsafe class VulkanVideoPresenter
 
             if (!TryTakePresentation(_presentedSequence, out var presentation))
             {
-                if (ShouldTracePresentedGuestImageContentsForDiagnostics())
+                if (ShouldTracePresentedGuestImageContentsForDiagnostics() &&
+                    _presentNotTakenLoggedSequence != _presentedSequence)
                 {
+                    _presentNotTakenLoggedSequence = _presentedSequence;
                     Console.Error.WriteLine(
                         $"[LOADER][WARN] vk.present_not_taken seq={_presentedSequence} " +
                         "— presentation submitted but its required guest work isn't complete; nothing shown.");
