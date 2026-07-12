@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using System.Runtime.InteropServices;
+using System.Buffers.Binary;
 
 namespace SharpEmu.Libs.Bink;
 
@@ -23,8 +24,19 @@ internal static class Bink2MovieBridge
     private static IntPtr _activeMovie;
     private static Bink2MovieInfo _activeInfo;
     private static byte[]? _frameBuffer;
+    private static bool _usingDummyMovie;
     private static bool _loadAttempted;
     private static bool _availabilityReported;
+
+    /// <summary>
+    /// Returns true when the guest should receive a normal "file not found"
+    /// result for a Bink movie. This is the safe default without a decoder:
+    /// games that treat movies as optional fall through to their next state
+    /// rather than submitting an empty Bink GPU texture forever.
+    /// </summary>
+    internal static bool ShouldSkipGuestMovie(string hostPath) =>
+        hostPath.EndsWith(".bk2", StringComparison.OrdinalIgnoreCase) &&
+        ResolveMode() == MovieMode.Skip;
 
     internal static void ObserveGuestMovie(string hostPath)
     {
@@ -38,6 +50,12 @@ internal static class Bink2MovieBridge
         {
             if (string.Equals(_activePath, hostPath, StringComparison.OrdinalIgnoreCase))
             {
+                return;
+            }
+
+            if (ResolveMode() == MovieMode.Dummy)
+            {
+                AttachDummyMovieLocked(hostPath);
                 return;
             }
 
@@ -68,7 +86,7 @@ internal static class Bink2MovieBridge
             _activePath = hostPath;
             _activeMovie = movie;
             _activeInfo = info;
-            _frameBuffer = GC.AllocateUninitializedArray<byte>(checked((int)(info.Width * info.Height * 4)));
+            _frameBuffer = GC.AllocateUninitializedArray<byte>(GetFrameBufferLength(info));
             Console.Error.WriteLine(
                 "[LOADER][INFO] Bink2 bridge attached: " + Path.GetFileName(hostPath) + " " +
                 info.Width + "x" + info.Height + " @ " +
@@ -88,6 +106,14 @@ internal static class Bink2MovieBridge
             height = 0;
             if (_adapter is null || _activeMovie == IntPtr.Zero || _frameBuffer is null)
             {
+                if (_usingDummyMovie && _frameBuffer is not null)
+                {
+                    pixels = _frameBuffer;
+                    width = _activeInfo.Width;
+                    height = _activeInfo.Height;
+                    return true;
+                }
+
                 return false;
             }
 
@@ -117,6 +143,102 @@ internal static class Bink2MovieBridge
         info.Width > 0 && info.Height > 0 &&
         info.Width <= MaxDimension && info.Height <= MaxDimension &&
         (ulong)info.Width * info.Height * 4 <= int.MaxValue;
+
+    private static int GetFrameBufferLength(Bink2MovieInfo info) =>
+        checked((int)((ulong)info.Width * info.Height * 4));
+
+    private static MovieMode ResolveMode()
+    {
+        var configured = Environment.GetEnvironmentVariable("SHARPEMU_BINK_MODE");
+        if (string.Equals(configured, "dummy", StringComparison.OrdinalIgnoreCase))
+        {
+            return MovieMode.Dummy;
+        }
+
+        if (string.Equals(configured, "native", StringComparison.OrdinalIgnoreCase))
+        {
+            return MovieMode.Native;
+        }
+
+        if (string.Equals(configured, "skip", StringComparison.OrdinalIgnoreCase))
+        {
+            return MovieMode.Skip;
+        }
+
+        // With no SDK adapter present, returning "not found" makes optional
+        // cinematics advance. Supplying either an explicit path or the normal
+        // side-by-side adapter enables native playback automatically.
+        if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("SHARPEMU_BINK2_BRIDGE")) ||
+            EnumerateAdapterCandidates().Any(File.Exists))
+        {
+            return MovieMode.Native;
+        }
+
+        return MovieMode.Skip;
+    }
+
+    private static void AttachDummyMovieLocked(string hostPath)
+    {
+        if (!TryReadBinkInfo(hostPath, out var info) || !IsValid(info))
+        {
+            Console.Error.WriteLine(
+                "[LOADER][WARN] Bink dummy could not read movie header '" +
+                Path.GetFileName(hostPath) + "'.");
+            return;
+        }
+
+        CloseActiveLocked();
+        _activePath = hostPath;
+        _activeInfo = info;
+        _frameBuffer = GC.AllocateUninitializedArray<byte>(GetFrameBufferLength(info));
+        FillDummyFrame(_frameBuffer, info.Width, info.Height);
+        _usingDummyMovie = true;
+        Console.Error.WriteLine(
+            "[LOADER][INFO] Bink dummy attached: " + Path.GetFileName(hostPath) + " " +
+            info.Width + "x" + info.Height + ".");
+    }
+
+    private static bool TryReadBinkInfo(string path, out Bink2MovieInfo info)
+    {
+        info = default;
+        Span<byte> header = stackalloc byte[32];
+        try
+        {
+            using var stream = File.OpenRead(path);
+            if (stream.Read(header) != header.Length ||
+                !header[..4].SequenceEqual("KB2j"u8))
+            {
+                return false;
+            }
+
+            info = new Bink2MovieInfo(
+                BinaryPrimitives.ReadUInt32LittleEndian(header.Slice(0x14, 4)),
+                BinaryPrimitives.ReadUInt32LittleEndian(header.Slice(0x18, 4)),
+                BinaryPrimitives.ReadUInt32LittleEndian(header.Slice(0x1C, 4)),
+                1);
+            return true;
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+    }
+
+    private static void FillDummyFrame(byte[] pixels, uint width, uint height)
+    {
+        for (var y = 0u; y < height; y++)
+        {
+            for (var x = 0u; x < width; x++)
+            {
+                var offset = checked((int)(((ulong)y * width + x) * 4));
+                var band = ((x / 96) + (y / 96)) & 1;
+                pixels[offset] = band == 0 ? (byte)0x28 : (byte)0x18;
+                pixels[offset + 1] = band == 0 ? (byte)0x18 : (byte)0x28;
+                pixels[offset + 2] = 0x10;
+                pixels[offset + 3] = 0xFF;
+            }
+        }
+    }
 
     private static NativeAdapter? GetAdapterLocked()
     {
@@ -187,6 +309,7 @@ internal static class Bink2MovieBridge
         _activeMovie = IntPtr.Zero;
         _activeInfo = default;
         _frameBuffer = null;
+        _usingDummyMovie = false;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -196,6 +319,25 @@ internal static class Bink2MovieBridge
         public readonly uint Height;
         public readonly uint FramesPerSecondNumerator;
         public readonly uint FramesPerSecondDenominator;
+
+        internal Bink2MovieInfo(
+            uint width,
+            uint height,
+            uint framesPerSecondNumerator,
+            uint framesPerSecondDenominator)
+        {
+            Width = width;
+            Height = height;
+            FramesPerSecondNumerator = framesPerSecondNumerator;
+            FramesPerSecondDenominator = framesPerSecondDenominator;
+        }
+    }
+
+    private enum MovieMode
+    {
+        Skip,
+        Dummy,
+        Native,
     }
 
     private sealed class NativeAdapter

@@ -1328,6 +1328,17 @@ public static partial class KernelMemoryCompatExports
         var mode = ResolveOpenMode(flags, access);
         try
         {
+            if (Bink2MovieBridge.ShouldSkipGuestMovie(hostPath))
+            {
+                LogOpenTrace(
+                    "_open bink-skip path='" + guestPath + "' host='" + hostPath +
+                    "' flags=0x" + flags.ToString("X8"));
+                Console.Error.WriteLine(
+                    "[LOADER][INFO] Skipping Bink movie without a decoder: " +
+                    Path.GetFileName(hostPath));
+                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+            }
+
             if (IsMutatingOpen(flags) && IsReadOnlyGuestMutationPath(guestPath))
             {
                 LogOpenTrace($"_open readonly path='{guestPath}' host='{hostPath}' flags=0x{flags:X8}");

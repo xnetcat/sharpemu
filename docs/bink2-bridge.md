@@ -9,6 +9,15 @@ available, presents its decoded BGRA frames at the normal guest-flip boundary.
 This preserves the game's own timing and lets the host Vulkan presenter display
 the movie without trying to execute the PS5-specific Bink GPU decode path.
 
+Without an adapter, Bink movies are skipped by default: their open call returns
+not-found so games that mark cinematics as optional progress to their next
+state instead of waiting on an empty Bink GPU texture.
+
+Set SHARPEMU_BINK_MODE=dummy to retain the open and show a built-in,
+non-decoded placeholder frame. This requires no SDK, but is a visual diagnostic
+only; it does not decode the movie or alter its game logic. Set
+SHARPEMU_BINK_MODE=native to force native bridge mode.
+
 ## Supplying the adapter
 
 Bink 2 is proprietary. Obtain a compatible Mac Bink 2 SDK from RAD Game Tools,
@@ -28,6 +37,5 @@ adapter opens one movie, exposes BGRA pixels, and advances after each decoded
 frame. The managed side validates dimensions and retains ownership of the
 destination buffer.
 
-If the bridge is absent, SharpEmu logs one informational line and retains the
-existing guest rendering path; it does not substitute a random movie or change
-game input/state.
+If the bridge is absent in native mode, SharpEmu logs one informational line
+and retains the existing guest rendering path.
