@@ -33,6 +33,8 @@ internal static class Gen5ShaderScalarEvaluator
             Environment.GetEnvironmentVariable("SHARPEMU_STRICT_BUFFER_LOAD"),
             "1",
             StringComparison.Ordinal);
+    private static readonly object _scalarFallbackTraceGate = new();
+    private static readonly HashSet<(ulong Shader, uint Pc)> _tracedScalarFallbacks = [];
 
     // Uniform forward branches select material/resource bodies that remain
     // statically present in the translated shader. Discover the skipped body's
@@ -1585,6 +1587,17 @@ internal static class Gen5ShaderScalarEvaluator
             isBufferLoad,
             address,
             _strictScalarLoad);
+        if (scalarPointerUnbound)
+        {
+            TraceScalarPointerFallback(
+                state,
+                instruction,
+                scalarBase.Value,
+                scalarRegisters,
+                control,
+                baseAddress,
+                dynamicOffset);
+        }
         var bufferSize = ulong.MaxValue;
         if (recordBinding && isBufferLoad)
         {
@@ -1742,6 +1755,52 @@ internal static class Gen5ShaderScalarEvaluator
         ulong address,
         bool strictScalarLoad) =>
         !isBufferLoad && address == 0 && !strictScalarLoad;
+
+    private static void TraceScalarPointerFallback(
+        Gen5ShaderState state,
+        Gen5ShaderInstruction instruction,
+        uint scalarBase,
+        IReadOnlyList<uint> scalarRegisters,
+        Gen5ScalarMemoryControl control,
+        ulong baseAddress,
+        ulong dynamicOffset)
+    {
+        lock (_scalarFallbackTraceGate)
+        {
+            if (!_tracedScalarFallbacks.Add((state.Program.Address, instruction.Pc)))
+            {
+                return;
+            }
+        }
+
+        var definitions = state.Program.Instructions
+            .Where(candidate =>
+                candidate.Pc < instruction.Pc &&
+                candidate.Destinations.Any(destination =>
+                    destination.Kind == Gen5OperandKind.ScalarRegister &&
+                    destination.Value is var register &&
+                    register >= scalarBase && register <= scalarBase + 1))
+            .TakeLast(8)
+            .Select(candidate =>
+                $"0x{candidate.Pc:X}:{candidate.Opcode}[" +
+                string.Join(',', candidate.Words.Select(word => $"{word:X8}")) + "]")
+            .ToArray();
+        var userData = string.Join(
+            ',',
+            state.UserData.Take(32).Select((value, index) => $"s{index}=0x{value:X8}"));
+        var high = scalarBase + 1 < scalarRegisters.Count
+            ? scalarRegisters[(int)scalarBase + 1]
+            : 0;
+        Console.Error.WriteLine(
+            $"[LOADER][WARN] agc.scalar_pointer_fallback " +
+            $"shader=0x{state.Program.Address:X16} pc=0x{instruction.Pc:X} " +
+            $"op={instruction.Opcode} base=s{scalarBase}" +
+            $"[0x{scalarRegisters[(int)scalarBase]:X8}:0x{high:X8}] " +
+            $"base_addr=0x{baseAddress:X16} imm={control.ImmediateOffsetBytes} " +
+            $"dynamic={dynamicOffset} definitions=[{string.Join(';', definitions)}] " +
+            $"user_data=[{userData}] metadata=" +
+            $"{(state.Metadata is null ? "missing" : $"srt={state.Metadata.ShaderResourceTableSizeDwords},eud={state.Metadata.ExtendedUserDataSizeDwords}")}");
+    }
 
     [Conditional("DEBUG")]
     private static void RunScalarLoadSelfChecks()

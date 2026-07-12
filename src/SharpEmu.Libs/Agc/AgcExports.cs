@@ -16,6 +16,7 @@ public static class AgcExports
     static AgcExports()
     {
         ValidateWriteDataControlDecoders();
+        ValidateDispatchInitiators();
     }
 #endif
 
@@ -834,13 +835,20 @@ public static class AgcExports
             !TryWriteUInt32(ctx, commandAddress + 4, groupCountX) ||
             !TryWriteUInt32(ctx, commandAddress + 8, groupCountY) ||
             !TryWriteUInt32(ctx, commandAddress + 12, groupCountZ) ||
-            !TryWriteUInt32(ctx, commandAddress + 16, (modifier & 0xA038u) | 0x41u))
+            // sceAgcCbDispatch takes thread dimensions. USE_THREAD_DIMENSIONS
+            // (bit 5) tells the CP to divide by COMPUTE_NUM_THREAD_*; omitting
+            // it multiplied large initialization kernels by the local size
+            // (64x in Demon's Souls) and reduced throughput to ~0.1 FPS.
+            !TryWriteUInt32(ctx, commandAddress + 16, DirectThreadDispatchInitiator(modifier)))
         {
             return ReturnPointer(ctx, 0);
         }
 
         return ReturnPointer(ctx, commandAddress);
     }
+
+    private static uint DirectThreadDispatchInitiator(uint modifier) =>
+        (modifier & 0xA038u) | 0x61u;
 
     [SysAbiExport(
         Nid = "UZbQjYAwwXM",
@@ -3311,6 +3319,17 @@ public static class AgcExports
         System.Diagnostics.Debug.Assert(agc.IncrementAddress);
         System.Diagnostics.Debug.Assert(agc.WriteConfirm);
         System.Diagnostics.Debug.Assert(agc.CachePolicy == 3u);
+    }
+
+    private static void ValidateDispatchInitiators()
+    {
+        const uint threadCount = 0x00F0_0100u;
+        const uint localSize = 64u;
+        var initiator = DirectThreadDispatchInitiator(0);
+        System.Diagnostics.Debug.Assert((initiator & (1u << 5)) != 0);
+        System.Diagnostics.Debug.Assert((initiator & (1u << 6)) != 0);
+        System.Diagnostics.Debug.Assert(threadCount % localSize == 0);
+        System.Diagnostics.Debug.Assert(threadCount / localSize == 0x0003_C004u);
     }
 #endif
 
