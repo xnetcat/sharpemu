@@ -1047,15 +1047,19 @@ internal static partial class Gen5SpirvTranslator
                 condition = _module.AddInstruction(operation, _boolType, left, right);
             }
 
-            StoreWaveMask(106, condition);
+            // Vector compares fully overwrite the destination mask, but only
+            // lanes enabled by EXEC can pass the test: VCC = EXEC & condition.
+            // Balloting the raw condition leaks results from disabled lanes
+            // into later saveexec/branch sequences.
+            var activeCondition = _module.AddInstruction(
+                SpirvOp.LogicalAnd,
+                _boolType,
+                Load(_boolType, _exec),
+                condition);
+            StoreWaveMask(106, activeCondition);
             if (opcode.StartsWith("VCmpx", StringComparison.Ordinal))
             {
-                var active = _module.AddInstruction(
-                    SpirvOp.LogicalAnd,
-                    _boolType,
-                    Load(_boolType, _exec),
-                    condition);
-                StoreWaveMask(126, active);
+                StoreWaveMask(126, activeCondition);
             }
 
             return true;
@@ -2340,7 +2344,13 @@ internal static partial class Gen5SpirvTranslator
                 _boolType,
                 _module.AddInstruction(SpirvOp.ULessThan, _boolType, partial, left),
                 _module.AddInstruction(SpirvOp.ULessThan, _boolType, result, partial));
-            StoreWaveMask(106, carry);
+            StoreWaveMask(
+                106,
+                _module.AddInstruction(
+                    SpirvOp.LogicalAnd,
+                    _boolType,
+                    Load(_boolType, _exec),
+                    carry));
             return result;
         }
 
@@ -2371,7 +2381,13 @@ internal static partial class Gen5SpirvTranslator
                     _boolType,
                     partial,
                     borrowIn));
-            StoreWaveMask(106, borrow);
+            StoreWaveMask(
+                106,
+                _module.AddInstruction(
+                    SpirvOp.LogicalAnd,
+                    _boolType,
+                    Load(_boolType, _exec),
+                    borrow));
             return result;
         }
 
@@ -2379,25 +2395,18 @@ internal static partial class Gen5SpirvTranslator
             Gen5ShaderInstruction instruction,
             uint carry)
         {
+            var activeCarry = _module.AddInstruction(
+                SpirvOp.LogicalAnd,
+                _boolType,
+                Load(_boolType, _exec),
+                carry);
             if (instruction.Control is Gen5Vop3Control { ScalarDestination: { } register })
             {
-                StoreS(
-                    register,
-                    _module.AddInstruction(
-                        SpirvOp.Select,
-                        _uintType,
-                        carry,
-                        UInt(1),
-                        UInt(0)));
-                if (register == 106)
-                {
-                    StoreWaveMask(106, carry);
-                }
-
+                StoreWaveMask(register, activeCarry);
                 return;
             }
 
-            StoreWaveMask(106, carry);
+            StoreWaveMask(106, activeCarry);
         }
 
         private uint EmitPermlane16(
