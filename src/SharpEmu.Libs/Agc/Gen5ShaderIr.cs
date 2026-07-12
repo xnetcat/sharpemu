@@ -275,7 +275,10 @@ internal sealed record Gen5GlobalMemoryBinding(
     IReadOnlyList<uint> InstructionPcs,
     byte[] Data,
     int DataLength,
-    bool DataPooled);
+    bool DataPooled)
+{
+    public bool Writable { get; set; }
+}
 
 internal sealed record Gen5VertexInputBinding(
     uint Pc,

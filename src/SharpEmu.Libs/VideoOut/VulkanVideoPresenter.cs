@@ -58,7 +58,8 @@ internal sealed record VulkanGuestMemoryBuffer(
     ulong BaseAddress,
     byte[] Data,
     int Length,
-    bool Pooled);
+    bool Pooled,
+    bool Writable = false);
 
 internal sealed record VulkanGuestVertexBuffer(
     uint Location,
@@ -716,7 +717,7 @@ internal static unsafe class VulkanVideoPresenter
         }
     }
 
-    public static void SubmitComputeDispatch(
+    public static long SubmitComputeDispatch(
         ulong shaderAddress,
         byte[] computeSpirv,
         IReadOnlyList<VulkanGuestDrawTexture> textures,
@@ -733,17 +734,18 @@ internal static unsafe class VulkanVideoPresenter
             textures.All(texture => !texture.IsStorage) &&
             !writesGlobalMemory)
         {
-            return;
+            return 0;
         }
 
+        long workSequence;
         lock (_gate)
         {
             if (_closed)
             {
-                return;
+                return 0;
             }
 
-            var workSequence = EnqueueGuestWorkLocked(
+            workSequence = EnqueueGuestWorkLocked(
                 new VulkanComputeGuestDispatch(
                     shaderAddress,
                     computeSpirv,
@@ -760,6 +762,38 @@ internal static unsafe class VulkanVideoPresenter
                     _guestImageWorkSequences[texture.Address] = workSequence;
                 }
             }
+        }
+
+        return workSequence;
+    }
+
+    public static bool WaitForGuestWork(long workSequence, int timeoutMilliseconds = 60_000)
+    {
+        if (workSequence <= 0)
+        {
+            return false;
+        }
+
+        var deadline = Environment.TickCount64 + Math.Max(timeoutMilliseconds, 1);
+        lock (_gate)
+        {
+            while (!_closed && _completedGuestWorkSequence < workSequence)
+            {
+                var remaining = deadline - Environment.TickCount64;
+                if (remaining <= 0)
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][WARN] Vulkan guest work wait timed out " +
+                        $"sequence={workSequence} completed={_completedGuestWorkSequence}");
+                    return false;
+                }
+
+                System.Threading.Monitor.Wait(
+                    _gate,
+                    checked((int)Math.Min(remaining, 1_000)));
+            }
+
+            return _completedGuestWorkSequence >= workSequence;
         }
     }
 
@@ -1390,6 +1424,7 @@ internal static unsafe class VulkanVideoPresenter
         private readonly HashSet<(ulong Address, uint Width, uint Height, Format Format)> _tracedTextureUploads = new();
         private readonly HashSet<(ulong Address, uint Width, uint Height, uint Format)> _dumpedTextures = new();
         private readonly HashSet<(ulong Address, int Size)> _tracedGlobalBuffers = new();
+        private readonly HashSet<(ulong Address, ulong Size)> _tracedGlobalWritebacks = new();
         private readonly HashSet<ulong> _tracedGuestImageContents = new();
         private readonly Dictionary<ulong, int> _tracedGuestWriteCounts = new();
         private int _tracedVertexBufferCount;
@@ -1502,6 +1537,7 @@ internal static unsafe class VulkanVideoPresenter
         private sealed class GlobalBufferResource
         {
             public ulong BaseAddress;
+            public bool Writable;
             public VkBuffer Buffer;
             public DeviceMemory Memory;
             public nint Mapped;
@@ -4892,6 +4928,7 @@ internal static unsafe class VulkanVideoPresenter
             return new GlobalBufferResource
             {
                 BaseAddress = guestBuffer.BaseAddress,
+                Writable = guestBuffer.Writable,
                 Buffer = buffer,
                 Memory = memory,
                 Mapped = _hostBufferAllocations.TryGetValue(buffer.Handle, out var allocation)
@@ -5824,7 +5861,8 @@ internal static unsafe class VulkanVideoPresenter
 
             foreach (var globalBuffer in resources.GlobalMemoryBuffers)
             {
-                if (globalBuffer.BaseAddress == 0 ||
+                if (!globalBuffer.Writable ||
+                    globalBuffer.BaseAddress == 0 ||
                     globalBuffer.Mapped == 0 ||
                     globalBuffer.Size == 0 ||
                     globalBuffer.Size > int.MaxValue)
@@ -5835,7 +5873,21 @@ internal static unsafe class VulkanVideoPresenter
                 var bytes = new ReadOnlySpan<byte>(
                     (void*)globalBuffer.Mapped,
                     checked((int)globalBuffer.Size));
-                memory.TryWrite(globalBuffer.BaseAddress, bytes);
+                var wrote = memory.TryWrite(globalBuffer.BaseAddress, bytes);
+                var probe = bytes[..Math.Min(bytes.Length, 256)];
+                var nonzero = 0;
+                foreach (var value in probe)
+                {
+                    nonzero += value == 0 ? 0 : 1;
+                }
+
+                if (_tracedGlobalWritebacks.Count < 256 &&
+                    _tracedGlobalWritebacks.Add((globalBuffer.BaseAddress, globalBuffer.Size)))
+                {
+                    TraceVulkanShader(
+                        $"vk.global_writeback base=0x{globalBuffer.BaseAddress:X16} " +
+                        $"bytes={bytes.Length} probe_nonzero={nonzero}/{probe.Length} wrote={wrote}");
+                }
             }
         }
 

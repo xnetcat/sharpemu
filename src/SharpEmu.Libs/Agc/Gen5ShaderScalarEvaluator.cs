@@ -246,6 +246,7 @@ internal static class Gen5ShaderScalarEvaluator
 
             if (instruction.Control is Gen5BufferMemoryControl bufferMemory)
             {
+                var writable = IsBufferMemoryWrite(instruction.Opcode);
                 if (bufferMemory.ScalarResource >= ScalarRegisterCount - 3)
                 {
                     error =
@@ -313,6 +314,7 @@ internal static class Gen5ShaderScalarEvaluator
                 var key = (bufferMemory.ScalarResource, bufferDescriptor.BaseAddress);
                 if (globalMemoryByAddress.TryGetValue(key, out var existingBinding))
                 {
+                    existingBinding.Writable |= writable;
                     if (existingBinding.InstructionPcs is List<uint> instructionPcs)
                     {
                         instructionPcs.Add(instruction.Pc);
@@ -361,7 +363,10 @@ internal static class Gen5ShaderScalarEvaluator
                         new List<uint> { instruction.Pc },
                         data,
                         dataLength,
-                        DataPooled: dataPooled);
+                        DataPooled: dataPooled)
+                    {
+                        Writable = writable,
+                    };
                     globalMemoryByAddress.Add(key, binding);
                     globalMemoryBindings.Add(binding);
                 }
@@ -422,6 +427,12 @@ internal static class Gen5ShaderScalarEvaluator
             vertexInputBindings);
         return true;
     }
+
+    private static bool IsBufferMemoryWrite(string opcode) =>
+        opcode.StartsWith("BufferStore", StringComparison.Ordinal) ||
+        opcode.StartsWith("TBufferStore", StringComparison.Ordinal) ||
+        opcode.StartsWith("BufferAtomic", StringComparison.Ordinal) ||
+        opcode.StartsWith("TBufferAtomic", StringComparison.Ordinal);
 
     private static bool TryCreateVertexInputBinding(
         Gen5ShaderInstruction instruction,

@@ -4616,7 +4616,11 @@ public static class AgcExports
             }
 
             combined.Add(new VulkanGuestMemoryBuffer(
-                binding.BaseAddress, data, data.Length, Pooled: false));
+                binding.BaseAddress,
+                data,
+                data.Length,
+                Pooled: false,
+                Writable: binding.Writable));
         }
 
         if (!_bakeScalars)
@@ -4744,7 +4748,8 @@ public static class AgcExports
                 bindings[index].BaseAddress,
                 bindings[index].Data,
                 bindings[index].DataLength,
-                bindings[index].DataPooled);
+                bindings[index].DataPooled,
+                bindings[index].Writable);
         }
 
         return buffers;
@@ -5451,9 +5456,8 @@ public static class AgcExports
         var localSizeX = GetComputeLocalSize(state.ShRegisters, ComputeNumThreadX);
         var localSizeY = GetComputeLocalSize(state.ShRegisters, ComputeNumThreadY);
         var localSizeZ = GetComputeLocalSize(state.ShRegisters, ComputeNumThreadZ);
-        var writesGlobalMemory = shaderState.Program.Instructions.Any(static instruction =>
-            instruction.Opcode.StartsWith("BufferStore", StringComparison.Ordinal) ||
-            instruction.Opcode.StartsWith("TBufferStore", StringComparison.Ordinal));
+        var writesGlobalMemory = evaluation.GlobalMemoryBindings.Any(static binding =>
+            binding.Writable);
         var gpuDispatch = false;
         var computeError = string.Empty;
         if ((hasStorageBinding || writesGlobalMemory) &&
@@ -5503,7 +5507,7 @@ public static class AgcExports
                     out _);
                 var globalMemoryBuffers =
                     CreateVulkanGuestMemoryBuffers(evaluation.GlobalMemoryBindings);
-                VulkanVideoPresenter.SubmitComputeDispatch(
+                var workSequence = VulkanVideoPresenter.SubmitComputeDispatch(
                     shaderAddress,
                     computeSpirv,
                     textures,
@@ -5513,6 +5517,11 @@ public static class AgcExports
                     dispatch.GroupCountZ,
                     writesGlobalMemory);
                 gpuDispatch = true;
+                if (writesGlobalMemory &&
+                    !VulkanVideoPresenter.WaitForGuestWork(workSequence))
+                {
+                    computeError = $"global-write-sync-timeout sequence={workSequence}";
+                }
             }
         }
 
