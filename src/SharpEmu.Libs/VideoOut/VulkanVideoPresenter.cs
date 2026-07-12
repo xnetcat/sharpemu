@@ -1543,8 +1543,6 @@ internal static unsafe class VulkanVideoPresenter
             public DeviceMemory Memory;
             public nint Mapped;
             public ulong Size;
-            public ulong DescriptorOffset;
-            public bool OwnsBuffer;
         }
 
         private sealed class VertexBufferResource
@@ -3355,9 +3353,11 @@ internal static unsafe class VulkanVideoPresenter
                     resources.Textures[index] = ResolveTextureResource(draw.Textures[index]);
                 }
 
-                CreateGlobalBufferResources(
-                    draw.GlobalMemoryBuffers,
-                    resources.GlobalMemoryBuffers);
+                for (var index = 0; index < draw.GlobalMemoryBuffers.Count; index++)
+                {
+                    resources.GlobalMemoryBuffers[index] =
+                        CreateGlobalBufferResource(draw.GlobalMemoryBuffers[index]);
+                }
 
                 for (var index = 0; index < draw.VertexBuffers.Count; index++)
                 {
@@ -3451,9 +3451,11 @@ internal static unsafe class VulkanVideoPresenter
                     TraceVulkanShader("vk.compute_resources resolve ready");
                 }
 
-                CreateGlobalBufferResources(
-                    dispatch.GlobalMemoryBuffers,
-                    resources.GlobalMemoryBuffers);
+                for (var index = 0; index < dispatch.GlobalMemoryBuffers.Count; index++)
+                {
+                    resources.GlobalMemoryBuffers[index] =
+                        CreateGlobalBufferResource(dispatch.GlobalMemoryBuffers[index]);
+                }
 
                 if (traceResources)
                 {
@@ -3637,7 +3639,7 @@ internal static unsafe class VulkanVideoPresenter
                         bufferInfoPointer[index] = new DescriptorBufferInfo
                         {
                             Buffer = resources.GlobalMemoryBuffers[index].Buffer,
-                            Offset = resources.GlobalMemoryBuffers[index].DescriptorOffset,
+                            Offset = 0,
                             Range = resources.GlobalMemoryBuffers[index].Size,
                         };
                     }
@@ -4900,112 +4902,46 @@ internal static unsafe class VulkanVideoPresenter
             return expanded;
         }
 
-        private void CreateGlobalBufferResources(
-            IReadOnlyList<VulkanGuestMemoryBuffer> guestBuffers,
-            GlobalBufferResource[] resources)
+        private GlobalBufferResource CreateGlobalBufferResource(
+            VulkanGuestMemoryBuffer guestBuffer)
         {
-            var remaining = new HashSet<int>(Enumerable.Range(0, guestBuffers.Count));
-            while (remaining.Count != 0)
+            var buffer = CreateHostBuffer(
+                guestBuffer.Data.AsSpan(0, guestBuffer.Length),
+                BufferUsageFlags.StorageBufferBit,
+                out var memory);
+            var size = (ulong)Math.Max(guestBuffer.Length, sizeof(uint));
+
+            if (ShouldTraceVulkanResources() &&
+                _tracedGlobalBuffers.Add((guestBuffer.BaseAddress, guestBuffer.Length)))
             {
-                var first = remaining.First();
-                var cluster = new List<int> { first };
-                remaining.Remove(first);
-                var clusterStart = guestBuffers[first].BaseAddress;
-                var clusterEnd = clusterStart + (ulong)Math.Max(guestBuffers[first].Length, sizeof(uint));
-
-                var expanded = true;
-                while (expanded)
-                {
-                    expanded = false;
-                    foreach (var index in remaining.ToArray())
-                    {
-                        var guest = guestBuffers[index];
-                        var start = guest.BaseAddress;
-                        var end = start + (ulong)Math.Max(guest.Length, sizeof(uint));
-                        if (start >= clusterEnd || end <= clusterStart)
-                        {
-                            continue;
-                        }
-
-                        cluster.Add(index);
-                        remaining.Remove(index);
-                        clusterStart = Math.Min(clusterStart, start);
-                        clusterEnd = Math.Max(clusterEnd, end);
-                        expanded = true;
-                    }
-                }
-
-                var clusterLength = checked((int)(clusterEnd - clusterStart));
-                var merged = System.Buffers.ArrayPool<byte>.Shared.Rent(clusterLength);
-                var mergedSpan = merged.AsSpan(0, clusterLength);
-                mergedSpan.Clear();
-                try
-                {
-                    foreach (var index in cluster)
-                    {
-                        var guest = guestBuffers[index];
-                        guest.Data.AsSpan(0, guest.Length).CopyTo(
-                            mergedSpan[(int)(guest.BaseAddress - clusterStart)..]);
-                    }
-
-                    var buffer = CreateHostBuffer(
-                        mergedSpan,
-                        BufferUsageFlags.StorageBufferBit,
-                        out var memory);
-                    var mappedBase = _hostBufferAllocations.TryGetValue(
-                        buffer.Handle,
-                        out var allocation)
-                        ? allocation.Mapped
-                        : 0;
-
-                    if (_setDebugUtilsObjectName is not null)
-                    {
-                        SetDebugName(
-                            ObjectType.Buffer,
-                            buffer.Handle,
-                            $"SharpEmu global 0x{clusterStart:X16} {clusterLength}b views={cluster.Count}");
-                    }
-
-                    for (var clusterIndex = 0; clusterIndex < cluster.Count; clusterIndex++)
-                    {
-                        var index = cluster[clusterIndex];
-                        var guest = guestBuffers[index];
-                        var offset = guest.BaseAddress - clusterStart;
-                        resources[index] = new GlobalBufferResource
-                        {
-                            BaseAddress = guest.BaseAddress,
-                            Writable = guest.Writable,
-                            Buffer = buffer,
-                            Memory = memory,
-                            Mapped = mappedBase == 0 ? 0 : mappedBase + checked((nint)offset),
-                            Size = (ulong)Math.Max(guest.Length, sizeof(uint)),
-                            DescriptorOffset = offset,
-                            OwnsBuffer = clusterIndex == 0,
-                        };
-
-                        if (ShouldTraceVulkanResources() &&
-                            _tracedGlobalBuffers.Add((guest.BaseAddress, guest.Length)))
-                        {
-                            Console.Error.WriteLine(
-                                $"[LOADER][TRACE] vk.global_buffer base=0x{guest.BaseAddress:X16} " +
-                                $"bytes={guest.Length} shared_base=0x{clusterStart:X16} " +
-                                $"shared_bytes={clusterLength} offset={offset}");
-                        }
-                    }
-                }
-                finally
-                {
-                    System.Buffers.ArrayPool<byte>.Shared.Return(merged);
-                    foreach (var index in cluster)
-                    {
-                        var guest = guestBuffers[index];
-                        if (guest.Pooled)
-                        {
-                            System.Buffers.ArrayPool<byte>.Shared.Return(guest.Data);
-                        }
-                    }
-                }
+                Console.Error.WriteLine(
+                    $"[LOADER][TRACE] vk.global_buffer base=0x{guestBuffer.BaseAddress:X16} " +
+                    $"bytes={guestBuffer.Length}");
             }
+            if (_setDebugUtilsObjectName is not null)
+            {
+                SetDebugName(
+                    ObjectType.Buffer,
+                    buffer.Handle,
+                    $"SharpEmu global 0x{guestBuffer.BaseAddress:X16} {guestBuffer.Length}b");
+            }
+
+            if (guestBuffer.Pooled)
+            {
+                System.Buffers.ArrayPool<byte>.Shared.Return(guestBuffer.Data);
+            }
+
+            return new GlobalBufferResource
+            {
+                BaseAddress = guestBuffer.BaseAddress,
+                Writable = guestBuffer.Writable,
+                Buffer = buffer,
+                Memory = memory,
+                Mapped = _hostBufferAllocations.TryGetValue(buffer.Handle, out var allocation)
+                    ? allocation.Mapped
+                    : 0,
+                Size = size,
+            };
         }
 
         private VertexBufferResource CreateVertexBufferResource(
@@ -8336,10 +8272,7 @@ internal static unsafe class VulkanVideoPresenter
                     continue;
                 }
 
-                if (globalBuffer.OwnsBuffer)
-                {
-                    RecycleHostBuffer(globalBuffer.Buffer, globalBuffer.Memory);
-                }
+                RecycleHostBuffer(globalBuffer.Buffer, globalBuffer.Memory);
             }
 
             foreach (var vertexBuffer in resources.VertexBuffers)
