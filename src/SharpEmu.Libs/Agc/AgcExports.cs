@@ -150,7 +150,7 @@ public static class AgcExports
     private static readonly HashSet<uint> _tracedSubmittedDrawOpcodes = new();
     private static readonly Dictionary<(ulong Ps, ulong State, Gen5PixelOutputKind Output), byte[]> _pixelSpirvCache = new();
     private static readonly Dictionary<
-        (ulong Es, ulong EsState, ulong Ps, ulong PsState, Gen5PixelOutputKind Output),
+        (ulong Es, ulong EsState, ulong Ps, ulong PsState, Gen5PixelOutputKind Output, uint Slot),
         (byte[] Vertex, byte[] Pixel)> _graphicsSpirvCache = new();
     // Per-render-target pixel variants for multi-render-target draws: each
     // routes its own MRT export slot to the fragment output. Keyed by the
@@ -3698,7 +3698,8 @@ public static class AgcExports
             exportStateFingerprint,
             pixelShaderAddress,
             pixelStateFingerprint,
-            outputKind);
+            outputKind,
+            renderTargets.FirstOrDefault().Slot);
 
         var guestGlobalBuffers =
             pixelEvaluation.GlobalMemoryBindings.Count +

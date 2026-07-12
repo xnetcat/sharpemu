@@ -4408,8 +4408,12 @@ internal static unsafe class VulkanVideoPresenter
                 if ((ulong)texture.RgbaPixels.Length == expectedSize &&
                     texture.RgbaPixels.AsSpan().IndexOfAnyExcept((byte)0) >= 0)
                 {
+                    var uploadPixels = texture.Format == 13
+                        ? ExpandRgb32Pixels(texture.RgbaPixels)
+                        : texture.RgbaPixels;
+                    var uploadSize = (ulong)uploadPixels.Length;
                     resource.StagingBuffer = CreateBuffer(
-                        expectedSize,
+                        uploadSize,
                         BufferUsageFlags.TransferSrcBit,
                         MemoryPropertyFlags.HostVisibleBit |
                         MemoryPropertyFlags.HostCoherentBit,
@@ -4421,17 +4425,17 @@ internal static unsafe class VulkanVideoPresenter
                             _device,
                             resource.StagingMemory,
                             0,
-                            expectedSize,
+                            uploadSize,
                             0,
                             &mapped),
                         "vkMapMemory(storage texture)");
-                    fixed (byte* source = texture.RgbaPixels)
+                    fixed (byte* source = uploadPixels)
                     {
                         System.Buffer.MemoryCopy(
                             source,
                             mapped,
-                            texture.RgbaPixels.Length,
-                            texture.RgbaPixels.Length);
+                            uploadPixels.Length,
+                            uploadPixels.Length);
                     }
 
                     _vk.UnmapMemory(_device, resource.StagingMemory);
@@ -4439,7 +4443,8 @@ internal static unsafe class VulkanVideoPresenter
                     guestImage.InitialUploadPending = true;
                     TraceVulkanShader(
                         $"vk.storage_upload addr=0x{texture.Address:X16} " +
-                        $"size={texture.Width}x{texture.Height} bytes={expectedSize}");
+                        $"size={texture.Width}x{texture.Height} " +
+                        $"logical_bytes={expectedSize} upload_bytes={uploadSize}");
                 }
             }
 

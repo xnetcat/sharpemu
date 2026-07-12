@@ -410,33 +410,51 @@ public sealed class CpuDispatcher : ICpuDispatcher, IDisposable
         ulong programExitHandlerAddress)
     {
         var imageName = string.IsNullOrWhiteSpace(processImageName) ? "eboot.bin" : processImageName;
-        var encodedNameLength = Encoding.UTF8.GetByteCount(imageName);
-        Span<byte> argv0Buffer = encodedNameLength + 1 <= 512
-            ? stackalloc byte[encodedNameLength + 1]
-            : new byte[encodedNameLength + 1];
-        if (Encoding.UTF8.GetBytes(imageName.AsSpan(), argv0Buffer) != encodedNameLength)
+        var arguments = new List<string>(3) { imageName };
+        var configuredArguments = Environment.GetEnvironmentVariable("SHARPEMU_GUEST_ARGS");
+        if (!string.IsNullOrWhiteSpace(configuredArguments))
         {
-            return false;
+            // The PS5 entry-parameter ABI exposes three inline argv pointers.
+            // Two compatibility arguments are therefore safe without changing
+            // the fixed 0x20-byte structure expected by existing titles.
+            var firstArgument = configuredArguments.Split(
+                (char[]?)null,
+                2,
+                StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)[0];
+            arguments.Add(firstArgument);
         }
 
-        argv0Buffer[encodedNameLength] = 0;
         var cursor = context[CpuRegister.Rsp];
-
-        var argv0Address = AlignDown(cursor - (ulong)argv0Buffer.Length, 16);
-        if (!context.Memory.TryWrite(argv0Address, argv0Buffer))
+        var argumentAddresses = new ulong[arguments.Count];
+        for (var index = arguments.Count - 1; index >= 0; index--)
         {
-            return false;
+            var encoded = Encoding.UTF8.GetBytes(arguments[index] + '\0');
+            cursor = AlignDown(cursor - (ulong)encoded.Length, 16);
+            if (!context.Memory.TryWrite(cursor, encoded))
+            {
+                return false;
+            }
+
+            argumentAddresses[index] = cursor;
         }
 
         const ulong entryParamsSize = 0x20;
-        var entryParamsAddress = AlignDown(argv0Address - entryParamsSize, 16);
-        if (!TryWriteUInt32(context, entryParamsAddress + 0x00, 1) ||
+        var entryParamsAddress = AlignDown(cursor - entryParamsSize, 16);
+        if (!TryWriteUInt32(context, entryParamsAddress + 0x00, (uint)arguments.Count) ||
             !TryWriteUInt32(context, entryParamsAddress + 0x04, 0) ||
-            !context.TryWriteUInt64(entryParamsAddress + 0x08, argv0Address) ||
-            !context.TryWriteUInt64(entryParamsAddress + 0x10, 0) ||
+            !context.TryWriteUInt64(entryParamsAddress + 0x08, argumentAddresses[0]) ||
+            !context.TryWriteUInt64(
+                entryParamsAddress + 0x10,
+                argumentAddresses.Length > 1 ? argumentAddresses[1] : 0) ||
             !context.TryWriteUInt64(entryParamsAddress + 0x18, 0))
         {
             return false;
+        }
+
+        if (arguments.Count > 1)
+        {
+            Console.Error.WriteLine(
+                $"[DISPATCHER] Guest arguments: {string.Join(' ', arguments.Skip(1))}");
         }
 
         var entryStackPointer = entryParamsAddress - sizeof(ulong);

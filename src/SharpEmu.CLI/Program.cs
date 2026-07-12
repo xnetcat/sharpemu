@@ -163,6 +163,8 @@ internal static partial class Program
             return 2;
         }
 
+        ConfigureKnownTitleArguments(ebootPath);
+
         Console.Error.WriteLine("[DEBUG] Creating runtime...");
 
         using var runtime = SharpEmuRuntime.CreateDefault(runtimeOptions);
@@ -210,6 +212,42 @@ internal static partial class Program
         }
 
         return result == OrbisGen2Result.ORBIS_GEN2_OK ? 0 : 4;
+    }
+
+    private static void ConfigureKnownTitleArguments(string ebootPath)
+    {
+        if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("SHARPEMU_GUEST_ARGS")))
+        {
+            return;
+        }
+
+        // Demon's Souls ships a supported engine flag for bypassing its splash
+        // state, but gates that flag out of Shipping builds. Detect the title by
+        // its own command-line configuration rather than a hard-coded install
+        // path/title id, and feed the same flag through the guest entry ABI.
+        var commandLineConfig = Path.Combine(
+            Path.GetDirectoryName(ebootPath) ?? string.Empty,
+            "misc",
+            "gamecommandlineargs.txt");
+        try
+        {
+            if (File.Exists(commandLineConfig) &&
+                File.ReadAllText(commandLineConfig).Contains(
+                    "cp11_debug_skipSplashScreens",
+                    StringComparison.Ordinal))
+            {
+                Environment.SetEnvironmentVariable(
+                    "SHARPEMU_GUEST_ARGS",
+                    "+cp11_debug_skipSplashScreens=true");
+                Console.Error.WriteLine(
+                    "[LOADER][INFO] Demon's Souls compatibility: skipping splash screens.");
+            }
+        }
+        catch (IOException exception)
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][WARN] Could not inspect title compatibility arguments: {exception.Message}");
+        }
     }
 
     private static string[] NormalizeInternalArguments(string[] args, out bool isMitigatedChild)
