@@ -5048,6 +5048,7 @@ public static class AgcExports
             sourceWidth,
             checked((int)sourceByteCount),
             source) ?? source.AsSpan(0, checked((int)sourceByteCount)).ToArray();
+        DumpLinearTextureIfRequested(descriptor, sourceWidth, rgba);
         texture = new VulkanGuestDrawTexture(
             descriptor.Address,
             descriptor.Width,
@@ -5289,6 +5290,45 @@ public static class AgcExports
                 directory,
                 $"{index:D3}-0x{descriptor.Address:X}-{descriptor.Width}x{descriptor.Height}" +
                 $"-p{sourcePitch}-f{descriptor.Format}-t{descriptor.TileMode}.bin");
+            File.WriteAllBytes(path, source);
+        }
+        catch (IOException)
+        {
+        }
+    }
+
+    /// <summary>
+    /// Writes the bytes after detiling when SHARPEMU_TEXTURE_LINEAR_DUMP_DIR is
+    /// set. Keeping this separate from the raw-source dump makes AddrLib
+    /// equation changes directly inspectable with ordinary image tools.
+    /// </summary>
+    private static void DumpLinearTextureIfRequested(
+        in TextureDescriptor descriptor,
+        uint sourcePitch,
+        byte[] source)
+    {
+        var directory = Environment.GetEnvironmentVariable("SHARPEMU_TEXTURE_LINEAR_DUMP_DIR");
+        if (string.IsNullOrWhiteSpace(directory))
+        {
+            return;
+        }
+
+        var key = $"linear-0x{descriptor.Address:X}-{descriptor.Width}x{descriptor.Height}";
+        var occurrence = _textureDumpKeys.AddOrUpdate(key, 1, static (_, count) => count + 1);
+        if ((occurrence > 3 && occurrence % 500 >= 3) ||
+            Interlocked.Increment(ref _textureDumpCount) > 200)
+        {
+            return;
+        }
+
+        var index = _textureDumpCount;
+        try
+        {
+            Directory.CreateDirectory(directory);
+            var path = Path.Combine(
+                directory,
+                $"{index:D3}-0x{descriptor.Address:X}-{descriptor.Width}x{descriptor.Height}" +
+                $"-p{sourcePitch}-f{descriptor.Format}-t{descriptor.TileMode}.linear.bin");
             File.WriteAllBytes(path, source);
         }
         catch (IOException)

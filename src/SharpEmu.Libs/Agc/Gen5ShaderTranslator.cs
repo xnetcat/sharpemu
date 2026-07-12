@@ -1202,6 +1202,7 @@ internal static class Gen5ShaderTranslator
             0x10 => "ImageAtomicCmpswap",
             0x1C => "ImageAtomicDec",
             0x20 => "ImageSample",
+            0x22 => "ImageSampleD",
             0x24 => "ImageSampleL",
             0x25 => "ImageSampleB",
             0x27 => "ImageSampleLz",

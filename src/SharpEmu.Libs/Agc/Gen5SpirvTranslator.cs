@@ -1860,9 +1860,12 @@ internal static partial class Gen5SpirvTranslator
                     instruction.Opcode.EndsWith("O", StringComparison.Ordinal);
                 var hasCompare =
                     instruction.Opcode.Contains("SampleC", StringComparison.Ordinal);
+                var hasGradients =
+                    instruction.Opcode.Contains("SampleD", StringComparison.Ordinal);
                 var start = (hasOffset ? 1 : 0) + (hasCompare ? 1 : 0);
                 var coordinates = BuildFloatCoordinates(image, start);
                 var explicitLod =
+                    hasGradients ||
                     instruction.Opcode.Contains("Lz", StringComparison.Ordinal) ||
                     instruction.Opcode.Contains("SampleL", StringComparison.Ordinal);
                 var lod = instruction.Opcode.Contains("Lz", StringComparison.Ordinal)
@@ -1870,9 +1873,20 @@ internal static partial class Gen5SpirvTranslator
                     : Bitcast(
                         _floatType,
                         LoadV(image.GetAddressRegister(start + 2)));
+                // IMAGE_SAMPLE_D carries the explicit 2D derivatives directly
+                // after the two coordinates: (s,t, dsdx,dtdx, dsdy,dtdy).
+                // SPIR-V's Grad image operand preserves those derivatives on
+                // compute stages, where implicit LOD is not available.
+                var gradientX = hasGradients
+                    ? BuildFloatCoordinates(image, start + 2)
+                    : 0u;
+                var gradientY = hasGradients
+                    ? BuildFloatCoordinates(image, start + 4)
+                    : 0u;
                 var offset = hasOffset ? BuildImageOffset(image, 0) : 0u;
                 var imageOperands =
-                    (explicitLod ? 2u : 0u) | (hasOffset ? 0x10u : 0u);
+                    (hasGradients ? 4u : explicitLod ? 2u : 0u) |
+                    (hasOffset ? 0x10u : 0u);
                 var reference = hasCompare
                     ? Bitcast(_floatType, LoadV(image.GetAddressRegister(hasOffset ? 1 : 0)))
                     : 0u;
@@ -1885,7 +1899,12 @@ internal static partial class Gen5SpirvTranslator
                 if (imageOperands != 0)
                 {
                     operands.Add(imageOperands);
-                    if (explicitLod)
+                    if (hasGradients)
+                    {
+                        operands.Add(gradientX);
+                        operands.Add(gradientY);
+                    }
+                    else if (explicitLod)
                     {
                         operands.Add(lod);
                     }

@@ -284,10 +284,15 @@ internal static unsafe class VulkanVideoPresenter
     private static readonly Dictionary<ulong, byte[]> _pendingGuestImageInitialData = new();
     private static readonly Dictionary<ulong, (uint Width, uint Height, ulong ByteCount)>
         _guestImageExtents = new();
-    private static readonly bool _traceGuestImageEvents = string.Equals(
-        Environment.GetEnvironmentVariable("SHARPEMU_TRACE_DRAWS"),
-        "1",
-        StringComparison.Ordinal);
+    private static readonly bool _traceGuestImageEvents =
+        string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_TRACE_DRAWS"),
+            "1",
+            StringComparison.Ordinal) ||
+        string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_TRACE_GUEST_IMAGE_EVENTS"),
+            "1",
+            StringComparison.Ordinal);
     private static readonly HashSet<(ulong Address, uint Width, uint Height)>
         _tracedGuestImageSubmissions = [];
     private static Thread? _thread;
@@ -6424,6 +6429,15 @@ internal static unsafe class VulkanVideoPresenter
                     }
 
                     return existing;
+                }
+
+                if (_traceGuestImageEvents)
+                {
+                    Console.Error.WriteLine(
+                        $"[GIMG] recreate addr=0x{target.Address:X} " +
+                        $"old={existing.Width}x{existing.Height}/{existing.Format}/m{existing.MipLevels} " +
+                        $"new={target.Width}x{target.Height}/{format}/m{mipLevels} " +
+                        $"initialized={existing.Initialized}");
                 }
 
                 DestroyGuestImage(existing);
