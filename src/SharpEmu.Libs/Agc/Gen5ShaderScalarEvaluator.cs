@@ -1758,24 +1758,19 @@ internal static class Gen5ShaderScalarEvaluator
         var baseAddress = word0 | ((ulong)(word1 & 0xFFFFu) << 32);
         var stride = (word1 >> 16) & 0x3FFFu;
         var unifiedFormat = (word3 >> 12) & 0x7Fu;
-        var (dataFormat, numberFormat) =
-            DecodeGfx10BufferFormat(unifiedFormat);
+        if (!Gfx10UnifiedFormat.TryDecode(
+                unifiedFormat,
+                out var dataFormat,
+                out var numberFormat))
+        {
+            return false;
+        }
+
         var sizeBytes = stride == 0
             ? word2
             : (ulong)stride * word2;
         descriptor = new BufferDescriptor(baseAddress, stride, word2, sizeBytes, numberFormat, dataFormat);
         return true;
-    }
-
-    private static (uint DataFormat, uint NumberFormat)
-        DecodeGfx10BufferFormat(uint format)
-    {
-        return Gfx10UnifiedFormat.TryDecode(
-            format,
-            out var dataFormat,
-            out var numberFormat)
-            ? (dataFormat, numberFormat)
-            : (0, 0);
     }
 
     private static bool TryReadUserDataScalarLoad(
