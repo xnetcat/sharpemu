@@ -188,6 +188,10 @@ internal sealed record VulkanComputeGuestDispatch(
     uint BaseGroupX,
     uint BaseGroupY,
     uint BaseGroupZ,
+    uint LocalSizeX,
+    uint LocalSizeY,
+    uint LocalSizeZ,
+    bool IsIndirect,
     bool WritesGlobalMemory);
 
 internal static unsafe class VulkanVideoPresenter
@@ -726,6 +730,10 @@ internal static unsafe class VulkanVideoPresenter
         uint baseGroupX,
         uint baseGroupY,
         uint baseGroupZ,
+        uint localSizeX,
+        uint localSizeY,
+        uint localSizeZ,
+        bool isIndirect,
         bool writesGlobalMemory)
     {
         if (computeSpirv.Length == 0 ||
@@ -758,6 +766,10 @@ internal static unsafe class VulkanVideoPresenter
                     baseGroupX,
                     baseGroupY,
                     baseGroupZ,
+                    localSizeX,
+                    localSizeY,
+                    localSizeZ,
+                    isIndirect,
                     writesGlobalMemory));
             foreach (var texture in textures)
             {
@@ -1340,6 +1352,13 @@ internal static unsafe class VulkanVideoPresenter
         private DebugUtilsMessengerEXT _debugMessenger;
         private ExtDebugUtils? _debugUtils;
         private PhysicalDevice _physicalDevice;
+        private uint _maxComputeWorkGroupCountX;
+        private uint _maxComputeWorkGroupCountY;
+        private uint _maxComputeWorkGroupCountZ;
+        private uint _maxComputeWorkGroupSizeX;
+        private uint _maxComputeWorkGroupSizeY;
+        private uint _maxComputeWorkGroupSizeZ;
+        private uint _maxComputeWorkGroupInvocations;
         private Device _device;
         private PipelineCache _pipelineCache;
         private string? _pipelineCachePath;
@@ -1423,6 +1442,8 @@ internal static unsafe class VulkanVideoPresenter
         private readonly HashSet<(ulong Address, uint Width, uint Height, uint Format)> _dumpedTextures = new();
         private readonly HashSet<(ulong Address, int Size)> _tracedGlobalBuffers = new();
         private readonly HashSet<(ulong Address, ulong Size)> _tracedGlobalWritebacks = new();
+        private readonly HashSet<(ulong Shader, uint X, uint Y, uint Z, string Reason)>
+            _rejectedComputeDispatches = new();
         private int _tracedSmallGlobalWritebackEvents;
         private readonly HashSet<ulong> _tracedGuestImageContents = new();
         private readonly Dictionary<ulong, int> _tracedGuestWriteCounts = new();
@@ -2096,11 +2117,29 @@ internal static unsafe class VulkanVideoPresenter
 
                     _physicalDevice = device;
                     _queueFamilyIndex = index;
+                    LoadComputeDeviceLimits();
                     return;
                 }
             }
 
             throw new InvalidOperationException("No Vulkan graphics/present queue was found.");
+        }
+
+        private void LoadComputeDeviceLimits()
+        {
+            _vk.GetPhysicalDeviceProperties(_physicalDevice, out var properties);
+            _maxComputeWorkGroupCountX = properties.Limits.MaxComputeWorkGroupCount[0];
+            _maxComputeWorkGroupCountY = properties.Limits.MaxComputeWorkGroupCount[1];
+            _maxComputeWorkGroupCountZ = properties.Limits.MaxComputeWorkGroupCount[2];
+            _maxComputeWorkGroupSizeX = properties.Limits.MaxComputeWorkGroupSize[0];
+            _maxComputeWorkGroupSizeY = properties.Limits.MaxComputeWorkGroupSize[1];
+            _maxComputeWorkGroupSizeZ = properties.Limits.MaxComputeWorkGroupSize[2];
+            _maxComputeWorkGroupInvocations = properties.Limits.MaxComputeWorkGroupInvocations;
+            Console.Error.WriteLine(
+                $"[LOADER][INFO] Vulkan compute limits groups=" +
+                $"{_maxComputeWorkGroupCountX}x{_maxComputeWorkGroupCountY}x{_maxComputeWorkGroupCountZ} " +
+                $"local={_maxComputeWorkGroupSizeX}x{_maxComputeWorkGroupSizeY}x" +
+                $"{_maxComputeWorkGroupSizeZ} invocations={_maxComputeWorkGroupInvocations}");
         }
 
         private void CreateDevice()
@@ -5797,7 +5836,7 @@ internal static unsafe class VulkanVideoPresenter
         }
 
         private const uint MaxComputeZSlicesPerSubmission = 8;
-        // A single guest dispatch above this size is not credible frame work
+        // An indirect guest dispatch above this size is not credible frame work
         // (at the minimum 64-thread group used by the captured title this is
         // already over one billion invocations).  Treat it as poisoned
         // indirect-command data and quarantine it instead of feeding a host
@@ -5825,14 +5864,9 @@ internal static unsafe class VulkanVideoPresenter
                 return;
             }
 
-            var totalWorkgroups =
-                (ulong)work.GroupCountX * work.GroupCountY * work.GroupCountZ;
-            if (totalWorkgroups > MaxCredibleGuestWorkgroupsPerDispatch)
+            if (!TryValidateComputeDispatch(work, out var validationError))
             {
-                TraceVulkanShader(
-                    $"vk.compute_reject_poisoned_indirect cs=0x{work.ShaderAddress:X16} " +
-                    $"groups={work.GroupCountX}x{work.GroupCountY}x{work.GroupCountZ} " +
-                    $"total={totalWorkgroups} textures={work.Textures.Count}");
+                LogRejectedComputeDispatch(work, validationError);
                 return;
             }
 
@@ -6011,6 +6045,99 @@ internal static unsafe class VulkanVideoPresenter
             }
         }
 
+        private bool TryValidateComputeDispatch(
+            VulkanComputeGuestDispatch work,
+            out string error)
+        {
+            if (work.LocalSizeX == 0 || work.LocalSizeY == 0 || work.LocalSizeZ == 0)
+            {
+                error = "zero-local-size";
+                return false;
+            }
+
+            if (work.LocalSizeX > _maxComputeWorkGroupSizeX ||
+                work.LocalSizeY > _maxComputeWorkGroupSizeY ||
+                work.LocalSizeZ > _maxComputeWorkGroupSizeZ)
+            {
+                error =
+                    $"local-size-exceeds-device({work.LocalSizeX}x{work.LocalSizeY}x{work.LocalSizeZ}>" +
+                    $"{_maxComputeWorkGroupSizeX}x{_maxComputeWorkGroupSizeY}x{_maxComputeWorkGroupSizeZ})";
+                return false;
+            }
+
+            var localInvocations =
+                (ulong)work.LocalSizeX * work.LocalSizeY * work.LocalSizeZ;
+            if (localInvocations > _maxComputeWorkGroupInvocations)
+            {
+                error =
+                    $"local-invocations-exceed-device({localInvocations}>" +
+                    $"{_maxComputeWorkGroupInvocations})";
+                return false;
+            }
+
+            if ((ulong)work.BaseGroupX + work.GroupCountX > _maxComputeWorkGroupCountX ||
+                (ulong)work.BaseGroupY + work.GroupCountY > _maxComputeWorkGroupCountY ||
+                (ulong)work.BaseGroupZ + work.GroupCountZ > _maxComputeWorkGroupCountZ)
+            {
+                error =
+                    $"group-range-exceeds-device(base={work.BaseGroupX}x{work.BaseGroupY}x{work.BaseGroupZ}," +
+                    $"count={work.GroupCountX}x{work.GroupCountY}x{work.GroupCountZ}," +
+                    $"limit={_maxComputeWorkGroupCountX}x{_maxComputeWorkGroupCountY}x" +
+                    $"{_maxComputeWorkGroupCountZ})";
+                return false;
+            }
+
+            if (work.IsIndirect)
+            {
+                ulong totalWorkgroups;
+                try
+                {
+                    totalWorkgroups = checked(
+                        (ulong)work.GroupCountX * work.GroupCountY * work.GroupCountZ);
+                }
+                catch (OverflowException)
+                {
+                    error = "indirect-workgroup-count-overflow";
+                    return false;
+                }
+
+                if (totalWorkgroups > MaxCredibleGuestWorkgroupsPerDispatch)
+                {
+                    error =
+                        $"poisoned-indirect-workgroup-count({totalWorkgroups}>" +
+                        $"{MaxCredibleGuestWorkgroupsPerDispatch})";
+                    return false;
+                }
+            }
+
+            error = string.Empty;
+            return true;
+        }
+
+        private void LogRejectedComputeDispatch(
+            VulkanComputeGuestDispatch work,
+            string reason)
+        {
+            if (_rejectedComputeDispatches.Count >= 256 ||
+                !_rejectedComputeDispatches.Add(
+                    (work.ShaderAddress,
+                     work.GroupCountX,
+                     work.GroupCountY,
+                     work.GroupCountZ,
+                     reason)))
+            {
+                return;
+            }
+
+            Console.Error.WriteLine(
+                $"[LOADER][WARN] vk.compute_reject cs=0x{work.ShaderAddress:X16} " +
+                $"source={(work.IsIndirect ? "indirect" : "direct")} " +
+                $"groups={work.GroupCountX}x{work.GroupCountY}x{work.GroupCountZ} " +
+                $"base={work.BaseGroupX}x{work.BaseGroupY}x{work.BaseGroupZ} " +
+                $"local={work.LocalSizeX}x{work.LocalSizeY}x{work.LocalSizeZ} " +
+                $"reason={reason}");
+        }
+
         private void WriteBackGlobalBuffers(TranslatedDrawResources resources)
         {
             var memory = _guestMemory;
@@ -6063,28 +6190,49 @@ internal static unsafe class VulkanVideoPresenter
             uint zCount)
         {
             const uint maxWorkgroupsPerCommand = 4096;
-            var yChunk = Math.Max(
+            ulong commandCount = 0;
+            var maxXChunk = Math.Max(
                 1u,
                 Math.Min(
-                    work.GroupCountY,
-                    maxWorkgroupsPerCommand / Math.Max(work.GroupCountX, 1u)));
-            var commandCount = 0u;
-
-            for (var z = zStart; z < zStart + zCount; z++)
+                    work.GroupCountX,
+                    Math.Min(_maxComputeWorkGroupCountX, maxWorkgroupsPerCommand)));
+            for (var x = 0u; x < work.GroupCountX;)
             {
-                for (var y = 0u; y < work.GroupCountY; y += yChunk)
+                var countX = Math.Min(maxXChunk, work.GroupCountX - x);
+                var xyBudget = Math.Max(maxWorkgroupsPerCommand / countX, 1u);
+                var maxYChunk = Math.Max(
+                    1u,
+                    Math.Min(
+                        work.GroupCountY,
+                        Math.Min(_maxComputeWorkGroupCountY, xyBudget)));
+                for (var y = 0u; y < work.GroupCountY;)
                 {
-                    var countY = Math.Min(yChunk, work.GroupCountY - y);
-                    _vk.CmdDispatchBase(
-                        commandBuffer,
-                        work.BaseGroupX,
-                        checked(work.BaseGroupY + y),
-                        checked(work.BaseGroupZ + z),
-                        work.GroupCountX,
-                        countY,
-                        1);
-                    commandCount++;
+                    var countY = Math.Min(maxYChunk, work.GroupCountY - y);
+                    var xyzBudget = Math.Max(xyBudget / countY, 1u);
+                    var maxZChunk = Math.Max(
+                        1u,
+                        Math.Min(
+                            zCount,
+                            Math.Min(_maxComputeWorkGroupCountZ, xyzBudget)));
+                    for (var z = 0u; z < zCount;)
+                    {
+                        var countZ = Math.Min(maxZChunk, zCount - z);
+                        _vk.CmdDispatchBase(
+                            commandBuffer,
+                            checked(work.BaseGroupX + x),
+                            checked(work.BaseGroupY + y),
+                            checked(work.BaseGroupZ + zStart + z),
+                            countX,
+                            countY,
+                            countZ);
+                        commandCount++;
+                        z += countZ;
+                    }
+
+                    y += countY;
                 }
+
+                x += countX;
             }
 
             if (commandCount > 1)
@@ -6093,7 +6241,10 @@ internal static unsafe class VulkanVideoPresenter
                     $"vk.compute_chunked cs=0x{work.ShaderAddress:X16} " +
                     $"groups={work.GroupCountX}x{work.GroupCountY}x{work.GroupCountZ} " +
                     $"base={work.BaseGroupX}x{work.BaseGroupY}x{work.BaseGroupZ} " +
-                    $"z_range={zStart}..{zStart + zCount} commands={commandCount} y_chunk={yChunk}");
+                    $"z_range={zStart}..{zStart + zCount} commands={commandCount} " +
+                    $"command_budget={maxWorkgroupsPerCommand} " +
+                    $"device_limit={_maxComputeWorkGroupCountX}x" +
+                    $"{_maxComputeWorkGroupCountY}x{_maxComputeWorkGroupCountZ}");
             }
         }
 

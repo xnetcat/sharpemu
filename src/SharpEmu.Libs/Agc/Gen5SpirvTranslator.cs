@@ -368,6 +368,34 @@ internal static partial class Gen5SpirvTranslator
                     loopHeader,
                     loopMerge);
                 _module.AddLabel(loopMerge);
+                if (_stage == Gen5SpirvStage.Pixel)
+                {
+                    // A fragment lane removed from EXEC is not a request to
+                    // write the output variable's zero initializer. It is a
+                    // killed fragment and must not participate in color,
+                    // depth, or blend operations. Keep EXEC masking during
+                    // translation, then terminate lanes that remain inactive
+                    // when the guest pixel shader exits.
+                    var returnLabel = _module.AllocateId();
+                    var killLabel = _module.AllocateId();
+                    // Materialize the condition before SelectionMerge: SPIR-V
+                    // requires the merge instruction to be immediately followed
+                    // by its structured branch terminator.
+                    var laneActive = Load(_boolType, _exec);
+                    _module.AddStatement(
+                        SpirvOp.SelectionMerge,
+                        returnLabel,
+                        0);
+                    _module.AddStatement(
+                        SpirvOp.BranchConditional,
+                        laneActive,
+                        returnLabel,
+                        killLabel);
+                    _module.AddLabel(killLabel);
+                    _module.AddStatement(SpirvOp.Kill);
+                    _module.AddLabel(returnLabel);
+                }
+
                 _module.AddStatement(SpirvOp.Return);
                 _module.EndFunction();
 
@@ -2607,9 +2635,26 @@ internal static partial class Gen5SpirvTranslator
                 var coordinates = BuildFloatCoordinates(image, addressCursor);
                 var explicitLod = hasGradients || hasZeroLod || hasLod;
                 var lod = hasZeroLod ? Float(0) : lodOrBias;
+                if (hasOffset)
+                {
+                    // Vulkan before maintenance8 forbids the dynamic Offset
+                    // image operand on non-gather sampling operations. RDNA
+                    // offsets are per-lane VGPR values, so ConstOffset is not
+                    // equivalent. Fold the texel offset into normalized sample
+                    // coordinates using the queried mip extent instead.
+                    var offsetLod = explicitLod && !hasGradients
+                        ? lod
+                        : Float(0);
+                    coordinates = ApplyDynamicSampleOffset(
+                        resource,
+                        imageObject,
+                        coordinates,
+                        offset,
+                        offsetLod);
+                }
+
                 var imageOperands =
-                    (hasGradients ? 4u : explicitLod ? 2u : hasBias ? 1u : 0u) |
-                    (hasOffset ? 0x10u : 0u);
+                    hasGradients ? 4u : explicitLod ? 2u : hasBias ? 1u : 0u;
                 var operands = new List<uint>
                 {
                     imageObject,
@@ -2633,10 +2678,6 @@ internal static partial class Gen5SpirvTranslator
                         operands.Add(lodOrBias);
                     }
 
-                    if (hasOffset)
-                    {
-                        operands.Add(offset);
-                    }
                 }
 
                 sampled = _module.AddInstruction(
@@ -3008,6 +3049,58 @@ internal static partial class Gen5SpirvTranslator
                 ivec2,
                 x,
                 y);
+        }
+
+        private uint ApplyDynamicSampleOffset(
+            SpirvImageResource resource,
+            uint sampledImage,
+            uint coordinates,
+            uint texelOffset,
+            uint lod)
+        {
+            var ivec2 = _module.TypeVector(_intType, 2);
+            var image = _module.AddInstruction(
+                SpirvOp.Image,
+                resource.ImageType,
+                sampledImage);
+            var signedLod = _module.AddInstruction(
+                SpirvOp.ConvertFToS,
+                _intType,
+                lod);
+            var lodIsNegative = _module.AddInstruction(
+                SpirvOp.SLessThan,
+                _boolType,
+                signedLod,
+                _module.Constant(_intType, 0));
+            var clampedLod = _module.AddInstruction(
+                SpirvOp.Select,
+                _intType,
+                lodIsNegative,
+                _module.Constant(_intType, 0),
+                signedLod);
+            var size = _module.AddInstruction(
+                SpirvOp.ImageQuerySizeLod,
+                ivec2,
+                image,
+                clampedLod);
+            var sizeFloat = _module.AddInstruction(
+                SpirvOp.ConvertSToF,
+                _vec2Type,
+                size);
+            var offsetFloat = _module.AddInstruction(
+                SpirvOp.ConvertSToF,
+                _vec2Type,
+                texelOffset);
+            var normalizedOffset = _module.AddInstruction(
+                SpirvOp.FDiv,
+                _vec2Type,
+                offsetFloat,
+                sizeFloat);
+            return _module.AddInstruction(
+                SpirvOp.FAdd,
+                _vec2Type,
+                coordinates,
+                normalizedOffset);
         }
 
         private bool TryEmitExport(

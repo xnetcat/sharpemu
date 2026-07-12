@@ -14,6 +14,15 @@ namespace SharpEmu.Core.Cpu.Native;
 
 public sealed partial class DirectExecutionBackend
 {
+	// The native import trampoline keeps the original guest GPR stack layout at
+	// argPackPtr and stores volatile SysV-only state immediately below it.  This
+	// lets the managed gateway observe AL (the variadic vector-argument count)
+	// and all eight vector argument registers without changing the return-slot
+	// offsets used by the guest scheduler.
+	private const int ImportSavedRaxOffset = -144;
+	private const int ImportSavedXmmOffset = -128;
+	private const int ImportVectorRegisterCount = 8;
+
 	private readonly object _importResultLogSampleGate = new();
 	private readonly Dictionary<string, int> _importResultLogSamples = new(StringComparer.Ordinal);
 
@@ -118,6 +127,7 @@ public sealed partial class DirectExecutionBackend
 		}
 
 		cpuContext.Rip = importStubEntry.Address;
+		LoadImportVolatileArguments(cpuContext, argPackPtr);
 		cpuContext[CpuRegister.Rdi] = *(ulong*)argPackPtr;
 		cpuContext[CpuRegister.Rsi] = *(ulong*)(argPackPtr + 8);
 		cpuContext[CpuRegister.Rdx] = *(ulong*)(argPackPtr + 16);
@@ -130,10 +140,6 @@ public sealed partial class DirectExecutionBackend
 		cpuContext[CpuRegister.R13] = *(ulong*)(argPackPtr + 72);
 		cpuContext[CpuRegister.R14] = *(ulong*)(argPackPtr + 80);
 		cpuContext[CpuRegister.R15] = *(ulong*)(argPackPtr + 88);
-		cpuContext.SetXmmRegister(
-			0,
-			*(ulong*)(argPackPtr - 16),
-			*(ulong*)(argPackPtr - 8));
 		cpuContext[CpuRegister.Rsp] = (ulong)argPackPtr + 96uL;
 		ulong value = cpuContext[CpuRegister.Rdi];
 		ulong value2 = cpuContext[CpuRegister.Rsi];
@@ -381,6 +387,7 @@ public sealed partial class DirectExecutionBackend
 			{
 				GuestThreadExecution.RestoreImportCallFrame(previousImportCallFrame);
 			}
+			StoreImportVectorReturn(cpuContext, argPackPtr);
 			if (dispatchResolved &&
 				orbisGen2Result == OrbisGen2Result.ORBIS_GEN2_OK &&
 				string.Equals(importStubEntry.Nid, "BohYr-F7-is", StringComparison.Ordinal))
@@ -506,6 +513,32 @@ public sealed partial class DirectExecutionBackend
 		}
 	}
 
+	private unsafe static void LoadImportVolatileArguments(CpuContext cpuContext, nint argPackPtr)
+	{
+		cpuContext[CpuRegister.Rax] = *(ulong*)(argPackPtr + ImportSavedRaxOffset);
+		for (var registerIndex = 0; registerIndex < ImportVectorRegisterCount; registerIndex++)
+		{
+			var registerAddress = argPackPtr + ImportSavedXmmOffset + (registerIndex * 16);
+			cpuContext.SetXmmRegister(
+				registerIndex,
+				*(ulong*)registerAddress,
+				*(ulong*)(registerAddress + 8));
+		}
+	}
+
+	private unsafe static void StoreImportVectorReturn(CpuContext cpuContext, nint argPackPtr)
+	{
+		// AMD64 returns scalar/vector floating-point values in XMM0 and may use
+		// XMM1 for the second eightbyte of a classified aggregate.
+		for (var registerIndex = 0; registerIndex < 2; registerIndex++)
+		{
+			cpuContext.GetXmmRegister(registerIndex, out var low, out var high);
+			var registerAddress = argPackPtr + ImportSavedXmmOffset + (registerIndex * 16);
+			*(ulong*)registerAddress = low;
+			*(ulong*)(registerAddress + 8) = high;
+		}
+	}
+
 	private unsafe bool TryDispatchLeafImport(
 		CpuContext cpuContext,
 		ImportStubEntry importStubEntry,
@@ -523,6 +556,7 @@ public sealed partial class DirectExecutionBackend
 		var arg0 = *(ulong*)argPackPtr;
 		var returnRip = *(ulong*)(argPackPtr + 96);
 		cpuContext.Rip = importStubEntry.Address;
+		LoadImportVolatileArguments(cpuContext, argPackPtr);
 		cpuContext[CpuRegister.Rdi] = arg0;
 		cpuContext[CpuRegister.Rsi] = *(ulong*)(argPackPtr + 8);
 		cpuContext[CpuRegister.Rdx] = *(ulong*)(argPackPtr + 16);
@@ -582,6 +616,7 @@ public sealed partial class DirectExecutionBackend
 				GuestThreadExecution.RestoreImportCallFrame(previousImportCallFrame);
 			}
 		}
+		StoreImportVectorReturn(cpuContext, argPackPtr);
 
 		if (returnValue != (int)OrbisGen2Result.ORBIS_GEN2_OK)
 		{

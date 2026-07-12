@@ -159,6 +159,8 @@ public static class AgcExports
     private static readonly HashSet<ulong> _tracedComputeShaders = new();
     private static readonly HashSet<(ulong Address, uint X, uint Y, uint Z)>
         _tracedDispatchArguments = new();
+    private static readonly HashSet<(ulong Address, uint Initiator, string Reason)>
+        _rejectedDispatchArguments = new();
     private static readonly HashSet<uint> _tracedSubmittedDrawOpcodes = new();
     private static readonly Dictionary<(ulong Ps, ulong State, Gen5PixelOutputKind Output), byte[]> _pixelSpirvCache = new();
     private static readonly Dictionary<
@@ -322,13 +324,25 @@ public static class AgcExports
         uint BaseLevel,
         uint LastLevel,
         uint Pitch,
-        uint DstSelect)
+        uint DstSelect,
+        uint Depth = 1,
+        uint BaseArray = 0,
+        uint ArrayPitch = 0,
+        uint MaxMip = 0,
+        uint MinLod = 0,
+        uint MinLodWarn = 0,
+        uint BcSwizzle = 0,
+        ulong MetadataAddress = 0,
+        uint DescriptorFlags = 0,
+        bool HasExtendedDescriptor = false)
     {
         public uint MipLevels
         {
             get
             {
-                var largestDimension = Math.Max(Width, Height);
+                var largestDimension = Type == 10
+                    ? Math.Max(Math.Max(Width, Height), Depth)
+                    : Math.Max(Width, Height);
                 uint maximumMipLevels = 1;
                 while (largestDimension > 1)
                 {
@@ -339,7 +353,12 @@ public static class AgcExports
                 var descriptorMipLevels = LastLevel >= BaseLevel
                     ? LastLevel - BaseLevel + 1
                     : 1;
-                return Math.Min(descriptorMipLevels, maximumMipLevels);
+                var resourceMipLevels = HasExtendedDescriptor
+                    ? MaxMip + 1
+                    : maximumMipLevels;
+                return Math.Min(
+                    descriptorMipLevels,
+                    Math.Min(resourceMipLevels, maximumMipLevels));
             }
         }
     }
@@ -400,7 +419,8 @@ public static class AgcExports
         uint BaseGroupX,
         uint BaseGroupY,
         uint BaseGroupZ,
-        uint WaveLaneCount);
+        uint WaveLaneCount,
+        bool IsIndirect);
 
     private sealed class SubmittedDcbState
     {
@@ -5554,12 +5574,21 @@ public static class AgcExports
         if ((initiator & 1) == 0 ||
             !TryReadUInt32(ctx, dimensionsAddress, out var dispatchEndX) ||
             !TryReadUInt32(ctx, dimensionsAddress + 4, out var dispatchEndY) ||
-            !TryReadUInt32(ctx, dimensionsAddress + 8, out var dispatchEndZ) ||
-            dispatchEndX == 0 ||
-            dispatchEndY == 0 ||
-            dispatchEndZ == 0)
+            !TryReadUInt32(ctx, dimensionsAddress + 8, out var dispatchEndZ))
         {
             return false;
+        }
+
+        if (dispatchEndX == 0 || dispatchEndY == 0 || dispatchEndZ == 0)
+        {
+            return RejectComputeDispatch(
+                dimensionsAddress,
+                initiator,
+                dispatchSource,
+                dispatchEndX,
+                dispatchEndY,
+                dispatchEndZ,
+                "zero-dimension");
         }
 
         // When FORCE_START_AT_000 is clear, RDNA2 interprets the three packet
@@ -5568,6 +5597,8 @@ public static class AgcExports
         // COMPUTE_START registers turned small high-base clears into apparent
         // multi-million/billion-group dispatches and forced an unsafe cap.
         const uint forceStartAtZero = 1u << 2;
+        const uint partialThreadGroupEnabled = 1u << 1;
+        const uint useThreadDimensions = 1u << 5;
         uint baseGroupX = 0;
         uint baseGroupY = 0;
         uint baseGroupZ = 0;
@@ -5578,16 +5609,95 @@ public static class AgcExports
             state.ShRegisters.TryGetValue(ComputeStartZ, out baseGroupZ);
         }
 
-        if (dispatchEndX <= baseGroupX ||
-            dispatchEndY <= baseGroupY ||
-            dispatchEndZ <= baseGroupZ)
+        var localSizeX = GetComputeLocalSize(state.ShRegisters, ComputeNumThreadX);
+        var localSizeY = GetComputeLocalSize(state.ShRegisters, ComputeNumThreadY);
+        var localSizeZ = GetComputeLocalSize(state.ShRegisters, ComputeNumThreadZ);
+        uint groupCountX;
+        uint groupCountY;
+        uint groupCountZ;
+        if ((initiator & useThreadDimensions) != 0)
         {
-            return false;
+            // In thread-dimension mode the packet contains thread counts, not
+            // group end coordinates. Vulkan still dispatches whole workgroups.
+            // Exact multiples are losslessly representable; a remainder needs
+            // an invocation guard in the translated shader and must not be run
+            // as an oversized final group until that guard is available.
+            if (dispatchEndX % localSizeX != 0 ||
+                dispatchEndY % localSizeY != 0 ||
+                dispatchEndZ % localSizeZ != 0)
+            {
+                return RejectComputeDispatch(
+                    dimensionsAddress,
+                    initiator,
+                    dispatchSource,
+                    dispatchEndX,
+                    dispatchEndY,
+                    dispatchEndZ,
+                    $"unrepresentable-thread-dimensions(local=" +
+                    $"{localSizeX}x{localSizeY}x{localSizeZ})");
+            }
+
+            groupCountX = dispatchEndX / localSizeX;
+            groupCountY = dispatchEndY / localSizeY;
+            groupCountZ = dispatchEndZ / localSizeZ;
+        }
+        else
+        {
+            if (dispatchEndX <= baseGroupX ||
+                dispatchEndY <= baseGroupY ||
+                dispatchEndZ <= baseGroupZ)
+            {
+                return RejectComputeDispatch(
+                    dimensionsAddress,
+                    initiator,
+                    dispatchSource,
+                    dispatchEndX,
+                    dispatchEndY,
+                    dispatchEndZ,
+                    $"end-not-after-base({baseGroupX}x{baseGroupY}x{baseGroupZ})");
+            }
+
+            groupCountX = dispatchEndX - baseGroupX;
+            groupCountY = dispatchEndY - baseGroupY;
+            groupCountZ = dispatchEndZ - baseGroupZ;
         }
 
-        var groupCountX = dispatchEndX - baseGroupX;
-        var groupCountY = dispatchEndY - baseGroupY;
-        var groupCountZ = dispatchEndZ - baseGroupZ;
+        if ((initiator & partialThreadGroupEnabled) != 0)
+        {
+            var partialSizeX = GetComputePartialSize(state.ShRegisters, ComputeNumThreadX);
+            var partialSizeY = GetComputePartialSize(state.ShRegisters, ComputeNumThreadY);
+            var partialSizeZ = GetComputePartialSize(state.ShRegisters, ComputeNumThreadZ);
+            if (partialSizeX == 0 || partialSizeX > localSizeX ||
+                partialSizeY == 0 || partialSizeY > localSizeY ||
+                partialSizeZ == 0 || partialSizeZ > localSizeZ)
+            {
+                return RejectComputeDispatch(
+                    dimensionsAddress,
+                    initiator,
+                    dispatchSource,
+                    dispatchEndX,
+                    dispatchEndY,
+                    dispatchEndZ,
+                    $"invalid-partial-size({partialSizeX}x{partialSizeY}x{partialSizeZ}/" +
+                    $"{localSizeX}x{localSizeY}x{localSizeZ})");
+            }
+
+            if (partialSizeX != localSizeX ||
+                partialSizeY != localSizeY ||
+                partialSizeZ != localSizeZ)
+            {
+                return RejectComputeDispatch(
+                    dimensionsAddress,
+                    initiator,
+                    dispatchSource,
+                    dispatchEndX,
+                    dispatchEndY,
+                    dispatchEndZ,
+                    $"unrepresentable-partial-group({partialSizeX}x{partialSizeY}x{partialSizeZ}/" +
+                    $"{localSizeX}x{localSizeY}x{localSizeZ})");
+            }
+        }
+
         var waveLaneCount = (initiator & (1u << 15)) != 0 ? 32u : 64u;
 
         if (_traceAgcShader &&
@@ -5620,8 +5730,33 @@ public static class AgcExports
             baseGroupX,
             baseGroupY,
             baseGroupZ,
-            waveLaneCount);
+            waveLaneCount,
+            IsIndirect: opcode == ItDispatchIndirect);
         return true;
+    }
+
+    private static bool RejectComputeDispatch(
+        ulong dimensionsAddress,
+        uint initiator,
+        string source,
+        uint rawX,
+        uint rawY,
+        uint rawZ,
+        string reason)
+    {
+        lock (_submitTraceGate)
+        {
+            if (_rejectedDispatchArguments.Count < 256 &&
+                _rejectedDispatchArguments.Add((dimensionsAddress, initiator, reason)))
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][WARN] agc.dispatch_reject source={source} " +
+                    $"dims=0x{dimensionsAddress:X16} raw={rawX:X8}/{rawY:X8}/{rawZ:X8} " +
+                    $"initiator=0x{initiator:X8} reason={reason}");
+            }
+        }
+
+        return false;
     }
 
     private static void ObserveComputeDispatch(
@@ -5804,6 +5939,10 @@ public static class AgcExports
                     dispatch.BaseGroupX,
                     dispatch.BaseGroupY,
                     dispatch.BaseGroupZ,
+                    localSizeX,
+                    localSizeY,
+                    localSizeZ,
+                    dispatch.IsIndirect,
                     writesGlobalMemory);
                 gpuDispatch = true;
                 if (writesGlobalMemory &&
@@ -5979,9 +6118,16 @@ public static class AgcExports
         uint register)
     {
         return registers.TryGetValue(register, out var value)
-            ? Math.Max(value & 0x3FFu, 1u)
+            ? Math.Max(value & 0xFFFFu, 1u)
             : 1u;
     }
+
+    private static uint GetComputePartialSize(
+        IReadOnlyDictionary<uint, uint> registers,
+        uint register) =>
+        registers.TryGetValue(register, out var value)
+            ? value >> 16
+            : 0u;
 
     private static int TryApplySoftwareComputeBlits(
         CpuContext ctx,
@@ -6497,7 +6643,7 @@ public static class AgcExports
             packetAddress +
             8 +
             ((ulong)(PsTextureUserDataRegister - startRegister) * sizeof(uint));
-        Span<uint> fields = stackalloc uint[4];
+        Span<uint> fields = stackalloc uint[8];
         for (var i = 0; i < fields.Length; i++)
         {
             if (!TryReadUInt32(ctx, descriptorAddress + ((ulong)i * sizeof(uint)), out fields[i]))
@@ -6519,22 +6665,16 @@ public static class AgcExports
             return false;
         }
 
-        // GFX10/RDNA2 T# layout: WIDTH is split across word1[31:30] (lo 2 bits)
-        // and word2[11:0] (hi 12 bits); FORMAT is the combined 9-bit unified
-        // field at word1[28:20]. Decode that field once here into the legacy
-        // data-format/number-format pair used by the translator and Vulkan
-        // boundary. Treating unified 13 as legacy data format 13, for example,
-        // turned an R16_FLOAT surface into a 96-bit RGB32 surface and overread
-        // every row by 6x.
-        // GNM T# exposes a 38-bit baseaddr256 field, but RPCSX and the
-        // Demon's Souls descriptors both show that only the low 32 bits are
-        // part of the guest GPU VA. The upper baseaddr bits carry resource
-        // metadata and produce bogus addresses such as 0x00003804... if used.
-        var address = ((ulong)(uint)((((ulong)fields[1] << 32) | fields[0]) & 0x3F_FFFF_FFFFUL)) << 8;
-        var width = (((fields[1] >> 30) & 0x3u) | ((fields[2] & 0xFFFu) << 2)) + 1;
-        var height = ((fields[2] >> 14) & 0x3FFFu) + 1;
+        // RDNA2 ISA table 45: BASE_ADDRESS is addr[47:8], WIDTH is the full
+        // 16-bit field split across word1/word2, and HEIGHT is word2[29:14].
+        // Keeping the high base byte is required for legal guest VAs above
+        // 1 TiB; it is not descriptor metadata.
+        var address = (((ulong)(fields[1] & 0xFFu) << 32) | fields[0]) << 8;
+        var width = (((fields[1] >> 30) & 0x3u) | ((fields[2] & 0x3FFFu) << 2)) + 1;
+        var height = ((fields[2] >> 14) & 0xFFFFu) + 1;
         var unifiedFormat = (fields[1] >> 20) & 0x1FFu;
-        if (!Gfx10UnifiedFormat.TryDecode(
+        if (unifiedFormat == 0 ||
+            !Gfx10UnifiedFormat.TryDecode(
                 unifiedFormat,
                 out var format,
                 out var numberType))
@@ -6545,11 +6685,31 @@ public static class AgcExports
         var type = (fields[3] >> 28) & 0xFu;
         var baseLevel = (fields[3] >> 12) & 0xFu;
         var lastLevel = (fields[3] >> 16) & 0xFu;
-        var pitch = fields.Count >= 5
-            ? ((fields[4] >> 13) & 0x3FFFu) + 1
+        var bcSwizzle = (fields[3] >> 25) & 0x7u;
+        var hasExtendedDescriptor = fields.Count >= 8;
+        var word4 = fields.Count >= 5 ? fields[4] : 0u;
+        var depthOrLastSlice = (word4 & 0x1FFFu) + 1;
+        var baseArray = (word4 >> 16) & 0x1FFFu;
+        // In a 256-bit 1D/2D/2D-MSAA descriptor word4[13:0] is
+        // (pitch-1). A zeroed upper half denotes the common 128-bit resource,
+        // where pitch is implicit; use width rather than inventing pitch=1.
+        var pitch = type is 8u or 9u or 14u && word4 != 0
+            ? (word4 & 0x3FFFu) + 1
             : width;
+        var depth = type is 10u or 11u or 12u or 13u or 15u
+            ? depthOrLastSlice
+            : 1u;
+        var word5 = fields.Count >= 6 ? fields[5] : 0u;
+        var arrayPitch = word5 & 0xFu;
+        var maxMip = (word5 >> 4) & 0xFu;
+        var minLod = (fields[1] >> 8) & 0xFFFu;
+        var minLodWarn = (word5 >> 8) & 0xFFFu;
+        var word6 = fields.Count >= 7 ? fields[6] : 0u;
+        var word7 = fields.Count >= 8 ? fields[7] : 0u;
+        var metadataAddress = ((((ulong)word7 << 8) | (word6 >> 24)) << 8);
+        var descriptorFlags = word6 & 0x00FF_FFFFu;
         var dstSelect = fields[3] & 0xFFFu;
-        if (address == 0 || width == 0 || height == 0)
+        if (address == 0 || width == 0 || height == 0 || type is >= 1 and <= 7)
         {
             return false;
         }
@@ -6565,7 +6725,17 @@ public static class AgcExports
             baseLevel,
             lastLevel,
             pitch,
-            dstSelect);
+            dstSelect,
+            depth,
+            baseArray,
+            arrayPitch,
+            maxMip,
+            minLod,
+            minLodWarn,
+            bcSwizzle,
+            metadataAddress,
+            descriptorFlags,
+            hasExtendedDescriptor);
         return true;
     }
 
@@ -7429,8 +7599,12 @@ public static class AgcExports
     private static string FormatTextureDescriptor(TextureDescriptor descriptor) =>
         $"addr=0x{descriptor.Address:X16} {descriptor.Width}x{descriptor.Height} " +
         $"fmt={descriptor.Format} num={descriptor.NumberType} tile={descriptor.TileMode} " +
-        $"type={descriptor.Type} levels={descriptor.BaseLevel}-{descriptor.LastLevel} " +
-        $"pitch={descriptor.Pitch} dst=0x{descriptor.DstSelect:X3}";
+        $"type={descriptor.Type} depth={descriptor.Depth} base_array={descriptor.BaseArray} " +
+        $"levels={descriptor.BaseLevel}-{descriptor.LastLevel}/max{descriptor.MaxMip} " +
+        $"pitch={descriptor.Pitch} array_pitch={descriptor.ArrayPitch} " +
+        $"lod={descriptor.MinLod:X3}/{descriptor.MinLodWarn:X3} " +
+        $"bc={descriptor.BcSwizzle} meta=0x{descriptor.MetadataAddress:X16} " +
+        $"flags=0x{descriptor.DescriptorFlags:X6} dst=0x{descriptor.DstSelect:X3}";
 
     private static void DumpSpirv(
         string stage,

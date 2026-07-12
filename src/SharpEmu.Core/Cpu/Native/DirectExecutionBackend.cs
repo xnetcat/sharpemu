@@ -1622,7 +1622,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private unsafe nint CreateImportHandlerTrampoline(int importIndex)
 	{
-		void* ptr = VirtualAlloc(null, 192u, 12288u, 64u);
+		void* ptr = VirtualAlloc(null, 256u, 12288u, 64u);
 		if (ptr == null)
 		{
 			return 0;
@@ -1650,20 +1650,34 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			ptr2[num++] = 82;
 			ptr2[num++] = 86;
 			ptr2[num++] = 87;
-			ptr2[num++] = 72;
-			ptr2[num++] = 131;
-			ptr2[num++] = 236;
-			ptr2[num++] = 16;
-			ptr2[num++] = 243;
-			ptr2[num++] = 15;
-			ptr2[num++] = 127;
-			ptr2[num++] = 4;
-			ptr2[num++] = 36;
-			ptr2[num++] = 76;
-			ptr2[num++] = 141;
-			ptr2[num++] = 100;
-			ptr2[num++] = 36;
-			ptr2[num++] = 16;
+			// Preserve incoming guest RAX/AL and XMM0-XMM7 below the existing
+			// GPR argument pack.  The original pack still begins with RDI and its
+			// return address remains at +0x60.
+			ptr2[num++] = 0x48;
+			ptr2[num++] = 0x81;
+			ptr2[num++] = 0xEC;
+			*(uint*)(ptr2 + num) = 0x90;
+			num += 4;
+			ptr2[num++] = 0x48;
+			ptr2[num++] = 0x89;
+			ptr2[num++] = 0x04;
+			ptr2[num++] = 0x24;
+			for (var xmm = 0; xmm < 8; xmm++)
+			{
+				ptr2[num++] = 0xF3;
+				ptr2[num++] = 0x0F;
+				ptr2[num++] = 0x7F;
+				ptr2[num++] = (byte)(0x84 | (xmm << 3));
+				ptr2[num++] = 0x24;
+				*(uint*)(ptr2 + num) = (uint)(0x10 + (xmm * 0x10));
+				num += 4;
+			}
+			ptr2[num++] = 0x4C;
+			ptr2[num++] = 0x8D;
+			ptr2[num++] = 0xA4;
+			ptr2[num++] = 0x24;
+			*(uint*)(ptr2 + num) = 0x90;
+			num += 4;
 			ptr2[num++] = 72;
 			ptr2[num++] = 131;
 			ptr2[num++] = 236;
@@ -1711,6 +1725,19 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			ptr2[num++] = 131;
 			ptr2[num++] = 196;
 			ptr2[num++] = 40;
+			// Materialize SysV vector return registers written by the managed HLE
+			// gateway before restoring the guest stack.
+			for (var xmm = 0; xmm < 2; xmm++)
+			{
+				ptr2[num++] = 0xF3;
+				ptr2[num++] = 0x41;
+				ptr2[num++] = 0x0F;
+				ptr2[num++] = 0x6F;
+				ptr2[num++] = (byte)(0x84 | (xmm << 3));
+				ptr2[num++] = 0x24;
+				*(int*)(ptr2 + num) = -0x80 + (xmm * 0x10);
+				num += 4;
+			}
 			ptr2[num++] = 76;
 			ptr2[num++] = 137;
 			ptr2[num++] = 228;
@@ -1734,8 +1761,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			ptr2[num++] = 95;
 			ptr2[num++] = 195;
 			uint num2 = default(uint);
-			VirtualProtect(ptr, 192u, 32u, &num2);
-			FlushInstructionCache(GetCurrentProcess(), ptr, 192u);
+			VirtualProtect(ptr, 256u, 32u, &num2);
+			FlushInstructionCache(GetCurrentProcess(), ptr, 256u);
 			return (nint)ptr;
 		}
 		catch
