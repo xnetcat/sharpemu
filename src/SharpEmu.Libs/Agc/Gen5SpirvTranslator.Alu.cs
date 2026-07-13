@@ -2791,13 +2791,7 @@ internal static partial class Gen5SpirvTranslator
                 _boolType,
                 _module.AddInstruction(SpirvOp.ULessThan, _boolType, partial, left),
                 _module.AddInstruction(SpirvOp.ULessThan, _boolType, result, partial));
-            StoreWaveMask(
-                106,
-                _module.AddInstruction(
-                    SpirvOp.LogicalAnd,
-                    _boolType,
-                    Load(_boolType, _exec),
-                    carry));
+            StoreCarryOut(instruction, carry);
             return result;
         }
 
@@ -2807,10 +2801,13 @@ internal static partial class Gen5SpirvTranslator
         {
             var left = GetRawSource(instruction, reverse ? 1 : 0);
             var right = GetRawSource(instruction, reverse ? 0 : 1);
+            var borrowMask = instruction.Sources.Count > 2
+                ? IsCurrentLaneSet(GetRawSource64(instruction, 2))
+                : Load(_boolType, _vcc);
             var borrowIn = _module.AddInstruction(
                 SpirvOp.Select,
                 _uintType,
-                Load(_boolType, _vcc),
+                borrowMask,
                 UInt(1),
                 UInt(0));
             var partial = _module.AddInstruction(SpirvOp.ISub, _uintType, left, right);
@@ -2828,13 +2825,7 @@ internal static partial class Gen5SpirvTranslator
                     _boolType,
                     partial,
                     borrowIn));
-            StoreWaveMask(
-                106,
-                _module.AddInstruction(
-                    SpirvOp.LogicalAnd,
-                    _boolType,
-                    Load(_boolType, _exec),
-                    borrow));
+            StoreCarryOut(instruction, borrow);
             return result;
         }
 

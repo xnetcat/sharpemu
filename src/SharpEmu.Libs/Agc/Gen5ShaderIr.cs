@@ -184,7 +184,9 @@ internal sealed record Gen5ImageControl(
     uint Dimension,
     bool IsArray,
     bool Glc,
-    bool Slc) : Gen5InstructionControl
+    bool Slc,
+    bool A16,
+    bool D16) : Gen5InstructionControl
 {
     public uint GetAddressRegister(int component) =>
         component < AddressRegisters.Count

@@ -588,10 +588,10 @@ internal static class Gen5ShaderScalarEvaluator
                     resourceDescriptor,
                     samplerDescriptor,
                     instruction.Opcode is "ImageLoadMip" or "ImageStoreMip" &&
-                    TryResolveVectorConstantBefore(
+                    TryResolveImageMipLevel(
                         state.Program,
                         instruction.Pc,
-                        image.GetAddressRegister(2),
+                        image,
                         out var mipLevel)
                         ? mipLevel
                         : null);
@@ -755,6 +755,26 @@ internal static class Gen5ShaderScalarEvaluator
 
         value = 0;
         return false;
+    }
+
+    private static bool TryResolveImageMipLevel(
+        Gen5ShaderProgram program,
+        uint pc,
+        Gen5ImageControl image,
+        out uint mipLevel)
+    {
+        // For the currently translated 2D image path, mip follows x/y. A16
+        // packs x/y into the first VGPR and places mip in the low half of the
+        // next; ordinary addresses use the third VGPR.
+        var register = image.GetAddressRegister(image.A16 ? 1 : 2);
+        if (!TryResolveVectorConstantBefore(program, pc, register, out var raw))
+        {
+            mipLevel = 0;
+            return false;
+        }
+
+        mipLevel = image.A16 ? raw & 0xFFFF : raw;
+        return true;
     }
 
     private static bool TryResolveConstantOperand(Gen5Operand operand, out uint value)

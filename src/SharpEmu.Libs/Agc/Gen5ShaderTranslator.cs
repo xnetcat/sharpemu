@@ -1999,7 +1999,9 @@ internal static class Gen5ShaderTranslator
                     dimension,
                     dimension is 4 or 5 or 7,
                     ((word >> 13) & 1) != 0,
-                    ((word >> 25) & 1) != 0);
+                    ((word >> 25) & 1) != 0,
+                    ((extra >> 30) & 1) != 0,
+                    ((extra >> 31) & 1) != 0);
                 break;
             }
             case Gen5ShaderEncoding.Exp:
@@ -2170,6 +2172,7 @@ internal static class Gen5ShaderTranslator
                     $"va={addressRegisters},vd=v{image.VectorData}," +
                     $"sr=s{image.ScalarResource},ss=s{image.ScalarSampler}," +
                     $"dim={image.Dimension},da={(image.IsArray ? 1 : 0)}," +
+                    $"a16={(image.A16 ? 1 : 0)},d16={(image.D16 ? 1 : 0)}," +
                     $"glc={(image.Glc ? 1 : 0)}," +
                     $"slc={(image.Slc ? 1 : 0)}";
             }

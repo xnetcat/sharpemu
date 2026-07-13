@@ -2814,7 +2814,10 @@ internal static partial class Gen5SpirvTranslator
                 {
                     if ((image.Dmask & (1u << component)) != 0)
                     {
-                        var raw = LoadV(image.VectorData + sourceIndex++);
+                        var raw = LoadImageStoreComponent(
+                            image,
+                            resource,
+                            sourceIndex++);
                         components[component] = resource.ComponentKind switch
                         {
                             ImageComponentKind.Sint => Bitcast(_intType, raw),
@@ -2915,17 +2918,33 @@ internal static partial class Gen5SpirvTranslator
                 // sampled gradients as coordinates in every captured
                 // derivative operation.
                 var addressCursor = 0;
-                var offset = hasOffset ? BuildImageOffset(image, addressCursor++) : 0u;
-                var lodOrBias = hasLod || hasBias
-                    ? Bitcast(
-                        _floatType,
-                        LoadV(image.GetAddressRegister(addressCursor++)))
+                var offset = 0u;
+                if (hasOffset)
+                {
+                    addressCursor = AlignFullImageAddress(image, addressCursor);
+                    offset = BuildImageOffset(image, addressCursor);
+                    addressCursor += ImageFullAddressSlots(image);
+                }
+
+                // SAMPLE_B prefixes the body with a bias. SAMPLE_L instead
+                // carries LOD as the final body component (x, y, lod for 2D),
+                // per the RDNA image-address table.
+                var lodOrBias = hasBias
+                    ? LoadImageFloatAddress(image, addressCursor++)
                     : 0u;
-                var reference = hasCompare
-                    ? Bitcast(
+                var reference = 0u;
+                if (hasCompare)
+                {
+                    // PCF references remain full-width even when A16 packs the
+                    // ordinary address components two per VGPR.
+                    addressCursor = AlignFullImageAddress(image, addressCursor);
+                    reference = Bitcast(
                         _floatType,
-                        LoadV(image.GetAddressRegister(addressCursor++)))
-                    : 0u;
+                        LoadV(image.GetAddressRegister(
+                            ImageAddressRegister(image, addressCursor))));
+                    addressCursor += ImageFullAddressSlots(image);
+                }
+
                 var gradientX = hasGradients
                     ? BuildFloatCoordinates(image, addressCursor)
                     : 0u;
@@ -2939,7 +2958,11 @@ internal static partial class Gen5SpirvTranslator
 
                 var coordinates = BuildFloatCoordinates(image, addressCursor);
                 var explicitLod = hasGradients || hasZeroLod || hasLod;
-                var lod = hasZeroLod ? Float(0) : lodOrBias;
+                var lod = hasZeroLod
+                    ? Float(0)
+                    : hasLod
+                        ? LoadImageFloatAddress(image, addressCursor + 2)
+                        : lodOrBias;
                 if (hasOffset)
                 {
                     // Vulkan before maintenance8 forbids the dynamic Offset
@@ -3004,12 +3027,26 @@ internal static partial class Gen5SpirvTranslator
                     instruction.Opcode.EndsWith("O", StringComparison.Ordinal);
                 var hasCompare =
                     instruction.Opcode.Contains("Gather4C", StringComparison.Ordinal);
-                var start = (hasOffset ? 1 : 0) + (hasCompare ? 1 : 0);
-                var coordinates = BuildFloatCoordinates(image, start);
-                var offset = hasOffset ? BuildImageOffset(image, 0) : 0u;
-                var reference = hasCompare
-                    ? Bitcast(_floatType, LoadV(image.GetAddressRegister(hasOffset ? 1 : 0)))
-                    : 0u;
+                var addressCursor = 0;
+                var offset = 0u;
+                if (hasOffset)
+                {
+                    offset = BuildImageOffset(image, addressCursor);
+                    addressCursor += ImageFullAddressSlots(image);
+                }
+
+                var reference = 0u;
+                if (hasCompare)
+                {
+                    addressCursor = AlignFullImageAddress(image, addressCursor);
+                    reference = Bitcast(
+                        _floatType,
+                        LoadV(image.GetAddressRegister(
+                            ImageAddressRegister(image, addressCursor))));
+                    addressCursor += ImageFullAddressSlots(image);
+                }
+
+                var coordinates = BuildFloatCoordinates(image, addressCursor);
                 var operands = new List<uint>
                 {
                     imageObject,
@@ -3068,7 +3105,7 @@ internal static partial class Gen5SpirvTranslator
                 return false;
             }
 
-            uint output = 0;
+            var outputValues = new List<uint>(4);
             for (uint component = 0; component < 4; component++)
             {
                 if (!writeAllComponents &&
@@ -3087,7 +3124,28 @@ internal static partial class Gen5SpirvTranslator
                     ImageComponentKind.Uint => value,
                     _ => Bitcast(_uintType, value),
                 };
-                StoreV(image.VectorData + output++, raw);
+                outputValues.Add(raw);
+            }
+
+            if (image.D16)
+            {
+                for (var index = 0; index < outputValues.Count; index += 2)
+                {
+                    var low = outputValues[index];
+                    var high = index + 1 < outputValues.Count
+                        ? outputValues[index + 1]
+                        : UInt(0);
+                    StoreV(
+                        image.VectorData + (uint)(index / 2),
+                        PackImageD16(resource, low, high));
+                }
+            }
+            else
+            {
+                for (var index = 0; index < outputValues.Count; index++)
+                {
+                    StoreV(image.VectorData + (uint)index, outputValues[index]);
+                }
             }
 
             return true;
@@ -3156,12 +3214,8 @@ internal static partial class Gen5SpirvTranslator
 
         private uint BuildFloatCoordinates(Gen5ImageControl image, int start)
         {
-            var x = Bitcast(
-                _floatType,
-                LoadV(image.GetAddressRegister(start)));
-            var y = Bitcast(
-                _floatType,
-                LoadV(image.GetAddressRegister(start + 1)));
+            var x = LoadImageFloatAddress(image, start);
+            var y = LoadImageFloatAddress(image, start + 1);
             return _module.AddInstruction(
                 SpirvOp.CompositeConstruct,
                 _vec2Type,
@@ -3169,15 +3223,113 @@ internal static partial class Gen5SpirvTranslator
                 y);
         }
 
+        private static int ImageAddressRegister(
+            Gen5ImageControl image,
+            int component) => image.A16 ? component / 2 : component;
+
+        private static int ImageFullAddressSlots(Gen5ImageControl image) =>
+            image.A16 ? 2 : 1;
+
+        private static int AlignFullImageAddress(
+            Gen5ImageControl image,
+            int component) => image.A16 ? (component + 1) & ~1 : component;
+
+        private uint LoadImageFloatAddress(Gen5ImageControl image, int component)
+        {
+            var raw = LoadV(image.GetAddressRegister(
+                ImageAddressRegister(image, component)));
+            if (!image.A16)
+            {
+                return Bitcast(_floatType, raw);
+            }
+
+            var unpacked = Ext(62, _vec2Type, raw);
+            return _module.AddInstruction(
+                SpirvOp.CompositeExtract,
+                _floatType,
+                unpacked,
+                (uint)(component & 1));
+        }
+
+        private uint LoadImageIntegerAddress(Gen5ImageControl image, int component)
+        {
+            var raw = LoadV(image.GetAddressRegister(
+                ImageAddressRegister(image, component)));
+            if (!image.A16)
+            {
+                return raw;
+            }
+
+            return BitwiseAnd(
+                ShiftRightLogical(raw, UInt((uint)((component & 1) * 16))),
+                UInt(0xFFFF));
+        }
+
+        private uint LoadImageStoreComponent(
+            Gen5ImageControl image,
+            SpirvImageResource resource,
+            uint component)
+        {
+            if (!image.D16)
+            {
+                return LoadV(image.VectorData + component);
+            }
+
+            var packed = LoadV(image.VectorData + component / 2);
+            if (resource.ComponentKind == ImageComponentKind.Float)
+            {
+                var unpacked = Ext(62, _vec2Type, packed);
+                return Bitcast(
+                    _uintType,
+                    _module.AddInstruction(
+                        SpirvOp.CompositeExtract,
+                        _floatType,
+                        unpacked,
+                        component & 1));
+            }
+
+            var shifted = ShiftRightLogical(packed, UInt((component & 1) * 16));
+            var low = BitwiseAnd(shifted, UInt(0xFFFF));
+            if (resource.ComponentKind != ImageComponentKind.Sint)
+            {
+                return low;
+            }
+
+            return Bitcast(
+                _uintType,
+                _module.AddInstruction(
+                    SpirvOp.BitFieldSExtract,
+                    _intType,
+                    Bitcast(_intType, low),
+                    UInt(0),
+                    UInt(16)));
+        }
+
+        private uint PackImageD16(
+            SpirvImageResource resource,
+            uint low,
+            uint high)
+        {
+            if (resource.ComponentKind == ImageComponentKind.Float)
+            {
+                var pair = _module.AddInstruction(
+                    SpirvOp.CompositeConstruct,
+                    _vec2Type,
+                    Bitcast(_floatType, low),
+                    Bitcast(_floatType, high));
+                return Ext(58, _uintType, pair);
+            }
+
+            return BitwiseOr(
+                BitwiseAnd(low, UInt(0xFFFF)),
+                ShiftLeftLogical(BitwiseAnd(high, UInt(0xFFFF)), UInt(16)));
+        }
+
         private uint BuildIntegerCoordinates(Gen5ImageControl image, int start)
         {
             var ivec2 = _module.TypeVector(_intType, 2);
-            var x = Bitcast(
-                _intType,
-                LoadV(image.GetAddressRegister(start)));
-            var y = Bitcast(
-                _intType,
-                LoadV(image.GetAddressRegister(start + 1)));
+            var x = Bitcast(_intType, LoadImageIntegerAddress(image, start));
+            var y = Bitcast(_intType, LoadImageIntegerAddress(image, start + 1));
             return _module.AddInstruction(
                 SpirvOp.CompositeConstruct,
                 ivec2,
@@ -3195,12 +3347,12 @@ internal static partial class Gen5SpirvTranslator
             var x = ClampSignedCoordinate(
                 Bitcast(
                     _intType,
-                    LoadV(image.GetAddressRegister(start))),
+                    LoadImageIntegerAddress(image, start)),
                 width);
             var y = ClampSignedCoordinate(
                 Bitcast(
                     _intType,
-                    LoadV(image.GetAddressRegister(start + 1))),
+                    LoadImageIntegerAddress(image, start + 1)),
                 height);
             return _module.AddInstruction(
                 SpirvOp.CompositeConstruct,
@@ -3336,7 +3488,8 @@ internal static partial class Gen5SpirvTranslator
             var ivec2 = _module.TypeVector(_intType, 2);
             var packed = Bitcast(
                 _intType,
-                LoadV(image.GetAddressRegister(component)));
+                LoadV(image.GetAddressRegister(
+                    ImageAddressRegister(image, component))));
             var x = _module.AddInstruction(
                 SpirvOp.BitFieldSExtract,
                 _intType,

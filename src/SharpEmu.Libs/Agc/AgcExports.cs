@@ -18,6 +18,7 @@ public static class AgcExports
         ValidateWriteDataControlDecoders();
         ValidateDispatchInitiators();
         ValidateSubmittedQueueAndReleaseMemDecoders();
+        ValidateDepthTargetDecoder();
     }
 #endif
 
@@ -111,6 +112,15 @@ public static class AgcExports
     private const uint CbColor0Attrib3 = 0x3B8;
     private const uint CbBlend0Control = 0x1E0;
     private const uint PaScModeCntl0 = 0x292;
+    // GFX10 DB context registers (register byte address minus 0x28000, / 4).
+    private const uint DbDepthView = 0x002;
+    private const uint DbDepthSizeXy = 0x007;
+    private const uint DbDepthClear = 0x00B;
+    private const uint DbZInfo = 0x010;
+    private const uint DbZReadBase = 0x012;
+    private const uint DbZWriteBase = 0x014;
+    private const uint DbZReadBaseHi = 0x01A;
+    private const uint DbZWriteBaseHi = 0x01C;
     private const int ColorTargetCount = 8;
     private const uint PsTextureUserDataRegister = 0xC;
     private const uint VsUserDataRegister = 0x4C;
@@ -400,6 +410,7 @@ public static class AgcExports
         IReadOnlyList<Gen5GlobalMemoryBinding> GlobalMemoryBindings,
         IReadOnlyList<Gen5VertexInputBinding> VertexInputs,
         IReadOnlyList<RenderTargetDescriptor> RenderTargets,
+        VulkanGuestDepthTarget? DepthTarget,
         IReadOnlyList<byte[]> PixelSpirvByTarget,
         VulkanGuestRenderState RenderState,
         IReadOnlyList<uint> PixelUserData,
@@ -849,11 +860,7 @@ public static class AgcExports
             !TryWriteUInt32(ctx, commandAddress + 4, groupCountX) ||
             !TryWriteUInt32(ctx, commandAddress + 8, groupCountY) ||
             !TryWriteUInt32(ctx, commandAddress + 12, groupCountZ) ||
-            // sceAgcCbDispatch takes thread dimensions. USE_THREAD_DIMENSIONS
-            // (bit 5) tells the CP to divide by COMPUTE_NUM_THREAD_*; omitting
-            // it multiplied large initialization kernels by the local size
-            // (64x in Demon's Souls) and reduced throughput to ~0.1 FPS.
-            !TryWriteUInt32(ctx, commandAddress + 16, DirectThreadDispatchInitiator(modifier)))
+            !TryWriteUInt32(ctx, commandAddress + 16, DirectDispatchInitiator(modifier)))
         {
             return ReturnPointer(ctx, 0);
         }
@@ -861,8 +868,13 @@ public static class AgcExports
         return ReturnPointer(ctx, commandAddress);
     }
 
-    private static uint DirectThreadDispatchInitiator(uint modifier) =>
-        (modifier & 0xA038u) | 0x61u;
+    private static uint DirectDispatchInitiator(uint modifier) =>
+        // AGC's direct API takes workgroup counts by default. Preserve the
+        // caller's USE_THREAD_DIMENSIONS bit when explicitly requested; do not
+        // force it. Demon's Souls' 0xF00100 dispatch is paired with a
+        // 0x3C004000 element bound (exactly 64 lanes per group), proving the
+        // default packet is group-dimensional.
+        (modifier & 0xA038u) | 0x41u;
 
     [SysAbiExport(
         Nid = "UZbQjYAwwXM",
@@ -3589,17 +3601,23 @@ public static class AgcExports
     {
         const uint threadCount = 0x00F0_0100u;
         const uint localSize = 64u;
-        var initiator = DirectThreadDispatchInitiator(0);
-        System.Diagnostics.Debug.Assert((initiator & (1u << 5)) != 0);
+        var initiator = DirectDispatchInitiator(0);
+        System.Diagnostics.Debug.Assert((initiator & (1u << 5)) == 0);
         System.Diagnostics.Debug.Assert((initiator & (1u << 6)) != 0);
-        System.Diagnostics.Debug.Assert(threadCount % localSize == 0);
-        System.Diagnostics.Debug.Assert(threadCount / localSize == 0x0003_C004u);
+        System.Diagnostics.Debug.Assert(threadCount * localSize == 0x3C00_4000u);
         System.Diagnostics.Debug.Assert(CeilDivide(20, 8) == 3);
         System.Diagnostics.Debug.Assert(CeilDivide(12, 8) == 2);
     }
 
     private static void ValidateSubmittedQueueAndReleaseMemDecoders()
     {
+        var nggRegisters = new Dictionary<uint, uint>
+        {
+            [GsUserDataRegister - 1] = 3u << 1,
+        };
+        System.Diagnostics.Debug.Assert(
+            SelectExportUserDataRegister(nggRegisters) == GsUserDataRegister);
+
         var queue = new SubmittedDcbState();
         queue.PendingSubmissions.Enqueue(new(0x1000, 8, 11, false));
         queue.PendingSubmissions.Enqueue(new(0x2000, 16, 12, true));
@@ -3615,6 +3633,28 @@ public static class AgcExports
         System.Diagnostics.Debug.Assert(
             PatchUInt32Bits(0xABCD_1234u, 0x00FF_0000u, 3u << 16) ==
             0xAB03_1234u);
+    }
+
+    private static void ValidateDepthTargetDecoder()
+    {
+        var registers = new Dictionary<uint, uint>
+        {
+            [DbDepthControl] = 0x2u | 0x4u | (1u << 4),
+            [DbDepthSizeXy] = 1919u | (1079u << 16),
+            [DbDepthClear] = BitConverter.SingleToUInt32Bits(1f),
+            [DbZInfo] = 3u | (24u << 4),
+            [DbZReadBase] = 0x0123_4567u,
+            [DbZWriteBase] = 0x0123_4567u,
+            [DbZReadBaseHi] = 2u,
+            [DbZWriteBaseHi] = 2u,
+        };
+        var depth = DecodeDepthTarget(registers);
+        System.Diagnostics.Debug.Assert(depth is not null);
+        System.Diagnostics.Debug.Assert(depth.Width == 1920 && depth.Height == 1080);
+        System.Diagnostics.Debug.Assert(depth.GuestFormat == 3u);
+        System.Diagnostics.Debug.Assert(depth.SwizzleMode == 24u);
+        System.Diagnostics.Debug.Assert(depth.Address == 0x0000_0201_2345_6700UL);
+        System.Diagnostics.Debug.Assert(depth.ClearDepth == 1f);
     }
 #endif
 
@@ -4428,6 +4468,27 @@ public static class AgcExports
                     }
 
                     ProvideRenderTargetInitialData(ctx, renderTarget);
+                    var renderState = translatedDraw.RenderState;
+                    if (!isPrimary &&
+                        translatedDraw.DepthTarget is not null &&
+                        renderState.Depth.TestEnable &&
+                        renderState.Depth.WriteEnable)
+                    {
+                        // The guest performs one depth test and broadcasts all
+                        // MRT exports simultaneously.  SharpEmu currently
+                        // splits MRTs into serial Vulkan passes.  The primary
+                        // pass establishes the new depth; secondary passes use
+                        // Equal without writing so precisely the fragments that
+                        // survived the original test reach every color target.
+                        renderState = renderState with
+                        {
+                            Depth = new VulkanGuestDepthState(
+                                TestEnable: true,
+                                WriteEnable: false,
+                                CompareOp: 2),
+                        };
+                    }
+
                     VulkanVideoPresenter.SubmitOffscreenTranslatedDraw(
                         pixelSpirv,
                         textures,
@@ -4445,14 +4506,13 @@ public static class AgcExports
                         translatedDraw.PrimitiveType,
                         indexBuffer,
                         vertexBuffers,
-                        translatedDraw.RenderState);
+                        renderState,
+                        translatedDraw.DepthTarget);
                 }
             }
             else
             {
-                var storageTarget = translatedDraw.Textures
-                    .FirstOrDefault(binding => binding.IsStorage);
-                if (storageTarget is not null)
+                if (translatedDraw.DepthTarget is { } depthTarget)
                 {
                     var textures = CreateVulkanGuestDrawTextures(
                         ctx,
@@ -4460,33 +4520,76 @@ public static class AgcExports
                         out _);
                     var globalMemoryBuffers =
                         CreateTranslatedDrawGlobalBuffers(translatedDraw);
-                    TraceDrawCompact(drawSequence, translatedDraw, textures, []);
-                    VulkanVideoPresenter.SubmitStorageTranslatedDraw(
+                    var vertexBuffers =
+                        CreateVulkanGuestVertexBuffers(translatedDraw.VertexInputs);
+                    var renderState = translatedDraw.RenderState;
+                    if (depthTarget.ReadOnly && renderState.Depth.WriteEnable)
+                    {
+                        renderState = renderState with
+                        {
+                            Depth = renderState.Depth with { WriteEnable = false },
+                        };
+                    }
+
+                    TraceDrawCompact(
+                        drawSequence,
+                        translatedDraw,
+                        textures,
+                        vertexBuffers);
+                    VulkanVideoPresenter.SubmitDepthOnlyTranslatedDraw(
                         translatedDraw.PixelSpirv,
                         textures,
                         globalMemoryBuffers,
                         translatedDraw.AttributeCount,
-                        storageTarget.Descriptor.Width,
-                        storageTarget.Descriptor.Height);
-                    // The storage submit consumes the global buffers (the
-                    // presenter returns them) but never the vertex/index
-                    // arrays; return those here so they don't leak the pool.
-                    ReturnPooledDrawArrays(
-                        translatedDraw,
-                        globals: false,
-                        vertex: true,
-                        index: true);
+                        depthTarget,
+                        translatedDraw.VertexSpirv,
+                        translatedDraw.VertexCount,
+                        translatedDraw.InstanceCount,
+                        translatedDraw.PrimitiveType,
+                        translatedDraw.IndexBuffer,
+                        vertexBuffers,
+                        renderState);
                 }
                 else
                 {
-                    // No render target and no storage sink: nothing was
-                    // handed to the presenter, so every pooled array on the
-                    // draw is this branch's to return.
-                    ReturnPooledDrawArrays(
-                        translatedDraw,
-                        globals: true,
-                        vertex: true,
-                        index: true);
+                    var storageTarget = translatedDraw.Textures
+                        .FirstOrDefault(binding => binding.IsStorage);
+                    if (storageTarget is not null)
+                    {
+                        var textures = CreateVulkanGuestDrawTextures(
+                            ctx,
+                            translatedDraw.Textures,
+                            out _);
+                        var globalMemoryBuffers =
+                            CreateTranslatedDrawGlobalBuffers(translatedDraw);
+                        TraceDrawCompact(drawSequence, translatedDraw, textures, []);
+                        VulkanVideoPresenter.SubmitStorageTranslatedDraw(
+                            translatedDraw.PixelSpirv,
+                            textures,
+                            globalMemoryBuffers,
+                            translatedDraw.AttributeCount,
+                            storageTarget.Descriptor.Width,
+                            storageTarget.Descriptor.Height);
+                        // The storage submit consumes the global buffers (the
+                        // presenter returns them) but never the vertex/index
+                        // arrays; return those here so they don't leak the pool.
+                        ReturnPooledDrawArrays(
+                            translatedDraw,
+                            globals: false,
+                            vertex: true,
+                            index: true);
+                    }
+                    else
+                    {
+                        // No render target and no storage sink: nothing was
+                        // handed to the presenter, so every pooled array on the
+                        // draw is this branch's to return.
+                        ReturnPooledDrawArrays(
+                            translatedDraw,
+                            globals: true,
+                            vertex: true,
+                            index: true);
+                    }
                 }
             }
 
@@ -4844,6 +4947,7 @@ public static class AgcExports
             globalMemoryBindings,
             vertexInputs,
             renderTargets,
+            DecodeDepthTarget(state.CxRegisters),
             pixelSpirvByTarget,
             ApplyFillClearHack(
                 CreateRenderState(state.CxRegisters, renderTargets.FirstOrDefault()),
@@ -5146,6 +5250,65 @@ public static class AgcExports
         return new VulkanGuestDepthState(testEnable, writeEnable, compareOp);
     }
 
+    private static VulkanGuestDepthTarget? DecodeDepthTarget(
+        IReadOnlyDictionary<uint, uint> registers)
+    {
+        var depthState = DecodeDepthState(registers);
+        if (!depthState.TestEnable && !depthState.WriteEnable)
+        {
+            return null;
+        }
+
+        if (!registers.TryGetValue(DbZInfo, out var zInfo) ||
+            !registers.TryGetValue(DbDepthSizeXy, out var sizeXy))
+        {
+            return null;
+        }
+
+        var guestFormat = zInfo & 0x3u;
+        if (guestFormat == 0)
+        {
+            return null;
+        }
+
+        registers.TryGetValue(DbZReadBase, out var readBase);
+        registers.TryGetValue(DbZWriteBase, out var writeBase);
+        registers.TryGetValue(DbZReadBaseHi, out var readBaseHi);
+        registers.TryGetValue(DbZWriteBaseHi, out var writeBaseHi);
+        var readAddress = ((ulong)(readBaseHi & 0xFFu) << 40) | ((ulong)readBase << 8);
+        var writeAddress = ((ulong)(writeBaseHi & 0xFFu) << 40) | ((ulong)writeBase << 8);
+        if (readAddress == 0 && writeAddress == 0)
+        {
+            return null;
+        }
+
+        var width = (sizeXy & 0x3FFFu) + 1;
+        var height = ((sizeXy >> 16) & 0x3FFFu) + 1;
+        if (width == 0 || height == 0 || width > 16384 || height > 16384)
+        {
+            return null;
+        }
+
+        registers.TryGetValue(DbDepthView, out var depthView);
+        var clearDepth = registers.TryGetValue(DbDepthClear, out var clearBits)
+            ? BitConverter.UInt32BitsToSingle(clearBits)
+            : 1f;
+        if (!float.IsFinite(clearDepth) || clearDepth < 0f || clearDepth > 1f)
+        {
+            clearDepth = 1f;
+        }
+
+        return new VulkanGuestDepthTarget(
+            readAddress,
+            writeAddress,
+            width,
+            height,
+            guestFormat,
+            (zInfo >> 4) & 0x1Fu,
+            clearDepth,
+            ReadOnly: (depthView & (1u << 24)) != 0 || writeAddress == 0);
+    }
+
     // PA_SU_SC_MODE_CNTL (context register 0x205) carries face culling, the
     // front-face winding and polygon (wireframe) mode.
     private const uint PaSuScModeCntl = 0x205;
@@ -5412,6 +5575,12 @@ public static class AgcExports
                 draw.RenderTargets.Select(target =>
                     $"{target.Slot}:0x{target.Address:X16}:{target.Width}x{target.Height}:" +
                     $"fmt{target.Format}/num{target.NumberType}/tile{target.TileMode}"));
+        var depthTarget = draw.DepthTarget is { } depth
+            ? $"0x{depth.Address:X16}:{depth.Width}x{depth.Height}:" +
+              $"fmt{depth.GuestFormat}/sw{depth.SwizzleMode}:" +
+              $"read=0x{depth.ReadAddress:X16}/write=0x{depth.WriteAddress:X16}:" +
+              $"clear={depth.ClearDepth:0.######}/ro={(depth.ReadOnly ? 1 : 0)}"
+            : "none";
         var probes = new Dictionary<ulong, string>();
         var textures = string.Join(
             ',',
@@ -5503,7 +5672,7 @@ public static class AgcExports
             $"write_mask=0x{blend.WriteMask:X} scissor={scissor} viewport={viewport} " +
             $"raster=[{raster}] " +
             $"ps_ena=0x{psInputEna:X8} ps_addr=0x{psInputAddr:X8} " +
-            $"targets=[{targets}] textures=[{textures}] " +
+            $"targets=[{targets}] depth=[{depthTarget}] textures=[{textures}] " +
             $"buffers=[{buffers}] vertex=[{vertexInputs}] indices=[{indices}]");
     }
 
@@ -6953,6 +7122,29 @@ public static class AgcExports
     private static uint SelectExportUserDataRegister(
         IReadOnlyDictionary<uint, uint> registers)
     {
+        // RSRC2 is the authoritative stage selector: its USER_SGPR field
+        // describes the hardware SGPR window even when the shader has zero
+        // user-data dwords and therefore no USER_DATA register was written.
+        // GFX10 NGG export shaders use the GS user-data bank (RSRC2 at 0x8B),
+        // while their program address is carried in the ES/NGG registers.
+        // Looking only for a populated USER_DATA range made those shaders
+        // fall through to ES (0xCC) and reject every graphics draw because
+        // the unrelated ES RSRC2 register at 0xCB was legitimately absent.
+        if (HasShaderResource2(registers, GsUserDataRegister))
+        {
+            return GsUserDataRegister;
+        }
+
+        if (HasShaderResource2(registers, EsUserDataRegister))
+        {
+            return EsUserDataRegister;
+        }
+
+        if (HasShaderResource2(registers, VsUserDataRegister))
+        {
+            return VsUserDataRegister;
+        }
+
         if (HasUserDataRange(registers, GsUserDataRegister))
         {
             return GsUserDataRegister;
@@ -6974,6 +7166,11 @@ public static class AgcExports
             ? VsUserDataRegister
             : EsUserDataRegister;
     }
+
+    private static bool HasShaderResource2(
+        IReadOnlyDictionary<uint, uint> registers,
+        uint userDataBaseRegister) =>
+        registers.ContainsKey(userDataBaseRegister - 1);
 
     private static bool HasUserDataRange(
         IReadOnlyDictionary<uint, uint> registers,
