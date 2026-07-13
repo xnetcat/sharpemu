@@ -171,11 +171,13 @@ public static class KernelPthreadCompatExports
         public bool TryConsumePendingSignal()
         {
             if (PendingSignals == 0)
+
             {
                 return false;
             }
 
             PendingSignals = 0;
+
             return true;
         }
     }
@@ -1406,6 +1408,24 @@ public static class KernelPthreadCompatExports
             }
         }
 
+        var consumedPendingSignal = false;
+        lock (state.SyncRoot)
+        {
+            consumedPendingSignal = state.TryConsumePendingSignal();
+        }
+
+        if (consumedPendingSignal)
+        {
+            TracePthreadCond("wait-wake-pending", condAddress, mutexAddress, state, timed, (int)OrbisGen2Result.ORBIS_GEN2_OK);
+            var unlockResult = PthreadMutexUnlockCore(ctx, mutexAddress, requireOwner: true);
+            if (unlockResult != (int)OrbisGen2Result.ORBIS_GEN2_OK)
+            {
+                return unlockResult;
+            }
+
+            return PthreadMutexLockCore(ctx, mutexAddress, tryOnly: false);
+        }
+
         var cooperative = GuestThreadExecution.IsGuestThread &&
             GuestThreadExecution.TryGetCurrentImportCallFrame(out _);
         var compatibilityRecheck = !timed &&
@@ -1605,6 +1625,7 @@ public static class KernelPthreadCompatExports
                 // A binary latch is enough to bridge the UE startup race and
                 // cannot build an unbounded backlog of stale condition wakes.
                 state.PendingSignals = 1;
+
             }
 
             TracePthreadCond(broadcast ? "broadcast" : "signal", condAddress, mutexAddress: 0, state, timed: false, (int)OrbisGen2Result.ORBIS_GEN2_OK);

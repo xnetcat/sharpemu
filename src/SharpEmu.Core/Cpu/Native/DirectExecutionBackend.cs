@@ -4844,6 +4844,25 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 		_stallWatchdogStop = false;
 
+		// Drives woken threads when every guest thread is parked (nothing dispatches then).
+		var dispatcherThread = new Thread(new ThreadStart(delegate
+		{
+			while (!_stallWatchdogStop)
+			{
+				Thread.Sleep(1);
+				WakeExpiredBlockedGuestThreads();
+				if (Volatile.Read(ref _readyGuestThreadCount) > 0 && _cpuContext is { } dispatchContext)
+				{
+					Pump(dispatchContext, "dispatcher");
+				}
+			}
+		}))
+		{
+			IsBackground = true,
+			Name = "SharpEmu-GuestThreadDispatcher"
+		};
+		dispatcherThread.Start();
+
 		long num = (long)((double)stallWatchdogSeconds * Stopwatch.Frequency);
 		int periodicSnapshotSeconds =
 			int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_PERIODIC_SNAPSHOT_SECONDS"), out var pss)
