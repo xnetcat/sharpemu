@@ -74,6 +74,22 @@ public static class KernelPthreadCompatExports
     {
         public object SyncRoot { get; } = new();
         public LinkedList<PthreadCondWaiter> Waiters { get; } = new();
+
+        // Unreal Engine can signal its worker condition before the worker has
+        // entered the emulated wait. Preserve such a signal as compatibility
+        // state so the worker does not fall into a timed-wait polling loop.
+        public int PendingSignals { get; set; }
+
+        public bool TryConsumePendingSignal()
+        {
+            if (PendingSignals <= 0)
+            {
+                return false;
+            }
+
+            PendingSignals--;
+            return true;
+        }
     }
 
     private sealed class PthreadCondWaiter
@@ -146,6 +162,30 @@ public static class KernelPthreadCompatExports
     {
         _ = ctx;
         Thread.Yield();
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "GBUY7ywdULE",
+        ExportName = "scePthreadRename",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int PthreadRename(CpuContext ctx)
+    {
+        if (_tracePthreads)
+        {
+            var nameAddress = ctx[CpuRegister.Rsi];
+            Span<byte> nameBytes = stackalloc byte[64];
+            var name = "<unreadable>";
+            if (nameAddress != 0 && ctx.Memory.TryRead(nameAddress, nameBytes))
+            {
+                var length = nameBytes.IndexOf((byte)0);
+                name = System.Text.Encoding.UTF8.GetString(length >= 0 ? nameBytes[..length] : nameBytes);
+            }
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] pthread.rename thread=0x{ctx[CpuRegister.Rdi]:X16} name=\"{name}\"");
+        }
+
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
@@ -1236,6 +1276,24 @@ public static class KernelPthreadCompatExports
             }
         }
 
+        var consumedPendingSignal = false;
+        lock (state.SyncRoot)
+        {
+            consumedPendingSignal = state.TryConsumePendingSignal();
+        }
+
+        if (consumedPendingSignal)
+        {
+            TracePthreadCond("wait-wake-pending", condAddress, mutexAddress, state, timed, (int)OrbisGen2Result.ORBIS_GEN2_OK);
+            var unlockResult = PthreadMutexUnlockCore(ctx, mutexAddress, requireOwner: true);
+            if (unlockResult != (int)OrbisGen2Result.ORBIS_GEN2_OK)
+            {
+                return unlockResult;
+            }
+
+            return PthreadMutexLockCore(ctx, mutexAddress, tryOnly: false);
+        }
+
         var cooperative = GuestThreadExecution.IsGuestThread &&
             GuestThreadExecution.TryGetCurrentImportCallFrame(out _);
         var waiter = new PthreadCondWaiter
@@ -1371,6 +1429,11 @@ public static class KernelPthreadCompatExports
                 }
 
                 node = next;
+            }
+
+            if (completedWaiters is null || completedWaiters.Count == 0)
+            {
+                state.PendingSignals++;
             }
 
             TracePthreadCond(broadcast ? "broadcast" : "signal", condAddress, mutexAddress: 0, state, timed: false, (int)OrbisGen2Result.ORBIS_GEN2_OK);
@@ -1815,7 +1878,7 @@ public static class KernelPthreadCompatExports
 
         Console.Error.WriteLine(
             $"[LOADER][TRACE] pthread_cond_{operation}: cond=0x{condAddress:X16} mutex=0x{mutexAddress:X16} " +
-            $"waiters={(state?.Waiters.Count ?? 0)} timed={timed} result=0x{unchecked((uint)result):X8}");
+            $"waiters={(state?.Waiters.Count ?? 0)} pending={(state?.PendingSignals ?? 0)} timed={timed} result=0x{unchecked((uint)result):X8}");
     }
 
     private static void TracePthreadCondCallsite(CpuContext ctx, ulong condAddress)

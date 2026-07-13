@@ -2856,11 +2856,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		{
 			return;
 		}
-		if (_guestThreadPumpDepth != 0)
+		if (Interlocked.CompareExchange(ref _guestThreadPumpDepth, 1, 0) != 0)
 		{
 			return;
 		}
-		_guestThreadPumpDepth++;
 		try
 		{
 			for (int i = 0; i < 8; i++)
@@ -2886,7 +2885,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 		finally
 		{
-			_guestThreadPumpDepth--;
+			Volatile.Write(ref _guestThreadPumpDepth, 0);
 		}
 	}
 
@@ -2929,9 +2928,18 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			}
 		}
 
-		if (wakeCount != 0 && _logGuestThreads)
+		if (wakeCount != 0)
 		{
-			Console.Error.WriteLine($"[LOADER][INFO] guest_threads.wake key={wakeKey} count={wakeCount}");
+			if (_logGuestThreads)
+			{
+				Console.Error.WriteLine($"[LOADER][INFO] guest_threads.wake key={wakeKey} count={wakeCount}");
+			}
+
+			// Pump or the readied thread waits for an import dispatch that never comes.
+			if (_cpuContext is { } wakeContext)
+			{
+				Pump(wakeContext, "wake");
+			}
 		}
 
 		return wakeCount;
@@ -4730,6 +4738,26 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			return;
 		}
 		_stallWatchdogStop = false;
+
+		// Drives woken threads when every guest thread is parked (nothing dispatches then).
+		var dispatcherThread = new Thread(new ThreadStart(delegate
+		{
+			while (!_stallWatchdogStop)
+			{
+				Thread.Sleep(1);
+				WakeExpiredBlockedGuestThreads();
+				if (Volatile.Read(ref _readyGuestThreadCount) > 0 && _cpuContext is { } dispatchContext)
+				{
+					Pump(dispatchContext, "dispatcher");
+				}
+			}
+		}))
+		{
+			IsBackground = true,
+			Name = "SharpEmu-GuestThreadDispatcher"
+		};
+		dispatcherThread.Start();
+
 		long num = (long)((double)stallWatchdogSeconds * Stopwatch.Frequency);
 		int periodicSnapshotSeconds =
 			int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_PERIODIC_SNAPSHOT_SECONDS"), out var pss)
@@ -4780,6 +4808,15 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					MarkExecutionProgress();
 					continue;
 				}
+				if (IsExpectedBlockingImportStall(out var blockingNid, out var blockingName))
+				{
+					Console.Error.WriteLine(
+						$"[LOADER][WARN] No import progress for {stallWatchdogSeconds}s while waiting in {blockingName} ({blockingNid}); continuing.");
+					LogStallWatchdogSnapshot();
+					Console.Error.Flush();
+					MarkExecutionProgress();
+					continue;
+				}
 				if (Interlocked.Exchange(ref _stallWatchdogTriggered, 1) != 0)
 				{
 					continue;
@@ -4810,6 +4847,38 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					return true;
 				}
 			}
+		}
+
+		return false;
+	}
+
+	// A thread parked in a blocking wait is idle by design, not stalled.
+	private bool IsExpectedBlockingImportStall(out string nid, out string name)
+	{
+		nid = string.Empty;
+		name = string.Empty;
+		var cpuContext = _cpuContext;
+		if (cpuContext is null)
+		{
+			return false;
+		}
+
+		var importAddress = cpuContext.Rip & 0xFFFFFFFFFFFFFFF0uL;
+		foreach (var entry in _importEntries)
+		{
+			if (entry.Address != importAddress)
+			{
+				continue;
+			}
+
+			nid = entry.Nid;
+			name = _moduleManager.TryGetExport(nid, out var export)
+				? $"{export.LibraryName}:{export.Name}"
+				: nid;
+			return nid is
+				"Op8TBGY5KHg" or // pthread_cond_wait
+				"27bAgiJmOh0" or // pthread_cond_timedwait
+				"fzyMKs9kim0";   // sceKernelWaitEqueue
 		}
 
 		return false;
