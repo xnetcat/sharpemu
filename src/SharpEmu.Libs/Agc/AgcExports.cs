@@ -18,7 +18,6 @@ public static class AgcExports
         ValidateWriteDataControlDecoders();
         ValidateDispatchInitiators();
         ValidateSubmittedQueueAndReleaseMemDecoders();
-        ValidateAcquireMemAndQueueResetDecoders();
         ValidateDepthTargetDecoder();
     }
 #endif
@@ -493,54 +492,6 @@ public static class AgcExports
         uint ThreadCountX,
         uint ThreadCountY,
         uint ThreadCountZ);
-
-    private readonly record struct SubmittedAcquireMem(
-        uint Engine,
-        uint CbDbControl,
-        ulong BaseAddress,
-        ulong SizeBytes,
-        uint PollInterval,
-        uint GcrControl)
-    {
-        // GFX10 GCR_CNTL invalidation controls. The host has no separate GLI,
-        // GLM, GLK, GLV, GL1 and GL2 caches; they all converge on the guest
-        // memory snapshots used to build Vulkan resources.
-        private const uint GliInvalidateMask = 0x3u;
-        private const int Gl1RangeShift = 2;
-        private const uint Gl1RangeMask = 0x3u;
-        private const uint GlmInvalidate = 1u << 5;
-        private const uint GlkInvalidate = 1u << 7;
-        private const uint GlvInvalidate = 1u << 8;
-        private const uint Gl1Invalidate = 1u << 9;
-        private const uint Gl2Discard = 1u << 13;
-        private const uint Gl2Invalidate = 1u << 14;
-        private const int Gl2RangeShift = 11;
-        private const uint Gl2RangeMask = 0x3u;
-
-        public bool InvalidatesGuestResources =>
-            (GcrControl & (GliInvalidateMask |
-                           GlmInvalidate |
-                           GlkInvalidate |
-                           GlvInvalidate |
-                           Gl1Invalidate |
-                           Gl2Discard |
-                           Gl2Invalidate)) != 0;
-
-        // sceAgc encodes its all-memory sentinel with a zero COHER_SIZE. GFX10
-        // can also request ALL independently in GLI_INV, GL1_RANGE or
-        // GL2_RANGE; in the host's unified resource cache, any invalidated
-        // domain with ALL scope expands the operation to all tracked images.
-        public bool CoversAllGuestMemory =>
-            SizeBytes == 0 ||
-            (GcrControl & GliInvalidateMask) == 1u ||
-            ((GcrControl & (GlmInvalidate |
-                            GlkInvalidate |
-                            GlvInvalidate |
-                            Gl1Invalidate)) != 0 &&
-             ((GcrControl >> Gl1RangeShift) & Gl1RangeMask) == 0) ||
-            ((GcrControl & (Gl2Discard | Gl2Invalidate)) != 0 &&
-             ((GcrControl >> Gl2RangeShift) & Gl2RangeMask) == 0);
-    }
 
     private sealed class SubmittedDcbState
     {
@@ -2668,9 +2619,6 @@ public static class AgcExports
             return false;
         }
 
-        using var guestQueueScope = VulkanVideoPresenter.EnterGuestQueue(
-            state.QueueName,
-            state.ActiveSubmissionId);
         var windowByteCount = checked((int)(dwordCount * sizeof(uint)));
         var rented = System.Buffers.ArrayPool<byte>.Shared.Rent(windowByteCount);
         try
@@ -2750,27 +2698,6 @@ public static class AgcExports
             if (_traceDraws)
             {
                 CountSubmittedOpcode(op, register);
-            }
-
-            if (op == ItNop &&
-                register is RDrawReset or RAcbReset &&
-                length >= 2)
-            {
-                ResetSubmittedParserState(state);
-                TraceAgc(
-                    $"agc.queue_reset queue={state.QueueName} " +
-                    $"submission={state.ActiveSubmissionId} " +
-                    $"kind={(register == RDrawReset ? "draw" : "acb")} " +
-                    $"packet=0x{currentAddress:X16}");
-            }
-
-            if (op == ItNop && register == RAcquireMem && length >= 8)
-            {
-                ApplySubmittedAcquireMem(
-                    ctx,
-                    state,
-                    currentAddress,
-                    tracePackets);
             }
 
             if (op == ItSetShReg &&
@@ -3167,8 +3094,9 @@ public static class AgcExports
             producerLength,
             debugName);
 
-        void CompleteAndWake()
+        void ApplyAndWake()
         {
+            action();
             CompleteLabelProducer(producer);
             if (GpuWaitRegistry.Count == 0)
             {
@@ -3190,29 +3118,11 @@ public static class AgcExports
                 preferLocal: false);
         }
 
-        void ApplyAndQueueCompletion()
-        {
-            action();
-            // DMA side effects can enqueue a Vulkan image mirror while this
-            // ordered action is executing. Completing the label here would
-            // wake another queue before that mirror is visible. Queue a
-            // second same-queue ordered action after all immediate follow-up
-            // writes; it fences those writes before publishing the producer.
-            if (VulkanVideoPresenter.SubmitOrderedGuestAction(
-                    CompleteAndWake,
-                    $"{debugName} completion") == 0)
-            {
-                CompleteAndWake();
-            }
-        }
-
-        if (VulkanVideoPresenter.SubmitOrderedGuestAction(
-                ApplyAndQueueCompletion,
-                debugName) == 0)
+        if (VulkanVideoPresenter.SubmitOrderedGuestAction(ApplyAndWake, debugName) == 0)
         {
             // Headless/startup submissions have no Vulkan queue to order
             // against, so retaining the previous immediate behavior is exact.
-            ApplyAndQueueCompletion();
+            ApplyAndWake();
         }
     }
 
@@ -3360,156 +3270,6 @@ public static class AgcExports
             $"action='{producer.DebugName}'");
     }
 
-    private static void ApplySubmittedAcquireMem(
-        CpuContext ctx,
-        SubmittedDcbState state,
-        ulong packetAddress,
-        bool tracePacket)
-    {
-        if (!TryDecodeSubmittedAcquireMem(ctx, packetAddress, out var acquire))
-        {
-            TraceAgc(
-                $"agc.acquire_mem_decode_failed queue={state.QueueName} " +
-                $"submission={state.ActiveSubmissionId} packet=0x{packetAddress:X16}");
-            return;
-        }
-
-        var queueName = state.QueueName;
-        var submissionId = state.ActiveSubmissionId;
-        var debugName =
-            $"acquire_mem base=0x{acquire.BaseAddress:X16} size=0x{acquire.SizeBytes:X16} " +
-            $"gcr=0x{acquire.GcrControl:X8}";
-        void ApplyAcquire()
-        {
-            // ExecuteOrderedGuestAction first flushes and waits for this guest
-            // queue, then writes back dirty guest buffers. At that exact PM4
-            // point, refresh only tracked guest images covered by the acquire
-            // range. Cached sampled textures use the same dirty tracker and
-            // are evicted by the presenter without throwing away clean cache
-            // entries (hardware invalidation does not imply changed bytes).
-            if (acquire.InvalidatesGuestResources)
-            {
-                SyncCpuWrittenGuestImages(
-                    ctx,
-                    acquire.BaseAddress,
-                    acquire.CoversAllGuestMemory
-                        ? ulong.MaxValue
-                        : acquire.SizeBytes);
-            }
-
-            if (tracePacket)
-            {
-                TraceAgc(
-                    $"agc.acquire_mem_applied queue={queueName} " +
-                    $"submission={submissionId} packet=0x{packetAddress:X16} " +
-                    $"work_sequence={VulkanVideoPresenter.CurrentGuestWorkSequenceForDiagnostics}");
-            }
-        }
-
-        var sequence = VulkanVideoPresenter.SubmitOrderedGuestAction(
-            ApplyAcquire,
-            debugName);
-        if (sequence == 0)
-        {
-            // Headless startup has no host GPU queue, but the guest-memory
-            // cache model still needs the same invalidation semantics.
-            ApplyAcquire();
-        }
-
-        // The bulk PM4 read is itself a parser-side cache. Do not retain it
-        // across a guest cache-invalidation point; subsequent packets return
-        // to live guest memory while the host barrier remains ordered in the
-        // logical GPU queue. Submission stays asynchronous, matching hardware
-        // and avoiding a CPU stall for every ACQUIRE_MEM packet.
-        _dcbWindowBuffer = null;
-        _dcbWindowByteLength = 0;
-
-        if (tracePacket)
-        {
-            TraceAgc(
-                $"agc.acquire_mem queue={queueName} " +
-                $"submission={submissionId} packet=0x{packetAddress:X16} " +
-                $"engine={acquire.Engine} cbdb=0x{acquire.CbDbControl:X8} " +
-                $"base=0x{acquire.BaseAddress:X16} size=0x{acquire.SizeBytes:X16} " +
-                $"scope={(acquire.CoversAllGuestMemory ? "all" : "range")} " +
-                $"poll={acquire.PollInterval} gcr=0x{acquire.GcrControl:X8} " +
-                $"resource_inv={acquire.InvalidatesGuestResources} " +
-                $"sequence={sequence} scheduled={(sequence != 0)}");
-        }
-    }
-
-    private static bool TryDecodeSubmittedAcquireMem(
-        CpuContext ctx,
-        ulong packetAddress,
-        out SubmittedAcquireMem acquire)
-    {
-        if (!TryReadUInt32(ctx, packetAddress + 4, out var coherControl) ||
-            !TryReadUInt32(ctx, packetAddress + 8, out var sizeLow) ||
-            !TryReadUInt32(ctx, packetAddress + 12, out var sizeHigh) ||
-            !TryReadUInt32(ctx, packetAddress + 16, out var baseLow) ||
-            !TryReadUInt32(ctx, packetAddress + 20, out var baseHigh) ||
-            !TryReadUInt32(ctx, packetAddress + 24, out var pollInterval) ||
-            !TryReadUInt32(ctx, packetAddress + 28, out var gcrControl))
-        {
-            acquire = default;
-            return false;
-        }
-
-        acquire = DecodeSubmittedAcquireMem(
-            coherControl,
-            sizeLow,
-            sizeHigh,
-            baseLow,
-            baseHigh,
-            pollInterval,
-            gcrControl);
-        return true;
-    }
-
-    private static SubmittedAcquireMem DecodeSubmittedAcquireMem(
-        uint coherControl,
-        uint sizeLow,
-        uint sizeHigh,
-        uint baseLow,
-        uint baseHigh,
-        uint pollInterval,
-        uint gcrControl)
-    {
-        // GFX10 ACQUIRE_MEM expresses COHER_SIZE and COHER_BASE in 256-byte
-        // units. SIZE_HI is 8 bits and BASE_HI is 24 bits in the packet.
-        var sizeUnits = sizeLow | ((ulong)(sizeHigh & 0xFFu) << 32);
-        var baseUnits = baseLow | ((ulong)(baseHigh & 0x00FF_FFFFu) << 32);
-        return new SubmittedAcquireMem(
-            Engine: coherControl >> 31,
-            CbDbControl: coherControl & 0x7FFF_FFFFu,
-            BaseAddress: baseUnits << 8,
-            SizeBytes: sizeUnits << 8,
-            PollInterval: pollInterval & 0xFFFFu,
-            GcrControl: gcrControl & 0x7FFFFu);
-    }
-
-    private static void ResetSubmittedParserState(SubmittedDcbState state)
-    {
-        // Queue ownership, pending submissions and suspension bookkeeping are
-        // deliberately retained. Work emitted before this packet already owns
-        // immutable snapshots; clearing these fields affects only commands
-        // translated after RESET at this precise packet position.
-        state.CxRegisters.Clear();
-        state.ShRegisters.Clear();
-        state.UcRegisters.Clear();
-        state.PresenterTexture = null;
-        state.GuestDrawKind = GuestDrawKind.None;
-        state.TranslatedDraw = null;
-        state.RenderTargetWriters.Clear();
-        state.IndirectArgsAddress = 0;
-        state.SawIndexedDraw = false;
-        state.IndexBufferAddress = 0;
-        state.IndexBufferCount = 0;
-        state.IndexSize = 0;
-        state.InstanceCount = 1;
-        state.DrawIndexOffset = 0;
-    }
-
     private static bool RangesOverlap(
         ulong leftAddress,
         ulong leftLength,
@@ -3542,24 +3302,15 @@ public static class AgcExports
     /// </summary>
     private static long _guestImageSyncTraceCount;
 
-    private static void SyncCpuWrittenGuestImages(
-        CpuContext ctx,
-        ulong scopeAddress = 0,
-        ulong scopeByteCount = ulong.MaxValue)
+    private static void SyncCpuWrittenGuestImages(CpuContext ctx)
     {
-        if (!SharpEmu.HLE.GuestImageWriteTracker.Enabled || scopeByteCount == 0)
+        if (!SharpEmu.HLE.GuestImageWriteTracker.Enabled)
         {
             return;
         }
 
         foreach (var (address, width, height, byteCount) in VulkanVideoPresenter.GetGuestImageExtents())
         {
-            if (scopeByteCount != ulong.MaxValue &&
-                !RangesOverlap(address, byteCount, scopeAddress, scopeByteCount))
-            {
-                continue;
-            }
-
             if (!SharpEmu.HLE.GuestImageWriteTracker.ConsumeDirty(address))
             {
                 continue;
@@ -3925,68 +3676,6 @@ public static class AgcExports
         System.Diagnostics.Debug.Assert(
             PatchUInt32Bits(0xABCD_1234u, 0x00FF_0000u, 3u << 16) ==
             0xAB03_1234u);
-    }
-
-    private static void ValidateAcquireMemAndQueueResetDecoders()
-    {
-        var range = DecodeSubmittedAcquireMem(
-            0x8000_7FC0u,
-            0x0000_0123u,
-            0x45u,
-            0x89AB_CDEFu,
-            0x0012_3456u,
-            0x1_000Au,
-            0x0001_0388u);
-        System.Diagnostics.Debug.Assert(range.Engine == 1u);
-        System.Diagnostics.Debug.Assert(range.CbDbControl == 0x7FC0u);
-        System.Diagnostics.Debug.Assert(range.SizeBytes == 0x0000_4500_0001_2300UL);
-        System.Diagnostics.Debug.Assert(range.BaseAddress == 0x1234_5689_ABCD_EF00UL);
-        System.Diagnostics.Debug.Assert(range.PollInterval == 0xAu);
-        System.Diagnostics.Debug.Assert(range.InvalidatesGuestResources);
-        System.Diagnostics.Debug.Assert(!range.CoversAllGuestMemory);
-
-        var all = DecodeSubmittedAcquireMem(0, 0, 0, 0, 0, 0, 0x280u);
-        System.Diagnostics.Debug.Assert(all.CoversAllGuestMemory);
-        System.Diagnostics.Debug.Assert(all.InvalidatesGuestResources);
-        var explicitAll = DecodeSubmittedAcquireMem(0, 1, 0, 0, 0, 0, 0x103C0u);
-        System.Diagnostics.Debug.Assert(explicitAll.CoversAllGuestMemory);
-
-        var queue = new SubmittedDcbState
-        {
-            QueueName = "validator",
-            ActiveSubmissionId = 7,
-            HasActiveSubmission = true,
-            IsSuspended = true,
-            IndexBufferAddress = 0x1000,
-            IndexBufferCount = 12,
-            IndexSize = 1,
-            InstanceCount = 4,
-            DrawIndexOffset = 2,
-            IndirectArgsAddress = 0x2000,
-            SawIndexedDraw = true,
-            GuestDrawKind = GuestDrawKind.FullscreenBarycentric,
-        };
-        queue.CxRegisters.Add(1, 2);
-        queue.ShRegisters.Add(3, 4);
-        queue.UcRegisters.Add(5, 6);
-        queue.PendingSubmissions.Enqueue(new(0x3000, 2, 8, false));
-        ResetSubmittedParserState(queue);
-        System.Diagnostics.Debug.Assert(queue.CxRegisters.Count == 0);
-        System.Diagnostics.Debug.Assert(queue.ShRegisters.Count == 0);
-        System.Diagnostics.Debug.Assert(queue.UcRegisters.Count == 0);
-        System.Diagnostics.Debug.Assert(queue.IndexBufferAddress == 0);
-        System.Diagnostics.Debug.Assert(queue.IndexBufferCount == 0);
-        System.Diagnostics.Debug.Assert(queue.IndexSize == 0);
-        System.Diagnostics.Debug.Assert(queue.InstanceCount == 1);
-        System.Diagnostics.Debug.Assert(queue.DrawIndexOffset == 0);
-        System.Diagnostics.Debug.Assert(queue.IndirectArgsAddress == 0);
-        System.Diagnostics.Debug.Assert(!queue.SawIndexedDraw);
-        System.Diagnostics.Debug.Assert(queue.GuestDrawKind == GuestDrawKind.None);
-        System.Diagnostics.Debug.Assert(queue.QueueName == "validator");
-        System.Diagnostics.Debug.Assert(queue.ActiveSubmissionId == 7);
-        System.Diagnostics.Debug.Assert(queue.HasActiveSubmission);
-        System.Diagnostics.Debug.Assert(queue.IsSuspended);
-        System.Diagnostics.Debug.Assert(queue.PendingSubmissions.Count == 1);
     }
 
     private static void ValidateDepthTargetDecoder()
@@ -7938,11 +7627,7 @@ public static class AgcExports
                     return;
                 }
 
-                GuestImageWriteTracker.Track(
-                    destinationAddress,
-                    (ulong)output.Length,
-                    VulkanVideoPresenter.CurrentGuestWorkSequenceForDiagnostics,
-                    "agc.masked-dword-copy");
+                GuestImageWriteTracker.Track(destinationAddress, (ulong)output.Length);
             },
             $"masked_dword_copy dst=0x{destinationAddress:X16} bytes={output.Length}");
         description =

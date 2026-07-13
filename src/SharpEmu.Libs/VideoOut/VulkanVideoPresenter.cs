@@ -224,13 +224,6 @@ internal sealed record VulkanOrderedGuestAction(
     Action Action,
     string DebugName);
 
-internal readonly record struct VulkanGuestQueueIdentity(
-    string Name,
-    ulong SubmissionId)
-{
-    public static VulkanGuestQueueIdentity Default { get; } = new("host.default", 0);
-}
-
 internal static unsafe class VulkanVideoPresenter
 {
     private const uint DefaultWindowWidth = 1280;
@@ -322,25 +315,9 @@ internal static unsafe class VulkanVideoPresenter
     private const uint GuestPrimitiveRectList = 0x11;
 
     private static readonly object _gate = new();
-    private readonly record struct PendingGuestWork(
-        object Work,
-        ulong PayloadBytes,
-        long Sequence,
-        long RequiredSequence,
-        long EnqueuedTicks,
-        VulkanGuestQueueIdentity Queue);
+    private readonly record struct PendingGuestWork(object Work, ulong PayloadBytes);
 
-    // PS5 exposes independent graphics and asynchronous-compute queues. A
-    // single host FIFO adds dependencies that do not exist in the guest: one
-    // slow ACB dispatch can delay a graphics clear until the CPU has reused
-    // that heap. Keep FIFO order within each logical guest queue and schedule
-    // ready queues round-robin. Explicit WAIT_REG_MEM packets remain the only
-    // mechanism that orders one logical queue behind another.
-    private static readonly Dictionary<string, LinkedList<PendingGuestWork>>
-        _pendingGuestWorkByQueue = new(StringComparer.Ordinal);
-    private static readonly List<string> _pendingGuestQueueSchedule = [];
-    private static int _pendingGuestQueueCursor;
-    private static int _pendingGuestWorkCount;
+    private static readonly Queue<PendingGuestWork> _pendingGuestWork = new();
     private static ulong _pendingGuestWorkBytes;
     // A flip names an image that was rendered earlier in the command stream.
     // Keep a small FIFO of those flips instead of replacing an incomplete one
@@ -355,8 +332,7 @@ internal static unsafe class VulkanVideoPresenter
     // multi-megabyte guest-memory snapshot while waiting for that first writer
     // to reach the presenter.  Reference counts let failed/completed work
     // retire its reservation without leaving a permanent false cache hit.
-    private readonly record struct PendingGuestImageUpload(int Count, long OwnerSequence);
-    private static readonly Dictionary<(ulong Address, uint Format), PendingGuestImageUpload>
+    private static readonly Dictionary<(ulong Address, uint Format), int>
         _pendingGuestImageUploads = new();
     private static readonly Dictionary<ulong, byte[]> _pendingGuestImageInitialData = new();
     private static readonly Dictionary<ulong, (uint Width, uint Height, ulong ByteCount)>
@@ -384,59 +360,7 @@ internal static unsafe class VulkanVideoPresenter
     private const string PortabilitySubsetExtensionName = "VK_KHR_portability_subset";
     private static bool _splashHidden;
     private static long _enqueuedGuestWorkSequence;
-    // Largest contiguous completed sequence, retained for compact diagnostics.
-    // Per-queue scheduling can complete a later global id first, so correctness
-    // checks use IsGuestWorkCompletedLocked rather than numeric <= comparisons.
     private static long _completedGuestWorkSequence;
-    private static readonly HashSet<long> _completedGuestWorkOutOfOrder = [];
-    private static readonly Dictionary<string, long> _lastEnqueuedGuestWorkByQueue =
-        new(StringComparer.Ordinal);
-    private static long _executingGuestWorkSequence;
-    [ThreadStatic]
-    private static VulkanGuestQueueIdentity? _submittingGuestQueue;
-    [ThreadStatic]
-    private static bool _enqueueAsImmediateQueueFollowup;
-    [ThreadStatic]
-    private static LinkedListNode<PendingGuestWork>? _immediateFollowupTail;
-
-    private sealed class GuestQueueScope : IDisposable
-    {
-        private readonly VulkanGuestQueueIdentity? _previous;
-        private bool _disposed;
-
-        public GuestQueueScope(VulkanGuestQueueIdentity queue)
-        {
-            _previous = _submittingGuestQueue;
-            _submittingGuestQueue = queue;
-        }
-
-        public void Dispose()
-        {
-            if (_disposed)
-            {
-                return;
-            }
-
-            _disposed = true;
-            _submittingGuestQueue = _previous;
-        }
-    }
-
-    public static IDisposable EnterGuestQueue(
-        string queueName,
-        ulong submissionId) =>
-        new GuestQueueScope(new VulkanGuestQueueIdentity(
-            string.IsNullOrWhiteSpace(queueName) ? "guest.unknown" : queueName,
-            submissionId));
-
-    private static long CurrentSubmittingQueueTailLocked()
-    {
-        var queue = _submittingGuestQueue;
-        return queue is { } identity &&
-            _lastEnqueuedGuestWorkByQueue.TryGetValue(identity.Name, out var tail)
-                ? tail
-                : 0;
-    }
 
     public static void EnsureStarted(uint width, uint height)
     {
@@ -474,7 +398,7 @@ internal static unsafe class VulkanVideoPresenter
                     1,
                     GuestDrawKind.None,
                     TranslatedDraw: null,
-                    RequiredGuestWorkSequence: 0,
+                    RequiredGuestWorkSequence: _enqueuedGuestWorkSequence,
                     IsSplash: false)
                 : hasSplash
                 ? new Presentation(
@@ -484,7 +408,7 @@ internal static unsafe class VulkanVideoPresenter
                     1,
                     GuestDrawKind.None,
                     TranslatedDraw: null,
-                    RequiredGuestWorkSequence: 0,
+                    RequiredGuestWorkSequence: _enqueuedGuestWorkSequence,
                     IsSplash: true)
                 : new Presentation(
                     null,
@@ -493,7 +417,7 @@ internal static unsafe class VulkanVideoPresenter
                     0,
                     GuestDrawKind.None,
                     TranslatedDraw: null,
-                    RequiredGuestWorkSequence: 0,
+                    RequiredGuestWorkSequence: _enqueuedGuestWorkSequence,
                     IsSplash: false);
             StartPresenterLocked();
         }
@@ -517,7 +441,7 @@ internal static unsafe class VulkanVideoPresenter
                 sequence,
                 GuestDrawKind.None,
                 TranslatedDraw: null,
-                RequiredGuestWorkSequence: 0,
+                RequiredGuestWorkSequence: _enqueuedGuestWorkSequence,
                 IsSplash: false);
             Console.Error.WriteLine("[LOADER][INFO] Vulkan VideoOut hid splash");
         }
@@ -545,7 +469,7 @@ internal static unsafe class VulkanVideoPresenter
                 sequence,
                 GuestDrawKind.None,
                 TranslatedDraw: null,
-                RequiredGuestWorkSequence: 0,
+                RequiredGuestWorkSequence: _enqueuedGuestWorkSequence,
                 IsSplash: false);
             if (_thread is not null)
             {
@@ -584,7 +508,7 @@ internal static unsafe class VulkanVideoPresenter
                 sequence,
                 drawKind,
                 TranslatedDraw: null,
-                RequiredGuestWorkSequence: CurrentSubmittingQueueTailLocked(),
+                RequiredGuestWorkSequence: _enqueuedGuestWorkSequence,
                 IsSplash: false);
             if (_thread is not null)
             {
@@ -643,7 +567,7 @@ internal static unsafe class VulkanVideoPresenter
                     primitiveType,
                     indexBuffer,
                     renderState ?? VulkanGuestRenderState.Default),
-                RequiredGuestWorkSequence: CurrentSubmittingQueueTailLocked(),
+                RequiredGuestWorkSequence: _enqueuedGuestWorkSequence,
                 IsSplash: false);
             if (_thread is not null)
             {
@@ -969,9 +893,9 @@ internal static unsafe class VulkanVideoPresenter
             foreach (var key in GetStorageImageUploadKeys(textures))
             {
                 _pendingGuestImageUploads[key] =
-                    _pendingGuestImageUploads.TryGetValue(key, out var pendingUpload)
-                        ? pendingUpload with { Count = checked(pendingUpload.Count + 1) }
-                        : new PendingGuestImageUpload(1, workSequence);
+                    _pendingGuestImageUploads.TryGetValue(key, out var count)
+                        ? checked(count + 1)
+                        : 1;
             }
 
             foreach (var texture in textures)
@@ -1002,19 +926,6 @@ internal static unsafe class VulkanVideoPresenter
         }
     }
 
-    /// <summary>
-    /// Sequence currently being executed by the single guest-work consumer.
-    /// Intended only for address-filtered lifetime diagnostics emitted from a
-    /// guest-work callback before <see cref="CompleteGuestWork"/> advances it.
-    /// </summary>
-    public static long CurrentGuestWorkSequenceForDiagnostics =>
-        Volatile.Read(ref _executingGuestWorkSequence);
-
-    private static bool IsGuestWorkCompletedLocked(long sequence) =>
-        sequence <= 0 ||
-        sequence <= _completedGuestWorkSequence ||
-        _completedGuestWorkOutOfOrder.Contains(sequence);
-
     public static bool WaitForGuestWork(
         long workSequence,
         int timeoutMilliseconds = System.Threading.Timeout.Infinite)
@@ -1030,7 +941,7 @@ internal static unsafe class VulkanVideoPresenter
             : Environment.TickCount64 + Math.Max(timeoutMilliseconds, 1);
         lock (_gate)
         {
-            while (!_closed && !IsGuestWorkCompletedLocked(workSequence))
+            while (!_closed && _completedGuestWorkSequence < workSequence)
             {
                 if (!waitIndefinitely)
                 {
@@ -1039,8 +950,7 @@ internal static unsafe class VulkanVideoPresenter
                     {
                         Console.Error.WriteLine(
                             $"[LOADER][WARN] Vulkan guest work wait timed out " +
-                            $"sequence={workSequence} contiguous_completed={_completedGuestWorkSequence} " +
-                            $"out_of_order={_completedGuestWorkOutOfOrder.Count}");
+                            $"sequence={workSequence} completed={_completedGuestWorkSequence}");
                         return false;
                     }
 
@@ -1059,7 +969,7 @@ internal static unsafe class VulkanVideoPresenter
                 System.Threading.Monitor.Wait(_gate, 1_000);
             }
 
-            return IsGuestWorkCompletedLocked(workSequence);
+            return _completedGuestWorkSequence >= workSequence;
         }
     }
 
@@ -1485,7 +1395,7 @@ internal static unsafe class VulkanVideoPresenter
             if (_pendingGuestImagePresentations.Count > 0)
             {
                 var pending = _pendingGuestImagePresentations.Peek();
-                if (IsGuestWorkCompletedLocked(pending.RequiredGuestWorkSequence))
+                if (pending.RequiredGuestWorkSequence <= _completedGuestWorkSequence)
                 {
                     presentation = _pendingGuestImagePresentations.Dequeue();
                     TryReplaceWithBinkFrame(ref presentation);
@@ -1498,7 +1408,7 @@ internal static unsafe class VulkanVideoPresenter
 
             if (_latestPresentation is not { } latest ||
                 latest.Sequence == presentedSequence ||
-                !IsGuestWorkCompletedLocked(latest.RequiredGuestWorkSequence))
+                latest.RequiredGuestWorkSequence > _completedGuestWorkSequence)
             {
                 if (_latestPresentation is { } rej &&
                     rej.GuestImageAddress != 0 &&
@@ -1506,9 +1416,8 @@ internal static unsafe class VulkanVideoPresenter
                 {
                     var reason = rej.Sequence == presentedSequence
                         ? "already-presented(seq==presented)"
-                        : !IsGuestWorkCompletedLocked(rej.RequiredGuestWorkSequence)
-                            ? $"work-not-done(req={rej.RequiredGuestWorkSequence}>" +
-                              $"contiguous_done={_completedGuestWorkSequence})"
+                        : rej.RequiredGuestWorkSequence > _completedGuestWorkSequence
+                            ? $"work-not-done(req={rej.RequiredGuestWorkSequence}>done={_completedGuestWorkSequence})"
                             : "unknown";
                     Console.Error.WriteLine(
                         $"[LOADER][WARN] vk.guest_present_rejected addr=0x{rej.GuestImageAddress:X16} " +
@@ -1551,7 +1460,7 @@ internal static unsafe class VulkanVideoPresenter
         var backpressureLogged = false;
         while (!_closed &&
                _thread is not null &&
-               (_pendingGuestWorkCount >= MaxPendingGuestWork ||
+               (_pendingGuestWork.Count >= MaxPendingGuestWork ||
                 // Always admit one item when no payload is outstanding, even
                 // when that single item exceeds the configured budget. This
                 // avoids an impossible wait while still bounding the normal
@@ -1565,8 +1474,7 @@ internal static unsafe class VulkanVideoPresenter
                 backpressureLogged = true;
                 Console.Error.WriteLine(
                     $"[LOADER][TRACE] vk.guest_queue_backpressure " +
-                    $"queued={_pendingGuestWorkCount} " +
-                    $"logical_queues={_pendingGuestWorkByQueue.Count} " +
+                    $"queued={_pendingGuestWork.Count} " +
                     $"retained_mb={_pendingGuestWorkBytes / (1024 * 1024)} " +
                     $"incoming_mb={payloadBytes / (1024 * 1024)} " +
                     $"budget_mb={_maxPendingGuestWorkBytes / (1024 * 1024)} " +
@@ -1581,178 +1489,28 @@ internal static unsafe class VulkanVideoPresenter
             return 0;
         }
 
-        var queue = _submittingGuestQueue ?? VulkanGuestQueueIdentity.Default;
-        var sequence = ++_enqueuedGuestWorkSequence;
-        _lastEnqueuedGuestWorkByQueue[queue.Name] = sequence;
-        var requiredSequence = GetGuestWorkDependencyLocked(work);
-        if (!_pendingGuestWorkByQueue.TryGetValue(queue.Name, out var pendingQueue))
-        {
-            pendingQueue = new LinkedList<PendingGuestWork>();
-            _pendingGuestWorkByQueue.Add(queue.Name, pendingQueue);
-            _pendingGuestQueueSchedule.Add(queue.Name);
-        }
-
-        var pending = new PendingGuestWork(
-            work,
-            payloadBytes,
-            sequence,
-            requiredSequence,
-            System.Diagnostics.Stopwatch.GetTimestamp(),
-            queue);
-        if (_enqueueAsImmediateQueueFollowup &&
-            _immediateFollowupTail is { List: not null } tail &&
-            ReferenceEquals(tail.List, pendingQueue))
-        {
-            _immediateFollowupTail = pendingQueue.AddAfter(tail, pending);
-        }
-        else if (_enqueueAsImmediateQueueFollowup)
-        {
-            _immediateFollowupTail = pendingQueue.AddFirst(pending);
-        }
-        else
-        {
-        pendingQueue.AddLast(pending);
-        }
-        RecordGuestImageWritersLocked(work, sequence);
-        _pendingGuestWorkCount++;
+        _pendingGuestWork.Enqueue(new PendingGuestWork(work, payloadBytes));
         _pendingGuestWorkBytes = SaturatingAdd(_pendingGuestWorkBytes, payloadBytes);
-        return sequence;
-    }
-
-    private static long GetGuestWorkDependencyLocked(object work)
-    {
-        IReadOnlyList<VulkanGuestDrawTexture> textures = work switch
-        {
-            VulkanOffscreenGuestDraw draw => draw.Draw.Textures,
-            VulkanComputeGuestDispatch compute => compute.Textures,
-            _ => Array.Empty<VulkanGuestDrawTexture>(),
-        };
-        var required = 0L;
-        foreach (var texture in textures)
-        {
-            if (!texture.IsStorage ||
-                texture.Address == 0 ||
-                texture.RgbaPixels.Length != 0)
-            {
-                continue;
-            }
-
-            var format = GetGuestTextureFormat(texture.Format, texture.NumberType);
-            if (_pendingGuestImageUploads.TryGetValue(
-                    (texture.Address, format),
-                    out var pendingUpload))
-            {
-                required = Math.Max(required, pendingUpload.OwnerSequence);
-            }
-        }
-
-        return required;
-    }
-
-    private static void RecordGuestImageWritersLocked(object work, long sequence)
-    {
-        static IEnumerable<ulong> StorageAddresses(
-            IReadOnlyList<VulkanGuestDrawTexture> textures) =>
-            textures
-                .Where(static texture => texture.IsStorage && texture.Address != 0)
-                .Select(static texture => texture.Address);
-
-        IEnumerable<ulong> addresses = work switch
-        {
-            VulkanOffscreenGuestDraw draw =>
-                (draw.PublishTarget && draw.Target.Address != 0
-                    ? new[] { draw.Target.Address }
-                    : Array.Empty<ulong>())
-                .Concat(StorageAddresses(draw.Draw.Textures)),
-            VulkanComputeGuestDispatch compute => StorageAddresses(compute.Textures),
-            VulkanGuestImageWrite imageWrite when imageWrite.Address != 0 =>
-                new[] { imageWrite.Address },
-            _ => Array.Empty<ulong>(),
-        };
-        foreach (var address in addresses.Distinct())
-        {
-            _guestImageWorkSequences[address] = sequence;
-        }
+        return ++_enqueuedGuestWorkSequence;
     }
 
     private static bool TryTakeGuestWork(out PendingGuestWork work)
     {
         lock (_gate)
         {
-            var queuesToProbe = _pendingGuestQueueSchedule.Count;
-            while (_pendingGuestQueueSchedule.Count > 0 && queuesToProbe > 0)
-            {
-                if (_pendingGuestQueueCursor >= _pendingGuestQueueSchedule.Count)
-                {
-                    _pendingGuestQueueCursor = 0;
-                }
-
-                var queueName = _pendingGuestQueueSchedule[_pendingGuestQueueCursor];
-                if (!_pendingGuestWorkByQueue.TryGetValue(queueName, out var queue) ||
-                    queue.First is not { } first)
-                {
-                    _pendingGuestWorkByQueue.Remove(queueName);
-                    _pendingGuestQueueSchedule.RemoveAt(_pendingGuestQueueCursor);
-                    queuesToProbe = Math.Min(
-                        queuesToProbe,
-                        _pendingGuestQueueSchedule.Count);
-                    continue;
-                }
-
-                work = first.Value;
-                if (!IsGuestWorkCompletedLocked(work.RequiredSequence))
-                {
-                    _pendingGuestQueueCursor =
-                        (_pendingGuestQueueCursor + 1) % _pendingGuestQueueSchedule.Count;
-                    queuesToProbe--;
-                    continue;
-                }
-
-                queue.RemoveFirst();
-                _pendingGuestWorkCount--;
-                if (queue.Count == 0)
-                {
-                    _pendingGuestWorkByQueue.Remove(queueName);
-                    _pendingGuestQueueSchedule.RemoveAt(_pendingGuestQueueCursor);
-                }
-                else
-                {
-                    _pendingGuestQueueCursor =
-                        (_pendingGuestQueueCursor + 1) % _pendingGuestQueueSchedule.Count;
-                }
-
-                return true;
-            }
-
-            work = default;
-            return false;
+            return _pendingGuestWork.TryDequeue(out work!);
         }
     }
 
     private static void CompleteGuestWork(in PendingGuestWork pending)
     {
-        SharpEmu.HLE.GuestImageWriteTracker.FlushPendingDiagnostics();
         lock (_gate)
         {
             _pendingGuestWorkBytes = pending.PayloadBytes >= _pendingGuestWorkBytes
                 ? 0
                 : _pendingGuestWorkBytes - pending.PayloadBytes;
             ReleasePendingGuestImageUploadsLocked(pending.Work);
-            if (pending.Sequence == _completedGuestWorkSequence + 1)
-            {
-                _completedGuestWorkSequence = pending.Sequence;
-                while (_completedGuestWorkOutOfOrder.Remove(
-                           _completedGuestWorkSequence + 1))
-                {
-                    _completedGuestWorkSequence++;
-                }
-            }
-            else if (pending.Sequence > _completedGuestWorkSequence)
-            {
-                System.Diagnostics.Debug.Assert(
-                    _completedGuestWorkOutOfOrder.Add(pending.Sequence),
-                    "A guest work sequence must complete exactly once.");
-            }
+            _completedGuestWorkSequence++;
             System.Threading.Monitor.PulseAll(_gate);
         }
     }
@@ -1820,21 +1578,18 @@ internal static unsafe class VulkanVideoPresenter
 
         foreach (var key in GetStorageImageUploadKeys(compute.Textures))
         {
-            if (!_pendingGuestImageUploads.TryGetValue(key, out var pendingUpload))
+            if (!_pendingGuestImageUploads.TryGetValue(key, out var count))
             {
                 continue;
             }
 
-            if (pendingUpload.Count <= 1)
+            if (count <= 1)
             {
                 _pendingGuestImageUploads.Remove(key);
             }
             else
             {
-                _pendingGuestImageUploads[key] = pendingUpload with
-                {
-                    Count = pendingUpload.Count - 1,
-                };
+                _pendingGuestImageUploads[key] = count - 1;
             }
         }
     }
@@ -2018,12 +1773,7 @@ internal static unsafe class VulkanVideoPresenter
         private readonly Dictionary<ulong, HostBufferAllocation> _hostBufferAllocations = new();
         private readonly List<GuestBufferAllocation> _guestBufferAllocations = [];
         private readonly Queue<PendingGuestSubmission> _pendingGuestSubmissions = new();
-        private readonly Dictionary<string, ulong> _lastSubmittedTimelineByGuestQueue =
-            new(StringComparer.Ordinal);
         private readonly Stack<DescriptorPool> _recycledDescriptorPools = new();
-        private VulkanGuestQueueIdentity _activeGuestQueue =
-            VulkanGuestQueueIdentity.Default;
-        private long _activeGuestWorkSequence;
 
         private readonly record struct GraphicsPipelineKey(
             string VertexShader,
@@ -2062,7 +1812,6 @@ internal static unsafe class VulkanVideoPresenter
 
         private sealed class GuestBufferAllocation
         {
-            public string QueueName = VulkanGuestQueueIdentity.Default.Name;
             public ulong BaseAddress;
             public ulong Size;
             public VkBuffer Buffer;
@@ -2072,8 +1821,6 @@ internal static unsafe class VulkanVideoPresenter
             public ulong LastUseTimeline;
             public List<DirtyGuestBufferRange> DirtyRanges { get; } = [];
         }
-
-        private const string SharedReadOnlyGuestBufferQueue = "shared.readonly";
 
         private sealed class TranslatedDrawResources
         {
@@ -2231,9 +1978,7 @@ internal static unsafe class VulkanVideoPresenter
             IReadOnlyList<GuestImageResource> TraceImages,
             IReadOnlyList<(VkBuffer Buffer, DeviceMemory Memory)> RetireBuffers,
             ulong Timeline,
-            string DebugName,
-            VulkanGuestQueueIdentity Queue,
-            long WorkSequence);
+            string DebugName);
 
         public Presenter(uint width, uint height)
         {
@@ -3353,7 +3098,7 @@ internal static unsafe class VulkanVideoPresenter
             int pendingWork;
             lock (_gate)
             {
-                pendingWork = _pendingGuestWorkCount;
+                pendingWork = _pendingGuestWork.Count;
             }
 
             var pixels = new Span<byte>(
@@ -3721,11 +3466,7 @@ internal static unsafe class VulkanVideoPresenter
                     traceImages,
                     retireBuffers ?? [],
                     _submitTimeline,
-                    resources.Count > 0 ? resources[0].DebugName : "batch",
-                    _activeGuestQueue,
-                    _activeGuestWorkSequence));
-            _lastSubmittedTimelineByGuestQueue[_activeGuestQueue.Name] =
-                _submitTimeline;
+                    resources.Count > 0 ? resources[0].DebugName : "batch"));
         }
 
         private void EnsureGuestSubmissionCapacity()
@@ -3834,58 +3575,12 @@ internal static unsafe class VulkanVideoPresenter
             }
         }
 
-        private void WaitForActiveGuestQueueSubmissionsForCpuVisibility()
-        {
-            FlushBatchedGuestCommands();
-            if (!_lastSubmittedTimelineByGuestQueue.TryGetValue(
-                    _activeGuestQueue.Name,
-                    out var targetTimeline) ||
-                targetTimeline <= _completedTimeline)
-            {
-                return;
-            }
-
-            PendingGuestSubmission? target = null;
-            foreach (var submission in _pendingGuestSubmissions)
-            {
-                if (submission.Timeline == targetTimeline)
-                {
-                    target = submission;
-                    break;
-                }
-            }
-
-            if (target is null)
-            {
-                throw new InvalidOperationException(
-                    $"Guest queue '{_activeGuestQueue.Name}' lost pending timeline " +
-                    $"{targetTimeline} (completed={_completedTimeline}).");
-            }
-
-            var waitStart = System.Diagnostics.Stopwatch.GetTimestamp();
-            var fence = target.Fence;
-            Check(
-                _vk.WaitForFences(_device, 1, &fence, true, ulong.MaxValue),
-                $"vkWaitForFences(queue visibility: {_activeGuestQueue.Name})");
-            CollectCompletedGuestSubmissions(waitForOldest: false);
-            var waitedMs = (System.Diagnostics.Stopwatch.GetTimestamp() - waitStart) *
-                1000.0 / System.Diagnostics.Stopwatch.Frequency;
-            TraceVulkanShader(
-                $"vk.queue_visibility queue={_activeGuestQueue.Name} " +
-                $"submission={_activeGuestQueue.SubmissionId} " +
-                $"target_timeline={targetTimeline} completed_timeline={_completedTimeline} " +
-                $"waited_ms={waitedMs:F3}");
-        }
-
         private void ExecuteOrderedGuestAction(VulkanOrderedGuestAction work)
         {
-            WaitForActiveGuestQueueSubmissionsForCpuVisibility();
-            WriteBackAllDirtyGuestBuffers(_activeGuestQueue.Name);
+            WaitForAllGuestSubmissionsForCpuVisibility();
+            WriteBackAllDirtyGuestBuffers();
             work.Action();
-            TraceVulkanShader(
-                $"vk.ordered_action queue={_activeGuestQueue.Name} " +
-                $"submission={_activeGuestQueue.SubmissionId} " +
-                $"work_sequence={_activeGuestWorkSequence} name='{work.DebugName}'");
+            TraceVulkanShader($"vk.ordered_action name='{work.DebugName}'");
         }
 
         private static byte[]? TryReadGuestTexturePixels(VulkanGuestDrawTexture texture)
@@ -5331,9 +5026,7 @@ internal static unsafe class VulkanVideoPresenter
                 MarkTextureContentCached(key);
                 SharpEmu.HLE.GuestImageWriteTracker.Track(
                     texture.Address,
-                    (ulong)texture.RgbaPixels.Length,
-                    CurrentGuestWorkSequenceForDiagnostics,
-                    "vulkan.texture-cache");
+                    (ulong)texture.RgbaPixels.Length);
             }
 
             return resource;
@@ -6227,21 +5920,9 @@ internal static unsafe class VulkanVideoPresenter
 
             var size = (ulong)Math.Max(guestBuffer.Length, sizeof(uint));
             var endAddress = checked(guestBuffer.BaseAddress + size);
-            var allocation = _guestBufferAllocations
-                .Where(candidate =>
-                    candidate.BaseAddress <= guestBuffer.BaseAddress &&
-                    candidate.BaseAddress + candidate.Size >= endAddress)
-                .OrderByDescending(candidate =>
-                    string.Equals(
-                        candidate.QueueName,
-                        _activeGuestQueue.Name,
-                        StringComparison.Ordinal))
-                .ThenByDescending(candidate =>
-                    string.Equals(
-                        candidate.QueueName,
-                        SharedReadOnlyGuestBufferQueue,
-                        StringComparison.Ordinal))
-                .First();
+            var allocation = _guestBufferAllocations.Single(candidate =>
+                candidate.BaseAddress <= guestBuffer.BaseAddress &&
+                candidate.BaseAddress + candidate.Size >= endAddress);
             var guestOffset = guestBuffer.BaseAddress - allocation.BaseAddress;
             var descriptorOffset = guestOffset &
                 ~(GuestStorageBufferOffsetAlignment - 1);
@@ -6271,25 +5952,8 @@ internal static unsafe class VulkanVideoPresenter
                 // an in-flight shader access. Retire prior users, publish their
                 // dirty ranges to guest memory, then upload the current guest
                 // bytes (which may be newer than the parser's captured array).
-                if (string.Equals(
-                        allocation.QueueName,
-                        SharedReadOnlyGuestBufferQueue,
-                        StringComparison.Ordinal))
-                {
-                    // Shared read-only storage can still be referenced by any
-                    // logical guest queue, so replacing its mapped contents
-                    // requires retiring every prior reader.
-                    WaitForAllGuestSubmissionsForCpuVisibility();
-                    WriteBackAllDirtyGuestBuffers();
-                }
-                else
-                {
-                    // Writable aliases are private to one logical guest queue.
-                    // Retiring unrelated queues here recreates the global FIFO
-                    // and turns routine buffer refreshes into queue-wide stalls.
-                    WaitForActiveGuestQueueSubmissionsForCpuVisibility();
-                    WriteBackAllDirtyGuestBuffers(_activeGuestQueue.Name);
-                }
+                WaitForAllGuestSubmissionsForCpuVisibility();
+                WriteBackAllDirtyGuestBuffers();
                 var live = new byte[guestBuffer.Length];
                 if (_guestMemory?.TryRead(guestBuffer.BaseAddress, live) == true)
                 {
@@ -6374,7 +6038,7 @@ internal static unsafe class VulkanVideoPresenter
                 return;
             }
 
-            var ranges = new List<(ulong Start, ulong End, bool Writable)>(buffers.Count);
+            var ranges = new List<(ulong Start, ulong End)>(buffers.Count);
             foreach (var buffer in buffers)
             {
                 if (buffer.BaseAddress == 0)
@@ -6386,10 +6050,7 @@ internal static unsafe class VulkanVideoPresenter
                 var alignedStart = buffer.BaseAddress &
                     ~(GuestStorageBufferOffsetAlignment - 1);
                 var paddedEnd = checked(buffer.BaseAddress + size + 3) & ~3UL;
-                ranges.Add((
-                    alignedStart,
-                    paddedEnd,
-                    buffer.Writable && buffer.WriteBackToGuest));
+                ranges.Add((alignedStart, paddedEnd));
             }
 
             if (ranges.Count == 0)
@@ -6398,7 +6059,7 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             ranges.Sort(static (left, right) => left.Start.CompareTo(right.Start));
-            var merged = new List<(ulong Start, ulong End, bool Writable)>(ranges.Count);
+            var merged = new List<(ulong Start, ulong End)>(ranges.Count);
             foreach (var range in ranges)
             {
                 if (merged.Count == 0 || range.Start > merged[^1].End)
@@ -6408,27 +6069,16 @@ internal static unsafe class VulkanVideoPresenter
                 }
 
                 var previous = merged[^1];
-                merged[^1] = (
-                    previous.Start,
-                    Math.Max(previous.End, range.End),
-                    previous.Writable || range.Writable);
+                merged[^1] = (previous.Start, Math.Max(previous.End, range.End));
             }
 
             foreach (var range in merged)
             {
-                EnsureGuestBufferAllocation(
-                    range.Start,
-                    range.End,
-                    range.Writable
-                        ? _activeGuestQueue.Name
-                        : SharedReadOnlyGuestBufferQueue);
+                EnsureGuestBufferAllocation(range.Start, range.End);
             }
         }
 
-        private void EnsureGuestBufferAllocation(
-            ulong requestedStart,
-            ulong requestedEnd,
-            string queueName)
+        private void EnsureGuestBufferAllocation(ulong requestedStart, ulong requestedEnd)
         {
             var start = requestedStart;
             var end = requestedEnd;
@@ -6437,10 +6087,6 @@ internal static unsafe class VulkanVideoPresenter
             {
                 overlaps = _guestBufferAllocations
                     .Where(allocation =>
-                        string.Equals(
-                            allocation.QueueName,
-                            queueName,
-                            StringComparison.Ordinal) &&
                         allocation.BaseAddress < end &&
                         start < allocation.BaseAddress + allocation.Size)
                     .ToList();
@@ -6477,7 +6123,7 @@ internal static unsafe class VulkanVideoPresenter
                 WriteBackAllDirtyGuestBuffers();
             }
 
-            var replacement = CreateGuestBufferAllocation(start, end, queueName);
+            var replacement = CreateGuestBufferAllocation(start, end);
             foreach (var overlap in overlaps)
             {
                 _guestBufferAllocations.Remove(overlap);
@@ -6486,22 +6132,13 @@ internal static unsafe class VulkanVideoPresenter
 
             _guestBufferAllocations.Add(replacement);
             _guestBufferAllocations.Sort(static (left, right) =>
-            {
-                var queueOrder = string.CompareOrdinal(left.QueueName, right.QueueName);
-                return queueOrder != 0
-                    ? queueOrder
-                    : left.BaseAddress.CompareTo(right.BaseAddress);
-            });
+                left.BaseAddress.CompareTo(right.BaseAddress));
             TraceVulkanShader(
-                $"vk.guest_buffer_allocation queue={queueName} " +
-                $"base=0x{start:X16} bytes={replacement.Size} " +
+                $"vk.guest_buffer_allocation base=0x{start:X16} bytes={replacement.Size} " +
                 $"merged={overlaps.Count}");
         }
 
-        private GuestBufferAllocation CreateGuestBufferAllocation(
-            ulong start,
-            ulong end,
-            string queueName)
+        private GuestBufferAllocation CreateGuestBufferAllocation(ulong start, ulong end)
         {
             var size = checked(end - start);
             if (size == 0 || size > int.MaxValue)
@@ -6527,7 +6164,6 @@ internal static unsafe class VulkanVideoPresenter
                 $"SharpEmu guest VA 0x{start:X16}-0x{end:X16}");
             return new GuestBufferAllocation
             {
-                QueueName = queueName,
                 BaseAddress = start,
                 Size = size,
                 Buffer = buffer,
@@ -7419,8 +7055,8 @@ internal static unsafe class VulkanVideoPresenter
                     // argument written by this dispatch. Wait for the specific
                     // guest fences and publish only dirty ranges; a queue-wide
                     // idle unnecessarily serialized presentation work too.
-                    WaitForActiveGuestQueueSubmissionsForCpuVisibility();
-                    WriteBackAllDirtyGuestBuffers(_activeGuestQueue.Name);
+                    WaitForAllGuestSubmissionsForCpuVisibility();
+                    WriteBackAllDirtyGuestBuffers();
                 }
                 TraceVulkanShader(
                     $"vk.compute_dispatch groups={work.GroupCountX}x" +
@@ -7624,7 +7260,7 @@ internal static unsafe class VulkanVideoPresenter
             allocation.DirtyRanges.Add(new DirtyGuestBufferRange(start, end - start));
         }
 
-        private void WriteBackAllDirtyGuestBuffers(string? queueName = null)
+        private void WriteBackAllDirtyGuestBuffers()
         {
             var memory = _guestMemory;
             if (memory is null)
@@ -7634,12 +7270,6 @@ internal static unsafe class VulkanVideoPresenter
 
             foreach (var allocation in _guestBufferAllocations)
             {
-                if (queueName is not null &&
-                    !string.Equals(allocation.QueueName, queueName, StringComparison.Ordinal))
-                {
-                    continue;
-                }
-
                 if (allocation.DirtyRanges.Count != 0 &&
                     allocation.LastUseTimeline > _completedTimeline)
                 {
@@ -8723,9 +8353,7 @@ internal static unsafe class VulkanVideoPresenter
             {
                 SharpEmu.HLE.GuestImageWriteTracker.Track(
                     target.Address,
-                    (ulong)target.Width * target.Height * GetTextureBytesPerPixel(target.Format),
-                    CurrentGuestWorkSequenceForDiagnostics,
-                    "vulkan.render-target");
+                    (ulong)target.Width * target.Height * GetTextureBytesPerPixel(target.Format));
             }
 
             if (_traceGuestImageEvents)
@@ -9400,27 +9028,6 @@ internal static unsafe class VulkanVideoPresenter
                     break;
                 }
 
-                if (!string.Equals(
-                        _activeGuestQueue.Name,
-                        pendingGuestWork.Queue.Name,
-                        StringComparison.Ordinal))
-                {
-                    // A host command buffer must never contain commands from
-                    // two independent guest queues: an ordered action fences
-                    // only its own queue's predecessor submissions.
-                    FlushBatchedGuestCommands();
-                }
-
-                _activeGuestQueue = pendingGuestWork.Queue;
-                _activeGuestWorkSequence = pendingGuestWork.Sequence;
-                Volatile.Write(
-                    ref _executingGuestWorkSequence,
-                    pendingGuestWork.Sequence);
-                using var guestQueueScope = EnterGuestQueue(
-                    pendingGuestWork.Queue.Name,
-                    pendingGuestWork.Queue.SubmissionId);
-                _enqueueAsImmediateQueueFollowup = true;
-                _immediateFollowupTail = null;
                 var work = pendingGuestWork.Work;
 
                 var traceWork = ShouldTracePresentedGuestImageContentsForDiagnostics();
@@ -9428,12 +9035,7 @@ internal static unsafe class VulkanVideoPresenter
                 if (traceWork && work is VulkanComputeGuestDispatch or VulkanOffscreenGuestDraw)
                 {
                     Console.Error.WriteLine(
-                        $"[LOADER][TRACE] vk.render_work_enter #{completedWork} " +
-                        $"sequence={pendingGuestWork.Sequence} " +
-                        $"queue={pendingGuestWork.Queue.Name} " +
-                        $"submission={pendingGuestWork.Queue.SubmissionId} " +
-                        $"queued_ms={(System.Diagnostics.Stopwatch.GetTimestamp() - pendingGuestWork.EnqueuedTicks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F3} " +
-                        work.GetType().Name);
+                        $"[LOADER][TRACE] vk.render_work_enter #{completedWork} {work.GetType().Name}");
                 }
                 try
                 {
@@ -9456,9 +9058,6 @@ internal static unsafe class VulkanVideoPresenter
                 finally
                 {
                     CompleteGuestWork(pendingGuestWork);
-                    _enqueueAsImmediateQueueFollowup = false;
-                    _immediateFollowupTail = null;
-                    Volatile.Write(ref _executingGuestWorkSequence, 0);
                 }
 
                 if (workStart != 0)
@@ -9474,10 +9073,7 @@ internal static unsafe class VulkanVideoPresenter
                             _ => work.GetType().Name,
                         };
                         Console.Error.WriteLine(
-                            $"[LOADER][WARN] vk.slow_render_work {elapsedMs:F0}ms " +
-                            $"queue={pendingGuestWork.Queue.Name} " +
-                            $"submission={pendingGuestWork.Queue.SubmissionId} " +
-                            $"sequence={pendingGuestWork.Sequence}: {desc}");
+                            $"[LOADER][WARN] vk.slow_render_work {elapsedMs:F0}ms: {desc}");
                     }
                 }
 
