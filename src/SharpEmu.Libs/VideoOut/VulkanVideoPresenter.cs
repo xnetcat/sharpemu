@@ -6975,7 +6975,7 @@ internal static unsafe class VulkanVideoPresenter
                     break;
                 }
 
-                var traceWork = ShouldTracePresentedGuestImageContentsForDiagnostics();
+                var traceWork = ShouldTraceGuestImageContentsForDiagnostics();
                 var workStart = traceWork ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
                 if (traceWork && work is VulkanComputeGuestDispatch or VulkanOffscreenGuestDraw)
                 {
@@ -7035,7 +7035,7 @@ internal static unsafe class VulkanVideoPresenter
 
             if (!TryTakePresentation(_presentedSequence, out var presentation))
             {
-                if (ShouldTracePresentedGuestImageContentsForDiagnostics())
+                if (ShouldTraceGuestImageContentsForDiagnostics())
                 {
                     Console.Error.WriteLine(
                         $"[LOADER][WARN] vk.present_not_taken seq={_presentedSequence} " +
@@ -7045,7 +7045,7 @@ internal static unsafe class VulkanVideoPresenter
                 return;
             }
 
-            if (ShouldTracePresentedGuestImageContentsForDiagnostics())
+            if (ShouldTraceGuestImageContentsForDiagnostics())
             {
                 Console.Error.WriteLine(
                     $"[LOADER][TRACE] vk.present_taken addr=0x{presentation.GuestImageAddress:X16} " +
@@ -7086,7 +7086,7 @@ internal static unsafe class VulkanVideoPresenter
                     out presentedGuestImage) ||
                  !presentedGuestImage.Initialized))
             {
-                if (ShouldTracePresentedGuestImageContentsForDiagnostics())
+                if (ShouldTraceGuestImageContentsForDiagnostics())
                 {
                     Console.Error.WriteLine(
                         $"[LOADER][WARN] vk.present_dropped addr=0x{presentation.GuestImageAddress:X16} " +
@@ -7100,9 +7100,8 @@ internal static unsafe class VulkanVideoPresenter
             if (presentedGuestImage is not null)
             {
                 _directPresentationCount++;
-                if (ShouldTracePresentedGuestImageContentsForDiagnostics() &&
-                    (_directPresentationCount is 1 or 30 or 120 ||
-                     _directPresentationCount % 600 == 0))
+                if (ShouldSamplePresentedGuestImageForDiagnostics(
+                        _directPresentationCount))
                 {
                     Console.Error.WriteLine(
                         $"[LOADER][TRACE] vk.present_sample frame={_directPresentationCount} " +
@@ -8061,6 +8060,23 @@ internal static unsafe class VulkanVideoPresenter
 
         private static bool ShouldTracePresentedGuestImageContentsForDiagnostics() =>
             _tracePresentedGuestImagesEnabled;
+
+        private static bool ShouldSamplePresentedGuestImageForDiagnostics(long frame)
+        {
+            if (string.Equals(
+                    _traceGuestImagesMode,
+                    "present",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                // Synchronous 4K readbacks can take several seconds on Linux.
+                // Lightweight presentation tracing only needs one proof that
+                // the final image contains rendered pixels.
+                return frame == 1;
+            }
+
+            return _traceGuestImagesEnabled &&
+                   (frame is 1 or 30 or 120 || frame % 600 == 0);
+        }
 
         private static bool ShouldTraceVulkanResources() =>
             _traceVulkanResourcesEnabled;
