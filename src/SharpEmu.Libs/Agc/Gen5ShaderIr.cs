@@ -233,6 +233,13 @@ internal sealed record Gen5Vop3Control(
     uint OperandSelect,
     uint? ScalarDestination) : Gen5InstructionControl;
 
+internal sealed record Gen5Vop3PControl(
+    uint LowOperandSelect,
+    uint HighOperandSelect,
+    uint LowNegateMask,
+    uint HighNegateMask,
+    bool Clamp) : Gen5InstructionControl;
+
 internal sealed record Gen5SdwaControl(
     uint DestinationSelect,
     uint DestinationUnused,

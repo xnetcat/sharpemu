@@ -1268,10 +1268,7 @@ public static class KernelPthreadCompatExports
             // caller can opt into compatibility polling globally or narrow it
             // to known queue conditions with the address filter.
             var compatibilityRecheck = !timed &&
-                _condCompatibilityRecheck.HasValue &&
-                (_condCompatibilityRecheckFilter is null ||
-                 _condCompatibilityRecheckFilter.Contains(condAddress) ||
-                 _condCompatibilityRecheckFilter.Contains(resolvedCondAddress));
+                ShouldCompatibilityRecheck(condAddress, resolvedCondAddress);
             if (cooperative && (timed || compatibilityRecheck))
             {
                 waiter.TimeoutTimer = new Timer(
@@ -1289,7 +1286,9 @@ public static class KernelPthreadCompatExports
         if (cooperative &&
             GuestThreadExecution.RequestCurrentThreadBlock(
                 ctx,
-                timed ? "pthread_cond_timedwait" : "pthread_cond_wait",
+                timed
+                    ? $"pthread_cond_timedwait:0x{condAddress:X16}"
+                    : $"pthread_cond_wait:0x{condAddress:X16}",
                 waiter.WakeKey,
                 () => CompleteBlockedCondWait(ctx, condAddress, mutexAddress, state, waiter),
                 () => TryGrantCondWaiterMutex(waiter)))
@@ -1375,6 +1374,7 @@ public static class KernelPthreadCompatExports
             }
 
             TracePthreadCond(broadcast ? "broadcast" : "signal", condAddress, mutexAddress: 0, state, timed: false, (int)OrbisGen2Result.ORBIS_GEN2_OK);
+
         }
 
         if (completedWaiters is not null)
@@ -1653,6 +1653,12 @@ public static class KernelPthreadCompatExports
             ? TimeSpan.FromMilliseconds(milliseconds)
             : null;
     }
+
+    private static bool ShouldCompatibilityRecheck(ulong condAddress, ulong resolvedCondAddress) =>
+        _condCompatibilityRecheck.HasValue &&
+        (_condCompatibilityRecheckFilter is null ||
+         _condCompatibilityRecheckFilter.Contains(condAddress) ||
+         _condCompatibilityRecheckFilter.Contains(resolvedCondAddress));
 
     private static int NormalizeMutexType(int type)
     {

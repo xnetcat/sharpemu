@@ -10,6 +10,7 @@ namespace SharpEmu.Libs.Kernel;
 public static class KernelEventQueueCompatExports
 {
     private const int KernelEventSize = 0x20;
+    public const short KernelEventFilterUser = -11;
     public const short KernelEventFilterGraphics = -14;
     public const short KernelEventFilterAmpr = -16;
     public const short KernelEventFilterAmprSystem = -17;
@@ -89,8 +90,7 @@ public static class KernelEventQueueCompatExports
         LibraryName = "libKernel")]
     public static int KernelAddUserEventEdge(CpuContext ctx)
     {
-        TraceEventQueue(ctx, "add_user_edge", ctx[CpuRegister.Rdi]);
-        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        return KernelAddUserEventCore(ctx, "add_user_edge");
     }
 
     [SysAbiExport(
@@ -100,8 +100,7 @@ public static class KernelEventQueueCompatExports
         LibraryName = "libKernel")]
     public static int KernelAddUserEvent(CpuContext ctx)
     {
-        TraceEventQueue(ctx, "add_user", ctx[CpuRegister.Rdi]);
-        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        return KernelAddUserEventCore(ctx, "add_user");
     }
 
     [SysAbiExport(
@@ -111,8 +110,13 @@ public static class KernelEventQueueCompatExports
         LibraryName = "libKernel")]
     public static int KernelDeleteUserEvent(CpuContext ctx)
     {
-        TraceEventQueue(ctx, "delete_user", ctx[CpuRegister.Rdi]);
-        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        var handle = ctx[CpuRegister.Rdi];
+        var ident = ctx[CpuRegister.Rsi];
+        var deleted = DeleteRegisteredEvent(handle, ident, KernelEventFilterUser);
+        TraceEventQueue(ctx, "delete_user", handle);
+        return deleted
+            ? (int)OrbisGen2Result.ORBIS_GEN2_OK
+            : (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
     }
 
     [SysAbiExport(
@@ -122,8 +126,49 @@ public static class KernelEventQueueCompatExports
         LibraryName = "libKernel")]
     public static int KernelTriggerUserEvent(CpuContext ctx)
     {
-        TraceEventQueue(ctx, "trigger_user", ctx[CpuRegister.Rdi]);
-        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        var handle = ctx[CpuRegister.Rdi];
+        var ident = ctx[CpuRegister.Rsi];
+        var suppliedUserData = ctx[CpuRegister.Rdx];
+        ulong registeredUserData;
+        lock (_eventQueueGate)
+        {
+            if (!_eventQueues.Contains(handle))
+            {
+                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+            }
+
+            registeredUserData =
+                _registeredEvents.TryGetValue(handle, out var registrations) &&
+                registrations.TryGetValue((ident, KernelEventFilterUser), out var registration)
+                    ? registration.UserData
+                    : 0;
+        }
+
+        var queued = EnqueueEvent(
+            handle,
+            new KernelQueuedEvent(
+                ident,
+                KernelEventFilterUser,
+                0,
+                0,
+                0,
+                suppliedUserData != 0 ? suppliedUserData : registeredUserData));
+        TraceEventQueue(ctx, "trigger_user", handle);
+        return queued
+            ? (int)OrbisGen2Result.ORBIS_GEN2_OK
+            : (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+    }
+
+    private static int KernelAddUserEventCore(CpuContext ctx, string operation)
+    {
+        var handle = ctx[CpuRegister.Rdi];
+        var ident = ctx[CpuRegister.Rsi];
+        var userData = ctx[CpuRegister.Rdx];
+        var registered = RegisterEvent(handle, ident, KernelEventFilterUser, userData);
+        TraceEventQueue(ctx, operation, handle);
+        return registered
+            ? (int)OrbisGen2Result.ORBIS_GEN2_OK
+            : (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
     }
 
     [SysAbiExport(
@@ -475,6 +520,52 @@ public static class KernelEventQueueCompatExports
         return triggeredCount;
     }
 
+    public static int TriggerRegisteredEventsDistinct(short filter)
+    {
+        HashSet<ulong>? wakeHandles = null;
+        var triggeredCount = 0;
+        lock (_eventQueueGate)
+        {
+            foreach (var (handle, registrations) in _registeredEvents)
+            {
+                foreach (var registration in registrations.Values)
+                {
+                    if (registration.Filter != filter)
+                    {
+                        continue;
+                    }
+
+                    if (!_pendingEvents.TryGetValue(handle, out var queue))
+                    {
+                        queue = new LinkedList<KernelQueuedEvent>();
+                        _pendingEvents[handle] = queue;
+                    }
+
+                    queue.AddLast(
+                        new KernelQueuedEvent(
+                            registration.Ident,
+                            registration.Filter,
+                            0,
+                            1,
+                            registration.Ident,
+                            registration.UserData));
+                    (wakeHandles ??= []).Add(handle);
+                    triggeredCount++;
+                }
+            }
+        }
+
+        if (wakeHandles is not null)
+        {
+            foreach (var handle in wakeHandles)
+            {
+                WakeEventQueue(handle);
+            }
+        }
+
+        return triggeredCount;
+    }
+
     public static bool TriggerDisplayEvent(
         ulong handle,
         ulong ident,
@@ -629,6 +720,19 @@ public static class KernelEventQueueCompatExports
             if (!WriteKernelEvent(ctx, eventsAddress + ((ulong)i * KernelEventSize), events[i]))
             {
                 return i;
+            }
+
+            if (string.Equals(
+                    Environment.GetEnvironmentVariable("SHARPEMU_LOG_EQUEUE"),
+                    "1",
+                    StringComparison.Ordinal))
+            {
+                var queuedEvent = events[i];
+                Console.Error.WriteLine(
+                    $"[LOADER][TRACE] equeue.deliver: handle=0x{handle:X16} " +
+                    $"ident=0x{queuedEvent.Ident:X16} filter={queuedEvent.Filter} " +
+                    $"flags=0x{queuedEvent.Flags:X4} fflags=0x{queuedEvent.Fflags:X8} " +
+                    $"data=0x{queuedEvent.Data:X16} udata=0x{queuedEvent.UserData:X16}");
             }
         }
 

@@ -1401,7 +1401,9 @@ public static partial class KernelMemoryCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
-        var hostPath = ResolveGuestPath(guestPath);
+        var hostPath = IsMutatingOpen(flags)
+            ? ResolveGuestMutationPath(guestPath)
+            : ResolveGuestPath(guestPath);
         var access = ResolveOpenAccess(flags);
         var mode = ResolveOpenMode(flags, access);
         try
@@ -1772,7 +1774,7 @@ public static partial class KernelMemoryCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
-        var hostPath = ResolveGuestPath(guestPath);
+        var hostPath = ResolveGuestMutationPath(guestPath);
         if (IsReadOnlyGuestMutationPath(guestPath))
         {
             LogOpenTrace($"unlink readonly path='{guestPath}' host='{hostPath}'");
@@ -1828,7 +1830,7 @@ public static partial class KernelMemoryCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
-        var hostPath = ResolveGuestPath(guestPath);
+        var hostPath = ResolveGuestMutationPath(guestPath);
         if (IsReadOnlyGuestMutationPath(guestPath))
         {
             LogOpenTrace($"mkdir readonly path='{guestPath}' host='{hostPath}'");
@@ -1887,7 +1889,7 @@ public static partial class KernelMemoryCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
-        var hostPath = ResolveGuestPath(guestPath);
+        var hostPath = ResolveGuestMutationPath(guestPath);
         if (IsReadOnlyGuestMutationPath(guestPath))
         {
             LogOpenTrace($"rmdir readonly path='{guestPath}' host='{hostPath}'");
@@ -4390,6 +4392,12 @@ public static partial class KernelMemoryCompatExports
             return guestPath;
         }
 
+        if (TryResolveWritableApp0CompatibilityPath(guestPath, out var writablePath) &&
+            (File.Exists(writablePath) || Directory.Exists(writablePath)))
+        {
+            return writablePath;
+        }
+
         if (TryResolveRegisteredGuestMount(guestPath, out var mountedPath))
         {
             return mountedPath;
@@ -4505,6 +4513,48 @@ public static partial class KernelMemoryCompatExports
         }
 
         return guestPath;
+    }
+
+    private static string ResolveGuestMutationPath(string guestPath) =>
+        TryResolveWritableApp0CompatibilityPath(guestPath, out var writablePath)
+            ? writablePath
+            : ResolveGuestPath(guestPath);
+
+    private static bool TryResolveWritableApp0CompatibilityPath(
+        string guestPath,
+        out string hostPath)
+    {
+        hostPath = string.Empty;
+        if (!string.Equals(
+                Environment.GetEnvironmentVariable("SHARPEMU_WRITABLE_APP0_COMPAT"),
+                "1",
+                StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        var normalized = NormalizeGuestStatCachePath(guestPath);
+        if (normalized is null ||
+            (!string.Equals(normalized, "/app0", StringComparison.OrdinalIgnoreCase) &&
+             !normalized.StartsWith("/app0/", StringComparison.OrdinalIgnoreCase)))
+        {
+            return false;
+        }
+
+        var root = Path.GetFullPath(Path.Combine(ResolveTemp0Root(), "app0-writable"));
+        Directory.CreateDirectory(root);
+        var relative = normalized.Length == "/app0".Length
+            ? string.Empty
+            : normalized["/app0/".Length..];
+        var candidate = Path.GetFullPath(Path.Combine(root, NormalizeMountRelativePath(relative)));
+        if (!string.Equals(candidate, root, StringComparison.Ordinal) &&
+            !candidate.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        hostPath = candidate;
+        return true;
     }
 
     private static bool TryResolveRegisteredGuestMount(string guestPath, out string hostPath)
@@ -4710,6 +4760,12 @@ public static partial class KernelMemoryCompatExports
     private static bool IsReadOnlyGuestMutationPath(string guestPath)
     {
         var normalized = NormalizeGuestStatCachePath(guestPath);
+        if (normalized is not null &&
+            TryResolveWritableApp0CompatibilityPath(normalized, out _))
+        {
+            return false;
+        }
+
         return normalized is not null &&
                (string.Equals(normalized, "/app0", StringComparison.OrdinalIgnoreCase) ||
                 normalized.StartsWith("/app0/", StringComparison.OrdinalIgnoreCase));

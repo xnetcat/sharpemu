@@ -2967,13 +2967,14 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		Func<bool>? wakeHandler,
 		long blockDeadlineTimestamp)
 	{
-		if (guestThreadHandle == 0 || continuation.Rip < 65536 || continuation.Rsp == 0)
-		{
-			return;
-		}
+			if (guestThreadHandle == 0 || continuation.Rip < 65536 || continuation.Rsp == 0)
+			{
+				return;
+			}
 
-		lock (_guestThreadGate)
-		{
+			var wokeDuringRegistration = false;
+			lock (_guestThreadGate)
+			{
 			if (!_guestThreads.TryGetValue(guestThreadHandle, out var thread))
 			{
 				return;
@@ -2982,11 +2983,34 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			thread.BlockedContinuation = continuation;
 			thread.HasBlockedContinuation = true;
 			thread.BlockWakeKey = wakeKey;
-			thread.BlockResumeHandler = resumeHandler;
-			thread.BlockWakeHandler = wakeHandler;
-			thread.BlockDeadlineTimestamp = blockDeadlineTimestamp;
+				thread.BlockResumeHandler = resumeHandler;
+				thread.BlockWakeHandler = wakeHandler;
+				thread.BlockDeadlineTimestamp = blockDeadlineTimestamp;
+
+				// The producer can signal after the HLE call requests a block but
+				// before this continuation is registered. Recheck the predicate while
+				// publishing the continuation so that edge is not lost with the guest
+				// left blocked even though the resource is already ready.
+				if (thread.State == GuestThreadRunState.Blocked &&
+					wakeHandler is not null &&
+					wakeHandler())
+				{
+					thread.State = GuestThreadRunState.Ready;
+					thread.BlockReason = null;
+					thread.BlockWakeHandler = null;
+					thread.BlockDeadlineTimestamp = 0;
+					_readyGuestThreads.Enqueue(thread);
+					Interlocked.Increment(ref _readyGuestThreadCount);
+					wokeDuringRegistration = true;
+				}
+			}
+
+			if (wokeDuringRegistration && _logGuestThreads)
+			{
+				Console.Error.WriteLine(
+					$"[LOADER][INFO] guest_threads.registration_wake key={wakeKey} guest=0x{guestThreadHandle:X16}");
+			}
 		}
-	}
 
 	private int WakeExpiredBlockedGuestThreads()
 	{
@@ -4712,7 +4736,14 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				? Math.Max(0, pss)
 				: 0;
 		long periodicSnapshotTicks = (long)((double)periodicSnapshotSeconds * Stopwatch.Frequency);
-		long lastPeriodicSnapshot = Stopwatch.GetTimestamp();
+		int periodicSnapshotStartSeconds =
+			int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_PERIODIC_SNAPSHOT_START_SECONDS"), out var psss)
+				? Math.Max(0, psss)
+				: periodicSnapshotSeconds;
+		long periodicSnapshotStartTicks =
+			(long)((double)periodicSnapshotStartSeconds * Stopwatch.Frequency);
+		long watchdogStarted = Stopwatch.GetTimestamp();
+		long lastPeriodicSnapshot = watchdogStarted;
 		_stallWatchdogThread = new Thread(new ThreadStart(delegate
 		{
 			while (!_stallWatchdogStop)
@@ -4723,6 +4754,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					break;
 				}
 				if (periodicSnapshotTicks > 0 &&
+					Stopwatch.GetTimestamp() - watchdogStarted >= periodicSnapshotStartTicks &&
 					Stopwatch.GetTimestamp() - lastPeriodicSnapshot >= periodicSnapshotTicks)
 				{
 					lastPeriodicSnapshot = Stopwatch.GetTimestamp();
