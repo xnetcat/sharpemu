@@ -4096,6 +4096,15 @@ public static class AgcExports
     {
         var state = waiter.State as SubmittedDcbState ?? gpuState.Graphics;
         var remainingDwords = waiter.TotalDwords - waiter.ResumeOffset;
+        var waitedMilliseconds = waiter.RegisteredTicks == 0
+            ? 0.0
+            : (System.Diagnostics.Stopwatch.GetTimestamp() - waiter.RegisteredTicks) *
+              1000.0 / System.Diagnostics.Stopwatch.Frequency;
+        TraceAgcShader(
+            $"agc.queue_resumed queue={waiter.QueueName} " +
+            $"submission={waiter.SubmissionId} label=0x{waiter.WaitAddress:X16} " +
+            $"resume=0x{waiter.ResumeAddress:X16} remaining_dwords={remainingDwords} " +
+            $"waited_ms={waitedMilliseconds:F3}");
         if (remainingDwords == 0)
         {
             state.IsSuspended = false;
@@ -7128,6 +7137,7 @@ public static class AgcExports
                 {
                     TraceAgcShader(
                         $"agc.dispatch_args source={dispatchSource} op=0x{opcode:X2} " +
+                        $"queue={state.QueueName} submission={state.ActiveSubmissionId} " +
                         $"packet=0x{packetAddress:X16} len={packetLength} " +
                         $"dims=0x{dimensionsAddress:X16} " +
                         $"raw={dispatchEndX:X8}/{dispatchEndY:X8}/{dispatchEndZ:X8} " +
@@ -7299,6 +7309,7 @@ public static class AgcExports
             evaluationHandledByCpu = true;
             TraceAgcShader(
                 $"agc.compute_semantic_fast_path cs=0x{shaderAddress:X16} " +
+                $"queue={state.QueueName} submission={state.ActiveSubmissionId} " +
                 copyDescription);
             // The scalar evaluator snapshots guest buffers while parsing the
             // command stream.  Do not let another submission (or the CPU)
@@ -7524,13 +7535,16 @@ public static class AgcExports
         if (instructions.Count != expectedOpcodes.Length ||
             !instructions.Select(static instruction => instruction.Opcode)
                 .SequenceEqual(expectedOpcodes) ||
+            !IsExactMaskedDwordCopyInstructionShape(instructions) ||
             dispatch.BaseGroupX != 0 ||
             dispatch.BaseGroupY != 0 ||
             dispatch.BaseGroupZ != 0 ||
             dispatch.GroupCountY != 1 ||
             dispatch.GroupCountZ != 1 ||
+            localSizeX != 64 ||
             localSizeY != 1 ||
-            localSizeZ != 1)
+            localSizeZ != 1 ||
+            evaluation.ComputeSystemRegisters?.WorkGroupXRegister != 12)
         {
             return false;
         }
@@ -7547,7 +7561,15 @@ public static class AgcExports
             control.DataLength < 2 * sizeof(uint) ||
             source.DataLength < sizeof(uint) ||
             destination.BaseAddress == 0 ||
-            destination.DataLength < sizeof(uint))
+            destination.DataLength < sizeof(uint) ||
+            !IsExactMaskedDwordCopyDescriptor(
+                evaluation.InitialScalarRegisters,
+                source.ScalarAddress,
+                source.BaseAddress) ||
+            !IsExactMaskedDwordCopyDescriptor(
+                evaluation.InitialScalarRegisters,
+                destination.ScalarAddress,
+                destination.BaseAddress))
         {
             return false;
         }
@@ -7611,6 +7633,120 @@ public static class AgcExports
             $"elements={elementCount} mask=0x{sourceMask:X8} " +
             $"dispatch={dispatch.GroupCountX}x{localSizeX}";
         return workSequence > 0;
+    }
+
+    private static bool IsExactMaskedDwordCopyInstructionShape(
+        IReadOnlyList<Gen5ShaderInstruction> instructions)
+    {
+        static bool IsOperand(
+            Gen5Operand operand,
+            Gen5OperandKind kind,
+            uint value) =>
+            operand.Kind == kind && operand.Value == value;
+
+        static bool IsBufferControl(
+            Gen5ShaderInstruction instruction,
+            uint vectorAddress,
+            uint vectorData,
+            uint scalarResource) =>
+            instruction.Control is Gen5BufferMemoryControl
+            {
+                DwordCount: 1,
+                OffsetBytes: 0,
+                IndexEnabled: true,
+                OffsetEnabled: false,
+            } control &&
+            control.VectorAddress == vectorAddress &&
+            control.VectorData == vectorData &&
+            control.ScalarResource == scalarResource;
+
+        static bool IsScalarLoad(
+            Gen5ShaderInstruction instruction,
+            int offsetBytes) =>
+            instruction.Control is Gen5ScalarMemoryControl
+            {
+                DestinationCount: 1,
+                DynamicOffsetRegister: null,
+            } control &&
+            control.ImmediateOffsetBytes == offsetBytes &&
+            instruction.Destinations.Count == 1 &&
+            IsOperand(
+                instruction.Destinations[0],
+                Gen5OperandKind.ScalarRegister,
+                106) &&
+            instruction.Sources.Count >= 1 &&
+            IsOperand(
+                instruction.Sources[0],
+                Gen5OperandKind.ScalarRegister,
+                8);
+
+        // This replacement depends on the operands as much as the opcode
+        // sequence. Reversing V_CMPX_GT or enabling offen on either MUBUF
+        // operation changes the set or address of written lanes.
+        var globalId = instructions[3];
+        var compare = instructions[6];
+        var sourceIndex = instructions[10];
+        var load = instructions[11];
+        var store = instructions[13];
+        return
+            globalId.Destinations.Count == 1 &&
+            IsOperand(globalId.Destinations[0], Gen5OperandKind.VectorRegister, 0) &&
+            globalId.Sources.Count == 3 &&
+            IsOperand(globalId.Sources[0], Gen5OperandKind.ScalarRegister, 12) &&
+            IsOperand(globalId.Sources[1], Gen5OperandKind.EncodedConstant, 134) &&
+            IsOperand(globalId.Sources[2], Gen5OperandKind.VectorRegister, 0) &&
+            IsScalarLoad(instructions[4], offsetBytes: 0) &&
+            compare.Sources.Count == 2 &&
+            IsOperand(compare.Sources[0], Gen5OperandKind.ScalarRegister, 106) &&
+            IsOperand(compare.Sources[1], Gen5OperandKind.VectorRegister, 0) &&
+            instructions[7].Words.Count == 1 &&
+            (instructions[7].Words[0] & 0xFFFFu) == 9 &&
+            IsScalarLoad(instructions[8], offsetBytes: sizeof(uint)) &&
+            sourceIndex.Destinations.Count == 1 &&
+            IsOperand(sourceIndex.Destinations[0], Gen5OperandKind.VectorRegister, 1) &&
+            sourceIndex.Sources.Count == 2 &&
+            IsOperand(sourceIndex.Sources[0], Gen5OperandKind.ScalarRegister, 106) &&
+            IsOperand(sourceIndex.Sources[1], Gen5OperandKind.VectorRegister, 0) &&
+            IsBufferControl(load, vectorAddress: 1, vectorData: 1, scalarResource: 0) &&
+            IsBufferControl(store, vectorAddress: 0, vectorData: 1, scalarResource: 4);
+    }
+
+    private static bool IsExactMaskedDwordCopyDescriptor(
+        IReadOnlyList<uint> scalarRegisters,
+        uint scalarBase,
+        ulong expectedBaseAddress)
+    {
+        if (scalarBase + 3 >= scalarRegisters.Count)
+        {
+            return false;
+        }
+
+        var word0 = scalarRegisters[(int)scalarBase];
+        var word1 = scalarRegisters[(int)scalarBase + 1];
+        var word3 = scalarRegisters[(int)scalarBase + 3];
+        var baseAddress = word0 | ((ulong)(word1 & 0xFFFFu) << 32);
+        var stride = (word1 >> 16) & 0x3FFFu;
+        var cacheSwizzle = (word1 & (1u << 30)) != 0;
+        var swizzleEnabled = (word1 & (1u << 31)) != 0;
+        var unifiedFormat = (word3 >> 12) & 0x7Fu;
+        var addTidEnabled = (word3 & (1u << 23)) != 0;
+        var outOfBoundsSelect = (word3 >> 28) & 0x3u;
+        var type = word3 >> 30;
+        var dstSelectX = word3 & 0x7u;
+
+        // RDNA2 tables 35 and 37: OOB_SELECT=0 is structured indexing, so
+        // NUM_RECORDS counts stride-sized records. FORMAT=20 is 32_UINT and
+        // dst_sel_x=4 selects its R component. ADD_TID and either swizzle bit
+        // alter addressing and are therefore outside this replacement.
+        return baseAddress == expectedBaseAddress &&
+               stride == sizeof(uint) &&
+               !cacheSwizzle &&
+               !swizzleEnabled &&
+               unifiedFormat == 20 &&
+               !addTidEnabled &&
+               outOfBoundsSelect == 0 &&
+               type == 0 &&
+               dstSelectX == 4;
     }
 
     private static Gen5ComputeSystemRegisters DecodeComputeSystemRegisters(
