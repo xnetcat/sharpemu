@@ -184,6 +184,18 @@ internal static class Gen5ShaderTranslator
                 .Select(word => $"{word:X8}"))
             : $"error={error}";
 
+    public static string DescribeInstructions(CpuContext ctx, ulong shaderAddress) =>
+        TryDecodeProgram(ctx, shaderAddress, out var program, out var error)
+            ? string.Join(
+                Environment.NewLine,
+                program.Instructions.Select(instruction =>
+                    $"0x{instruction.Pc:X4} {instruction.Opcode} " +
+                    $"src=[{string.Join(',', instruction.Sources)}] " +
+                    $"dst=[{string.Join(',', instruction.Destinations)}] " +
+                    $"words=[{string.Join(',', instruction.Words.Select(word => $"{word:X8}"))}] " +
+                    $"control={instruction.Control}"))
+            : $"error={error}";
+
     public static bool TryCreateState(
         CpuContext ctx,
         ulong shaderAddress,

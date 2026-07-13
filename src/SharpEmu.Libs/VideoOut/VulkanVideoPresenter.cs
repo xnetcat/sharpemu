@@ -157,7 +157,8 @@ internal sealed record VulkanGuestRenderTarget(
     uint Height,
     uint Format,
     uint NumberType,
-    uint MipLevels = 1);
+    uint MipLevels = 1,
+    uint ComponentSwap = 0);
 
 internal sealed record VulkanTranslatedGuestDraw(
     byte[] VertexSpirv,
@@ -175,7 +176,8 @@ internal sealed record VulkanTranslatedGuestDraw(
 internal sealed record VulkanOffscreenGuestDraw(
     VulkanTranslatedGuestDraw Draw,
     VulkanGuestRenderTarget Target,
-    bool PublishTarget);
+    bool PublishTarget,
+    ulong PixelShaderAddress = 0);
 
 internal sealed record VulkanComputeGuestDispatch(
     ulong ShaderAddress,
@@ -545,7 +547,8 @@ internal static unsafe class VulkanVideoPresenter
         uint primitiveType = 4,
         VulkanGuestIndexBuffer? indexBuffer = null,
         IReadOnlyList<VulkanGuestVertexBuffer>? vertexBuffers = null,
-        VulkanGuestRenderState? renderState = null)
+        VulkanGuestRenderState? renderState = null,
+        ulong pixelShaderAddress = 0)
     {
         if (pixelSpirv.Length == 0 ||
             target.Address == 0 ||
@@ -585,7 +588,8 @@ internal static unsafe class VulkanVideoPresenter
                         indexBuffer,
                         renderState ?? VulkanGuestRenderState.Default),
                     target,
-                    PublishTarget: true));
+                    PublishTarget: true,
+                    PixelShaderAddress: pixelShaderAddress));
             _guestImageWorkSequences[target.Address] = workSequence;
         }
     }
@@ -986,6 +990,17 @@ internal static unsafe class VulkanVideoPresenter
 
     internal static bool IsTextureContentCached(in TextureContentIdentity identity) =>
         _cachedTextureIdentities.ContainsKey(identity);
+
+    /// <summary>
+    /// Reserves a texture identity as soon as the guest submit thread captures
+    /// its first texel copy. Guest work is consumed in FIFO order, so later
+    /// draws can omit duplicate multi-megabyte copies while that first upload
+    /// is still waiting in the presenter queue. A cache miss on the render
+    /// thread self-heals from guest memory, so a translation failure after the
+    /// reservation cannot leave a permanent fallback texture.
+    /// </summary>
+    internal static bool TryReserveTextureContent(in TextureContentIdentity identity) =>
+        _cachedTextureIdentities.TryAdd(identity, 0);
 
     private static void MarkTextureContentCached(in TextureContentIdentity identity) =>
         _cachedTextureIdentities.TryAdd(identity, 0);
@@ -1475,6 +1490,9 @@ internal static unsafe class VulkanVideoPresenter
         private int _tracedLargeGlobalWritebackEvents;
         private readonly HashSet<ulong> _tracedGuestImageContents = new();
         private readonly Dictionary<ulong, int> _tracedGuestWriteCounts = new();
+        private static readonly HashSet<int> _traceLargeWriteOrdinals =
+            ParseLargeWriteOrdinals(
+                Environment.GetEnvironmentVariable("SHARPEMU_TRACE_GUEST_WRITES"));
         private int _tracedVertexBufferCount;
         // Compute translation can produce an equivalent new byte array on a
         // later submit. Reference identity turns that into an expensive new
@@ -6002,7 +6020,11 @@ internal static unsafe class VulkanVideoPresenter
         private static Format GetTextureFormat(uint format, uint numberType) =>
             (format, numberType) switch
             {
-                (9, _) => Format.A2R10G10B10UnormPack32,
+                // RDNA2 IMG_FORMAT 50 (2_10_10_10_UNORM) stores X/Y/Z/W as
+                // 10/10/10/2 from least- to most-significant bits. Vulkan's
+                // matching identity-component layout is A2B10G10R10. The
+                // A2R spelling is the color-target COMP_SWAP=ALT variant.
+                (9, _) => Format.A2B10G10R10UnormPack32,
                 (1, 0) => Format.R8Unorm,
                 (1, 1) => Format.R8SNorm,
                 (1, 2) => Format.R8Uscaled,
@@ -6079,7 +6101,10 @@ internal static unsafe class VulkanVideoPresenter
                 _ => Format.R8G8B8A8Unorm,
             };
 
-        private static Format GetRenderTargetFormat(uint format, uint numberType) =>
+        private static Format GetRenderTargetFormat(
+            uint format,
+            uint numberType,
+            uint componentSwap) =>
             (format, numberType) switch
             {
                 (4, 4) => Format.R32Uint,
@@ -6090,7 +6115,13 @@ internal static unsafe class VulkanVideoPresenter
                 (5, 7) => Format.R16G16Sfloat,
                 (6, 7) => Format.B10G11R11UfloatPack32,
                 (7, 7) => Format.B10G11R11UfloatPack32,
-                (9, _) => Format.A2R10G10B10UnormPack32,
+                // CB_COLOR_INFO.COMP_SWAP is independent from FORMAT. For
+                // COLOR_2_10_10_10, STD exposes the low 10-bit component as
+                // R (A2B10G10R10 in Vulkan); ALT reverses R/B. Void
+                // Terrarium uses STD (CB_COLOR_INFO=0x00008024).
+                (9, _) when componentSwap == 0 => Format.A2B10G10R10UnormPack32,
+                (9, _) when componentSwap == 1 => Format.A2R10G10B10UnormPack32,
+                (9, _) => Format.Undefined,
                 (10, 9) => Format.R8G8B8A8Srgb,
                 (10, 4) => Format.R8G8B8A8Uint,
                 (10, 5) => Format.R8G8B8A8Sint,
@@ -6905,13 +6936,16 @@ internal static unsafe class VulkanVideoPresenter
 
         private void ExecuteOffscreenDrawCore(VulkanOffscreenGuestDraw work)
         {
-            var format = GetRenderTargetFormat(work.Target.Format, work.Target.NumberType);
+            var format = GetRenderTargetFormat(
+                work.Target.Format,
+                work.Target.NumberType,
+                work.Target.ComponentSwap);
             if (format == Format.Undefined)
             {
                 Console.Error.WriteLine(
                     $"[LOADER][WARN] Vulkan skipped unsupported render target " +
                     $"addr=0x{work.Target.Address:X16} format={work.Target.Format} " +
-                    $"number={work.Target.NumberType}");
+                    $"number={work.Target.NumberType} swap={work.Target.ComponentSwap}");
                 ReturnPooledGuestData(work.Draw);
                 return;
             }
@@ -6974,9 +7008,11 @@ internal static unsafe class VulkanVideoPresenter
                     needsTextureUploads |= texture.NeedsUpload;
                 }
 
+                var hasWritableGlobalBuffers = resources.GlobalMemoryBuffers.Any(
+                    static buffer => buffer.Writable);
                 if (hasStorageImages ||
                     needsTextureUploads ||
-                    resources.GlobalMemoryBuffers.Length != 0 ||
+                    hasWritableGlobalBuffers ||
                     !ReferenceEquals(_openPassTarget, target))
                 {
                     CloseOpenTranslatedRenderPass();
@@ -7051,23 +7087,13 @@ internal static unsafe class VulkanVideoPresenter
                     guestWritesMode == "small" &&
                     target.Width <= 512 && target.Height <= 256;
                 // "large" mode: read back the first two >=2560x1440 render
-                // targets. "large@N" instead reads back only write N for each
+                // targets. "large@N[,M...]" instead reads back only those
+                // write ordinals for each
                 // such target. The latter is crucial for long composite chains:
                 // it finds the first later draw that turns a valid frame black
                 // without forcing hundreds of expensive 4K readbacks.
-                var traceLargeWriteOrdinal = 0L;
-                if (guestWritesMode is not null &&
-                    guestWritesMode.StartsWith("large@", StringComparison.Ordinal) &&
-                    long.TryParse(
-                        guestWritesMode.AsSpan("large@".Length),
-                        out var parsedTraceLargeWriteOrdinal) &&
-                    parsedTraceLargeWriteOrdinal > 0)
-                {
-                    traceLargeWriteOrdinal = parsedTraceLargeWriteOrdinal;
-                }
-
                 var traceLargeWrites =
-                    (guestWritesMode == "large" || traceLargeWriteOrdinal != 0) &&
+                    (guestWritesMode == "large" || _traceLargeWriteOrdinals.Count != 0) &&
                     target.Width >= 2560 && target.Height >= 1440;
                 if (ShouldTraceGuestImageWriteForDiagnostics(target.Address) || traceSmallWrites || traceLargeWrites)
                 {
@@ -7077,8 +7103,8 @@ internal static unsafe class VulkanVideoPresenter
                         ? previousCount + 1
                         : 1;
                     _tracedGuestWriteCounts[target.Address] = writeCount;
-                    var shouldTraceWrite = traceLargeWriteOrdinal != 0
-                        ? writeCount == traceLargeWriteOrdinal
+                    var shouldTraceWrite = _traceLargeWriteOrdinals.Count != 0
+                        ? _traceLargeWriteOrdinals.Contains(writeCount)
                         : writeCount <= (traceLargeWrites ? 2 : traceSmallWrites ? 48 : 3);
                     if (shouldTraceWrite)
                     {
@@ -7090,7 +7116,10 @@ internal static unsafe class VulkanVideoPresenter
                         Console.Error.WriteLine(
                             $"[LOADER][TRACE] vk.guest_write_sample " +
                             $"addr=0x{target.Address:X16} write={writeCount} " +
-                            $"ps_bytes={work.Draw.PixelSpirv.Length}");
+                            $"ps=0x{work.PixelShaderAddress:X16} " +
+                            $"ps_bytes={work.Draw.PixelSpirv.Length} " +
+                            $"inputs=[{string.Join(',', work.Draw.Textures.Select(texture =>
+                                $"0x{texture.Address:X16}/{texture.Width}x{texture.Height}/f{texture.Format}"))}]");
                         TraceGuestImageContents(target);
                     }
                 }
@@ -7860,6 +7889,7 @@ internal static unsafe class VulkanVideoPresenter
                 Format.R8G8B8A8Uint or
                 Format.R8G8B8A8Sint or
                 Format.A2R10G10B10UnormPack32 or
+                Format.A2B10G10R10UnormPack32 or
                 Format.B10G11R11UfloatPack32 => 32,
                 Format.R32G32Uint or
                 Format.R32G32Sint or
@@ -8552,7 +8582,8 @@ internal static unsafe class VulkanVideoPresenter
                 Format.R8G8B8A8Uint or
                 Format.R8G8B8A8Sint or
                 Format.R8G8B8A8Unorm or
-                Format.A2R10G10B10UnormPack32 => 4,
+                Format.A2R10G10B10UnormPack32 or
+                Format.A2B10G10R10UnormPack32 => 4,
                 Format.R16G16B16A16Uint or
                 Format.R16G16B16A16Sint or
                 Format.R16G16B16A16Sfloat => 8,
@@ -8576,7 +8607,8 @@ internal static unsafe class VulkanVideoPresenter
                 var pixel = bytes.Slice(offset, (int)bytesPerPixel);
                 var hasColor = format switch
                 {
-                    Format.A2R10G10B10UnormPack32 =>
+                    Format.A2R10G10B10UnormPack32 or
+                    Format.A2B10G10R10UnormPack32 =>
                         (BitConverter.ToUInt32(pixel) & 0x3FFFFFFFu) != 0,
                     Format.R8G8B8A8Uint or
                     Format.R8G8B8A8Sint or
@@ -8979,6 +9011,28 @@ internal static unsafe class VulkanVideoPresenter
             return AddressListContains(
                 "SHARPEMU_TRACE_GUEST_WRITES",
                 address);
+        }
+
+        private static HashSet<int> ParseLargeWriteOrdinals(string? value)
+        {
+            if (value is null ||
+                !value.StartsWith("large@", StringComparison.Ordinal))
+            {
+                return [];
+            }
+
+            var ordinals = new HashSet<int>();
+            foreach (var token in value["large@".Length..].Split(
+                         ',',
+                         StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                if (int.TryParse(token, out var ordinal) && ordinal > 0)
+                {
+                    ordinals.Add(ordinal);
+                }
+            }
+
+            return ordinals;
         }
 
         private static bool AddressListContains(

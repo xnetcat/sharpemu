@@ -193,6 +193,10 @@ public static class AgcExports
             Environment.GetEnvironmentVariable("SHARPEMU_LOG_AGC_SHADER"),
             "1",
             StringComparison.Ordinal);
+    private static readonly ulong? _shaderInstructionDumpSuffix =
+        TryParseShaderSuffix(
+            Environment.GetEnvironmentVariable("SHARPEMU_DUMP_SHADER_SUFFIX"));
+    private static readonly HashSet<ulong> _dumpedShaderInstructions = [];
     private static readonly bool _traceDraws = string.Equals(
         Environment.GetEnvironmentVariable("SHARPEMU_TRACE_DRAWS"),
         "1",
@@ -203,6 +207,32 @@ public static class AgcExports
         Environment.GetEnvironmentVariable("SHARPEMU_NO_TEXTURE_SKIP"),
         "1",
         StringComparison.Ordinal);
+    private static readonly bool _traceTextureCopies = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_TRACE_TEXTURE_COPIES"),
+        "1",
+        StringComparison.Ordinal);
+    private static readonly bool _traceFixedCopies = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_TRACE_FIXED_COPIES"),
+        "1",
+        StringComparison.Ordinal);
+    private static readonly bool _traceBfaSource = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_TRACE_BFA_SOURCE"),
+        "1",
+        StringComparison.Ordinal);
+    private static readonly bool _forceFixedB6e = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_FIXED_B6E"),
+        "1",
+        StringComparison.Ordinal);
+    private static readonly bool _forceFixedB5a = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_FIXED_B5A"),
+        "1",
+        StringComparison.Ordinal);
+    private static ulong _tracedBfaSourceAddress;
+    private static readonly object _textureCopyTraceGate = new();
+    private static readonly Dictionary<
+        (ulong Address, uint Width, uint Height, uint Format, uint TileMode),
+        (long Calls, long Bytes)> _textureCopyTraceTotals = [];
+    private static long _textureCopyTraceCalls;
     private static long _dcbWriteDataTraceCount;
     private static long _dcbWaitRegMemTraceCount;
     private static long _createShaderTraceCount;
@@ -375,6 +405,7 @@ public static class AgcExports
         uint Height,
         uint Format,
         uint NumberType,
+        uint ComponentSwap,
         uint TileMode);
 
     private sealed record TranslatedGuestDraw(
@@ -3886,6 +3917,35 @@ public static class AgcExports
             return;
         }
 
+        if (_shaderInstructionDumpSuffix is { } dumpSuffix)
+        {
+            foreach (var shaderAddress in new[]
+                     {
+                         hasExportShader ? exportShaderAddress : 0,
+                         hasPixelShader ? pixelShaderAddress : 0,
+                     })
+            {
+                if (shaderAddress == 0 ||
+                    (shaderAddress & 0xFFFFFuL) != dumpSuffix)
+                {
+                    continue;
+                }
+
+                var shouldDump = false;
+                lock (_submitTraceGate)
+                {
+                    shouldDump = _dumpedShaderInstructions.Add(shaderAddress);
+                }
+
+                if (shouldDump)
+                {
+                    Console.Error.WriteLine(
+                        $"[COMPAT][SHADER-DUMP] address=0x{shaderAddress:X16}\n" +
+                        Gen5ShaderTranslator.DescribeInstructions(ctx, shaderAddress));
+                }
+            }
+        }
+
         var translationError = string.Empty;
         if (hasExportShader &&
             hasPixelShader &&
@@ -3905,6 +3965,47 @@ public static class AgcExports
             var firstTarget = translatedDraw.RenderTargets.FirstOrDefault();
             if (firstTarget.Address != 0)
             {
+                if (_traceBfaSource &&
+                    (translatedDraw.PixelShaderAddress & 0xFFFFFuL) == 0xBFA00uL &&
+                    translatedDraw.Textures.Count != 0)
+                {
+                    var sourceAddress = translatedDraw.Textures[0].Descriptor.Address;
+                    lock (_submitTraceGate)
+                    {
+                        if (_tracedBfaSourceAddress != sourceAddress)
+                        {
+                            _tracedBfaSourceAddress = sourceAddress;
+                            Console.Error.WriteLine(
+                                $"[COMPAT][BFA-SOURCE] address=0x{sourceAddress:X16} " +
+                                $"display=0x{firstTarget.Address:X16}");
+                        }
+                    }
+                }
+
+                if (_traceBfaSource)
+                {
+                    ulong sourceAddress;
+                    lock (_submitTraceGate)
+                    {
+                        sourceAddress = _tracedBfaSourceAddress;
+                    }
+
+                    if (sourceAddress != 0 &&
+                        translatedDraw.RenderTargets.Any(target => target.Address == sourceAddress))
+                    {
+                        var inputs = string.Join(",", translatedDraw.Textures.Select(binding =>
+                            $"0x{binding.Descriptor.Address:X16}" +
+                            $"/{binding.Descriptor.Width}x{binding.Descriptor.Height}" +
+                            $"/f{binding.Descriptor.Format}"));
+                        Console.Error.WriteLine(
+                            $"[COMPAT][BFA-SOURCE-WRITER] seq={drawSequence} " +
+                            $"ps=0x{translatedDraw.PixelShaderAddress:X16} " +
+                            $"es=0x{translatedDraw.ExportShaderAddress:X16} " +
+                            $"vertices={translatedDraw.VertexCount} prim={translatedDraw.PrimitiveType} " +
+                            $"inputs=[{inputs}]");
+                    }
+                }
+
                 // Render every bound color target. A deferred G-buffer draw
                 // writes several targets in one guest pass; we render one bound
                 // target per Vulkan pass, each with the pixel variant that
@@ -3968,14 +4069,16 @@ public static class AgcExports
                                 renderTarget.Width,
                                 renderTarget.Height,
                                 renderTarget.Format,
-                                renderTarget.NumberType),
+                                renderTarget.NumberType,
+                                ComponentSwap: renderTarget.ComponentSwap),
                             translatedDraw.VertexSpirv,
                             translatedDraw.VertexCount,
                             translatedDraw.InstanceCount,
                             translatedDraw.PrimitiveType,
                             indexBuffer,
                             vertexBuffers,
-                            translatedDraw.RenderState);
+                            translatedDraw.RenderState,
+                            pixelShaderAddress: translatedDraw.PixelShaderAddress);
                     }
                 }
             }
@@ -4640,6 +4743,7 @@ public static class AgcExports
                 (attrib2 & 0x3FFFu) + 1,
                 (info >> 2) & 0x1Fu,
                 (info >> 8) & 0x7u,
+                (info >> 11) & 0x3u,
                 (attrib3 >> 14) & 0x1Fu));
         }
 
@@ -5235,13 +5339,13 @@ public static class AgcExports
     }
 
     // Void Terrarium copies its 10:10:10:2 scene into an RGBA8 post-processing
-    // input, runs a large gather-based AA shader back into 10-bit, then copies
-    // the composed image into its rotating display buffers.  The translated
-    // copy shaders and the gather-heavy AA shader currently lose the sampled
-    // colour on MoltenVK even though the source guest image is valid. Route
-    // only those three exact full-resolution programs through the presenter's
-    // fixed sampling shader; bloom, grading, framing, UI, and other ordinary
-    // post-processing draws retain their guest shaders and state.
+    // input and runs a large gather-based AA shader back into 10-bit. Those two
+    // translated stages currently lose the sampled colour on MoltenVK even
+    // though the source guest image is valid, so route only those exact stages
+    // through the presenter's fixed sampling shader. Later B6E00/B5A00/BFA00
+    // passes are not copies: they perform channel reconstruction, bloom and
+    // the final visibility mask. Raw-blitting any of them replaces the composed
+    // scene with one intermediate texture.
     private static bool TrySubmitFullscreenGuestImageCopy(
         TranslatedGuestDraw draw,
         RenderTargetDescriptor target)
@@ -5267,36 +5371,31 @@ public static class AgcExports
             draw.PrimitiveType == 4 &&
             target.Format == 9 &&
             (draw.PixelShaderAddress & 0xFFFFFuL) == 0xA8700uL;
-        var isScenePostProcessCopy =
+        var isForcedB6eCopy =
+            _forceFixedB6e &&
             draw.VertexCount == 4 &&
             draw.PrimitiveType == 6 &&
             target.Format == 9 &&
             (draw.PixelShaderAddress & 0xFFFFFuL) == 0xB6E00uL;
-        var isBloomCompositeCopy =
+        var isForcedB5aCopy =
+            _forceFixedB5a &&
             draw.VertexCount == 4 &&
             draw.PrimitiveType == 6 &&
             target.Format == 9 &&
             (draw.PixelShaderAddress & 0xFFFFFuL) == 0xB5A00uL;
-        var isDisplayBufferCopy =
-            draw.VertexCount == 4 &&
-            draw.PrimitiveType == 6 &&
-            target.Format == 9 &&
-            (draw.PixelShaderAddress & 0xFFFFFuL) == 0xBFA00uL;
         if (!isPostProcessInputCopy &&
             !isAntiAliasingCopy &&
-            !isScenePostProcessCopy &&
-            !isBloomCompositeCopy &&
-            !isDisplayBufferCopy)
+            !isForcedB6eCopy &&
+            !isForcedB5aCopy)
         {
             return false;
         }
 
         var source = draw.Textures[0].Descriptor;
-        // The bloom-composite shader has one full-resolution base image plus
-        // several smaller bloom inputs. Its broken translated variant is
-        // reduced to the base image; all other compatibility copies reference
-        // the same descriptor repeatedly and must agree exactly.
-        var bindingCountToValidate = isBloomCompositeCopy ? 1 : draw.Textures.Count;
+        // Both compatibility programs reference the same source descriptor
+        // repeatedly; reject anything that is not that exact conversion/AA
+        // shape rather than accidentally flattening a composite shader.
+        var bindingCountToValidate = isForcedB5aCopy ? 1 : draw.Textures.Count;
         for (var index = 0; index < bindingCountToValidate; index++)
         {
             var binding = draw.Textures[index];
@@ -5336,6 +5435,14 @@ public static class AgcExports
             TraceAgcShader(
                 $"agc.fixed_image_copy src=0x{source.Address:X16} " +
                 $"dst=0x{target.Address:X16} size={source.Width}x{source.Height}");
+            if (_traceFixedCopies)
+            {
+                Console.Error.WriteLine(
+                    $"[COMPAT][FIXED-COPY] ps=0x{draw.PixelShaderAddress:X16} " +
+                    $"src=0x{source.Address:X16}/f{source.Format} " +
+                    $"dst=0x{target.Address:X16}/f{target.Format} " +
+                    $"size={source.Width}x{source.Height}");
+            }
         }
 
         return submitted;
@@ -5611,29 +5718,30 @@ public static class AgcExports
             return true;
         }
 
-        // When the presenter already holds this exact texture identity in
-        // its cache, the texel copy below would be discarded on arrival; for
-        // scenes that sample large textures every draw this copy dominated
-        // CPU time. The dirty peek closes the race with eviction: a texture
-        // the guest rewrote must ship fresh texels with this draw, because
-        // the render thread evicts the stale cache entry before executing it
-        // (skipping would leave the draw with no pixels and a fallback
-        // texture for the frame — visible flicker on animated textures).
+        // Reserve the first queued copy, not only the first completed upload.
+        // The guest can enqueue dozens of draws before the render thread sees
+        // the first one; copying a 16-32 MiB texture into every queued draw
+        // rapidly grows the managed heap and eventually makes the process
+        // unresponsive. FIFO guest work guarantees the reserved upload is
+        // consumed before every later empty binding. The render thread also
+        // self-heals a reservation whose original draw failed by reading guest
+        // memory on cache miss. The dirty peek keeps rewritten textures from
+        // taking this immutable-content fast path.
         var sampler = ToVulkanSampler(samplerDescriptor);
+        var identity = new VulkanVideoPresenter.TextureContentIdentity(
+            descriptor.Address,
+            descriptor.Width,
+            descriptor.Height,
+            descriptor.Format,
+            descriptor.NumberType,
+            descriptor.DstSelect,
+            descriptor.TileMode,
+            sourceWidth,
+            sampler);
         if (!_textureCopySkipDisabled &&
             descriptor.Address != 0 &&
             !SharpEmu.HLE.GuestImageWriteTracker.PeekDirty(descriptor.Address) &&
-            VulkanVideoPresenter.IsTextureContentCached(
-                new VulkanVideoPresenter.TextureContentIdentity(
-                    descriptor.Address,
-                    descriptor.Width,
-                    descriptor.Height,
-                    descriptor.Format,
-                    descriptor.NumberType,
-                    descriptor.DstSelect,
-                    descriptor.TileMode,
-                    sourceWidth,
-                    sampler)))
+            !VulkanVideoPresenter.TryReserveTextureContent(identity))
         {
             texture = new VulkanGuestDrawTexture(
                 descriptor.Address,
@@ -5689,6 +5797,7 @@ public static class AgcExports
             sourceWidth,
             checked((int)sourceByteCount),
             source) ?? source.AsSpan(0, checked((int)sourceByteCount)).ToArray();
+        TraceTextureCopy(descriptor, physicalSourceByteCount + sourceByteCount);
         DumpLinearTextureIfRequested(descriptor, sourceWidth, rgba);
         texture = new VulkanGuestDrawTexture(
             descriptor.Address,
@@ -5706,6 +5815,43 @@ public static class AgcExports
             DstSelect: descriptor.DstSelect,
             Sampler: ToVulkanSampler(samplerDescriptor));
         return true;
+    }
+
+    private static void TraceTextureCopy(TextureDescriptor descriptor, ulong allocatedBytes)
+    {
+        if (!_traceTextureCopies)
+        {
+            return;
+        }
+
+        lock (_textureCopyTraceGate)
+        {
+            var key = (
+                descriptor.Address,
+                descriptor.Width,
+                descriptor.Height,
+                descriptor.Format,
+                descriptor.TileMode);
+            var current = _textureCopyTraceTotals.GetValueOrDefault(key);
+            _textureCopyTraceTotals[key] = (
+                current.Calls + 1,
+                current.Bytes + checked((long)allocatedBytes));
+            var calls = ++_textureCopyTraceCalls;
+            if ((calls & 0x3F) != 0)
+            {
+                return;
+            }
+
+            var leaders = _textureCopyTraceTotals
+                .OrderByDescending(entry => entry.Value.Bytes)
+                .Take(8)
+                .Select(entry =>
+                    $"0x{entry.Key.Address:X16}:{entry.Key.Width}x{entry.Key.Height}" +
+                    $"/f{entry.Key.Format}/t{entry.Key.TileMode}" +
+                    $"={entry.Value.Calls}x/{entry.Value.Bytes / (1024 * 1024)}MiB");
+            Console.Error.WriteLine(
+                $"[COMPAT][TEXTURE-COPIES] calls={calls} top=[{string.Join(", ", leaders)}]");
+        }
     }
 
 
@@ -5796,7 +5942,7 @@ public static class AgcExports
 
         Console.Error.WriteLine(
             $"[DRAW] seq={sequence} es=0x{draw.ExportShaderAddress:X} ps=0x{draw.PixelShaderAddress:X} " +
-            $"target=0x{target.Address:X}:{target.Width}x{target.Height}:f{target.Format}/n{target.NumberType} " +
+            $"target=0x{target.Address:X}:{target.Width}x{target.Height}:f{target.Format}/n{target.NumberType}/s{target.ComponentSwap} " +
             $"prim=0x{draw.PrimitiveType:X} verts={draw.VertexCount} indexed={draw.IndexBuffer is not null} " +
             $"blend={(blend.Enable ? 1 : 0)}:{blend.ColorSrcFactor}/{blend.ColorDstFactor}/{blend.ColorFunc}" +
             $":a{blend.AlphaSrcFactor}/{blend.AlphaDstFactor}/{blend.AlphaFunc}/s{(blend.SeparateAlphaBlend ? 1 : 0)} " +
@@ -8120,6 +8266,28 @@ public static class AgcExports
         values.Count == 0
             ? "none"
             : string.Join(',', values.Select(static value => $"{value:X8}"));
+
+    private static ulong? TryParseShaderSuffix(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return null;
+        }
+
+        var span = value.AsSpan().Trim();
+        if (span.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+        {
+            span = span[2..];
+        }
+
+        return ulong.TryParse(
+                   span,
+                   System.Globalization.NumberStyles.HexNumber,
+                   System.Globalization.CultureInfo.InvariantCulture,
+                   out var suffix) && suffix <= 0xFFFFFuL
+            ? suffix
+            : null;
+    }
 
     private static string FormatTextureDescriptor(TextureDescriptor descriptor) =>
         $"addr=0x{descriptor.Address:X16} {descriptor.Width}x{descriptor.Height} " +

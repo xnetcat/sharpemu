@@ -4339,6 +4339,12 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		return 20;
 	}
 
+	private static bool IsStallWatchdogFatal() =>
+		string.Equals(
+			Environment.GetEnvironmentVariable("SHARPEMU_STALL_WATCHDOG_FATAL"),
+			"1",
+			StringComparison.Ordinal);
+
 
 	private void StartStallWatchdog()
 	{
@@ -4394,11 +4400,29 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				{
 					continue;
 				}
-				LastError = $"Execution stalled with no import progress for {stallWatchdogSeconds}s (imports={Volatile.Read(ref _importDispatchCount)}).";
-				Console.Error.WriteLine("[LOADER][ERROR] " + LastError);
+				var stallMessage =
+					$"Execution stalled with no import progress for {stallWatchdogSeconds}s " +
+					$"(imports={Volatile.Read(ref _importDispatchCount)}).";
+				var fatal = IsStallWatchdogFatal();
+				if (fatal)
+				{
+					LastError = stallMessage;
+				}
+				Console.Error.WriteLine(
+					fatal
+						? "[LOADER][ERROR] " + stallMessage
+						: "[LOADER][WARN] " + stallMessage +
+						  " Keeping the emulator alive for recovery; set " +
+						  "SHARPEMU_STALL_WATCHDOG_FATAL=1 to restore fail-fast exit.");
 				LogStallWatchdogSnapshot();
 				Console.Error.Flush();
-				Environment.Exit(4);
+				if (fatal)
+				{
+					Environment.Exit(4);
+				}
+
+				Interlocked.Exchange(ref _stallWatchdogTriggered, 0);
+				MarkExecutionProgress();
 			}
 		}))
 		{
