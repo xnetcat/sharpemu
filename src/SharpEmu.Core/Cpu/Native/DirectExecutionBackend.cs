@@ -300,6 +300,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private string? _importFilter;
 
+	private ulong _guestPointerSearchTarget;
+
+	private int _guestPointerSearchDone;
+
 	private bool _disableImportLoopGuard;
 
 	private int _importLoopGuardSeconds;
@@ -433,6 +437,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		public long ExecutorClaimDeferrals { get; set; }
 
 		public GuestContinuationRunner? ContinuationRunner { get; set; }
+
+		public GuestExecutionRunner? ExecutionRunner { get; set; }
 	}
 
 	private sealed class GuestContinuationRunner : IDisposable
@@ -509,6 +515,101 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			}
 			_workAvailable.Dispose();
 			_workCompleted.Dispose();
+		}
+	}
+
+	private sealed class GuestExecutionRunner : IDisposable
+	{
+		private readonly object _gate = new();
+		private readonly AutoResetEvent _workAvailable = new(false);
+		private readonly Thread _thread;
+		private Action? _work;
+		private volatile bool _stopping;
+		private int _busy;
+
+		public GuestExecutionRunner(string name, ThreadPriority priority)
+		{
+			_thread = new Thread(ThreadMain)
+			{
+				IsBackground = true,
+				Name = $"SharpEmu-{name}",
+				Priority = priority,
+			};
+			_thread.Start();
+		}
+
+		public bool IsBusy => Volatile.Read(ref _busy) != 0;
+
+		public bool TryPost(Action work)
+		{
+			lock (_gate)
+			{
+				if (_stopping || _work is not null)
+				{
+					return false;
+				}
+
+				_work = work;
+				Volatile.Write(ref _busy, 1);
+				_workAvailable.Set();
+				return true;
+			}
+		}
+
+		public void TrySetPriority(ThreadPriority priority)
+		{
+			try
+			{
+				_thread.Priority = priority;
+			}
+			catch (Exception exception) when (exception is ThreadStateException or InvalidOperationException)
+			{
+			}
+		}
+
+		private void ThreadMain()
+		{
+			while (true)
+			{
+				_workAvailable.WaitOne();
+				if (_stopping)
+				{
+					return;
+				}
+
+				Action? work;
+				lock (_gate)
+				{
+					work = _work;
+				}
+
+				try
+				{
+					work?.Invoke();
+				}
+				finally
+				{
+					lock (_gate)
+					{
+						_work = null;
+						Volatile.Write(ref _busy, 0);
+					}
+				}
+			}
+		}
+
+		public void Dispose()
+		{
+			_stopping = true;
+			_workAvailable.Set();
+			if (!ReferenceEquals(Thread.CurrentThread, _thread))
+			{
+				_thread.Join(1000);
+			}
+			if (!_thread.IsAlive)
+			{
+				_workAvailable.Dispose();
+			}
 		}
 	}
 
@@ -888,6 +989,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		_logStackCheck = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_STACK_CHK"), "1", StringComparison.Ordinal);
 		_probeImportReturn = Environment.GetEnvironmentVariable("SHARPEMU_PROBE_IMPORT_RET");
 		_importFilter = Environment.GetEnvironmentVariable("SHARPEMU_LOG_IMPORT_FILTER");
+		_guestPointerSearchTarget = ParseOptionalHexAddress(
+			Environment.GetEnvironmentVariable("SHARPEMU_FIND_GUEST_POINTER"));
+		_guestPointerSearchDone = 0;
 		_disableImportLoopGuard = string.Equals(
 			Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_IMPORT_LOOP_GUARD"),
 			"1",
@@ -945,6 +1049,25 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			GuestThreadExecution.Scheduler = previousGuestThreadScheduler;
 			Console.Error.WriteLine("[LOADER][INFO] === Execute END (LastError: " + (LastError ?? "null") + ") ===");
 		}
+	}
+
+	private static ulong ParseOptionalHexAddress(string? value)
+	{
+		if (string.IsNullOrWhiteSpace(value))
+		{
+			return 0;
+		}
+
+		var normalized = value.StartsWith("0x", StringComparison.OrdinalIgnoreCase)
+			? value[2..]
+			: value;
+		return ulong.TryParse(
+			normalized,
+			System.Globalization.NumberStyles.HexNumber,
+			System.Globalization.CultureInfo.InvariantCulture,
+			out var address)
+			? address
+			: 0;
 	}
 
 	private bool SetupImportStubs(IReadOnlyDictionary<ulong, string> importStubs)
@@ -2758,17 +2881,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					continue;
 				}
 
-				var hostThread = new Thread(() => RunGuestThread(thread, reason))
-				{
-					IsBackground = true,
-					Name = $"SharpEmu-{thread.Name}",
-					Priority = MapGuestThreadPriority(thread.Priority),
-				};
-				lock (_guestThreadGate)
-				{
-					thread.HostThread = hostThread;
-				}
-				hostThread.Start();
+				QueueGuestThreadExecution(thread, reason);
 			}
 		}
 		finally
@@ -3381,20 +3494,30 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private void ClearGuestThreads()
 	{
-		GuestContinuationRunner[] runners;
+		GuestContinuationRunner[] continuationRunners;
+		GuestExecutionRunner[] executionRunners;
 		lock (_guestThreadGate)
 		{
-			runners = _guestThreads.Values
+			continuationRunners = _guestThreads.Values
 				.Select(static thread => thread.ContinuationRunner)
 				.Where(static runner => runner is not null)
 				.Cast<GuestContinuationRunner>()
+				.ToArray();
+			executionRunners = _guestThreads.Values
+				.Select(static thread => thread.ExecutionRunner)
+				.Where(static runner => runner is not null)
+				.Cast<GuestExecutionRunner>()
 				.ToArray();
 			_readyGuestThreads.Clear();
 			Interlocked.Exchange(ref _readyGuestThreadCount, 0);
 			_guestThreads.Clear();
 		}
 
-		foreach (var runner in runners)
+		foreach (var runner in continuationRunners)
+		{
+			runner.Dispose();
+		}
+		foreach (var runner in executionRunners)
 		{
 			runner.Dispose();
 		}
@@ -3668,6 +3791,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			}
 
 			thread.Priority = guestPriority;
+			thread.ExecutionRunner?.TrySetPriority(MapGuestThreadPriority(guestPriority));
 			var host = thread.HostThread;
 			if (host is not null && host.IsAlive)
 			{
@@ -4613,6 +4737,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				}
 				if (HasReadyGuestThread())
 				{
+					// The ready dispatcher owns guest execution.  Calling Pump from this
+					// diagnostic thread re-enters the native guest trampoline on an
+					// unrelated host stack, which can recursively nest CallDescrWorker
+					// frames and starve the actual emulation thread.
 					Console.Error.WriteLine(
 						$"[LOADER][WARN] No import progress for {stallWatchdogSeconds}s, but a guest thread is ready; dispatcher will resume it.");
 					LogStallWatchdogSnapshot();
@@ -4759,18 +4887,34 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				return;
 			}
 
-			var dispatched = thread;
-			var hostThread = new Thread(() => RunGuestThread(dispatched, "ready-dispatch"))
+			QueueGuestThreadExecution(thread, "ready-dispatch");
+		}
+	}
+
+	private void QueueGuestThreadExecution(GuestThreadState thread, string reason)
+	{
+		GuestExecutionRunner runner;
+		lock (_guestThreadGate)
+		{
+			runner = thread.ExecutionRunner ??= new GuestExecutionRunner(
+				thread.Name,
+				MapGuestThreadPriority(thread.Priority));
+		}
+
+		if (runner.TryPost(() => RunGuestThread(thread, reason)))
+		{
+			return;
+		}
+
+		lock (_guestThreadGate)
+		{
+			if (thread.State == GuestThreadRunState.Running)
 			{
-				IsBackground = true,
-				Name = $"SharpEmu-{dispatched.Name}",
-				Priority = MapGuestThreadPriority(dispatched.Priority),
-			};
-			lock (_guestThreadGate)
-			{
-				dispatched.HostThread = hostThread;
+				thread.ExecutorActive = false;
+				thread.State = GuestThreadRunState.Ready;
+				_readyGuestThreads.Enqueue(thread);
+				Interlocked.Increment(ref _readyGuestThreadCount);
 			}
-			hostThread.Start();
 		}
 	}
 
@@ -4792,7 +4936,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				continue;
 			}
 
-			if (candidate.ExecutorActive)
+			if (candidate.ExecutorActive || candidate.ExecutionRunner is { IsBusy: true })
 			{
 				_readyGuestThreads.Enqueue(candidate);
 				Interlocked.Increment(ref _readyGuestThreadCount);
@@ -4889,7 +5033,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 						$"nid={Volatile.Read(ref thread.LastImportNid) ?? "none"} ret=0x{Volatile.Read(ref thread.LastReturnRip):X16} " +
 						$"block={thread.BlockReason ?? "none"}{hostContextText}");
 					logged++;
-					if (logged >= 48 && threads.Length > logged)
+					if (logged >= 96 && threads.Length > logged)
 					{
 						Console.Error.WriteLine($"[LOADER][ERROR] Stall guest-thread: ... {threads.Length - logged} more");
 						break;

@@ -67,6 +67,8 @@ public static class AgcExports
     private const uint RDmaData = 0x19;
     private const uint SpiShaderPgmLoPs = 0x8;
     private const uint SpiShaderPgmHiPs = 0x9;
+    private const uint SpiShaderPgmLoGs = 0x8A;
+    private const uint SpiShaderPgmHiGs = 0x8B;
     private const uint SpiShaderPgmLoEs = 0xC8;
     private const uint SpiShaderPgmHiEs = 0xC9;
     private const uint SpiShaderPgmLoLs = 0x148;
@@ -9118,6 +9120,7 @@ public static class AgcExports
             0 => ComputePgmLo,
             1 => SpiShaderPgmLoPs,
             2 or 6 => SpiShaderPgmLoEs,
+            4 => SpiShaderPgmLoGs,
             7 => SpiShaderPgmLoLs,
             _ => 0u,
         };
@@ -9126,6 +9129,7 @@ public static class AgcExports
             0 => ComputePgmHi,
             1 => SpiShaderPgmHiPs,
             2 or 6 => SpiShaderPgmHiEs,
+            4 => SpiShaderPgmHiGs,
             7 => SpiShaderPgmHiLs,
             _ => 0u,
         };

@@ -158,6 +158,13 @@ public sealed partial class DirectExecutionBackend
 		ulong value7 = cpuContext[CpuRegister.R14];
 		ulong value8 = cpuContext[CpuRegister.R15];
 		ulong num7 = *(ulong*)(argPackPtr + 96);
+		if (_guestPointerSearchTarget != 0 &&
+			importStubEntry.Nid == "Op8TBGY5KHg" &&
+			value == _guestPointerSearchTarget + 0x28 &&
+			Interlocked.CompareExchange(ref _guestPointerSearchDone, 1, 0) == 0)
+		{
+			TraceGuestPointerReferences(cpuContext, _guestPointerSearchTarget);
+		}
 		var isGuestWorker = GuestThreadExecution.IsGuestThread;
 		if (!IsLikelyReturnAddress(num7))
 		{
@@ -949,6 +956,77 @@ public sealed partial class DirectExecutionBackend
 		}
 
 		return _nextImportDispatchIndex++;
+	}
+
+	private void TraceGuestPointerReferences(CpuContext context, ulong target)
+	{
+		if (!TryGetVirtualMemory(context, out var virtualMemory))
+		{
+			Console.Error.WriteLine("[LOADER][TRACE] guest_pointer_search: virtual memory unavailable");
+			return;
+		}
+
+		const int chunkSize = 1024 * 1024;
+		const ulong maxRegionSize = 1024UL * 1024 * 1024;
+		const ulong maxTotalBytes = 4UL * 1024 * 1024 * 1024;
+		var buffer = System.Buffers.ArrayPool<byte>.Shared.Rent(chunkSize);
+		ulong scannedBytes = 0;
+		var matches = 0;
+		try
+		{
+			foreach (var region in virtualMemory.SnapshotRegions())
+			{
+				// PhysicalVirtualMemory currently reports allocation-level snapshots as
+				// readable even when writable pages exist inside the allocation.  This
+				// diagnostic is opt-in, so scan every readable snapshot instead of
+				// incorrectly filtering all physical guest regions out here.
+				if ((region.Protection & SharpEmu.Core.Loader.ProgramHeaderFlags.Read) == 0 ||
+					region.MemorySize == 0 ||
+					region.MemorySize > maxRegionSize ||
+					scannedBytes >= maxTotalBytes)
+				{
+					continue;
+				}
+
+				var regionBytes = Math.Min(region.MemorySize, maxTotalBytes - scannedBytes);
+				for (ulong regionOffset = 0; regionOffset < regionBytes && matches < 128; regionOffset += chunkSize)
+				{
+					var byteCount = (int)Math.Min((ulong)chunkSize, regionBytes - regionOffset);
+					var span = buffer.AsSpan(0, byteCount);
+					if (!context.Memory.TryRead(region.VirtualAddress + regionOffset, span))
+					{
+						continue;
+					}
+
+					for (var offset = 0; offset + sizeof(ulong) <= byteCount; offset += sizeof(ulong))
+					{
+						if (System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(span.Slice(offset, sizeof(ulong))) != target)
+						{
+							continue;
+						}
+
+						var matchAddress = region.VirtualAddress + regionOffset + (ulong)offset;
+						Console.Error.WriteLine(
+							$"[LOADER][TRACE] guest_pointer_match: target=0x{target:X16} address=0x{matchAddress:X16} " +
+							$"region=0x{region.VirtualAddress:X16}+0x{region.MemorySize:X}");
+						matches++;
+					}
+				}
+
+				scannedBytes += regionBytes;
+				if (matches >= 128)
+				{
+					break;
+				}
+			}
+		}
+		finally
+		{
+			System.Buffers.ArrayPool<byte>.Shared.Return(buffer);
+		}
+
+		Console.Error.WriteLine(
+			$"[LOADER][TRACE] guest_pointer_search_done: target=0x{target:X16} matches={matches} scanned=0x{scannedBytes:X}");
 	}
 
 	private void TraceImportFrameChain(CpuContext context, long dispatchIndex)

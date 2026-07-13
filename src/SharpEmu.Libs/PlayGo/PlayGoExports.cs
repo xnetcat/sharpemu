@@ -680,13 +680,34 @@ public static class PlayGoExports
         var chunkDefsXml = Path.Combine(app0Root, "playgo-chunkdefs.xml");
 
         var hasMetadata = File.Exists(playGoDat) || File.Exists(scenarioJson) || File.Exists(chunkDefsXml);
-        if (!hasMetadata)
+        if (hasMetadata)
         {
-            return PlayGoMetadata.Empty;
+            var chunkIds = LoadChunkIds(chunkDefsXml);
+            return new PlayGoMetadata(true, chunkIds);
         }
 
-        var chunkIds = LoadChunkIds(chunkDefsXml);
-        return new PlayGoMetadata(true, chunkIds);
+        // Retail dumps sometimes omit the PlayGo scenario metadata while
+        // retaining their complete UE package payload. In that layout the
+        // presence of a pakchunk is enough to model the base chunk as fully
+        // installed, rather than rejecting scePlayGoOpen outright.
+        try
+        {
+            if (Directory.EnumerateFiles(app0Root, "pakchunk*.pak", SearchOption.AllDirectories).Any())
+            {
+                TracePlayGo("metadata absent; using packaged pakchunk fallback");
+                return new PlayGoMetadata(true, new ushort[] { 0 });
+            }
+        }
+        catch (IOException)
+        {
+            // Treat an unreadable app root like a title without PlayGo data.
+        }
+        catch (UnauthorizedAccessException)
+        {
+            // Treat an unreadable app root like a title without PlayGo data.
+        }
+
+        return PlayGoMetadata.Empty;
     }
 
     private static ushort[] LoadChunkIds(string chunkDefsXml)

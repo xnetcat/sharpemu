@@ -228,9 +228,27 @@ internal static partial class Program
 
     private static void ConfigureKnownTitleArguments(string ebootPath)
     {
-        if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("SHARPEMU_GUEST_ARGS")))
+        var installRoot = Path.GetDirectoryName(ebootPath) ?? string.Empty;
+        var paramPath = Path.Combine(installRoot, "sce_sys", "param.json");
+        try
         {
-            return;
+            if (File.Exists(paramPath) &&
+                File.ReadAllText(paramPath).Contains("PPSA10112", StringComparison.Ordinal))
+            {
+                // The Short Message starts an FAPR listener that can broadcast
+                // immediately before the main thread registers its condition
+                // waiter. Recheck the condition after a short bounded delay so
+                // that lost startup notification cannot park Unreal forever.
+                SetEnvironmentDefault("SHARPEMU_PTHREAD_COND_RECHECK_MS", "10");
+                SetEnvironmentDefault("SHARPEMU_AGC_SUBMIT_COMPLETION_EVENT", "1");
+                Console.Error.WriteLine(
+                    "[LOADER][INFO] SILENT HILL compatibility: enabling startup condition recheck.");
+            }
+        }
+        catch (IOException exception)
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][WARN] Could not inspect title metadata: {exception.Message}");
         }
 
         // Demon's Souls ships a supported engine flag for bypassing its splash
@@ -238,12 +256,13 @@ internal static partial class Program
         // its own command-line configuration rather than a hard-coded install
         // path/title id, and feed the same flag through the guest entry ABI.
         var commandLineConfig = Path.Combine(
-            Path.GetDirectoryName(ebootPath) ?? string.Empty,
+            installRoot,
             "misc",
             "gamecommandlineargs.txt");
         try
         {
-            if (File.Exists(commandLineConfig) &&
+            if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("SHARPEMU_GUEST_ARGS")) &&
+                File.Exists(commandLineConfig) &&
                 File.ReadAllText(commandLineConfig).Contains(
                     "cp11_debug_skipSplashScreens",
                     StringComparison.Ordinal))
@@ -259,6 +278,14 @@ internal static partial class Program
         {
             Console.Error.WriteLine(
                 $"[LOADER][WARN] Could not inspect title compatibility arguments: {exception.Message}");
+        }
+    }
+
+    private static void SetEnvironmentDefault(string name, string value)
+    {
+        if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(name)))
+        {
+            Environment.SetEnvironmentVariable(name, value);
         }
     }
 

@@ -844,6 +844,7 @@ public static partial class KernelMemoryCompatExports
             {
                 copied += readBytes / WideCharSize;
             }
+
         }
 
         if (!TryWriteCompat(ctx, destination, payload))
@@ -879,22 +880,39 @@ public static partial class KernelMemoryCompatExports
             }
 
             var remainingBytes = (maxUnits - index) * WideCharSize;
-            var pageBytesRemaining = maxReadBytes -
-                (int)(unitAddress & (maxReadBytes - 1));
-            var readBytes = (int)Math.Min(
-                (ulong)Math.Min(readBuffer.Length, pageBytesRemaining),
-                remainingBytes);
+            var pageBytesRemaining = maxReadBytes - (int)(unitAddress & (maxReadBytes - 1));
+            var readBytes = (int)Math.Min((ulong)Math.Min(readBuffer.Length, pageBytesRemaining), remainingBytes);
             readBytes &= ~(WideCharSize - 1);
-            if (readBytes == 0 ||
-                !TryReadCompat(ctx, unitAddress, readBuffer.AsSpan(0, readBytes)))
+            if (readBytes == 0)
+            {
+                if (!TryReadUInt16Compat(ctx, unitAddress, out var unit))
+                {
+                    return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+                }
+
+                if (unit == needle)
+                {
+                    ctx[CpuRegister.Rax] = unitAddress;
+                    return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+                }
+
+                if (unit == 0)
+                {
+                    break;
+                }
+
+                index++;
+                continue;
+            }
+
+            if (!TryReadCompat(ctx, unitAddress, readBuffer.AsSpan(0, readBytes)))
             {
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
             }
 
             for (var offset = 0; offset < readBytes; offset += WideCharSize)
             {
-                var unit = BinaryPrimitives.ReadUInt16LittleEndian(
-                    readBuffer.AsSpan(offset, WideCharSize));
+                var unit = BinaryPrimitives.ReadUInt16LittleEndian(readBuffer.AsSpan(offset, WideCharSize));
                 if (unit == needle)
                 {
                     ctx[CpuRegister.Rax] = unitAddress + (ulong)offset;
@@ -907,7 +925,6 @@ public static partial class KernelMemoryCompatExports
                     return (int)OrbisGen2Result.ORBIS_GEN2_OK;
                 }
             }
-
             index += (ulong)(readBytes / WideCharSize);
         }
 
@@ -2760,11 +2777,15 @@ public static partial class KernelMemoryCompatExports
             if (fixedMapping && requestedAddress != 0)
             {
                 mappedAddress = requestedAddress;
-                reserved = IsGuestRangeBacked(ctx, requestedAddress, length);
+                reserved = ShouldBypassGpuApertureHostMap(requestedAddress, protection);
                 if (!reserved)
                 {
-                    TryReserveExactGuestVirtualRange(ctx, requestedAddress, length, protection);
                     reserved = IsGuestRangeBacked(ctx, requestedAddress, length);
+                    if (!reserved)
+                    {
+                        TryReserveExactGuestVirtualRange(ctx, requestedAddress, length, protection);
+                        reserved = IsGuestRangeBacked(ctx, requestedAddress, length);
+                    }
                 }
 
                 if (!reserved)
@@ -4866,14 +4887,29 @@ public static partial class KernelMemoryCompatExports
             }
 
             var remainingBytes = (limit - index) * WideCharSize;
-            var pageBytesRemaining = maxReadBytes -
-                (int)(unitAddress & (maxReadBytes - 1));
-            var readBytes = Math.Min(
-                readBuffer.Length,
-                Math.Min(pageBytesRemaining, remainingBytes));
+            var pageBytesRemaining = maxReadBytes - (int)(unitAddress & (maxReadBytes - 1));
+            var readBytes = Math.Min(readBuffer.Length, Math.Min(pageBytesRemaining, remainingBytes));
             readBytes &= ~(WideCharSize - 1);
-            if (readBytes == 0 ||
-                !TryReadCompat(ctx, unitAddress, readBuffer.AsSpan(0, readBytes)))
+            if (readBytes == 0)
+            {
+                if (!TryReadUInt16Compat(ctx, unitAddress, out var unit))
+                {
+                    return false;
+                }
+
+                if (unit == 0)
+                {
+                    terminated = true;
+                    units = buffer.ToArray();
+                    return true;
+                }
+
+                buffer.Add(unit);
+                index++;
+                continue;
+            }
+
+            if (!TryReadCompat(ctx, unitAddress, readBuffer.AsSpan(0, readBytes)))
             {
                 return false;
             }
@@ -5523,6 +5559,14 @@ public static partial class KernelMemoryCompatExports
     private static bool ShouldTraceDirectMemory()
     {
         return string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_DIRECT_MEMORY"), "1", StringComparison.Ordinal);
+    }
+
+    private static bool ShouldBypassGpuApertureHostMap(ulong address, int protection)
+    {
+        return string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_BYPASS_GPU_APERTURE_MAPS"), "1", StringComparison.Ordinal) &&
+            address >= 0x70_0000_0000UL &&
+            address < 0xF0_0000_0000UL &&
+            (protection & OrbisProtCpuRead) == 0;
     }
 
     private static bool TryAllocateDirectMemoryLocked(
