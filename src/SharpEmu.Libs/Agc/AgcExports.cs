@@ -2969,6 +2969,22 @@ public static class AgcExports
                 ObserveComputeDispatch(ctx, gpuState, state, dispatch);
             }
 
+            if (op == ItNop &&
+                register == RWaitFlipDone &&
+                length >= 3 &&
+                TryReadUInt32(ctx, currentAddress + 4, out var waitVideoOutHandle) &&
+                TryReadUInt32(ctx, currentAddress + 8, out var waitDisplayBufferIndex))
+            {
+                var waitSequence = VulkanVideoPresenter.SubmitOrderedGuestFlipWait(
+                    unchecked((int)waitVideoOutHandle),
+                    unchecked((int)waitDisplayBufferIndex));
+                TraceAgcShader(
+                    $"agc.flip_wait_safe queue={state.QueueName} " +
+                    $"submission={state.ActiveSubmissionId} " +
+                    $"handle={waitVideoOutHandle} index={waitDisplayBufferIndex} " +
+                    $"work_sequence={waitSequence}");
+            }
+
             if (op == ItNop && register == RFlip && length >= 6)
             {
                 SyncCpuWrittenGuestImages(ctx);
@@ -2988,7 +3004,9 @@ public static class AgcExports
                         handle,
                         displayBufferIndex,
                         out var cachedDisplayBuffer) &&
-                    VulkanVideoPresenter.TrySubmitGuestImage(
+                    VulkanVideoPresenter.TrySubmitOrderedGuestImageFlip(
+                        handle,
+                        displayBufferIndex,
                         cachedDisplayBuffer.Address,
                         cachedDisplayBuffer.Width,
                         cachedDisplayBuffer.Height,
