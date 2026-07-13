@@ -9,6 +9,8 @@ path = [
     "scripts/ps5_names.txt",
     "src/SharpEmu.HLE/Aerolib/aerolib.bin",
     "_logs/**",
+    "debug-logs/**",
+    "docs/bink2-bridge.md",
     ".github/images/**",
     "assets/images/**"
 ]
