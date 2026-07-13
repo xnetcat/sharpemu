@@ -33,6 +33,8 @@ public static class KernelPthreadExtendedCompatExports
     private static long _nextSyntheticRwlockHandleId = 1;
     private static long _nextSyntheticPthreadAttrHandleId = 1;
     private static long _nextSyntheticRwlockAttrHandleId = 1;
+    private static readonly bool _strictRwlockWriterPreference =
+        string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_STRICT_RWLOCK_WRITER_PREFERENCE"), "1", StringComparison.Ordinal);
 
     private static readonly ConcurrentDictionary<ulong, ConcurrentDictionary<int, ulong>> _threadLocalSpecific = new();
 
@@ -87,13 +89,22 @@ public static class KernelPthreadExtendedCompatExports
         public PthreadAttrState Attributes { get; set; } = PthreadAttrState.Default;
     }
 
+    // On the outer class deliberately: a static on the nested state class gives it a type
+    // initializer that first runs on a guest thread and fail-fasts the CLR.
+    private static long _nextRwlockWakeId;
+
     private sealed class PthreadRwlockState
     {
         public object SyncRoot { get; } = new();
         public Dictionary<ulong, int> ReaderCounts { get; } = new();
+        public Dictionary<ulong, int> CompatWriterCounts { get; } = new();
         public int ReaderTotalCount { get; set; }
+        public int CompatWriterTotalCount { get; set; }
         public ulong WriterThreadId { get; set; }
         public int WaitingWriters { get; set; }
+
+        // See PthreadMutexState.WakeKey.
+        public string WakeKey { get; } = "pthread_rwlock#" + Interlocked.Increment(ref _nextRwlockWakeId).ToString("X");
 
         public int GetReaderCount(ulong threadId)
         {
@@ -105,6 +116,33 @@ public static class KernelPthreadExtendedCompatExports
             ReaderCounts.TryGetValue(threadId, out var currentCount);
             ReaderCounts[threadId] = currentCount + 1;
             ReaderTotalCount++;
+        }
+
+        public void AddCompatWriter(ulong threadId)
+        {
+            CompatWriterCounts.TryGetValue(threadId, out var currentCount);
+            CompatWriterCounts[threadId] = currentCount + 1;
+            CompatWriterTotalCount++;
+        }
+
+        public bool RemoveCompatWriter(ulong threadId)
+        {
+            if (!CompatWriterCounts.TryGetValue(threadId, out var currentCount) || currentCount <= 0)
+            {
+                return false;
+            }
+
+            if (currentCount == 1)
+            {
+                CompatWriterCounts.Remove(threadId);
+            }
+            else
+            {
+                CompatWriterCounts[threadId] = currentCount - 1;
+            }
+
+            CompatWriterTotalCount = Math.Max(0, CompatWriterTotalCount - 1);
+            return true;
         }
 
         public bool RemoveReader(ulong threadId)
@@ -941,7 +979,7 @@ public static class KernelPthreadExtendedCompatExports
 
         lock (state.SyncRoot)
         {
-            if (state.WriterThreadId != 0 || state.ReaderTotalCount != 0 || state.WaitingWriters != 0)
+            if (state.WriterThreadId != 0 || state.ReaderTotalCount != 0 || state.WaitingWriters != 0 || state.CompatWriterTotalCount != 0)
             {
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY;
             }
@@ -1009,7 +1047,7 @@ public static class KernelPthreadExtendedCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
-        if (!TryResolveRwlockState(ctx, rwlockAddress, createIfZero: false, out _, out var rwlock))
+        if (!TryResolveRwlockState(ctx, rwlockAddress, createIfZero: false, out var resolvedAddress, out var rwlock))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
         }
@@ -1020,7 +1058,11 @@ public static class KernelPthreadExtendedCompatExports
         {
             lock (rwlock.SyncRoot)
             {
-                if (rwlock.WriterThreadId == currentThreadId)
+                if (rwlock.RemoveCompatWriter(currentThreadId))
+                {
+                    Monitor.PulseAll(rwlock.SyncRoot);
+                }
+                else if (rwlock.WriterThreadId == currentThreadId)
                 {
                     rwlock.WriterThreadId = 0;
                     Monitor.PulseAll(rwlock.SyncRoot);
@@ -1043,6 +1085,7 @@ public static class KernelPthreadExtendedCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_PERMISSION_DENIED;
         }
 
+        _ = GuestThreadExecution.Scheduler?.WakeBlockedThreads(rwlock.WakeKey);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
@@ -1299,7 +1342,7 @@ public static class KernelPthreadExtendedCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
-        if (!TryResolveRwlockState(ctx, rwlockAddress, createIfZero: true, out _, out var rwlock))
+        if (!TryResolveRwlockState(ctx, rwlockAddress, createIfZero: true, out var resolvedAddress, out var rwlock))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
         }
@@ -1314,20 +1357,60 @@ public static class KernelPthreadExtendedCompatExports
                     return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_DEADLOCK;
                 }
 
+                if (rwlock.CompatWriterCounts.GetValueOrDefault(currentThreadId) > 0)
+                {
+                    rwlock.AddCompatWriter(currentThreadId);
+                    return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+                }
+
+                if (GuestThreadExecution.IsGuestThread &&
+                    !_strictRwlockWriterPreference &&
+                    rwlock.WriterThreadId == 0 &&
+                    rwlock.ReaderTotalCount == 0 &&
+                    rwlock.CompatWriterTotalCount == 0)
+                {
+                    rwlock.AddCompatWriter(currentThreadId);
+                    return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+                }
+
+                if (rwlock.WriterThreadId == 0 && rwlock.ReaderTotalCount == 0 && rwlock.CompatWriterTotalCount == 0)
+                {
+                    DetectRwlockWriterConflict(resolvedAddress, rwlock, currentThreadId, "wrlock");
+                    rwlock.WriterThreadId = currentThreadId;
+                    return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+                }
+
                 rwlock.WaitingWriters++;
+                var transferredToScheduler = false;
                 try
                 {
-                    while (rwlock.WriterThreadId != 0 || rwlock.ReaderTotalCount != 0)
+                    if (GuestThreadExecution.IsGuestThread &&
+                        GuestThreadExecution.TryGetCurrentImportCallFrame(out _) &&
+                        GuestThreadExecution.RequestCurrentThreadBlock(
+                            ctx,
+                            "pthread_rwlock_wrlock",
+                            rwlock.WakeKey,
+                            static () => (int)OrbisGen2Result.ORBIS_GEN2_OK,
+                            () => TryAcquireBlockedRwlock(rwlock, currentThreadId, write: true)))
+                    {
+                        transferredToScheduler = true;
+                        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+                    }
+
+                    while (rwlock.WriterThreadId != 0 || rwlock.ReaderTotalCount != 0 || rwlock.CompatWriterTotalCount != 0)
                     {
                         Monitor.Wait(rwlock.SyncRoot);
                     }
+
+                    rwlock.WriterThreadId = currentThreadId;
                 }
                 finally
                 {
-                    rwlock.WaitingWriters--;
+                    if (!transferredToScheduler)
+                    {
+                        rwlock.WaitingWriters = Math.Max(0, rwlock.WaitingWriters - 1);
+                    }
                 }
-
-                rwlock.WriterThreadId = currentThreadId;
             }
             else
             {
@@ -1336,17 +1419,115 @@ public static class KernelPthreadExtendedCompatExports
                     return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_DEADLOCK;
                 }
 
-                while (rwlock.WriterThreadId != 0 ||
-                       (rwlock.WaitingWriters > 0 && rwlock.GetReaderCount(currentThreadId) == 0))
+                while (ReaderMustWaitForRwlock(rwlock, currentThreadId))
                 {
+                    if (GuestThreadExecution.IsGuestThread &&
+                        GuestThreadExecution.TryGetCurrentImportCallFrame(out _) &&
+                        GuestThreadExecution.RequestCurrentThreadBlock(
+                            ctx,
+                            "pthread_rwlock_rdlock",
+                            rwlock.WakeKey,
+                            static () => (int)OrbisGen2Result.ORBIS_GEN2_OK,
+                            () => TryAcquireBlockedRwlock(rwlock, currentThreadId, write: false)))
+                    {
+                        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+                    }
+
                     Monitor.Wait(rwlock.SyncRoot);
                 }
 
+                if (rwlock.WriterThreadId != 0 ||
+                    rwlock.CompatWriterTotalCount > rwlock.CompatWriterCounts.GetValueOrDefault(currentThreadId))
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][ERROR] RWLOCK READER/WRITER COEXIST: resolved=0x{resolvedAddress:X} reader=0x{currentThreadId:X} " +
+                        $"writer=0x{rwlock.WriterThreadId:X} compat_total={rwlock.CompatWriterTotalCount} readers_total={rwlock.ReaderTotalCount}");
+                }
                 rwlock.AddReader(currentThreadId);
             }
         }
 
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    private static bool TryAcquireBlockedRwlock(PthreadRwlockState rwlock, ulong currentThreadId, bool write)
+    {
+        lock (rwlock.SyncRoot)
+        {
+            if (write)
+            {
+                if (rwlock.WriterThreadId != 0 || rwlock.ReaderTotalCount != 0 || rwlock.CompatWriterTotalCount != 0)
+                {
+                    return false;
+                }
+
+                DetectRwlockWriterConflict(0, rwlock, currentThreadId, "wrlock-resume");
+                rwlock.WriterThreadId = currentThreadId;
+                rwlock.WaitingWriters = Math.Max(0, rwlock.WaitingWriters - 1);
+                return true;
+            }
+
+            if (ReaderMustWaitForRwlock(rwlock, currentThreadId))
+            {
+                return false;
+            }
+
+            rwlock.AddReader(currentThreadId);
+            return true;
+        }
+    }
+
+    // Call while holding lock(rwlock.SyncRoot): an existing reader/writer here means a
+    // writer would share the rwlock with another holder — a data race.
+    private static void DetectRwlockWriterConflict(ulong resolvedAddress, PthreadRwlockState rwlock, ulong currentThreadId, string site)
+    {
+        if (rwlock.WriterThreadId != 0 ||
+            rwlock.ReaderTotalCount != 0 ||
+            rwlock.CompatWriterTotalCount > rwlock.CompatWriterCounts.GetValueOrDefault(currentThreadId))
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][ERROR] RWLOCK WRITER CONFLICT at {site}: resolved=0x{resolvedAddress:X} writer=0x{currentThreadId:X} " +
+                $"existing_writer=0x{rwlock.WriterThreadId:X} readers_total={rwlock.ReaderTotalCount} compat_total={rwlock.CompatWriterTotalCount}");
+        }
+    }
+
+    private static bool ReaderMustWaitForRwlock(PthreadRwlockState rwlock, ulong currentThreadId)
+    {
+        if (rwlock.WriterThreadId != 0)
+        {
+            return true;
+        }
+
+        if (rwlock.CompatWriterTotalCount > rwlock.CompatWriterCounts.GetValueOrDefault(currentThreadId))
+        {
+            return true;
+        }
+
+        return rwlock.WaitingWriters > 0 &&
+               rwlock.GetReaderCount(currentThreadId) == 0;
+    }
+
+    private static string GetRwlockWakeKey(ulong rwlockAddress) => $"pthread_rwlock:0x{rwlockAddress:X16}";
+
+    public static string? DumpRwlockStateForStall(ulong rwlockAddress)
+    {
+        PthreadRwlockState? rwlock;
+        lock (_stateGate)
+        {
+            if (!_rwlockStates.TryGetValue(rwlockAddress, out rwlock))
+            {
+                return null;
+            }
+        }
+
+        lock (rwlock.SyncRoot)
+        {
+            var readers = string.Join(",", rwlock.ReaderCounts.Select(pair => $"0x{pair.Key:X}x{pair.Value}"));
+            var compatWriters = string.Join(",", rwlock.CompatWriterCounts.Select(pair => $"0x{pair.Key:X}x{pair.Value}"));
+            return $"rwlock=0x{rwlockAddress:X16} writer=0x{rwlock.WriterThreadId:X} waiting_writers={rwlock.WaitingWriters} " +
+                   $"readers_total={rwlock.ReaderTotalCount} readers=[{readers}] " +
+                   $"compat_writers_total={rwlock.CompatWriterTotalCount} compat_writers=[{compatWriters}]";
+        }
     }
 
     private static ulong ResolveRwlockHandle(CpuContext ctx, ulong rwlockAddress)
