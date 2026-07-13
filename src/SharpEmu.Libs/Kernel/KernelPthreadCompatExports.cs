@@ -69,6 +69,7 @@ public static class KernelPthreadCompatExports
         public required PthreadMutexState MutexState { get; init; }
         public required string WakeKey { get; init; }
         public required bool Cooperative { get; init; }
+        public bool PosixErrors { get; init; }
         public LinkedListNode<PthreadCondWaiter>? Node { get; set; }
         public PthreadMutexWaiter? MutexWaiter { get; set; }
         public Timer? TimeoutTimer { get; set; }
@@ -336,6 +337,62 @@ public static class KernelPthreadCompatExports
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libKernel")]
     public static int PosixPthreadCondWait(CpuContext ctx) => PthreadCondWaitCore(ctx, ctx[CpuRegister.Rdi], ctx[CpuRegister.Rsi], timed: false);
+
+    [SysAbiExport(
+        Nid = "27bAgiJmOh0",
+        ExportName = "pthread_cond_timedwait",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int PosixPthreadCondTimedwait(CpuContext ctx)
+    {
+        var deadlineAddress = ctx[CpuRegister.Rdx];
+        if (deadlineAddress == 0 ||
+            !KernelMemoryCompatExports.TryReadUInt64Compat(ctx, deadlineAddress, out var rawSeconds) ||
+            !KernelMemoryCompatExports.TryReadUInt64Compat(
+                ctx,
+                deadlineAddress + sizeof(long),
+                out var rawNanoseconds))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        var seconds = unchecked((long)rawSeconds);
+        var nanoseconds = unchecked((long)rawNanoseconds);
+        if (seconds < 0 || nanoseconds is < 0 or >= 1_000_000_000)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        var deltaSeconds = seconds - now.ToUnixTimeSeconds();
+        var nowNanoseconds = (now.Ticks % TimeSpan.TicksPerSecond) * 100L;
+        uint timeoutUsec;
+        if (deltaSeconds < 0)
+        {
+            timeoutUsec = 0;
+        }
+        else if (deltaSeconds > uint.MaxValue / 1_000_000L + 1)
+        {
+            timeoutUsec = uint.MaxValue;
+        }
+        else
+        {
+            var remainingNanoseconds =
+                deltaSeconds * 1_000_000_000L + nanoseconds - nowNanoseconds;
+            var remainingUsec = remainingNanoseconds <= 0
+                ? 0
+                : (remainingNanoseconds + 999L) / 1_000L;
+            timeoutUsec = (uint)Math.Min(remainingUsec, uint.MaxValue);
+        }
+
+        return PthreadCondWaitCore(
+            ctx,
+            ctx[CpuRegister.Rdi],
+            ctx[CpuRegister.Rsi],
+            timed: true,
+            timeoutUsec,
+            posixErrors: true);
+    }
 
     [SysAbiExport(
         Nid = "mkx2fVhNMsg",
@@ -1112,7 +1169,13 @@ public static class KernelPthreadCompatExports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
-    private static int PthreadCondWaitCore(CpuContext ctx, ulong condAddress, ulong mutexAddress, bool timed, uint timeoutUsec = 0)
+    private static int PthreadCondWaitCore(
+        CpuContext ctx,
+        ulong condAddress,
+        ulong mutexAddress,
+        bool timed,
+        uint timeoutUsec = 0,
+        bool posixErrors = false)
     {
         if (condAddress == 0 || mutexAddress == 0)
         {
@@ -1147,6 +1210,7 @@ public static class KernelPthreadCompatExports
             ThreadId = currentThreadId,
             MutexState = mutexState,
             Cooperative = cooperative,
+            PosixErrors = posixErrors,
             WakeKey = cooperative
                 ? $"pthread_cond_waiter:{Interlocked.Increment(ref _nextSynchronizationWaiterId)}"
                 : string.Empty,
@@ -1223,7 +1287,7 @@ public static class KernelPthreadCompatExports
 
         _ = WaitForHostMutexLock(mutexState, waiter.MutexWaiter);
         var waitResult = waiter.CompletionState == 2
-            ? (int)OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT
+            ? CondTimedOutResult(waiter)
             : (int)OrbisGen2Result.ORBIS_GEN2_OK;
         TracePthreadCond(waiter.CompletionState == 2 ? "wait-exit-timeout" : "wait-exit", condAddress, mutexAddress, state, timed, waitResult);
         return waitResult;
@@ -1485,7 +1549,7 @@ public static class KernelPthreadCompatExports
         var result = waiter.MutexWaiter is not null &&
             Volatile.Read(ref waiter.MutexWaiter.Granted) == 1
                 ? (waiter.CompletionState == 2
-                    ? (int)OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT
+                    ? CondTimedOutResult(waiter)
                     : (int)OrbisGen2Result.ORBIS_GEN2_OK)
                 : (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY;
         TracePthreadCond(
@@ -1498,6 +1562,11 @@ public static class KernelPthreadCompatExports
         _ = ctx;
         return result;
     }
+
+    private static int CondTimedOutResult(PthreadCondWaiter waiter) =>
+        waiter.PosixErrors
+            ? 60 // ETIMEDOUT on Orbis/FreeBSD; pthread APIs return errno directly.
+            : (int)OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT;
 
     private static void WakeCooperativeWaiter(PthreadCondWaiter waiter)
     {

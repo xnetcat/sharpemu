@@ -529,7 +529,8 @@ internal static class Gen5ShaderScalarEvaluator
                         Console.Error.WriteLine(
                             $"[LOADER][WARN] AGC buffer read unavailable; using zero buffer " +
                             $"pc=0x{instruction.Pc:X} address=0x{bufferDescriptor.BaseAddress:X16} " +
-                            $"bytes={bufferDescriptor.SizeBytes} s{bufferMemory.ScalarResource}=[{descriptorWords}]");
+                            $"bytes={bufferDescriptor.SizeBytes} guest_writeback=disabled " +
+                            $"s{bufferMemory.ScalarResource}=[{descriptorWords}]");
                     }
 
                     var binding = new Gen5GlobalMemoryBinding(
@@ -541,6 +542,7 @@ internal static class Gen5ShaderScalarEvaluator
                         DataPooled: dataPooled)
                     {
                         Writable = writable,
+                        WriteBackToGuest = dataPooled,
                     };
                     globalMemoryByAddress.Add(key, binding);
                     globalMemoryBindings.Add(binding);
@@ -1034,6 +1036,27 @@ internal static class Gen5ShaderScalarEvaluator
             return true;
         }
 
+        if (instruction.Opcode == "SBfmB64")
+        {
+            if (instruction.Sources.Count < 2 ||
+                destination.Value >= ScalarRegisterCount - 1 ||
+                !TryEvaluateScalarOperand(instruction.Sources[0], registers, out var widthSource) ||
+                !TryEvaluateScalarOperand(instruction.Sources[1], registers, out var offsetSource))
+            {
+                error = $"scalar-source64 pc=0x{instruction.Pc:X} op={instruction.Opcode}";
+                return false;
+            }
+
+            var width = (int)widthSource & 63;
+            var offset = (int)offsetSource & 63;
+            var value = width == 0
+                ? 0UL
+                : (ulong.MaxValue >> (64 - width)) << offset;
+            WriteScalarPair(registers, destination.Value, value, ref execMask);
+            scalarConditionCode = value != 0;
+            return true;
+        }
+
         if (instruction.Opcode is
             "SCselectB64" or
             "SAndB64" or
@@ -1319,6 +1342,44 @@ internal static class Gen5ShaderScalarEvaluator
         out string error)
     {
         error = string.Empty;
+        if (instruction.Opcode.EndsWith("SaveexecB32", StringComparison.Ordinal))
+        {
+            if (instruction.Destinations.Count != 1 ||
+                instruction.Destinations[0] is not
+                {
+                    Kind: Gen5OperandKind.ScalarRegister,
+                    Value: < ScalarRegisterCount,
+                } destination32 ||
+                instruction.Sources.Count == 0 ||
+                !TryEvaluateScalarOperand(instruction.Sources[0], registers, out var source32))
+            {
+                error = $"scalar-source32 pc=0x{instruction.Pc:X} op={instruction.Opcode}";
+                return false;
+            }
+
+            var oldExec32 = (uint)execMask;
+            var newExec32 = instruction.Opcode switch
+            {
+                "SAndSaveexecB32" => oldExec32 & source32,
+                "SOrSaveexecB32" => oldExec32 | source32,
+                "SXorSaveexecB32" => oldExec32 ^ source32,
+                "SAndn1SaveexecB32" => ~source32 & oldExec32,
+                "SAndn2SaveexecB32" => source32 & ~oldExec32,
+                "SOrn1SaveexecB32" => ~source32 | oldExec32,
+                "SOrn2SaveexecB32" => source32 | ~oldExec32,
+                "SNandSaveexecB32" => ~(source32 & oldExec32),
+                "SNorSaveexecB32" => ~(source32 | oldExec32),
+                "SXnorSaveexecB32" => ~(oldExec32 ^ source32),
+                _ => 0u,
+            };
+            registers[destination32.Value] = oldExec32;
+            execMask = newExec32;
+            registers[126] = newExec32;
+            registers[127] = 0;
+            scalarConditionCode = newExec32 != 0;
+            return true;
+        }
+
         if (instruction.Opcode is not (
             "SAndSaveexecB64" or
             "SOrSaveexecB64" or
@@ -1646,7 +1707,10 @@ internal static class Gen5ShaderScalarEvaluator
                     new List<uint> { instruction.Pc },
                     data,
                     dataLength,
-                    DataPooled: pooled);
+                    DataPooled: pooled)
+                {
+                    WriteBackToGuest = pooled,
+                };
                 globalMemoryByAddress.Add(key, binding);
                 globalMemoryBindings.Add(binding);
             }
@@ -1685,7 +1749,10 @@ internal static class Gen5ShaderScalarEvaluator
                     new List<uint> { instruction.Pc },
                     data,
                     dataLength,
-                    DataPooled: pooled);
+                    DataPooled: pooled)
+                {
+                    WriteBackToGuest = pooled,
+                };
                 globalMemoryByAddress.Add(key, binding);
                 globalMemoryBindings.Add(binding);
             }

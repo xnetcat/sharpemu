@@ -289,6 +289,14 @@ internal sealed record Gen5GlobalMemoryBinding(
     bool DataPooled)
 {
     public bool Writable { get; set; }
+
+    // Writable describes shader access and is also used to decide whether a
+    // compute dispatch has observable work. A statically reachable resource
+    // can nevertheless be unbound for the current scalar path; the evaluator
+    // supplies zero-filled storage for Vulkan in that case. Such synthetic
+    // storage must remain shader-writable, but must never be copied to the
+    // descriptor's unmapped guest address.
+    public bool WriteBackToGuest { get; set; } = true;
 }
 
 internal sealed record Gen5VertexInputBinding(

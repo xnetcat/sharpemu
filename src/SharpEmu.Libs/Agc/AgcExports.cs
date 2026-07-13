@@ -185,6 +185,11 @@ public static class AgcExports
     private static readonly Dictionary<
         (ulong Es, ulong EsState, ulong Ps, ulong PsState, Gen5PixelOutputKind Output, uint Slot, ulong AliasAlignment),
         (byte[] Vertex, byte[] Pixel)> _graphicsSpirvCache = new();
+    private static readonly Dictionary<
+        (ulong Es, ulong EsState, ulong AliasAlignment), byte[]>
+        _depthOnlyVertexSpirvCache = new();
+    private static readonly byte[] _depthOnlyFragmentSpirv =
+        SpirvFixedShaders.CreateDepthOnlyFragment();
     // Per-render-target pixel variants for multi-render-target draws: each
     // routes its own MRT export slot to the fragment output. Keyed by the
     // shader identity plus the target's output kind and slot.
@@ -360,30 +365,66 @@ public static class AgcExports
         uint DescriptorFlags = 0,
         bool HasExtendedDescriptor = false)
     {
+        public uint ResourceMipLevels
+        {
+            get
+            {
+                // RDNA2 table 45 explicitly distinguishes MAX_MIP (the
+                // resource allocation) from BASE_LEVEL/LAST_LEVEL (the
+                // resource view). Do not size a Vulkan image from a view:
+                // another descriptor for the same allocation may expose a
+                // different subset of its mip chain.
+                var maximumMipLevels = GetMaximumMipLevels();
+                var resourceMipLevels = HasExtendedDescriptor
+                    ? MaxMip + 1
+                    : maximumMipLevels;
+                return Math.Min(Math.Max(resourceMipLevels, 1u), maximumMipLevels);
+            }
+        }
+
         public uint MipLevels
         {
             get
             {
-                var largestDimension = Type == 10
-                    ? Math.Max(Math.Max(Width, Height), Depth)
-                    : Math.Max(Width, Height);
-                uint maximumMipLevels = 1;
-                while (largestDimension > 1)
-                {
-                    largestDimension >>= 1;
-                    maximumMipLevels++;
-                }
-
-                var descriptorMipLevels = LastLevel >= BaseLevel
-                    ? LastLevel - BaseLevel + 1
+                var descriptorMipLevels = LastLevel >= ViewBaseLevel
+                    ? LastLevel - ViewBaseLevel + 1
                     : 1;
-                var resourceMipLevels = HasExtendedDescriptor
-                    ? MaxMip + 1
-                    : maximumMipLevels;
                 return Math.Min(
                     descriptorMipLevels,
-                    Math.Min(resourceMipLevels, maximumMipLevels));
+                    ResourceMipLevels - ViewBaseLevel);
             }
+        }
+
+        public uint ViewBaseLevel
+        {
+            get
+            {
+                // Some single-mip Gen5 descriptors use the reserved/inverted
+                // 15-0 range as a mip-disabled sentinel. The resource still
+                // has exactly one addressable level (MAX_MIP=0). Treating 15
+                // literally makes Vulkan reject an otherwise compatible GPU
+                // image and falls back to stale guest-memory pixels. For any
+                // malformed range, keep BASE_LEVEL's meaning and clamp it to
+                // the allocation's last addressable mip. In particular, the
+                // common 15-0/MAX_MIP=0 sentinel resolves to mip 0 without
+                // making LAST_LEVEL the base of unrelated inverted views.
+                return Math.Min(BaseLevel, ResourceMipLevels - 1);
+            }
+        }
+
+        private uint GetMaximumMipLevels()
+        {
+            var largestDimension = Type == 10
+                ? Math.Max(Math.Max(Width, Height), Depth)
+                : Math.Max(Width, Height);
+            uint maximumMipLevels = 1;
+            while (largestDimension > 1)
+            {
+                largestDimension >>= 1;
+                maximumMipLevels++;
+            }
+
+            return maximumMipLevels;
         }
     }
 
@@ -4385,12 +4426,19 @@ public static class AgcExports
         state.GuestDrawKind = GuestDrawKind.None;
         foreach (var target in renderTargets)
         {
-            state.RenderTargetWriters[target.Address] = new RenderTargetWriter(
-                drawSequence,
-                hasExportShader ? exportShaderAddress : 0,
-                hasPixelShader ? pixelShaderAddress : 0,
-                vertexCount,
-                primitiveType);
+            // Colour exports originate in the pixel stage.  A depth-only draw
+            // can leave old CB registers bound, but it must not become the
+            // advertised writer of those surfaces merely because they remain
+            // in state.
+            if (hasPixelShader)
+            {
+                state.RenderTargetWriters[target.Address] = new RenderTargetWriter(
+                    drawSequence,
+                    hasExportShader ? exportShaderAddress : 0,
+                    pixelShaderAddress,
+                    vertexCount,
+                    primitiveType);
+            }
 
             if (_traceAgcShader)
             {
@@ -4400,7 +4448,8 @@ public static class AgcExports
                     $"size={target.Width}x{target.Height} vertices={vertexCount} " +
                     $"prim=0x{primitiveType:X} indexed={indexed} " +
                     $"es=0x{(hasExportShader ? exportShaderAddress : 0):X16} " +
-                    $"ps=0x{(hasPixelShader ? pixelShaderAddress : 0):X16}");
+                    $"ps=0x{(hasPixelShader ? pixelShaderAddress : 0):X16} " +
+                    $"color_write={(hasPixelShader ? 1 : 0)}");
             }
         }
 
@@ -4410,6 +4459,77 @@ public static class AgcExports
         }
 
         var translationError = string.Empty;
+        var depthState = DecodeDepthState(state.CxRegisters);
+        var depthTarget = DecodeDepthTarget(state.CxRegisters);
+        var hasDepthOnlyCandidate = hasExportShader &&
+            !hasPixelShader &&
+            depthTarget is not null &&
+            (depthState.TestEnable || depthState.WriteEnable);
+        if (hasDepthOnlyCandidate &&
+            TryCreateTranslatedDepthOnlyGuestDraw(
+                ctx,
+                state,
+                exportShaderAddress,
+                vertexCount,
+                indexed,
+                depthTarget!,
+                out var depthOnlyDraw,
+                out translationError))
+        {
+            state.TranslatedDraw = depthOnlyDraw;
+            var activeDepthTarget = depthOnlyDraw.DepthTarget!;
+            var textures = CreateVulkanGuestDrawTextures(
+                ctx,
+                depthOnlyDraw.Textures,
+                out _);
+            var globalMemoryBuffers =
+                CreateTranslatedDrawGlobalBuffers(depthOnlyDraw);
+            var vertexBuffers =
+                CreateVulkanGuestVertexBuffers(depthOnlyDraw.VertexInputs);
+            var renderState = depthOnlyDraw.RenderState;
+            if (activeDepthTarget.ReadOnly && renderState.Depth.WriteEnable)
+            {
+                renderState = renderState with
+                {
+                    Depth = renderState.Depth with { WriteEnable = false },
+                };
+            }
+
+            TraceDrawCompact(
+                drawSequence,
+                depthOnlyDraw,
+                textures,
+                vertexBuffers);
+            VulkanVideoPresenter.SubmitDepthOnlyTranslatedDraw(
+                depthOnlyDraw.PixelSpirv,
+                textures,
+                globalMemoryBuffers,
+                depthOnlyDraw.AttributeCount,
+                activeDepthTarget,
+                depthOnlyDraw.VertexSpirv,
+                depthOnlyDraw.VertexCount,
+                depthOnlyDraw.InstanceCount,
+                depthOnlyDraw.PrimitiveType,
+                depthOnlyDraw.IndexBuffer,
+                vertexBuffers,
+                renderState);
+
+            if (_traceAgcShader)
+            {
+                TraceAgcShader(
+                    $"agc.depth_only_draw seq={drawSequence} " +
+                    $"es=0x{exportShaderAddress:X16} " +
+                    $"depth=0x{activeDepthTarget.Address:X16}:" +
+                    $"{activeDepthTarget.Width}x{activeDepthTarget.Height}:" +
+                    $"fmt{activeDepthTarget.GuestFormat}/sw{activeDepthTarget.SwizzleMode} " +
+                    $"test={(renderState.Depth.TestEnable ? 1 : 0)} " +
+                    $"write={(renderState.Depth.WriteEnable ? 1 : 0)} " +
+                    $"func={renderState.Depth.CompareOp} ro={(activeDepthTarget.ReadOnly ? 1 : 0)}");
+            }
+
+            return;
+        }
+
         if (hasExportShader &&
             hasPixelShader &&
             hasPsInputEna &&
@@ -4512,7 +4632,7 @@ public static class AgcExports
             }
             else
             {
-                if (translatedDraw.DepthTarget is { } depthTarget)
+                if (translatedDraw.DepthTarget is { } translatedDepthTarget)
                 {
                     var textures = CreateVulkanGuestDrawTextures(
                         ctx,
@@ -4523,7 +4643,7 @@ public static class AgcExports
                     var vertexBuffers =
                         CreateVulkanGuestVertexBuffers(translatedDraw.VertexInputs);
                     var renderState = translatedDraw.RenderState;
-                    if (depthTarget.ReadOnly && renderState.Depth.WriteEnable)
+                    if (translatedDepthTarget.ReadOnly && renderState.Depth.WriteEnable)
                     {
                         renderState = renderState with
                         {
@@ -4541,7 +4661,7 @@ public static class AgcExports
                         textures,
                         globalMemoryBuffers,
                         translatedDraw.AttributeCount,
-                        depthTarget,
+                        translatedDepthTarget,
                         translatedDraw.VertexSpirv,
                         translatedDraw.VertexCount,
                         translatedDraw.InstanceCount,
@@ -4633,6 +4753,8 @@ public static class AgcExports
             vertexCount,
             hasExportShader && hasPixelShader
                 ? translationError
+                : hasDepthOnlyCandidate && !string.IsNullOrEmpty(translationError)
+                    ? $"depth-only: {translationError}"
                 : $"missing-shaders es={hasExportShader} ps={hasPixelShader} ena={hasPsInputEna} addr={hasPsInputAddr}");
         TraceShaderTranslationMiss(
             ctx,
@@ -4646,7 +4768,178 @@ public static class AgcExports
             psInputEna,
             hasPsInputAddr,
             psInputAddr,
-            hasExportShader && hasPixelShader ? translationError : null);
+            hasExportShader && hasPixelShader || hasDepthOnlyCandidate
+                ? translationError
+                : null);
+    }
+
+    private static bool TryCreateTranslatedDepthOnlyGuestDraw(
+        CpuContext ctx,
+        SubmittedDcbState state,
+        ulong exportShaderAddress,
+        uint vertexCount,
+        bool indexed,
+        VulkanGuestDepthTarget depthTarget,
+        out TranslatedGuestDraw draw,
+        out string error)
+    {
+        draw = default!;
+        error = string.Empty;
+        ulong exportShaderHeader;
+        lock (_submitTraceGate)
+        {
+            _shaderHeadersByCode.TryGetValue(exportShaderAddress, out exportShaderHeader);
+        }
+
+        if (!Gen5ShaderTranslator.TryCreateState(
+                ctx,
+                exportShaderAddress,
+                exportShaderHeader,
+                state.ShRegisters,
+                SelectExportUserDataRegister(state.ShRegisters),
+                out var exportState,
+                out error,
+                userDataScalarRegisterBase: NggUserDataScalarRegisterBase) ||
+            !Gen5ShaderScalarEvaluator.TryEvaluate(
+                ctx,
+                exportState,
+                out var exportEvaluation,
+                out error,
+                resolveVertexInputs: true))
+        {
+            return false;
+        }
+
+        var exportFingerprint = _bakeScalars
+            ? ComputeShaderStateFingerprint(exportEvaluation)
+            : ComputeShaderStructuralFingerprint(exportEvaluation);
+        var cacheKey = (
+            exportShaderAddress,
+            exportFingerprint,
+            VulkanVideoPresenter.GuestStorageBufferOffsetAlignment);
+        byte[]? vertexSpirv;
+        lock (_submitTraceGate)
+        {
+            _depthOnlyVertexSpirvCache.TryGetValue(cacheKey, out vertexSpirv);
+        }
+
+        if (vertexSpirv is null)
+        {
+            var guestGlobalBufferCount = exportEvaluation.GlobalMemoryBindings.Count;
+            // CreateTranslatedDrawGlobalBuffers appends both stage scalar
+            // blocks.  The pixel block is unused by the fixed fragment stage;
+            // the vertex block remains at guestCount+1, matching this layout.
+            var totalGlobalBufferCount = _bakeScalars
+                ? guestGlobalBufferCount
+                : guestGlobalBufferCount + 2;
+            if (!Gen5SpirvTranslator.TryCompileVertexShader(
+                    exportState,
+                    exportEvaluation,
+                    out var vertexShader,
+                    out error,
+                    globalBufferBase: 0,
+                    totalGlobalBufferCount: totalGlobalBufferCount,
+                    imageBindingBase: 0,
+                    initialScalarBufferIndex: _bakeScalars
+                        ? -1
+                        : guestGlobalBufferCount + 1,
+                    requiredVertexOutputCount: 0,
+                    storageBufferOffsetAlignment:
+                        VulkanVideoPresenter.GuestStorageBufferOffsetAlignment))
+            {
+                ReturnPooledEvaluationArrays(exportEvaluation);
+                return false;
+            }
+
+            vertexSpirv = vertexShader.Spirv;
+            DumpSpirv(
+                "depth-vs",
+                exportShaderAddress,
+                exportFingerprint,
+                vertexSpirv,
+                exportState.Program);
+            VulkanVideoPresenter.CountSpirvCompilation();
+            lock (_submitTraceGate)
+            {
+                _depthOnlyVertexSpirvCache.TryAdd(cacheKey, vertexSpirv);
+            }
+        }
+
+        var textures = new List<TranslatedImageBinding>(
+            exportEvaluation.ImageBindings.Count);
+        foreach (var binding in exportEvaluation.ImageBindings)
+        {
+            if (!TryDecodeTextureDescriptor(binding.ResourceDescriptor, out var texture))
+            {
+                if (_strictShaderDescriptors)
+                {
+                    error = $"invalid export texture descriptor at pc=0x{binding.Pc:X}";
+                    ReturnPooledEvaluationArrays(exportEvaluation);
+                    return false;
+                }
+
+                texture = new TextureDescriptor(
+                    0,
+                    1,
+                    1,
+                    Gen5TextureFormatR8G8B8A8Unorm,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    1,
+                    0xFAC);
+            }
+
+            textures.Add(new TranslatedImageBinding(
+                texture,
+                Gen5ShaderTranslator.IsStorageImageOperation(binding.Opcode),
+                binding.MipLevel ?? 0,
+                binding.SamplerDescriptor));
+        }
+
+        IReadOnlyList<Gen5VertexInputBinding> vertexInputs =
+            exportEvaluation.VertexInputs ?? [];
+        state.UcRegisters.TryGetValue(VgtPrimitiveType, out var primitiveType);
+        var syntheticTarget = new RenderTargetDescriptor(
+            Slot: 0,
+            Address: 0,
+            depthTarget.Width,
+            depthTarget.Height,
+            Format: 0,
+            NumberType: 0,
+            TileMode: 0);
+        var renderState = CreateRenderState(state.CxRegisters, syntheticTarget) with
+        {
+            // A guest pass without a pixel shader has no colour exports.  The
+            // presenter uses a private compatibility attachment, so disable
+            // all writes to it and expose only the persistent DB result.
+            Blend = VulkanGuestBlendState.Default with { WriteMask = 0 },
+        };
+        draw = new TranslatedGuestDraw(
+            exportShaderAddress,
+            PixelShaderAddress: 0,
+            primitiveType,
+            vertexSpirv,
+            _depthOnlyFragmentSpirv,
+            AttributeCount: 0,
+            vertexCount,
+            state.InstanceCount,
+            indexed ? CreateVulkanIndexBuffer(ctx, state, vertexCount) : null,
+            textures,
+            exportEvaluation.GlobalMemoryBindings,
+            vertexInputs,
+            RenderTargets: [],
+            depthTarget,
+            PixelSpirvByTarget: [],
+            renderState,
+            PixelUserData: [],
+            RawBlendControl: 0,
+            RawColorInfo: 0,
+            PixelInitialScalars: [],
+            exportEvaluation.InitialScalarRegisters);
+        return true;
     }
 
     private static bool TryCreateTranslatedGuestDraw(
@@ -5112,15 +5405,13 @@ public static class AgcExports
         {
             Mix(binding.Pc);
             Mix((ulong)(uint)binding.Opcode.GetHashCode());
-            if (binding.ResourceDescriptor.Count > 3)
+            if (binding.ResourceDescriptor.Count > 1)
             {
-                Mix(binding.ResourceDescriptor[1]);
-                Mix(binding.ResourceDescriptor[3]);
-            }
-
-            foreach (var word in binding.SamplerDescriptor)
-            {
-                Mix(word);
+                // The generated image type depends only on unified format.
+                // Bounds are queried from the bound view in SPIR-V; guest image
+                // addresses, dimensions, swizzles and sampler state are all
+                // runtime descriptor data and must not create pipeline variants.
+                Mix(binding.ResourceDescriptor[1] & 0x1FF0_0000u);
             }
 
             Mix(binding.MipLevel ?? 0xFFFF_FFFFUL);
@@ -5169,6 +5460,16 @@ public static class AgcExports
         foreach (var value in evaluation.ScalarRegisters)
         {
             hash = (hash ^ value) * prime;
+        }
+
+        // Baked-scalar mode has no runtime state block from which the shader
+        // can load descriptor-alignment biases, so the low guest address bits
+        // remain part of the generated module and must participate in its key.
+        foreach (var binding in evaluation.GlobalMemoryBindings)
+        {
+            hash = (hash ^ (
+                binding.BaseAddress &
+                (VulkanVideoPresenter.GuestStorageBufferOffsetAlignment - 1))) * prime;
         }
 
         if (evaluation.ComputeSystemRegisters is { } computeSystemRegisters)
@@ -5720,10 +6021,22 @@ public static class AgcExports
 
         var combined = new List<VulkanGuestMemoryBuffer>(buffers.Count + 2);
         combined.AddRange(buffers);
+        var runtimeStateLength = GetRuntimeScalarBufferLength(
+            translatedDraw.GlobalMemoryBindings.Count);
         combined.Add(new VulkanGuestMemoryBuffer(
-            0, PackScalarRegisters(translatedDraw.PixelInitialScalars), 256 * sizeof(uint), Pooled: true));
+            0,
+            PackRuntimeScalarState(
+                translatedDraw.PixelInitialScalars,
+                translatedDraw.GlobalMemoryBindings),
+            runtimeStateLength,
+            Pooled: true));
         combined.Add(new VulkanGuestMemoryBuffer(
-            0, PackScalarRegisters(translatedDraw.VertexInitialScalars), 256 * sizeof(uint), Pooled: true));
+            0,
+            PackRuntimeScalarState(
+                translatedDraw.VertexInitialScalars,
+                translatedDraw.GlobalMemoryBindings),
+            runtimeStateLength,
+            Pooled: true));
         return combined;
     }
 
@@ -5742,9 +6055,10 @@ public static class AgcExports
         foreach (var binding in bindings)
         {
             var data = new byte[Math.Max(binding.DataLength, sizeof(uint))];
-            if (binding.BaseAddress != 0 &&
-                !ctx.Memory.TryRead(binding.BaseAddress, data) &&
-                !KernelMemoryCompatExports.TryReadTrackedLibcHeap(binding.BaseAddress, data))
+            var guestMemoryBacked = binding.BaseAddress != 0 &&
+                (ctx.Memory.TryRead(binding.BaseAddress, data) ||
+                 KernelMemoryCompatExports.TryReadTrackedLibcHeap(binding.BaseAddress, data));
+            if (!guestMemoryBacked)
             {
                 // Keep the zero-filled buffer; layout must match the shader.
             }
@@ -5754,32 +6068,70 @@ public static class AgcExports
                 data,
                 data.Length,
                 Pooled: false,
-                Writable: binding.Writable));
+                Writable: binding.Writable,
+                WriteBackToGuest: binding.WriteBackToGuest && guestMemoryBacked));
         }
 
         if (!_bakeScalars)
         {
+            var runtimeStateLength = GetRuntimeScalarBufferLength(bindings.Count);
             combined.Add(new VulkanGuestMemoryBuffer(
-                0, PackScalarRegistersUnpooled(translatedDraw.PixelInitialScalars), 256 * sizeof(uint), Pooled: false));
+                0,
+                PackRuntimeScalarStateUnpooled(
+                    translatedDraw.PixelInitialScalars,
+                    bindings),
+                runtimeStateLength,
+                Pooled: false));
             combined.Add(new VulkanGuestMemoryBuffer(
-                0, PackScalarRegistersUnpooled(translatedDraw.VertexInitialScalars), 256 * sizeof(uint), Pooled: false));
+                0,
+                PackRuntimeScalarStateUnpooled(
+                    translatedDraw.VertexInitialScalars,
+                    bindings),
+                runtimeStateLength,
+                Pooled: false));
         }
 
         return combined;
     }
 
-    private static byte[] PackScalarRegisters(IReadOnlyList<uint> registers)
+    private static int GetRuntimeScalarBufferLength(int bindingCount) =>
+        checked((256 + bindingCount) * sizeof(uint));
+
+    private static byte[] PackRuntimeScalarState(
+        IReadOnlyList<uint> registers,
+        IReadOnlyList<Gen5GlobalMemoryBinding> bindings)
     {
-        var bytes = System.Buffers.ArrayPool<byte>.Shared.Rent(256 * sizeof(uint));
-        PackScalarRegistersInto(bytes, registers);
+        var bytes = System.Buffers.ArrayPool<byte>.Shared.Rent(
+            GetRuntimeScalarBufferLength(bindings.Count));
+        PackRuntimeScalarStateInto(bytes, registers, bindings);
         return bytes;
     }
 
-    private static byte[] PackScalarRegistersUnpooled(IReadOnlyList<uint> registers)
+    private static byte[] PackRuntimeScalarStateUnpooled(
+        IReadOnlyList<uint> registers,
+        IReadOnlyList<Gen5GlobalMemoryBinding> bindings)
     {
-        var bytes = new byte[256 * sizeof(uint)];
-        PackScalarRegistersInto(bytes, registers);
+        var bytes = new byte[GetRuntimeScalarBufferLength(bindings.Count)];
+        PackRuntimeScalarStateInto(bytes, registers, bindings);
         return bytes;
+    }
+
+    private static void PackRuntimeScalarStateInto(
+        byte[] bytes,
+        IReadOnlyList<uint> registers,
+        IReadOnlyList<Gen5GlobalMemoryBinding> bindings)
+    {
+        PackScalarRegistersInto(bytes, registers);
+        var biasOffset = 256 * sizeof(uint);
+        for (var index = 0; index < bindings.Count; index++)
+        {
+            var byteBias = checked((uint)(
+                bindings[index].BaseAddress &
+                (VulkanVideoPresenter.GuestStorageBufferOffsetAlignment - 1)));
+            BinaryPrimitives.WriteUInt32LittleEndian(
+                bytes.AsSpan(biasOffset + index * sizeof(uint), sizeof(uint)),
+                byteBias);
+        }
     }
 
     private static void PackScalarRegistersInto(byte[] bytes, IReadOnlyList<uint> registers)
@@ -5883,7 +6235,8 @@ public static class AgcExports
                 bindings[index].Data,
                 bindings[index].DataLength,
                 bindings[index].DataPooled,
-                bindings[index].Writable);
+                bindings[index].Writable,
+                bindings[index].WriteBackToGuest);
         }
 
         return buffers;
@@ -5907,8 +6260,10 @@ public static class AgcExports
         combined.AddRange(buffers);
         combined.Add(new VulkanGuestMemoryBuffer(
             0,
-            PackScalarRegisters(evaluation.InitialScalarRegisters),
-            256 * sizeof(uint),
+            PackRuntimeScalarState(
+                evaluation.InitialScalarRegisters,
+                evaluation.GlobalMemoryBindings),
+            GetRuntimeScalarBufferLength(evaluation.GlobalMemoryBindings.Count),
             Pooled: true));
         return combined;
     }
@@ -6089,6 +6444,8 @@ public static class AgcExports
                 IsStorage: false,
                 MipLevels: descriptor.MipLevels,
                 MipLevel: mipLevel,
+                BaseMipLevel: descriptor.ViewBaseLevel,
+                ResourceMipLevels: descriptor.ResourceMipLevels,
                 Pitch: sourceWidth,
                 TileMode: descriptor.TileMode,
                 DstSelect: descriptor.DstSelect,
@@ -6099,7 +6456,11 @@ public static class AgcExports
         if (isStorage)
         {
             var initialPixels = Array.Empty<byte>();
-            if (descriptor.Address != 0)
+            if (descriptor.Address != 0 &&
+                !VulkanVideoPresenter.IsGuestImageUploadKnown(
+                    descriptor.Address,
+                    descriptor.Format,
+                    descriptor.NumberType))
             {
                 // Storage images can be pre-populated in tiled guest memory
                 // just like sampled images. Reading only the logical linear
@@ -6135,6 +6496,8 @@ public static class AgcExports
                 IsStorage: true,
                 MipLevels: descriptor.MipLevels,
                 MipLevel: mipLevel,
+                BaseMipLevel: descriptor.ViewBaseLevel,
+                ResourceMipLevels: descriptor.ResourceMipLevels,
                 Pitch: sourceWidth,
                 TileMode: descriptor.TileMode,
                 DstSelect: descriptor.DstSelect,
@@ -6177,6 +6540,8 @@ public static class AgcExports
                 IsStorage: false,
                 MipLevels: descriptor.MipLevels,
                 MipLevel: mipLevel,
+                BaseMipLevel: descriptor.ViewBaseLevel,
+                ResourceMipLevels: descriptor.ResourceMipLevels,
                 Pitch: sourceWidth,
                 TileMode: descriptor.TileMode,
                 DstSelect: descriptor.DstSelect,
@@ -6232,6 +6597,8 @@ public static class AgcExports
             IsStorage: isStorage,
             MipLevels: descriptor.MipLevels,
             MipLevel: mipLevel,
+            BaseMipLevel: descriptor.ViewBaseLevel,
+            ResourceMipLevels: descriptor.ResourceMipLevels,
             Pitch: sourceWidth,
             TileMode: descriptor.TileMode,
             DstSelect: descriptor.DstSelect,
@@ -6913,8 +7280,42 @@ public static class AgcExports
         var writesGlobalMemory = evaluation.GlobalMemoryBindings.Any(static binding =>
             binding.Writable);
         var gpuDispatch = false;
+        var evaluationHandledByCpu = false;
         var computeError = string.Empty;
-        if ((hasStorageBinding || writesGlobalMemory) &&
+        if (!hasStorageBinding &&
+            writesGlobalMemory &&
+            TrySubmitMaskedDwordCopyKernel(
+                ctx,
+                shaderState.Program,
+                evaluation,
+                dispatch,
+                localSizeX,
+                localSizeY,
+                localSizeZ,
+                out var semanticCopySequence,
+                out var copyDescription))
+        {
+            gpuDispatch = true;
+            evaluationHandledByCpu = true;
+            TraceAgcShader(
+                $"agc.compute_semantic_fast_path cs=0x{shaderAddress:X16} " +
+                copyDescription);
+            // The scalar evaluator snapshots guest buffers while parsing the
+            // command stream.  Do not let another submission (or the CPU)
+            // observe that snapshot until the semantic replacement has
+            // reached the same CPU-visible completion point as a translated
+            // writable-buffer dispatch below.  Returning early here allowed
+            // the guest to reuse a transient heap while its delayed clear was
+            // still queued, so the clear could erase newly constructed CPU
+            // objects.  Waiting on the work sequence also retires preceding
+            // Vulkan writes before the next evaluator snapshot is captured.
+            if (!VulkanVideoPresenter.WaitForGuestWork(semanticCopySequence))
+            {
+                computeError =
+                    $"semantic-global-write-sync-timeout sequence={semanticCopySequence}";
+            }
+        }
+        else if ((hasStorageBinding || writesGlobalMemory) &&
             (ulong)localSizeX * localSizeY * localSizeZ <= 1024)
         {
             var shaderKey = (
@@ -7071,6 +7472,145 @@ public static class AgcExports
                     $" bindings=[{string.Join(',', descriptions)}]");
             }
         }
+
+        if (evaluationHandledByCpu)
+        {
+            ReturnPooledEvaluationArrays(evaluation);
+        }
+    }
+
+    /// <summary>
+    /// Recognizes the SDK's masked-dword resource initialization kernel and
+    /// executes its exact semantics over the guest-memory window that the
+    /// emulator can map. The guest dispatches this kernel over multi-gigabyte
+    /// virtual heaps (up to ~67 million 64-lane workgroups); translating every
+    /// out-of-window invocation to Vulkan dominated startup despite those
+    /// stores being bounds-discarded. This is a semantic kernel replacement,
+    /// not a generic dispatch cap: the complete instruction shape and SGPR
+    /// bindings must match before the ordered CPU action is used.
+    /// </summary>
+    private static bool TrySubmitMaskedDwordCopyKernel(
+        CpuContext ctx,
+        Gen5ShaderProgram program,
+        Gen5ShaderEvaluation evaluation,
+        ComputeDispatch dispatch,
+        uint localSizeX,
+        uint localSizeY,
+        uint localSizeZ,
+        out long workSequence,
+        out string description)
+    {
+        workSequence = 0;
+        description = string.Empty;
+        var instructions = program.Instructions;
+        string[] expectedOpcodes =
+        [
+            "SMovB32",
+            "STtraceData",
+            "SInstPrefetch",
+            "VLshlAddU32",
+            "SBufferLoadDword",
+            "SWaitcnt",
+            "VCmpxGtU32",
+            "SCbranchExecz",
+            "SBufferLoadDword",
+            "SWaitcnt",
+            "VAndB32",
+            "BufferLoadFormatX",
+            "SWaitcnt",
+            "BufferStoreFormatX",
+            "SEndpgm",
+        ];
+        if (instructions.Count != expectedOpcodes.Length ||
+            !instructions.Select(static instruction => instruction.Opcode)
+                .SequenceEqual(expectedOpcodes) ||
+            dispatch.BaseGroupX != 0 ||
+            dispatch.BaseGroupY != 0 ||
+            dispatch.BaseGroupZ != 0 ||
+            dispatch.GroupCountY != 1 ||
+            dispatch.GroupCountZ != 1 ||
+            localSizeY != 1 ||
+            localSizeZ != 1)
+        {
+            return false;
+        }
+
+        var control = evaluation.GlobalMemoryBindings.SingleOrDefault(
+            static binding => binding.ScalarAddress == 8 && !binding.Writable);
+        var source = evaluation.GlobalMemoryBindings.SingleOrDefault(
+            static binding => binding.ScalarAddress == 0 && !binding.Writable);
+        var destination = evaluation.GlobalMemoryBindings.SingleOrDefault(
+            static binding => binding.ScalarAddress == 4 &&
+                              binding.Writable &&
+                              binding.WriteBackToGuest);
+        if (control is null || source is null || destination is null ||
+            control.DataLength < 2 * sizeof(uint) ||
+            source.DataLength < sizeof(uint) ||
+            destination.BaseAddress == 0 ||
+            destination.DataLength < sizeof(uint))
+        {
+            return false;
+        }
+
+        var elementCount = BinaryPrimitives.ReadUInt32LittleEndian(
+            control.Data.AsSpan(0, sizeof(uint)));
+        var sourceMask = BinaryPrimitives.ReadUInt32LittleEndian(
+            control.Data.AsSpan(sizeof(uint), sizeof(uint)));
+        var dispatchedThreads = dispatch.ThreadCountX != uint.MaxValue
+            ? dispatch.ThreadCountX
+            : Math.Min(
+                (ulong)uint.MaxValue,
+                (ulong)dispatch.GroupCountX * localSizeX);
+        var writableDwords = (uint)(destination.DataLength / sizeof(uint));
+        var outputDwords = (uint)Math.Min(
+            Math.Min((ulong)elementCount, dispatchedThreads),
+            writableDwords);
+        if (outputDwords == 0)
+        {
+            return false;
+        }
+
+        var output = new byte[checked((int)outputDwords * sizeof(uint))];
+        var outputWords = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, uint>(
+            output.AsSpan());
+        if (sourceMask == 0)
+        {
+            outputWords.Fill(BinaryPrimitives.ReadUInt32LittleEndian(
+                source.Data.AsSpan(0, sizeof(uint))));
+        }
+        else
+        {
+            var sourceWords = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, uint>(
+                source.Data.AsSpan(0, source.DataLength - (source.DataLength % sizeof(uint))));
+            for (uint index = 0; index < outputDwords; index++)
+            {
+                var sourceIndex = index & sourceMask;
+                outputWords[(int)index] = sourceIndex < (uint)sourceWords.Length
+                    ? sourceWords[(int)sourceIndex]
+                    : 0;
+            }
+        }
+
+        var destinationAddress = destination.BaseAddress;
+        workSequence = VulkanVideoPresenter.SubmitOrderedGuestAction(
+            () =>
+            {
+                if (!ctx.Memory.TryWrite(destinationAddress, output))
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][ERROR] AGC masked-copy fast path failed " +
+                        $"dst=0x{destinationAddress:X16} bytes={output.Length}");
+                    return;
+                }
+
+                GuestImageWriteTracker.Track(destinationAddress, (ulong)output.Length);
+            },
+            $"masked_dword_copy dst=0x{destinationAddress:X16} bytes={output.Length}");
+        description =
+            $"dst=0x{destinationAddress:X16} bytes={output.Length} " +
+            $"elements={elementCount} mask=0x{sourceMask:X8} " +
+            $"dispatch={dispatch.GroupCountX}x{localSizeX}";
+        return workSequence > 0;
     }
 
     private static Gen5ComputeSystemRegisters DecodeComputeSystemRegisters(
@@ -7517,12 +8057,46 @@ public static class AgcExports
             return;
         }
 
+        // Translation failures are compatibility issues, not merely verbose
+        // shader diagnostics. Report each distinct failure once even when AGC
+        // tracing is disabled so normal runs preserve the missing opcode or
+        // unsupported translation reason needed to fix the game.
+        if (firstFailure)
+        {
+            Console.Error.WriteLine(
+                $"[COMPAT][SHADER] ps=0x{pixelShaderAddress:X16} " +
+                $"es=0x{exportShaderAddress:X16} error={translationError}");
+        }
+
         if ((!hasPixelShader || !hasPsInputEna || !hasPsInputAddr) &&
             TryMarkMissingPixelShaderBindingsTrace())
         {
             TraceAgcShader(
                 $"agc.shader_register_candidates " +
                 DescribeShaderRegisterCandidates(ctx, state.ShRegisters));
+        }
+
+        if (!hasPixelShader)
+        {
+            state.CxRegisters.TryGetValue(DbDepthControl, out var rawDepthControl);
+            state.CxRegisters.TryGetValue(DbZInfo, out var rawZInfo);
+            state.CxRegisters.TryGetValue(DbDepthSizeXy, out var rawDepthSize);
+            state.CxRegisters.TryGetValue(DbDepthView, out var rawDepthView);
+            var depthState = DecodeDepthState(state.CxRegisters);
+            var depthTarget = DecodeDepthTarget(state.CxRegisters);
+            TraceAgcShader(
+                $"agc.shader_depth_state control=0x{rawDepthControl:X8} " +
+                $"zinfo=0x{rawZInfo:X8} size=0x{rawDepthSize:X8} " +
+                $"view=0x{rawDepthView:X8} " +
+                $"test={(depthState.TestEnable ? 1 : 0)} " +
+                $"write={(depthState.WriteEnable ? 1 : 0)} " +
+                $"func={depthState.CompareOp} " +
+                (depthTarget is null
+                    ? "target=none"
+                    : $"target=0x{depthTarget.Address:X16}:" +
+                      $"{depthTarget.Width}x{depthTarget.Height}:" +
+                      $"fmt{depthTarget.GuestFormat}/sw{depthTarget.SwizzleMode}:" +
+                      $"ro={(depthTarget.ReadOnly ? 1 : 0)}"));
         }
 
         var shaderDecode = string.Empty;

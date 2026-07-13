@@ -790,20 +790,59 @@ public static partial class KernelMemoryCompatExports
         }
 
         var payload = new byte[count * WideCharSize];
-        for (var copied = 0; copied < count; copied++)
+        if (count == 0)
         {
-            if (!TryReadUInt16Compat(ctx, source + ((ulong)copied * WideCharSize), out var unit))
+            ctx[CpuRegister.Rax] = destination;
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+
+        // Keep host-pointer reads page-bounded and copy several UTF-16 code
+        // units per validation. Large scratch strings otherwise pay the host
+        // address-validation and temporary-buffer cost once per character.
+        const int maxReadBytes = 4096;
+        var readBuffer = GC.AllocateUninitializedArray<byte>(
+            Math.Min(maxReadBytes, payload.Length));
+        var copied = 0;
+        while (copied < count)
+        {
+            var sourceAddress = source + ((ulong)copied * WideCharSize);
+            if (sourceAddress < source)
             {
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
             }
 
-            BinaryPrimitives.WriteUInt16LittleEndian(
-                payload.AsSpan(copied * WideCharSize, WideCharSize),
-                unit);
-
-            if (unit == 0)
+            var pageBytesRemaining = maxReadBytes -
+                (int)(sourceAddress & (maxReadBytes - 1));
+            var remainingBytes = (count - copied) * WideCharSize;
+            var readBytes = Math.Min(
+                readBuffer.Length,
+                Math.Min(pageBytesRemaining, remainingBytes));
+            readBytes &= ~(WideCharSize - 1);
+            if (readBytes == 0 ||
+                !TryReadCompat(ctx, sourceAddress, readBuffer.AsSpan(0, readBytes)))
             {
-                break;
+                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+            }
+
+            for (var offset = 0; offset < readBytes; offset += WideCharSize)
+            {
+                var unit = BinaryPrimitives.ReadUInt16LittleEndian(
+                    readBuffer.AsSpan(offset, WideCharSize));
+                if (unit == 0)
+                {
+                    // payload is zero-initialized, supplying wcsncpy padding.
+                    copied = count;
+                    break;
+                }
+
+                BinaryPrimitives.WriteUInt16LittleEndian(
+                    payload.AsSpan((copied * WideCharSize) + offset, WideCharSize),
+                    unit);
+            }
+
+            if (copied != count)
+            {
+                copied += readBytes / WideCharSize;
             }
         }
 
@@ -828,23 +867,48 @@ public static partial class KernelMemoryCompatExports
 
     private static int WcschrCore(CpuContext ctx, ulong address, ushort needle)
     {
-        for (ulong index = 0; index < 1_048_576; index++)
+        const int maxReadBytes = 4096;
+        var readBuffer = GC.AllocateUninitializedArray<byte>(maxReadBytes);
+        const ulong maxUnits = 1_048_576;
+        for (ulong index = 0; index < maxUnits;)
         {
-            if (!TryReadUInt16Compat(ctx, address + (index * WideCharSize), out var unit))
+            var unitAddress = address + (index * WideCharSize);
+            if (unitAddress < address)
             {
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
             }
 
-            if (unit == needle)
+            var remainingBytes = (maxUnits - index) * WideCharSize;
+            var pageBytesRemaining = maxReadBytes -
+                (int)(unitAddress & (maxReadBytes - 1));
+            var readBytes = (int)Math.Min(
+                (ulong)Math.Min(readBuffer.Length, pageBytesRemaining),
+                remainingBytes);
+            readBytes &= ~(WideCharSize - 1);
+            if (readBytes == 0 ||
+                !TryReadCompat(ctx, unitAddress, readBuffer.AsSpan(0, readBytes)))
             {
-                ctx[CpuRegister.Rax] = address + (index * WideCharSize);
-                return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
             }
 
-            if (unit == 0)
+            for (var offset = 0; offset < readBytes; offset += WideCharSize)
             {
-                break;
+                var unit = BinaryPrimitives.ReadUInt16LittleEndian(
+                    readBuffer.AsSpan(offset, WideCharSize));
+                if (unit == needle)
+                {
+                    ctx[CpuRegister.Rax] = unitAddress + (ulong)offset;
+                    return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+                }
+
+                if (unit == 0)
+                {
+                    ctx[CpuRegister.Rax] = 0;
+                    return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+                }
             }
+
+            index += (ulong)(readBytes / WideCharSize);
         }
 
         ctx[CpuRegister.Rax] = 0;
@@ -4765,35 +4829,20 @@ public static partial class KernelMemoryCompatExports
 
     private static bool TryReadWideCString(CpuContext ctx, ulong address, ulong maxLength, out ushort[] units)
     {
-        units = Array.Empty<ushort>();
-        if (address == 0)
-        {
-            return false;
-        }
-
-        var limit = (int)Math.Min(maxLength, 1_048_576UL);
-        var buffer = new List<ushort>(Math.Min(limit, 256));
-        for (var i = 0; i < limit; i++)
-        {
-            if (!TryReadUInt16Compat(ctx, address + ((ulong)i * WideCharSize), out var unit))
-            {
-                return false;
-            }
-
-            if (unit == 0)
-            {
-                units = buffer.ToArray();
-                return true;
-            }
-
-            buffer.Add(unit);
-        }
-
-        units = buffer.ToArray();
-        return true;
+        return TryReadWideCStringCore(ctx, address, maxLength, out units, out _);
     }
 
     private static bool TryReadWideCStringBounded(CpuContext ctx, ulong address, ulong maxLength, out ushort[] units, out bool terminated)
+    {
+        return TryReadWideCStringCore(ctx, address, maxLength, out units, out terminated);
+    }
+
+    private static bool TryReadWideCStringCore(
+        CpuContext ctx,
+        ulong address,
+        ulong maxLength,
+        out ushort[] units,
+        out bool terminated)
     {
         units = Array.Empty<ushort>();
         terminated = false;
@@ -4804,21 +4853,45 @@ public static partial class KernelMemoryCompatExports
 
         var limit = (int)Math.Min(maxLength, 1_048_576UL);
         var buffer = new List<ushort>(Math.Min(limit, 256));
-        for (var i = 0; i < limit; i++)
+        const int maxReadBytes = 4096;
+        var readBuffer = GC.AllocateUninitializedArray<byte>(
+            Math.Min(maxReadBytes, Math.Max(WideCharSize, limit * WideCharSize)));
+        var index = 0;
+        while (index < limit)
         {
-            if (!TryReadUInt16Compat(ctx, address + ((ulong)i * WideCharSize), out var unit))
+            var unitAddress = address + ((ulong)index * WideCharSize);
+            if (unitAddress < address)
             {
                 return false;
             }
 
-            if (unit == 0)
+            var remainingBytes = (limit - index) * WideCharSize;
+            var pageBytesRemaining = maxReadBytes -
+                (int)(unitAddress & (maxReadBytes - 1));
+            var readBytes = Math.Min(
+                readBuffer.Length,
+                Math.Min(pageBytesRemaining, remainingBytes));
+            readBytes &= ~(WideCharSize - 1);
+            if (readBytes == 0 ||
+                !TryReadCompat(ctx, unitAddress, readBuffer.AsSpan(0, readBytes)))
             {
-                terminated = true;
-                units = buffer.ToArray();
-                return true;
+                return false;
             }
 
-            buffer.Add(unit);
+            for (var offset = 0; offset < readBytes; offset += WideCharSize)
+            {
+                var unit = BinaryPrimitives.ReadUInt16LittleEndian(
+                    readBuffer.AsSpan(offset, WideCharSize));
+                if (unit == 0)
+                {
+                    terminated = true;
+                    units = buffer.ToArray();
+                    return true;
+                }
+
+                buffer.Add(unit);
+                index++;
+            }
         }
 
         units = buffer.ToArray();

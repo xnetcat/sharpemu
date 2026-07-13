@@ -4,6 +4,7 @@
 using SharpEmu.Core.Runtime;
 using SharpEmu.Core.Cpu;
 using SharpEmu.HLE;
+using SharpEmu.Libs.Agc;
 using SharpEmu.Logging;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -27,6 +28,11 @@ internal static partial class Program
 
     private static int Main(string[] args)
     {
+        if (TryParseOpcodeScan(args, out var scanPath))
+        {
+            return RunOpcodeScan(scanPath);
+        }
+
         // Frame-loop friendly GC: avoids blocking gen-2 collections stalling
         // the guest and render threads mid-frame.
         System.Runtime.GCSettings.LatencyMode = System.Runtime.GCLatencyMode.SustainedLowLatency;
@@ -54,6 +60,12 @@ internal static partial class Program
             }, 32 * 1024 * 1024)
             {
                 Name = "SharpEmu Emulation",
+                Priority = string.Equals(
+                    Environment.GetEnvironmentVariable("SHARPEMU_HIGH_PRIORITY"),
+                    "1",
+                    StringComparison.Ordinal)
+                        ? ThreadPriority.Highest
+                        : ThreadPriority.Normal,
             };
             emulation.Start();
             HostMainThread.Pump();
@@ -524,6 +536,56 @@ internal static partial class Program
     {
         Log.Info("Usage: SharpEmu.CLI [--strict] [--trace-imports[=N]] [--cpu-engine=<native>] [--log-level=<level>] <path-to-eboot.bin>");
         Log.Info(@"Example: SharpEmu.CLI --cpu-engine=native --trace-imports=64 --log-level=debug ""E:\Games\...\eboot.bin""");
+        Log.Info("Preflight: SharpEmu.CLI --scan-opcodes <path-to-eboot.bin>");
+    }
+
+    private static int RunOpcodeScan(string scanPath)
+    {
+        try
+        {
+            scanPath = Path.GetFullPath(scanPath);
+            Console.Error.WriteLine($"[OPCODE-SCAN] scanning: {scanPath}");
+            if (!Gen5ShaderPreflightScanner.TryScan(scanPath, Console.Out, out var error))
+            {
+                Console.Error.WriteLine($"[OPCODE-SCAN][ERROR] {error}");
+                return 2;
+            }
+
+            return 0;
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine($"[OPCODE-SCAN][ERROR] {exception.Message}");
+            return 3;
+        }
+    }
+
+    private static bool TryParseOpcodeScan(string[] args, out string scanPath)
+    {
+        scanPath = string.Empty;
+        for (var index = 0; index < args.Length; index++)
+        {
+            var argument = args[index];
+            if (string.Equals(argument, "--scan-opcodes", StringComparison.OrdinalIgnoreCase))
+            {
+                if (index + 1 >= args.Length)
+                {
+                    return false;
+                }
+
+                scanPath = args[index + 1];
+                return true;
+            }
+
+            const string scanPrefix = "--scan-opcodes=";
+            if (argument.StartsWith(scanPrefix, StringComparison.OrdinalIgnoreCase))
+            {
+                scanPath = argument[scanPrefix.Length..];
+                return !string.IsNullOrWhiteSpace(scanPath);
+            }
+        }
+
+        return false;
     }
 
     private static bool TryParseArguments(

@@ -176,8 +176,22 @@ public sealed partial class DirectExecutionBackend
 		if (_activeGuestThreadState is { } activeGuestThreadState)
 		{
 			Interlocked.Increment(ref activeGuestThreadState.ImportCount);
-			Volatile.Write(ref activeGuestThreadState.LastImportNid, importStubEntry.Nid);
+			activeGuestThreadState.LastImportRdi = value;
+			activeGuestThreadState.LastImportRsi = value2;
+			activeGuestThreadState.LastImportRdx = num3;
+			activeGuestThreadState.LastImportRcx = num4;
+			activeGuestThreadState.LastImportR8 = num5;
+			activeGuestThreadState.LastImportR9 = num6;
+			activeGuestThreadState.LastImportStack0 = ReadImportStackArgument(argPackPtr, 0);
+			activeGuestThreadState.LastImportStack1 = ReadImportStackArgument(argPackPtr, 1);
+			activeGuestThreadState.LastImportStack2 = ReadImportStackArgument(argPackPtr, 2);
+			activeGuestThreadState.LastImportStack3 = ReadImportStackArgument(argPackPtr, 3);
+			activeGuestThreadState.LastImportStack4 = ReadImportStackArgument(argPackPtr, 4);
+			activeGuestThreadState.LastImportStack5 = ReadImportStackArgument(argPackPtr, 5);
 			Volatile.Write(ref activeGuestThreadState.LastReturnRip, num7);
+			// Publish the NID last so readers cannot pair a new import name with
+			// the preceding import's argument snapshot.
+			Volatile.Write(ref activeGuestThreadState.LastImportNid, importStubEntry.Nid);
 		}
 		if (_logStrlenBursts)
 		{
@@ -547,6 +561,12 @@ public sealed partial class DirectExecutionBackend
 		}
 	}
 
+	private static ulong ReadImportStackArgument(nint argPackPtr, int index)
+	{
+		var address = checked((ulong)argPackPtr + 104UL + (ulong)index * sizeof(ulong));
+		return TryReadHostQword(address, out var value) ? value : 0;
+	}
+
 	private unsafe bool TryDispatchLeafImport(
 		CpuContext cpuContext,
 		ImportStubEntry importStubEntry,
@@ -582,8 +602,20 @@ public sealed partial class DirectExecutionBackend
 		if (_activeGuestThreadState is { } activeGuestThreadState)
 		{
 			Interlocked.Increment(ref activeGuestThreadState.ImportCount);
-			Volatile.Write(ref activeGuestThreadState.LastImportNid, importStubEntry.Nid);
+			activeGuestThreadState.LastImportRdi = arg0;
+			activeGuestThreadState.LastImportRsi = *(ulong*)(argPackPtr + 8);
+			activeGuestThreadState.LastImportRdx = *(ulong*)(argPackPtr + 16);
+			activeGuestThreadState.LastImportRcx = *(ulong*)(argPackPtr + 24);
+			activeGuestThreadState.LastImportR8 = *(ulong*)(argPackPtr + 32);
+			activeGuestThreadState.LastImportR9 = *(ulong*)(argPackPtr + 40);
+			activeGuestThreadState.LastImportStack0 = ReadImportStackArgument(argPackPtr, 0);
+			activeGuestThreadState.LastImportStack1 = ReadImportStackArgument(argPackPtr, 1);
+			activeGuestThreadState.LastImportStack2 = ReadImportStackArgument(argPackPtr, 2);
+			activeGuestThreadState.LastImportStack3 = ReadImportStackArgument(argPackPtr, 3);
+			activeGuestThreadState.LastImportStack4 = ReadImportStackArgument(argPackPtr, 4);
+			activeGuestThreadState.LastImportStack5 = ReadImportStackArgument(argPackPtr, 5);
 			Volatile.Write(ref activeGuestThreadState.LastReturnRip, returnRip);
+			Volatile.Write(ref activeGuestThreadState.LastImportNid, importStubEntry.Nid);
 		}
 		if (dispatchIndex % 100000 == 0)
 		{
@@ -1036,7 +1068,12 @@ public sealed partial class DirectExecutionBackend
 	}
 
 	private static bool IsImportLoopGuardBoundary(string nid) =>
-		string.Equals(nid, "1jfXLRVzisc", StringComparison.Ordinal);
+		nid is
+			"1jfXLRVzisc" or // sceKernelUsleep
+			"WKAXJ4XBPQ4" or // scePthreadCondWait
+			"BmMjYxmew1w" or // scePthreadCondTimedwait
+			"Op8TBGY5KHg" or // pthread_cond_wait
+			"27bAgiJmOh0";   // pthread_cond_timedwait
 
 	private void ResetImportLoopPattern()
 	{

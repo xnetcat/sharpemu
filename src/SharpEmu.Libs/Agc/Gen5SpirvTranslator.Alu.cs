@@ -1203,6 +1203,56 @@ internal static partial class Gen5SpirvTranslator
             }
 
             var left = GetRawSource(instruction, 0);
+            if (instruction.Opcode.EndsWith("SaveexecB32", StringComparison.Ordinal))
+            {
+                var oldExec64 = BooleanToWaveMask(Load(_boolType, _exec));
+                var oldExec = _module.AddInstruction(
+                    SpirvOp.UConvert,
+                    _uintType,
+                    oldExec64);
+                var notLeft = _module.AddInstruction(SpirvOp.Not, _uintType, left);
+                var notOldExec = _module.AddInstruction(SpirvOp.Not, _uintType, oldExec);
+                var newExec = instruction.Opcode switch
+                {
+                    "SAndSaveexecB32" => BitwiseAnd(oldExec, left),
+                    "SOrSaveexecB32" => BitwiseOr(oldExec, left),
+                    "SXorSaveexecB32" => _module.AddInstruction(
+                        SpirvOp.BitwiseXor, _uintType, oldExec, left),
+                    "SAndn1SaveexecB32" => BitwiseAnd(notLeft, oldExec),
+                    "SAndn2SaveexecB32" => BitwiseAnd(left, notOldExec),
+                    "SOrn1SaveexecB32" => BitwiseOr(notLeft, oldExec),
+                    "SOrn2SaveexecB32" => BitwiseOr(left, notOldExec),
+                    "SNandSaveexecB32" => _module.AddInstruction(
+                        SpirvOp.Not, _uintType, BitwiseAnd(left, oldExec)),
+                    "SNorSaveexecB32" => _module.AddInstruction(
+                        SpirvOp.Not, _uintType, BitwiseOr(left, oldExec)),
+                    "SXnorSaveexecB32" => _module.AddInstruction(
+                        SpirvOp.Not,
+                        _uintType,
+                        _module.AddInstruction(
+                            SpirvOp.BitwiseXor,
+                            _uintType,
+                            left,
+                            oldExec)),
+                    _ => 0u,
+                };
+                if (newExec == 0)
+                {
+                    error = $"unsupported scalar 32-bit saveexec opcode {instruction.Opcode}";
+                    return false;
+                }
+
+                StoreS(destination, oldExec);
+                // B32 saveexec is the Wave32 form; EXEC_HI is zero.
+                var newExec64 = _module.AddInstruction(
+                    SpirvOp.UConvert,
+                    _ulongType,
+                    newExec);
+                StoreS64(126, newExec64);
+                Store(_scc, IsNotZero(newExec));
+                return true;
+            }
+
             uint result;
             switch (instruction.Opcode)
             {
@@ -1883,6 +1933,39 @@ internal static partial class Gen5SpirvTranslator
 
                 StoreS64(destination, extracted);
                 Store(_scc, IsNotZero64(extracted));
+                return true;
+            }
+
+            if (instruction.Opcode == "SBfmB64")
+            {
+                if (instruction.Sources.Count < 2)
+                {
+                    error = "missing scalar 64-bit bitfield-mask source";
+                    return false;
+                }
+
+                var width = _module.AddInstruction(
+                    SpirvOp.UConvert,
+                    _ulongType,
+                    BitwiseAnd(GetRawSource(instruction, 0), UInt(63)));
+                var offset = _module.AddInstruction(
+                    SpirvOp.UConvert,
+                    _ulongType,
+                    BitwiseAnd(GetRawSource(instruction, 1), UInt(63)));
+                // Width is masked to 0..63, so (1 << width) never invokes an
+                // undefined 64-bit shift. This naturally yields zero for a
+                // zero-width mask and avoids OpBitFieldInsert, which the
+                // MoltenVK/SPIRV-Cross path rejects for 64-bit integers.
+                var lowMask = _module.AddInstruction(
+                    SpirvOp.ISub,
+                    _ulongType,
+                    ShiftLeftLogical64(
+                        _module.Constant64(_ulongType, 1),
+                        width),
+                    _module.Constant64(_ulongType, 1));
+                var maskValue = ShiftLeftLogical64(lowMask, offset);
+                StoreS64(destination, maskValue);
+                Store(_scc, IsNotZero64(maskValue));
                 return true;
             }
 

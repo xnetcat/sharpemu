@@ -174,6 +174,22 @@ public sealed partial class DirectExecutionBackend
 					$"name='{activeGuestThread.Name}' state={activeGuestThread.State} " +
 					$"last_import={activeGuestThread.LastImportNid ?? "<none>"} " +
 					$"last_ret=0x{activeGuestThread.LastReturnRip:X16}");
+				Console.Error.WriteLine(
+					$"[LOADER][INFO]   Last import registers: " +
+					$"rdi=0x{activeGuestThread.LastImportRdi:X16} " +
+					$"rsi=0x{activeGuestThread.LastImportRsi:X16} " +
+					$"rdx=0x{activeGuestThread.LastImportRdx:X16} " +
+					$"rcx=0x{activeGuestThread.LastImportRcx:X16} " +
+					$"r8=0x{activeGuestThread.LastImportR8:X16} " +
+					$"r9=0x{activeGuestThread.LastImportR9:X16}");
+				Console.Error.WriteLine(
+					$"[LOADER][INFO]   Last import stack args: " +
+					$"0=0x{activeGuestThread.LastImportStack0:X16} " +
+					$"1=0x{activeGuestThread.LastImportStack1:X16} " +
+					$"2=0x{activeGuestThread.LastImportStack2:X16} " +
+					$"3=0x{activeGuestThread.LastImportStack3:X16} " +
+					$"4=0x{activeGuestThread.LastImportStack4:X16} " +
+					$"5=0x{activeGuestThread.LastImportStack5:X16}");
 			}
 			if (TryFormatNearestRuntimeSymbol(rip, out string symbol))
 			{
@@ -231,13 +247,19 @@ public sealed partial class DirectExecutionBackend
 				Console.Error.WriteLine($"[LOADER][INFO]     [rsp+0x{i * 8:X2}] @0x{stackAddr:X16} = 0x{value:X16}");
 			}
 
+			DumpPointerWindow("fault-register-rbx", rbx, 0x60);
+			DumpPointerWindow("fault-register-rsi", rsi, 0x60);
+			DumpPointerWindow("fault-register-rdi", rdi, 0x60);
+			DumpPointerWindow("fault-register-r13", r13, 0x60);
+			DumpPointerWindow("fault-register-r14", r14, 0x60);
+
 			try
 			{
 				Console.Error.WriteLine("[LOADER][INFO]   Frame chain (RBP walk):");
 				ulong frame = rbp;
 				for (int i = 0; i < 12; i++)
 				{
-					if (frame < 140733193388032L || frame > 140737488355327L)
+					if (frame < 0x10000)
 					{
 						break;
 					}
@@ -302,7 +324,10 @@ public sealed partial class DirectExecutionBackend
 						Console.Error.WriteLine("[LOADER][ERROR]   Could not read code at RIP");
 					}
 					DumpRecentImportTrace();
-					DumpGuestDisasmDiagnostics(rip, rbp);
+					DumpGuestDisasmDiagnostics(rip, rbp, rsp);
+					DumpGuestRegisterWindowDiagnostics(
+						rax, rbx, rcx, rdx, rsi, rdi, rbp, rsp,
+						r8, r9, r10, r11, r12, r13, r14, r15);
 					DumpGuestReferenceDiagnostics();
 					DumpGuestPointerWindowDiagnostics();
 					break;
@@ -447,7 +472,7 @@ public sealed partial class DirectExecutionBackend
 		}
 	}
 
-	private void DumpGuestDisasmDiagnostics(ulong rip, ulong rbp)
+	private void DumpGuestDisasmDiagnostics(ulong rip, ulong rbp, ulong rsp)
 	{
 		if (!string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_DISASM"), "1", StringComparison.Ordinal))
 		{
@@ -459,12 +484,20 @@ public sealed partial class DirectExecutionBackend
 			DumpGuestInstructionStream("fault-prelude", rip - 0x20, 24);
 		}
 
+		// Optimized guest code frequently omits frame pointers. The return
+		// address at RSP is then more useful than an RBP walk and identifies the
+		// exact call site that supplied the faulting arguments.
+		if (TryReadHostQword(rsp, out var stackReturn) && stackReturn >= 0x60)
+		{
+			DumpGuestInstructionStream("stack-return-prelude", stackReturn - 0x60, 40);
+		}
+
 		try
 		{
 			ulong frame = rbp;
 			for (int i = 0; i < 3; i++)
 			{
-				if (frame < 140733193388032L || frame > 140737488355327L)
+				if (frame < 0x10000)
 				{
 					break;
 				}
@@ -605,6 +638,55 @@ public sealed partial class DirectExecutionBackend
 		foreach (var target in targetList)
 		{
 			DumpPointerWindow($"ptrwin-0x{target:X16}", target, windowSize);
+		}
+	}
+
+	private void DumpGuestRegisterWindowDiagnostics(
+		ulong rax,
+		ulong rbx,
+		ulong rcx,
+		ulong rdx,
+		ulong rsi,
+		ulong rdi,
+		ulong rbp,
+		ulong rsp,
+		ulong r8,
+		ulong r9,
+		ulong r10,
+		ulong r11,
+		ulong r12,
+		ulong r13,
+		ulong r14,
+		ulong r15)
+	{
+		if (!string.Equals(
+				Environment.GetEnvironmentVariable("SHARPEMU_LOG_REGISTER_WINDOWS"),
+				"1",
+				StringComparison.Ordinal))
+		{
+			return;
+		}
+
+		// A register can be the only surviving reference to the object or
+		// argument array that caused a native guest fault. Capture a compact
+		// window while the process is alive so the post-mortem log can
+		// distinguish an absent object from a partially initialized one.
+		var registers = new (string Name, ulong Value)[]
+		{
+			("rax", rax), ("rbx", rbx), ("rcx", rcx), ("rdx", rdx),
+			("rsi", rsi), ("rdi", rdi), ("rbp", rbp), ("rsp", rsp),
+			("r8", r8), ("r9", r9), ("r10", r10), ("r11", r11),
+			("r12", r12), ("r13", r13), ("r14", r14), ("r15", r15),
+		};
+		var seen = new HashSet<ulong>();
+		foreach (var (name, value) in registers)
+		{
+			if (value < 0x10000 || !seen.Add(value))
+			{
+				continue;
+			}
+
+			DumpPointerWindow($"register-{name}", value, 0x80);
 		}
 	}
 

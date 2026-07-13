@@ -192,6 +192,7 @@ internal static partial class Gen5SpirvTranslator
         private uint _uvec4Type;
         private uint _privateUintPointer;
         private uint _privateBoolPointer;
+        private uint _runtimeBufferBiases;
         private uint _scalarRegisters;
         private uint _vectorRegisters;
         private uint _scc;
@@ -570,6 +571,24 @@ internal static partial class Gen5SpirvTranslator
             _interfaces.Add(_programActive);
             _module.AddName(_scalarRegisters, "sgpr");
             _module.AddName(_vectorRegisters, "vgpr");
+
+            var runtimeBufferBiasCount =
+                _globalBufferBase + _evaluation.GlobalMemoryBindings.Count;
+            if (_initialScalarBufferIndex >= 0 && runtimeBufferBiasCount > 0)
+            {
+                var biasArrayType = _module.TypeArray(
+                    _uintType,
+                    (uint)runtimeBufferBiasCount);
+                var privateBiasArrayPointer = _module.TypePointer(
+                    SpirvStorageClass.Private,
+                    biasArrayType);
+                _runtimeBufferBiases = _module.AddGlobalVariable(
+                    privateBiasArrayPointer,
+                    SpirvStorageClass.Private,
+                    _module.ConstantNull(biasArrayType));
+                _module.AddName(_runtimeBufferBiases, "guestBufferByteBias");
+                _interfaces.Add(_runtimeBufferBiases);
+            }
 
             DeclareBuffers();
             DeclareImages();
@@ -1073,6 +1092,19 @@ internal static partial class Gen5SpirvTranslator
                             index,
                             LoadBufferWord(_initialScalarBufferIndex, UInt(index)));
                     }
+                }
+
+                var runtimeBufferBiasCount =
+                    _globalBufferBase + _evaluation.GlobalMemoryBindings.Count;
+                for (var binding = 0;
+                     binding < runtimeBufferBiasCount;
+                     binding++)
+                {
+                    Store(
+                        RuntimeBufferBiasPointer(binding),
+                        LoadBufferWord(
+                            _initialScalarBufferIndex,
+                            UInt(checked(256u + (uint)binding))));
                 }
             }
             else
@@ -2841,27 +2873,15 @@ internal static partial class Gen5SpirvTranslator
                     SpirvOp.CompositeConstruct,
                     resource.VectorType,
                     components);
-                if (TryGetImageBounds(
-                        _evaluation.ImageBindings[bindingIndex].ResourceDescriptor,
-                        out var width,
-                        out var height))
-                {
-                    EmitBoundsCheckedImageWrite(
-                        coordinates,
-                        width,
-                        height,
-                        imageObject,
-                        texel);
-                }
-                else
-                {
-                    EmitExecConditional(
-                        () => _module.AddStatement(
-                            SpirvOp.ImageWrite,
-                            imageObject,
-                            coordinates,
-                            texel));
-                }
+                var imageSize = _module.AddInstruction(
+                    SpirvOp.ImageQuerySize,
+                    _module.TypeVector(_intType, 2),
+                    imageObject);
+                EmitBoundsCheckedImageWrite(
+                    coordinates,
+                    imageSize,
+                    imageObject,
+                    texel);
 
                 return true;
             }
@@ -2876,17 +2896,20 @@ internal static partial class Gen5SpirvTranslator
             var writeAllComponents = false;
             if (instruction.Opcode is "ImageLoad" or "ImageLoadMip")
             {
-                var coordinates = TryGetImageBounds(
-                        _evaluation.ImageBindings[bindingIndex].ResourceDescriptor,
-                        out var width,
-                        out var height)
-                    ? BuildClampedIntegerCoordinates(image, 0, width, height)
-                    : BuildIntegerCoordinates(image, 0);
                 var mipLevel = _evaluation.ImageBindings[bindingIndex].MipLevel ?? 0;
                 var fetchedImage = _module.AddInstruction(
                     SpirvOp.Image,
                     resource.ImageType,
                     imageObject);
+                var imageSize = _module.AddInstruction(
+                    SpirvOp.ImageQuerySizeLod,
+                    _module.TypeVector(_intType, 2),
+                    fetchedImage,
+                    UInt(mipLevel));
+                var coordinates = BuildClampedIntegerCoordinates(
+                    image,
+                    0,
+                    imageSize);
                 sampled = _module.AddInstruction(
                     SpirvOp.ImageFetch,
                     resource.VectorType,
@@ -3340,20 +3363,27 @@ internal static partial class Gen5SpirvTranslator
         private uint BuildClampedIntegerCoordinates(
             Gen5ImageControl image,
             int start,
-            uint width,
-            uint height)
+            uint imageSize)
         {
             var ivec2 = _module.TypeVector(_intType, 2);
             var x = ClampSignedCoordinate(
                 Bitcast(
                     _intType,
                     LoadImageIntegerAddress(image, start)),
-                width);
+                _module.AddInstruction(
+                    SpirvOp.CompositeExtract,
+                    _intType,
+                    imageSize,
+                    0));
             var y = ClampSignedCoordinate(
                 Bitcast(
                     _intType,
                     LoadImageIntegerAddress(image, start + 1)),
-                height);
+                _module.AddInstruction(
+                    SpirvOp.CompositeExtract,
+                    _intType,
+                    imageSize,
+                    1));
             return _module.AddInstruction(
                 SpirvOp.CompositeConstruct,
                 ivec2,
@@ -3364,7 +3394,11 @@ internal static partial class Gen5SpirvTranslator
         private uint ClampSignedCoordinate(uint value, uint extent)
         {
             var zero = _module.Constant(_intType, 0);
-            var max = _module.Constant(_intType, Math.Max(extent, 1) - 1);
+            var max = _module.AddInstruction(
+                SpirvOp.ISub,
+                _intType,
+                extent,
+                _module.Constant(_intType, 1));
             var belowZero = _module.AddInstruction(
                 SpirvOp.SLessThan,
                 _boolType,
@@ -3391,8 +3425,7 @@ internal static partial class Gen5SpirvTranslator
 
         private void EmitBoundsCheckedImageWrite(
             uint coordinates,
-            uint width,
-            uint height,
+            uint imageSize,
             uint imageObject,
             uint texel)
         {
@@ -3405,6 +3438,16 @@ internal static partial class Gen5SpirvTranslator
                 SpirvOp.CompositeExtract,
                 _intType,
                 coordinates,
+                1);
+            var width = _module.AddInstruction(
+                SpirvOp.CompositeExtract,
+                _intType,
+                imageSize,
+                0);
+            var height = _module.AddInstruction(
+                SpirvOp.CompositeExtract,
+                _intType,
+                imageSize,
                 1);
             var zero = _module.Constant(_intType, 0);
             var xNonNegative = _module.AddInstruction(
@@ -3421,12 +3464,12 @@ internal static partial class Gen5SpirvTranslator
                 SpirvOp.SLessThan,
                 _boolType,
                 x,
-                _module.Constant(_intType, width));
+                width);
             var yInRange = _module.AddInstruction(
                 SpirvOp.SLessThan,
                 _boolType,
                 y,
-                _module.Constant(_intType, height));
+                height);
             var lowerInRange = _module.AddInstruction(
                 SpirvOp.LogicalAnd,
                 _boolType,
@@ -3463,24 +3506,6 @@ internal static partial class Gen5SpirvTranslator
                 texel);
             _module.AddStatement(SpirvOp.Branch, mergeLabel);
             _module.AddLabel(mergeLabel);
-        }
-
-        private static bool TryGetImageBounds(
-            IReadOnlyList<uint> descriptor,
-            out uint width,
-            out uint height)
-        {
-            width = 0;
-            height = 0;
-            if (descriptor.Count < 3)
-            {
-                return false;
-            }
-
-            width = (((descriptor[1] >> 30) & 0x3u) |
-                     ((descriptor[2] & 0xFFFu) << 2)) + 1;
-            height = ((descriptor[2] >> 14) & 0x3FFFu) + 1;
-            return width != 0 && height != 0 && width <= 16384 && height <= 16384;
         }
 
         private uint BuildImageOffset(Gen5ImageControl image, int component)
@@ -3771,6 +3796,21 @@ internal static partial class Gen5SpirvTranslator
                 return byteAddress;
             }
 
+            if (_initialScalarBufferIndex >= 0)
+            {
+                // Descriptor offsets must satisfy Vulkan's storage-buffer
+                // alignment. The presenter therefore rounds the shared guest
+                // allocation offset down and packs the discarded low address
+                // bits after the 256 initial SGPRs in the per-dispatch runtime
+                // block. Keeping this value runtime-stable prevents rotating
+                // guest allocations from producing a new multi-megabyte SPIR-V
+                // module and Metal pipeline while preserving exact byte access.
+                var runtimeByteBias = Load(
+                    _uintType,
+                    RuntimeBufferBiasPointer(binding));
+                return IAdd(byteAddress, runtimeByteBias);
+            }
+
             // The presenter binds the shared allocation at the largest aligned
             // offset not greater than this guest resource's offset. Because the
             // allocation base is aligned to the same power of two, the bytes
@@ -3828,6 +3868,13 @@ internal static partial class Gen5SpirvTranslator
                 _scalarRegisters,
                 UInt(register));
 
+        private uint RuntimeBufferBiasPointer(int binding) =>
+            _module.AddInstruction(
+                SpirvOp.AccessChain,
+                _privateUintPointer,
+                _runtimeBufferBiases,
+                UInt(checked((uint)binding)));
+
         private uint VectorPointer(uint register) =>
             _module.AddInstruction(
                 SpirvOp.AccessChain,
@@ -3869,8 +3916,16 @@ internal static partial class Gen5SpirvTranslator
             Store(VectorPointer(register), value);
         }
 
-        private uint Load(uint type, uint pointer) =>
-            _module.AddInstruction(SpirvOp.Load, type, pointer);
+        private uint Load(uint type, uint pointer)
+        {
+            if (pointer == 0)
+            {
+                throw new InvalidOperationException(
+                    "SPIR-V generator attempted OpLoad from id 0.");
+            }
+
+            return _module.AddInstruction(SpirvOp.Load, type, pointer);
+        }
 
         private void Store(uint pointer, uint value) =>
             _module.AddStatement(SpirvOp.Store, pointer, value);
@@ -3951,14 +4006,26 @@ internal static partial class Gen5SpirvTranslator
                     UInt(3),
                     condition);
 
-        private uint GuestWaveLane() =>
-            _waveLaneCount == 64 && _localInvocationIndexInput != 0
-                ? BitwiseAnd(
+        private uint GuestWaveLane()
+        {
+            if (_waveLaneCount == 64 && _localInvocationIndexInput != 0)
+            {
+                return BitwiseAnd(
                     Load(_uintType, _localInvocationIndexInput),
-                    UInt(63))
-                : BitwiseAnd(
+                    UInt(63));
+            }
+
+            if (_subgroupInvocationIdInput != 0)
+            {
+                return BitwiseAnd(
                     Load(_uintType, _subgroupInvocationIdInput),
                     UInt(31));
+            }
+
+            // Graphics stages without subgroup support have one logical lane;
+            // they must not emit OpLoad for absent SPIR-V input ID zero.
+            return UInt(0);
+        }
 
         private uint CurrentLaneBit()
         {

@@ -402,9 +402,33 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 		public ulong LastReturnRip;
 
+		// Busy guest workers overwrite the global recent-import ring. Preserve
+		// the most recent complete SysV call frame per guest thread so native
+		// fault diagnostics can identify the exact preceding HLE invocation.
+		public ulong LastImportRdi;
+		public ulong LastImportRsi;
+		public ulong LastImportRdx;
+		public ulong LastImportRcx;
+		public ulong LastImportR8;
+		public ulong LastImportR9;
+		public ulong LastImportStack0;
+		public ulong LastImportStack1;
+		public ulong LastImportStack2;
+		public ulong LastImportStack3;
+		public ulong LastImportStack4;
+		public ulong LastImportStack5;
+
 		public Thread? HostThread { get; set; }
 
 		public int HostThreadId;
+
+		// State may become Ready as soon as another guest thread satisfies this
+		// thread's wait, while the host executor that yielded it is still
+		// unwinding. Keep executor ownership separate from State so a Ready
+		// continuation cannot be claimed concurrently with that unwind.
+		public bool ExecutorActive { get; set; }
+
+		public long ExecutorClaimDeferrals { get; set; }
 
 		public GuestContinuationRunner? ContinuationRunner { get; set; }
 	}
@@ -2621,6 +2645,11 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			$"entry=0x{thread.EntryPoint:X16} arg=0x{thread.Argument:X16} priority={thread.Priority} " +
 			$"host_priority={MapGuestThreadPriority(thread.Priority)} affinity=0x{thread.AffinityMask:X}");
 		Pump(creatorContext, "pthread_create");
+		// Pump is suppressed while another cooperative dispatch is active. The
+		// background dispatcher would eventually observe this thread, but an
+		// immediate authoritative drain avoids making thread creation depend on
+		// the approximate ready-count polling hint.
+		DispatchReadyGuestThreads();
 		return true;
 	}
 
@@ -2710,17 +2739,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				GuestThreadState? thread = null;
 				lock (_guestThreadGate)
 				{
-					while (_readyGuestThreads.Count > 0)
-					{
-						var candidate = _readyGuestThreads.Dequeue();
-						Interlocked.Decrement(ref _readyGuestThreadCount);
-						if (candidate.State == GuestThreadRunState.Ready)
-						{
-							thread = candidate;
-							thread.State = GuestThreadRunState.Running;
-							break;
-						}
-					}
+					_ = TryClaimReadyGuestThreadLocked(out thread);
 				}
 				if (thread == null)
 				{
@@ -3547,6 +3566,16 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private void RunGuestThread(GuestThreadState thread, string reason)
 	{
+		lock (_guestThreadGate)
+		{
+			if (!thread.ExecutorActive)
+			{
+				throw new InvalidOperationException(
+					$"Guest thread '{thread.Name}' started without scheduler executor ownership.");
+			}
+
+			thread.HostThread = Thread.CurrentThread;
+		}
 		var previousLastError = LastError;
 		var previousGuestThreadHandle = GuestThreadExecution.EnterGuestThread(thread.ThreadHandle);
 		var previousGuestThreadState = _activeGuestThreadState;
@@ -3637,6 +3666,14 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			Volatile.Write(ref thread.HostThreadId, 0);
 			GuestThreadExecution.RestoreGuestThread(previousGuestThreadHandle);
 			LastError = previousLastError;
+			lock (_guestThreadGate)
+			{
+				if (ReferenceEquals(thread.HostThread, Thread.CurrentThread))
+				{
+					thread.HostThread = null;
+				}
+				thread.ExecutorActive = false;
+			}
 		}
 	}
 
@@ -4379,12 +4416,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				}
 				if (HasReadyGuestThread())
 				{
-					if (_cpuContext is { } watchdogContext)
-					{
-						Pump(watchdogContext, "watchdog");
-					}
 					Console.Error.WriteLine(
-						$"[LOADER][WARN] No import progress for {stallWatchdogSeconds}s, but a guest thread is ready; continuing.");
+						$"[LOADER][WARN] No import progress for {stallWatchdogSeconds}s, but a guest thread is ready; dispatcher will resume it.");
 					LogStallWatchdogSnapshot();
 					Console.Error.Flush();
 					MarkExecutionProgress();
@@ -4475,10 +4508,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				{
 					break;
 				}
-				if (Volatile.Read(ref _readyGuestThreadCount) > 0)
-				{
-					DispatchReadyGuestThreads();
-				}
+				// The count is a fast diagnostic hint, while the queue/state pair under
+				// _guestThreadGate is authoritative. Always attempt a locked drain so a
+				// stale hint cannot strand a runnable continuation.
+				DispatchReadyGuestThreads();
 			}
 		}))
 		{
@@ -4521,17 +4554,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			GuestThreadState? thread = null;
 			lock (_guestThreadGate)
 			{
-				while (_readyGuestThreads.Count > 0)
-				{
-					var candidate = _readyGuestThreads.Dequeue();
-					Interlocked.Decrement(ref _readyGuestThreadCount);
-					if (candidate.State == GuestThreadRunState.Ready)
-					{
-						candidate.State = GuestThreadRunState.Running;
-						thread = candidate;
-						break;
-					}
-				}
+				_ = TryClaimReadyGuestThreadLocked(out thread);
 			}
 
 			if (thread == null)
@@ -4552,6 +4575,52 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			}
 			hostThread.Start();
 		}
+	}
+
+	// Caller must hold _guestThreadGate. A guest wait can be satisfied before
+	// RunGuestThread has finished restoring its host/TLS state, so Ready alone
+	// is not sufficient to authorize another executor. ExecutorActive is the
+	// scheduler's authoritative single-owner token and covers both asynchronous
+	// host threads and synchronous Pump("entry_return") execution.
+	private bool TryClaimReadyGuestThreadLocked(out GuestThreadState? thread)
+	{
+		thread = null;
+		var candidatesToInspect = _readyGuestThreads.Count;
+		for (var index = 0; index < candidatesToInspect; index++)
+		{
+			var candidate = _readyGuestThreads.Dequeue();
+			Interlocked.Decrement(ref _readyGuestThreadCount);
+			if (candidate.State != GuestThreadRunState.Ready)
+			{
+				continue;
+			}
+
+			if (candidate.ExecutorActive)
+			{
+				_readyGuestThreads.Enqueue(candidate);
+				Interlocked.Increment(ref _readyGuestThreadCount);
+				candidate.ExecutorClaimDeferrals++;
+				if (_logGuestThreads &&
+					(candidate.ExecutorClaimDeferrals <= 4 ||
+					(candidate.ExecutorClaimDeferrals & (candidate.ExecutorClaimDeferrals - 1)) == 0))
+				{
+					Console.Error.WriteLine(
+						$"[LOADER][TRACE] guest_threads.defer_active_executor " +
+						$"handle=0x{candidate.ThreadHandle:X16} name='{candidate.Name}' " +
+						$"host_managed={candidate.HostThread?.ManagedThreadId ?? 0} " +
+						$"host_tid={Volatile.Read(ref candidate.HostThreadId)} " +
+						$"deferrals={candidate.ExecutorClaimDeferrals}");
+				}
+				continue;
+			}
+
+			candidate.ExecutorActive = true;
+			candidate.State = GuestThreadRunState.Running;
+			thread = candidate;
+			return true;
+		}
+
+		return false;
 	}
 
 	private void LogStallWatchdogSnapshot()

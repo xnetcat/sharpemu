@@ -320,12 +320,41 @@ public static unsafe class HostMemory
                 if (TryFindRegionLocked(pageAddress, out var region))
                 {
                     // Win32 VirtualQuery reports a run of pages sharing the
-                    // same protection, so stop the run where it changes.
-                    var protect = region.ProtectAt(pageAddress);
-                    var runEnd = pageAddress + PageSize;
-                    while (runEnd < region.End && region.ProtectAt(runEnd) == protect)
+                    // same protection, so stop the run where it changes. Do
+                    // not walk the whole mapping page-by-page here: PS5 GPU
+                    // apertures can span hundreds of GiB, while protection
+                    // overrides are sparse. A tiny read inside such a mapping
+                    // otherwise performs tens of millions of dictionary
+                    // lookups before it can return.
+                    var pageProtects = region.PageProtects;
+                    uint protect;
+                    ulong runEnd;
+                    if (pageProtects is null || pageProtects.Count == 0)
                     {
-                        runEnd += PageSize;
+                        protect = region.DefaultProtect;
+                        runEnd = region.End;
+                    }
+                    else if (pageProtects.TryGetValue(pageAddress, out protect))
+                    {
+                        runEnd = pageAddress + PageSize;
+                        while (runEnd < region.End &&
+                            pageProtects.TryGetValue(runEnd, out var nextProtect) &&
+                            nextProtect == protect)
+                        {
+                            runEnd += PageSize;
+                        }
+                    }
+                    else
+                    {
+                        protect = region.DefaultProtect;
+                        runEnd = region.End;
+                        foreach (var overrideAddress in pageProtects.Keys)
+                        {
+                            if (overrideAddress > pageAddress && overrideAddress < runEnd)
+                            {
+                                runEnd = overrideAddress;
+                            }
+                        }
                     }
 
                     info.BaseAddress = pageAddress;

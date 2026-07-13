@@ -90,6 +90,23 @@ internal static class GnmTiling
          Y(2), X(2), Y(3), X(3), Y(4), X(4), Y(5), X(5)],
     ];
 
+    // GFX10 4K_S has a separate 12-bit micro-tile equation. It is not the
+    // generic x/y interleave used by the 64K standard block; using that larger
+    // equation leaves a regular grid in linearized atlases.
+    private static readonly AddressBit[][] Standard4K =
+    [
+        [X(0), X(1), X(2), X(3), Y(0), Y(1), Y(2), Y(3),
+         Y(4), X(4), Y(5), X(5)],
+        [Zero, X(0), X(1), X(2), Y(0), Y(1), Y(2), X(3),
+         Y(3), X(4), Y(4), X(5)],
+        [Zero, Zero, X(0), X(1), Y(0), Y(1), Y(2), X(2),
+         Y(3), X(3), Y(4), X(4)],
+        [Zero, Zero, Zero, X(0), Y(0), Y(1), X(1), X(2),
+         Y(2), X(3), Y(3), X(4)],
+        [Zero, Zero, Zero, Zero, Y(0), Y(1), X(0), X(1),
+         Y(2), X(2), Y(3), X(3)],
+    ];
+
     private static readonly bool _enabled = string.Equals(
         Environment.GetEnvironmentVariable("SHARPEMU_DETILE"),
         "1",
@@ -309,6 +326,7 @@ internal static class GnmTiling
 
         pattern = swizzleMode switch
         {
+            5 => Standard4K[bytesPerElementLog2],
             9 => RbPlus64KStandard[bytesPerElementLog2],
             24 => RbPlus64KDepthX[bytesPerElementLog2],
             27 => RbPlus64KRenderX[bytesPerElementLog2],

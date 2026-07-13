@@ -629,6 +629,26 @@ internal static class Gen5ShaderTranslator
         }
     }
 
+    // Kept beside the production decoder so offline compatibility tools use
+    // precisely the same opcode tables and instruction-width rules as runtime
+    // shader translation.
+    internal static bool TryDecodeInstructionForPreflight(
+        CpuContext ctx,
+        uint pc,
+        uint word,
+        out string name,
+        out uint sizeDwords,
+        out string error) =>
+        TryDecodeInstruction(
+            ctx,
+            0,
+            pc,
+            word,
+            out _,
+            out name,
+            out sizeDwords,
+            out error);
+
     private static bool DecodeSop(uint word, out string name, out uint sizeDwords, out string error)
     {
         var opcode = (word >> 23) & 0x7F;
@@ -672,6 +692,16 @@ internal static class Gen5ShaderTranslator
             0x2B => "SXnorSaveexecB64",
             0x37 => "SAndn1SaveexecB64",
             0x38 => "SOrn1SaveexecB64",
+            0x3C => "SAndSaveexecB32",
+            0x3D => "SOrSaveexecB32",
+            0x3E => "SXorSaveexecB32",
+            0x3F => "SAndn2SaveexecB32",
+            0x40 => "SOrn2SaveexecB32",
+            0x41 => "SNandSaveexecB32",
+            0x42 => "SNorSaveexecB32",
+            0x43 => "SXnorSaveexecB32",
+            0x44 => "SAndn1SaveexecB32",
+            0x45 => "SOrn1SaveexecB32",
             _ => string.Empty,
         };
 
@@ -1356,6 +1386,7 @@ internal static class Gen5ShaderTranslator
             0x47 => "ImageGather4Lz",
             0x48 => "ImageGather4C",
             0x4E => "ImageGather4CBCl",
+            0x57 => "ImageGather4LzO",
             0x5F => "ImageGather4CLzO",
             _ => string.Empty,
         };

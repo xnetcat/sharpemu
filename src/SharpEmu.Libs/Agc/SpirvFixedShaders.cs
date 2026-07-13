@@ -164,4 +164,28 @@ internal static class SpirvFixedShaders
         module.AddExecutionMode(main, SpirvExecutionMode.OriginUpperLeft);
         return module.Build();
     }
+
+    /// <summary>
+    /// Minimal fragment stage for fixed-function depth-only passes.  The
+    /// guest has no pixel shader and therefore cannot export colour; keeping
+    /// this stage output-free preserves that contract while allowing Vulkan
+    /// to run early/late depth tests for the translated vertex shader.
+    /// </summary>
+    public static byte[] CreateDepthOnlyFragment()
+    {
+        var module = new SpirvModuleBuilder();
+        module.AddCapability(SpirvCapability.Shader);
+
+        var voidType = module.TypeVoid();
+        var functionType = module.TypeFunction(voidType);
+        var main = module.BeginFunction(voidType, functionType);
+        module.AddName(main, "main");
+        module.AddLabel();
+        module.AddStatement(SpirvOp.Return);
+        module.EndFunction();
+
+        module.AddEntryPoint(SpirvExecutionModel.Fragment, main, "main", []);
+        module.AddExecutionMode(main, SpirvExecutionMode.OriginUpperLeft);
+        return module.Build();
+    }
 }
