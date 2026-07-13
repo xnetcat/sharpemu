@@ -417,6 +417,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		public ulong LastImportStack3;
 		public ulong LastImportStack4;
 		public ulong LastImportStack5;
+		public ulong LastImportRax;
+		public int LastImportResultValid;
 
 		public Thread? HostThread { get; set; }
 
@@ -1985,7 +1987,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	private unsafe nint CreateGuestReturnStub()
 	{
 		const uint stubSize = 256u;
-		void* ptr = VirtualAlloc(null, stubSize, 12288u, 64u);
+		void* ptr = VirtualAlloc(null, stubSize, 12288u, 4u);
 		if (ptr == null)
 		{
 			return 0;
@@ -2024,7 +2026,11 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		EmitByte(code, ref offset, 0xC3);
 
 		uint oldProtect = default;
-		VirtualProtect(ptr, stubSize, 32u, &oldProtect);
+		if (!VirtualProtect(ptr, stubSize, 32u, &oldProtect))
+		{
+			VirtualFree(ptr, 0u, 32768u);
+			return 0;
+		}
 		FlushInstructionCache(GetCurrentProcess(), ptr, (nuint)offset);
 		return (nint)ptr;
 	}
@@ -3714,6 +3720,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		context[CpuRegister.Rdi] = continuation.Rdi;
 		context[CpuRegister.R8] = continuation.R8;
 		context[CpuRegister.R9] = continuation.R9;
+		context[CpuRegister.R10] = continuation.R10;
+		context[CpuRegister.R11] = continuation.R11;
 		context[CpuRegister.R12] = continuation.R12;
 		context[CpuRegister.R13] = continuation.R13;
 		context[CpuRegister.R14] = continuation.R14;
@@ -3734,10 +3742,17 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			return GuestNativeCallExitReason.Exception;
 		}
 		const uint stubSize = 512u;
-		void* ptr = VirtualAlloc(null, stubSize, 12288u, 64u);
+		void* ptr = VirtualAlloc(null, stubSize, 12288u, 4u);
 		if (ptr == null)
 		{
 			reason = "failed to allocate executable memory for guest thread stub";
+			return GuestNativeCallExitReason.Exception;
+		}
+		void* hostRspStorage = NativeMemory.Alloc((nuint)sizeof(ulong));
+		if (hostRspStorage == null)
+		{
+			VirtualFree(ptr, 0u, 32768u);
+			reason = "failed to allocate writable host-RSP storage for guest thread stub";
 			return GuestNativeCallExitReason.Exception;
 		}
 		var previousActiveBackend = _activeExecutionBackend;
@@ -3759,7 +3774,11 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			_activeGuestThreadYieldReason = null;
 			BindTlsBase(context);
 			byte* ptr2 = (byte*)ptr;
-			ulong hostRspSlot = (ulong)ptr + stubSize - 16uL;
+			// Rosetta does not reliably permit a generated x86 thunk to write data
+			// in the same page from which it is currently executing, even when the
+			// mapping reports PAGE_EXECUTE_READWRITE. Keep mutable transition state
+			// in a separate writable allocation.
+			ulong hostRspSlot = (ulong)hostRspStorage;
 			int offset = 0;
 			ptr2[offset++] = 83;
 			ptr2[offset++] = 85;
@@ -3865,9 +3884,17 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				return GuestNativeCallExitReason.Exception;
 			}
 			uint oldProtect = default(uint);
-			VirtualProtect(ptr, stubSize, 64u, &oldProtect);
+			if (!VirtualProtect(ptr, stubSize, 32u, &oldProtect))
+			{
+				reason = "failed to seal guest thread stub execute-read";
+				return GuestNativeCallExitReason.Exception;
+			}
 			FlushInstructionCache(GetCurrentProcess(), ptr, stubSize);
-			TlsSetValue(_hostRspSlotTlsIndex, (nint)hostRspSlot);
+			if (!TlsSetValue(_hostRspSlotTlsIndex, (nint)hostRspSlot))
+			{
+				reason = "failed to bind host-RSP storage for guest thread stub";
+				return GuestNativeCallExitReason.Exception;
+			}
 			ActiveGuestThreadYieldRequested = false;
 			ActiveGuestThreadYieldReason = null;
 			try
@@ -3908,6 +3935,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				previousForcedExit,
 				previousYieldRequested,
 				previousYieldReason);
+			NativeMemory.Free(hostRspStorage);
 			VirtualFree(ptr, 0u, 32768u);
 		}
 	}
@@ -3926,10 +3954,17 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			return GuestNativeCallExitReason.Exception;
 		}
 		const uint stubSize = 512u;
-		void* ptr = VirtualAlloc(null, stubSize, 12288u, 64u);
+		void* ptr = VirtualAlloc(null, stubSize, 12288u, 4u);
 		if (ptr == null)
 		{
 			reason = "failed to allocate executable memory for guest thread stub";
+			return GuestNativeCallExitReason.Exception;
+		}
+		void* hostRspStorage = NativeMemory.Alloc((nuint)sizeof(ulong));
+		if (hostRspStorage == null)
+		{
+			VirtualFree(ptr, 0u, 32768u);
+			reason = "failed to allocate writable host-RSP storage for guest continuation stub";
 			return GuestNativeCallExitReason.Exception;
 		}
 		var previousActiveBackend = _activeExecutionBackend;
@@ -3951,7 +3986,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			_activeGuestThreadYieldReason = null;
 			BindTlsBase(context);
 			byte* ptr2 = (byte*)ptr;
-			ulong hostRspSlot = (ulong)ptr + stubSize - 16uL;
+			ulong hostRspSlot = (ulong)hostRspStorage;
 			int offset = 0;
 
 			void Emit(byte value) => ptr2[offset++] = value;
@@ -4017,9 +4052,17 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				return GuestNativeCallExitReason.Exception;
 			}
 			uint oldProtect = default(uint);
-			VirtualProtect(ptr, stubSize, 64u, &oldProtect);
+			if (!VirtualProtect(ptr, stubSize, 32u, &oldProtect))
+			{
+				reason = "failed to seal guest continuation stub execute-read";
+				return GuestNativeCallExitReason.Exception;
+			}
 			FlushInstructionCache(GetCurrentProcess(), ptr, stubSize);
-			TlsSetValue(_hostRspSlotTlsIndex, (nint)hostRspSlot);
+			if (!TlsSetValue(_hostRspSlotTlsIndex, (nint)hostRspSlot))
+			{
+				reason = "failed to bind host-RSP storage for guest continuation stub";
+				return GuestNativeCallExitReason.Exception;
+			}
 			ActiveGuestThreadYieldRequested = false;
 			ActiveGuestThreadYieldReason = null;
 			try
@@ -4060,6 +4103,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				previousForcedExit,
 				previousYieldRequested,
 				previousYieldReason);
+			NativeMemory.Free(hostRspStorage);
 			VirtualFree(ptr, 0u, 32768u);
 		}
 	}
@@ -4144,10 +4188,18 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 		Console.Error.WriteLine($"[LOADER][INFO] StackTop: 0x{num:X16}");
 		const uint stubSize = 512u;
-		void* ptr = VirtualAlloc(null, stubSize, 12288u, 64u);
+		void* ptr = VirtualAlloc(null, stubSize, 12288u, 4u);
 		if (ptr == null)
 		{
 			LastError = "Failed to allocate executable memory for stub";
+			result = OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+			return false;
+		}
+		void* hostRspStorage = NativeMemory.Alloc((nuint)sizeof(ulong));
+		if (hostRspStorage == null)
+		{
+			VirtualFree(ptr, 0u, 32768u);
+			LastError = "Failed to allocate writable host-RSP storage for stub";
 			result = OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
 			return false;
 		}
@@ -4170,7 +4222,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			_activeGuestThreadYieldReason = null;
 			BindTlsBase(context);
 			byte* ptr2 = (byte*)ptr;
-			ulong num2 = (ulong)ptr + stubSize - 16uL;
+			ulong num2 = (ulong)hostRspStorage;
 			int num3 = 0;
 			ptr2[num3++] = 83;
 			ptr2[num3++] = 85;
@@ -4277,13 +4329,23 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				return false;
 			}
 			uint num5 = default(uint);
-			VirtualProtect(ptr, stubSize, 64u, &num5);
+			if (!VirtualProtect(ptr, stubSize, 32u, &num5))
+			{
+				LastError = "Failed to seal native entry stub execute-read";
+				result = OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+				return false;
+			}
 			FlushInstructionCache(GetCurrentProcess(), ptr, stubSize);
 			if (_hostRspSlotStorage != 0)
 			{
 				*(ulong*)_hostRspSlotStorage = num2;
 			}
-			TlsSetValue(_hostRspSlotTlsIndex, (nint)num2);
+			if (!TlsSetValue(_hostRspSlotTlsIndex, (nint)num2))
+			{
+				LastError = "Failed to bind host-RSP storage for native entry stub";
+				result = OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+				return false;
+			}
 			if (string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_SENTINEL_PROBE"), "1", StringComparison.Ordinal))
 			{
 				Console.Error.WriteLine("[LOADER][INFO] Running unresolved sentinel probe...");
@@ -4357,6 +4419,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				previousForcedExit,
 				previousYieldRequested,
 				previousYieldReason);
+			NativeMemory.Free(hostRspStorage);
 			VirtualFree(ptr, 0u, 32768u);
 		}
 	}

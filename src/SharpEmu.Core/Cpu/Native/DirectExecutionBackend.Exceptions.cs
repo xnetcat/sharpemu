@@ -176,6 +176,8 @@ public sealed partial class DirectExecutionBackend
 					$"last_ret=0x{activeGuestThread.LastReturnRip:X16}");
 				Console.Error.WriteLine(
 					$"[LOADER][INFO]   Last import registers: " +
+					$"rax=0x{Volatile.Read(ref activeGuestThread.LastImportRax):X16} " +
+					$"result_valid={Volatile.Read(ref activeGuestThread.LastImportResultValid) != 0} " +
 					$"rdi=0x{activeGuestThread.LastImportRdi:X16} " +
 					$"rsi=0x{activeGuestThread.LastImportRsi:X16} " +
 					$"rdx=0x{activeGuestThread.LastImportRdx:X16} " +

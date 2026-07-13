@@ -188,6 +188,7 @@ public sealed partial class DirectExecutionBackend
 			activeGuestThreadState.LastImportStack3 = ReadImportStackArgument(argPackPtr, 3);
 			activeGuestThreadState.LastImportStack4 = ReadImportStackArgument(argPackPtr, 4);
 			activeGuestThreadState.LastImportStack5 = ReadImportStackArgument(argPackPtr, 5);
+			Volatile.Write(ref activeGuestThreadState.LastImportResultValid, 0);
 			Volatile.Write(ref activeGuestThreadState.LastReturnRip, num7);
 			// Publish the NID last so readers cannot pair a new import name with
 			// the preceding import's argument snapshot.
@@ -474,6 +475,11 @@ public sealed partial class DirectExecutionBackend
 						$"fiber=0x{GuestThreadExecution.CurrentFiberAddress:X16}");
 				}
 
+				if (_activeGuestThreadState is { } transferGuestThreadState)
+				{
+					Volatile.Write(ref transferGuestThreadState.LastImportRax, transferTarget.Rax);
+					Volatile.Write(ref transferGuestThreadState.LastImportResultValid, 1);
+				}
 				return unchecked((ulong)transferFrame);
 			}
 			if (GuestThreadExecution.TryConsumeCurrentEntryExit(out var exitValue, out var exitReason))
@@ -519,7 +525,13 @@ public sealed partial class DirectExecutionBackend
 					Console.Error.Flush();
 				}
 			}
-			return cpuContext[CpuRegister.Rax];
+			var guestReturnValue = cpuContext[CpuRegister.Rax];
+			if (_activeGuestThreadState is { } completedGuestThreadState)
+			{
+				Volatile.Write(ref completedGuestThreadState.LastImportRax, guestReturnValue);
+				Volatile.Write(ref completedGuestThreadState.LastImportResultValid, 1);
+			}
+			return guestReturnValue;
 		}
 		catch (Exception ex)
 		{
@@ -527,7 +539,12 @@ public sealed partial class DirectExecutionBackend
 			Console.Error.WriteLine($"[LOADER][ERROR] {LastError}");
 			Console.Error.WriteLine($"[LOADER][ERROR] {ex.StackTrace}");
 			cpuContext[CpuRegister.Rax] = 18446744071562199298uL;
-			return 18446744071562199298uL;
+			if (_activeGuestThreadState is { } failedGuestThreadState)
+			{
+				Volatile.Write(ref failedGuestThreadState.LastImportRax, cpuContext[CpuRegister.Rax]);
+				Volatile.Write(ref failedGuestThreadState.LastImportResultValid, 1);
+			}
+			return cpuContext[CpuRegister.Rax];
 		}
 	}
 
@@ -614,6 +631,7 @@ public sealed partial class DirectExecutionBackend
 			activeGuestThreadState.LastImportStack3 = ReadImportStackArgument(argPackPtr, 3);
 			activeGuestThreadState.LastImportStack4 = ReadImportStackArgument(argPackPtr, 4);
 			activeGuestThreadState.LastImportStack5 = ReadImportStackArgument(argPackPtr, 5);
+			Volatile.Write(ref activeGuestThreadState.LastImportResultValid, 0);
 			Volatile.Write(ref activeGuestThreadState.LastReturnRip, returnRip);
 			Volatile.Write(ref activeGuestThreadState.LastImportNid, importStubEntry.Nid);
 		}
@@ -697,6 +715,11 @@ public sealed partial class DirectExecutionBackend
 		}
 
 		result = cpuContext[CpuRegister.Rax];
+		if (_activeGuestThreadState is { } completedGuestThreadState)
+		{
+			Volatile.Write(ref completedGuestThreadState.LastImportRax, result);
+			Volatile.Write(ref completedGuestThreadState.LastImportResultValid, 1);
+		}
 		return true;
 	}
 
