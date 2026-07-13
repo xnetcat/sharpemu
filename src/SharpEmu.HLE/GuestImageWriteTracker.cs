@@ -1,6 +1,7 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using System.Globalization;
 using System.Runtime.InteropServices;
 
 namespace SharpEmu.HLE;
@@ -19,13 +20,32 @@ public static unsafe class GuestImageWriteTracker
 {
     private const int ProtRead = 0x1;
     private const int ProtWrite = 0x2;
+    private const int ClockMonotonicRaw = 4;
 
     private sealed class TrackedRange
     {
+        public ulong Address;
+        public ulong ByteCount;
         public ulong Start;
         public ulong End;
         public int Dirty;
         public int Armed;
+        public int FirstCpuWriteSeen;
+        public int PendingFirstCpuWrite;
+        public bool TraceLifetime;
+        public long SourceSequence;
+        public long FirstCpuWriteTraceSequence;
+        public long FirstCpuWriteTimestampNanoseconds;
+        public ulong FirstCpuWriteAddress;
+        public ulong FirstCpuWritePage;
+        public string Source = "unspecified";
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Timespec
+    {
+        public long Seconds;
+        public long Nanoseconds;
     }
 
     private static readonly object _gate = new();
@@ -37,9 +57,24 @@ public static unsafe class GuestImageWriteTracker
 
     private static readonly bool _enabled = !OperatingSystem.IsWindows() &&
         Environment.GetEnvironmentVariable("SHARPEMU_GUEST_IMAGE_CPU_SYNC") != "0";
+    private static readonly (bool Wildcard, ulong[] Addresses) _lifetimeTraceFilter =
+        ParseAddressList(Environment.GetEnvironmentVariable("SHARPEMU_TRACE_GUEST_IMAGE_ADDRS"));
+    private static readonly (bool Wildcard, string[] Sources) _lifetimeSourceTraceFilter =
+        ParseSourceList(Environment.GetEnvironmentVariable("SHARPEMU_TRACE_GUEST_MEMORY_LIFETIME"));
+    private static readonly bool _lifetimeTraceEnabled =
+        _lifetimeTraceFilter.Wildcard ||
+        _lifetimeTraceFilter.Addresses.Length != 0 ||
+        _lifetimeSourceTraceFilter.Wildcard ||
+        _lifetimeSourceTraceFilter.Sources.Length != 0;
+    private static readonly long _lifetimeTraceEpochNanoseconds =
+        _enabled && _lifetimeTraceEnabled ? GetMonotonicNanoseconds() : 0;
+    private static long _lifetimeTraceSequence;
 
     [DllImport("libc", EntryPoint = "mprotect", SetLastError = true)]
     private static extern int Mprotect(nint address, nuint length, int protection);
+
+    [DllImport("libc", EntryPoint = "clock_gettime", SetLastError = false)]
+    private static extern int ClockGetTime(int clockId, Timespec* time);
 
     public static bool Enabled => _enabled;
 
@@ -58,6 +93,9 @@ public static unsafe class GuestImageWriteTracker
         var scratch = NativeMemory.AllocZeroed(4096);
         try
         {
+            // Warm the timestamp P/Invoke used by the signal-safe scalar
+            // capture path before a real protected-page write reaches it.
+            _ = GetMonotonicNanoseconds();
             var address = (ulong)scratch;
             Track(address, 4096);
             _ = TryHandleWriteFault(address);
@@ -71,7 +109,11 @@ public static unsafe class GuestImageWriteTracker
     }
 
     /// <summary>Registers a range and arms write protection on it.</summary>
-    public static void Track(ulong address, ulong byteCount)
+    public static void Track(
+        ulong address,
+        ulong byteCount,
+        long sourceSequence = 0,
+        string source = "unspecified")
     {
         if (!_enabled || address == 0 || byteCount == 0)
         {
@@ -81,18 +123,46 @@ public static unsafe class GuestImageWriteTracker
         var (start, length) = PageAlign(address, byteCount);
         lock (_gate)
         {
-            if (!_rangesByAddress.TryGetValue(address, out var range))
+            _rangesByAddress.TryGetValue(address, out var range);
+            if (range is not null &&
+                (range.Start != start ||
+                 range.End != start + length ||
+                 range.ByteCount != byteCount))
+            {
+                // Never resize an object that is still reachable from the
+                // signal handler's lock-free snapshot. Retire it and publish
+                // a fresh immutable range.
+                DisarmLocked(range, "replace-range");
+                _rangesByAddress.Remove(address);
+                range = null;
+            }
+
+            if (range is null)
             {
                 range = new TrackedRange
                 {
+                    Address = address,
+                    ByteCount = byteCount,
                     Start = start,
                     End = start + length,
+                    TraceLifetime =
+                        ShouldTraceRange(start, start + length) || ShouldTraceSource(source),
+                    SourceSequence = sourceSequence,
+                    Source = source,
                 };
                 _rangesByAddress[address] = range;
                 RebuildSnapshotLocked();
             }
+            else
+            {
+                FlushPendingFirstCpuWrite(range);
+            }
 
-            ArmLocked(range);
+            range.SourceSequence = sourceSequence;
+            range.Source = source;
+            range.TraceLifetime =
+                ShouldTraceRange(range.Start, range.End) || ShouldTraceSource(source);
+            ArmLocked(range, "arm");
         }
     }
 
@@ -107,7 +177,7 @@ public static unsafe class GuestImageWriteTracker
         {
             if (_rangesByAddress.TryGetValue(address, out var range))
             {
-                DisarmLocked(range);
+                DisarmLocked(range, "untrack");
                 _rangesByAddress.Remove(address);
                 RebuildSnapshotLocked();
             }
@@ -128,8 +198,13 @@ public static unsafe class GuestImageWriteTracker
 
         lock (_gate)
         {
-            return _rangesByAddress.TryGetValue(address, out var range) &&
-                Interlocked.Exchange(ref range.Dirty, 0) != 0;
+            if (!_rangesByAddress.TryGetValue(address, out var range))
+            {
+                return false;
+            }
+
+            FlushPendingFirstCpuWrite(range);
+            return Interlocked.Exchange(ref range.Dirty, 0) != 0;
         }
     }
 
@@ -147,8 +222,13 @@ public static unsafe class GuestImageWriteTracker
 
         lock (_gate)
         {
-            return _rangesByAddress.TryGetValue(address, out var range) &&
-                Volatile.Read(ref range.Dirty) != 0;
+            if (!_rangesByAddress.TryGetValue(address, out var range))
+            {
+                return false;
+            }
+
+            FlushPendingFirstCpuWrite(range);
+            return Volatile.Read(ref range.Dirty) != 0;
         }
     }
 
@@ -163,7 +243,27 @@ public static unsafe class GuestImageWriteTracker
         {
             if (_rangesByAddress.TryGetValue(address, out var range))
             {
-                ArmLocked(range);
+                ArmLocked(range, "rearm");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Flushes scalar first-write records captured by the POSIX signal handler.
+    /// Call only from ordinary managed execution, never from signal context.
+    /// </summary>
+    public static void FlushPendingDiagnostics()
+    {
+        if (!_enabled || !_lifetimeTraceEnabled)
+        {
+            return;
+        }
+
+        lock (_gate)
+        {
+            foreach (var range in _rangesByAddress.Values)
+            {
+                FlushPendingFirstCpuWrite(range);
             }
         }
     }
@@ -198,6 +298,20 @@ public static unsafe class GuestImageWriteTracker
                 {
                     return false;
                 }
+
+                if (range.TraceLifetime &&
+                    Interlocked.CompareExchange(ref range.FirstCpuWriteSeen, 1, 0) == 0)
+                {
+                    // Signal context: capture preallocated scalar fields only.
+                    // Formatting and I/O are deferred to a locked safe path.
+                    range.FirstCpuWriteTraceSequence =
+                        Interlocked.Increment(ref _lifetimeTraceSequence);
+                    range.FirstCpuWriteTimestampNanoseconds = GetMonotonicNanoseconds();
+                    range.FirstCpuWriteAddress = faultAddress;
+                    range.FirstCpuWritePage = faultAddress & ~0xFFFUL;
+                    Volatile.Write(ref range.PendingFirstCpuWrite, 1);
+                    Volatile.Write(ref range.FirstCpuWriteSeen, 2);
+                }
             }
 
             Volatile.Write(ref range.Dirty, 1);
@@ -207,15 +321,16 @@ public static unsafe class GuestImageWriteTracker
         return false;
     }
 
-    private static int _armTraceCount;
-
-    private static void ArmLocked(TrackedRange range)
+    private static void ArmLocked(TrackedRange range, string operation)
     {
+        FlushPendingFirstCpuWrite(range);
         if (Interlocked.Exchange(ref range.Armed, 1) == 1)
         {
             return;
         }
 
+        // A new publication/rearm starts a new first-write lifetime.
+        Volatile.Write(ref range.FirstCpuWriteSeen, 0);
         var failed = Mprotect(
             (nint)range.Start,
             (nuint)(range.End - range.Start),
@@ -225,23 +340,29 @@ public static unsafe class GuestImageWriteTracker
             Volatile.Write(ref range.Armed, 0);
         }
 
-        if (_armTraceCount < 24)
+        if (range.TraceLifetime)
         {
-            Interlocked.Increment(ref _armTraceCount);
-            Console.Error.WriteLine(
-                $"[WT] arm addr=0x{range.Start:X} bytes={range.End - range.Start} " +
-                $"{(failed ? $"FAILED errno={Marshal.GetLastPInvokeError()}" : "ok")}");
+            TraceLifetime(
+                range,
+                failed ? $"{operation}-failed-errno-{Marshal.GetLastPInvokeError()}" : operation);
         }
     }
 
-    private static void DisarmLocked(TrackedRange range)
+    private static void DisarmLocked(TrackedRange range, string operation)
     {
-        if (Interlocked.Exchange(ref range.Armed, 0) == 1)
+        FlushPendingFirstCpuWrite(range);
+        var wasArmed = Interlocked.Exchange(ref range.Armed, 0) == 1;
+        if (wasArmed)
         {
             _ = Mprotect(
                 (nint)range.Start,
                 (nuint)(range.End - range.Start),
                 ProtRead | ProtWrite);
+        }
+
+        if (range.TraceLifetime)
+        {
+            TraceLifetime(range, wasArmed ? operation : $"{operation}-already-disarmed");
         }
     }
 
@@ -256,5 +377,147 @@ public static unsafe class GuestImageWriteTracker
         var start = address & ~pageMask;
         var end = (address + byteCount + pageMask) & ~pageMask;
         return (start, end - start);
+    }
+
+    private static bool ShouldTraceRange(ulong start, ulong end)
+    {
+        if (_lifetimeTraceFilter.Wildcard)
+        {
+            return true;
+        }
+
+        var addresses = _lifetimeTraceFilter.Addresses;
+        for (var index = 0; index < addresses.Length; index++)
+        {
+            if (addresses[index] >= start && addresses[index] < end)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static (bool Wildcard, ulong[] Addresses) ParseAddressList(string? addresses)
+    {
+        if (string.IsNullOrWhiteSpace(addresses))
+        {
+            return (false, []);
+        }
+
+        var parsedAddresses = new List<ulong>();
+        foreach (var token in addresses.Split(
+                     [',', ';', ' ', '\t'],
+                     StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (token == "*")
+            {
+                return (true, []);
+            }
+
+            var span = token.AsSpan();
+            if (span.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+            {
+                span = span[2..];
+            }
+
+            if (ulong.TryParse(span, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var parsed))
+            {
+                parsedAddresses.Add(parsed);
+            }
+        }
+
+        return (false, parsedAddresses.ToArray());
+    }
+
+    private static bool ShouldTraceSource(string source)
+    {
+        if (_lifetimeSourceTraceFilter.Wildcard)
+        {
+            return true;
+        }
+
+        return Array.IndexOf(_lifetimeSourceTraceFilter.Sources, source) >= 0;
+    }
+
+    private static (bool Wildcard, string[] Sources) ParseSourceList(string? sources)
+    {
+        if (string.IsNullOrWhiteSpace(sources))
+        {
+            return (false, []);
+        }
+
+        var parsedSources = new List<string>();
+        foreach (var token in sources.Split(
+                     [',', ';'],
+                     StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (token == "*")
+            {
+                return (true, []);
+            }
+
+            parsedSources.Add(token);
+        }
+
+        return (false, parsedSources.ToArray());
+    }
+
+    private static void FlushPendingFirstCpuWrite(TrackedRange range)
+    {
+        var spin = new SpinWait();
+        while (Volatile.Read(ref range.FirstCpuWriteSeen) == 1)
+        {
+            spin.SpinOnce();
+        }
+
+        if (!range.TraceLifetime || Interlocked.Exchange(ref range.PendingFirstCpuWrite, 0) == 0)
+        {
+            return;
+        }
+
+        TraceLifetime(
+            range,
+            "first-cpu-write-disarm",
+            range.FirstCpuWriteAddress,
+            range.FirstCpuWritePage,
+            range.FirstCpuWriteTraceSequence,
+            range.FirstCpuWriteTimestampNanoseconds);
+    }
+
+    private static void TraceLifetime(
+        TrackedRange range,
+        string operation,
+        ulong faultAddress = 0,
+        ulong faultPage = 0,
+        long traceSequence = 0,
+        long timestampNanoseconds = 0)
+    {
+        if (traceSequence == 0)
+        {
+            traceSequence = Interlocked.Increment(ref _lifetimeTraceSequence);
+        }
+
+        if (timestampNanoseconds == 0)
+        {
+            timestampNanoseconds = GetMonotonicNanoseconds();
+        }
+
+        var elapsedMilliseconds =
+            (timestampNanoseconds - _lifetimeTraceEpochNanoseconds) / 1_000_000.0;
+        Console.Error.WriteLine(
+            $"[WT][LIFETIME] seq={traceSequence} t_ms={elapsedMilliseconds:F3} " +
+            $"event={operation} source_seq={range.SourceSequence} source='{range.Source}' " +
+            $"requested=0x{range.Address:X16}+0x{range.ByteCount:X} " +
+            $"range=0x{range.Start:X16}..0x{range.End:X16} " +
+            $"fault=0x{faultAddress:X16} page=0x{faultPage:X16}");
+    }
+
+    private static long GetMonotonicNanoseconds()
+    {
+        Timespec time;
+        return ClockGetTime(ClockMonotonicRaw, &time) == 0
+            ? unchecked((time.Seconds * 1_000_000_000L) + time.Nanoseconds)
+            : 0;
     }
 }
