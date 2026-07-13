@@ -1266,7 +1266,8 @@ internal static unsafe class VulkanVideoPresenter
                 latest.Sequence == presentedSequence ||
                 latest.RequiredGuestWorkSequence > _completedGuestWorkSequence)
             {
-                if (_latestPresentation is { } rej &&
+                if (_traceGuestImageEvents &&
+                    _latestPresentation is { } rej &&
                     rej.GuestImageAddress != 0 &&
                     _tracedGuestImagePresentRejections.Add(rej.Sequence))
                 {
@@ -7049,13 +7050,24 @@ internal static unsafe class VulkanVideoPresenter
                 var traceSmallWrites =
                     guestWritesMode == "small" &&
                     target.Width <= 512 && target.Height <= 256;
-                // "large" mode: read back every >=2560x1440 render target right
-                // after it is drawn, so the composite chain (G-buffers -> lighting
-                // -> final composite -> display buffer) can be traced to find
-                // exactly where a target goes black (unproduced input vs. a bad
-                // shader that outputs black from non-black inputs).
+                // "large" mode: read back the first two >=2560x1440 render
+                // targets. "large@N" instead reads back only write N for each
+                // such target. The latter is crucial for long composite chains:
+                // it finds the first later draw that turns a valid frame black
+                // without forcing hundreds of expensive 4K readbacks.
+                var traceLargeWriteOrdinal = 0L;
+                if (guestWritesMode is not null &&
+                    guestWritesMode.StartsWith("large@", StringComparison.Ordinal) &&
+                    long.TryParse(
+                        guestWritesMode.AsSpan("large@".Length),
+                        out var parsedTraceLargeWriteOrdinal) &&
+                    parsedTraceLargeWriteOrdinal > 0)
+                {
+                    traceLargeWriteOrdinal = parsedTraceLargeWriteOrdinal;
+                }
+
                 var traceLargeWrites =
-                    guestWritesMode == "large" &&
+                    (guestWritesMode == "large" || traceLargeWriteOrdinal != 0) &&
                     target.Width >= 2560 && target.Height >= 1440;
                 if (ShouldTraceGuestImageWriteForDiagnostics(target.Address) || traceSmallWrites || traceLargeWrites)
                 {
@@ -7065,7 +7077,10 @@ internal static unsafe class VulkanVideoPresenter
                         ? previousCount + 1
                         : 1;
                     _tracedGuestWriteCounts[target.Address] = writeCount;
-                    if (writeCount <= (traceLargeWrites ? 2 : traceSmallWrites ? 48 : 3))
+                    var shouldTraceWrite = traceLargeWriteOrdinal != 0
+                        ? writeCount == traceLargeWriteOrdinal
+                        : writeCount <= (traceLargeWrites ? 2 : traceSmallWrites ? 48 : 3);
+                    if (shouldTraceWrite)
                     {
                         _commandBuffer = _presentationCommandBuffer;
                         FlushBatchedGuestCommands();
@@ -9107,11 +9122,16 @@ internal static unsafe class VulkanVideoPresenter
                     offsets);
             }
 
-            var maxPixelsPerDraw = 512u * 512u;
-            if (Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_CHUNKED_DRAWS") == "1")
-            {
-                maxPixelsPerDraw = uint.MaxValue;
-            }
+            // Replaying a full-screen primitive once per 512x512 scissor tile
+            // multiplies an ordinary 4K composite into 32 complete draws. On
+            // MoltenVK this both starves the render thread and causes the
+            // game to fall behind its own flip queue. Vulkan already clips a
+            // normal full-screen draw efficiently; retain the tiled path only
+            // as an explicit diagnostics fallback for a future driver issue.
+            var maxPixelsPerDraw = Environment.GetEnvironmentVariable(
+                "SHARPEMU_ENABLE_CHUNKED_DRAWS") == "1"
+                ? 512u * 512u
+                : uint.MaxValue;
             var rowsPerDraw = Math.Max(
                 1u,
                 Math.Min(drawScissor.Height, maxPixelsPerDraw / Math.Max(drawScissor.Width, 1u)));

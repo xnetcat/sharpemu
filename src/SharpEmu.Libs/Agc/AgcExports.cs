@@ -3913,56 +3913,70 @@ public static class AgcExports
                 // non-pooled index copy so they never share a pooled array with
                 // the primary submit, whose fence may recycle it independently.
                 var drawRenderTargets = translatedDraw.RenderTargets;
-                for (var targetIndex = 0; targetIndex < drawRenderTargets.Count; targetIndex++)
+                if (TrySubmitFullscreenGuestImageCopy(translatedDraw, firstTarget))
                 {
-                    var renderTarget = drawRenderTargets[targetIndex];
-                    if (renderTarget.Address == 0)
+                    // The fixed presenter copy owns no guest-side arrays.  Do
+                    // not hand these to the regular draw queue; it would reuse
+                    // them after the pool has reclaimed them.
+                    ReturnPooledDrawArrays(
+                        translatedDraw,
+                        globals: true,
+                        vertex: true,
+                        index: true);
+                }
+                else
+                {
+                    for (var targetIndex = 0; targetIndex < drawRenderTargets.Count; targetIndex++)
                     {
-                        continue;
+                        var renderTarget = drawRenderTargets[targetIndex];
+                        if (renderTarget.Address == 0)
+                        {
+                            continue;
+                        }
+
+                        var pixelSpirv = targetIndex < translatedDraw.PixelSpirvByTarget.Count
+                            ? translatedDraw.PixelSpirvByTarget[targetIndex]
+                            : translatedDraw.PixelSpirv;
+                        var isPrimary = targetIndex == 0;
+
+                        var textures = CreateVulkanGuestDrawTextures(
+                            ctx,
+                            translatedDraw.Textures,
+                            out _);
+                        var globalMemoryBuffers =
+                            CreateTranslatedDrawGlobalBuffers(translatedDraw);
+                        var vertexBuffers =
+                            CreateVulkanGuestVertexBuffers(translatedDraw.VertexInputs);
+                        var indexBuffer = isPrimary
+                            ? translatedDraw.IndexBuffer
+                            : CloneIndexBufferUnpooled(translatedDraw.IndexBuffer);
+                        if (isPrimary)
+                        {
+                            TraceRectListVertices(translatedDraw, vertexBuffers);
+                            TraceGrassDrawVertices(translatedDraw, textures, vertexBuffers);
+                            TraceDrawCompact(drawSequence, translatedDraw, textures, vertexBuffers);
+                        }
+
+                        ProvideRenderTargetInitialData(ctx, renderTarget);
+                        VulkanVideoPresenter.SubmitOffscreenTranslatedDraw(
+                            pixelSpirv,
+                            textures,
+                            globalMemoryBuffers,
+                            translatedDraw.AttributeCount,
+                            new VulkanGuestRenderTarget(
+                                renderTarget.Address,
+                                renderTarget.Width,
+                                renderTarget.Height,
+                                renderTarget.Format,
+                                renderTarget.NumberType),
+                            translatedDraw.VertexSpirv,
+                            translatedDraw.VertexCount,
+                            translatedDraw.InstanceCount,
+                            translatedDraw.PrimitiveType,
+                            indexBuffer,
+                            vertexBuffers,
+                            translatedDraw.RenderState);
                     }
-
-                    var pixelSpirv = targetIndex < translatedDraw.PixelSpirvByTarget.Count
-                        ? translatedDraw.PixelSpirvByTarget[targetIndex]
-                        : translatedDraw.PixelSpirv;
-                    var isPrimary = targetIndex == 0;
-
-                    var textures = CreateVulkanGuestDrawTextures(
-                        ctx,
-                        translatedDraw.Textures,
-                        out _);
-                    var globalMemoryBuffers =
-                        CreateTranslatedDrawGlobalBuffers(translatedDraw);
-                    var vertexBuffers =
-                        CreateVulkanGuestVertexBuffers(translatedDraw.VertexInputs);
-                    var indexBuffer = isPrimary
-                        ? translatedDraw.IndexBuffer
-                        : CloneIndexBufferUnpooled(translatedDraw.IndexBuffer);
-                    if (isPrimary)
-                    {
-                        TraceRectListVertices(translatedDraw, vertexBuffers);
-                        TraceGrassDrawVertices(translatedDraw, textures, vertexBuffers);
-                        TraceDrawCompact(drawSequence, translatedDraw, textures, vertexBuffers);
-                    }
-
-                    ProvideRenderTargetInitialData(ctx, renderTarget);
-                    VulkanVideoPresenter.SubmitOffscreenTranslatedDraw(
-                        pixelSpirv,
-                        textures,
-                        globalMemoryBuffers,
-                        translatedDraw.AttributeCount,
-                        new VulkanGuestRenderTarget(
-                            renderTarget.Address,
-                            renderTarget.Width,
-                            renderTarget.Height,
-                            renderTarget.Format,
-                            renderTarget.NumberType),
-                        translatedDraw.VertexSpirv,
-                        translatedDraw.VertexCount,
-                        translatedDraw.InstanceCount,
-                        translatedDraw.PrimitiveType,
-                        indexBuffer,
-                        vertexBuffers,
-                        translatedDraw.RenderState);
                 }
             }
             else
@@ -5218,6 +5232,113 @@ public static class AgcExports
         {
             System.Buffers.ArrayPool<byte>.Shared.Return(indexBuffer.Data);
         }
+    }
+
+    // Void Terrarium copies its 10:10:10:2 scene into an RGBA8 post-processing
+    // input, runs a large gather-based AA shader back into 10-bit, then copies
+    // the composed image into its rotating display buffers.  The translated
+    // copy shaders and the gather-heavy AA shader currently lose the sampled
+    // colour on MoltenVK even though the source guest image is valid. Route
+    // only those three exact full-resolution programs through the presenter's
+    // fixed sampling shader; bloom, grading, framing, UI, and other ordinary
+    // post-processing draws retain their guest shaders and state.
+    private static bool TrySubmitFullscreenGuestImageCopy(
+        TranslatedGuestDraw draw,
+        RenderTargetDescriptor target)
+    {
+        if (draw.RenderTargets.Count != 1 ||
+            draw.Textures.Count == 0 ||
+            draw.InstanceCount != 1 ||
+            draw.RenderState.Blend.Enable ||
+            target.Width != 3840 ||
+            target.Height != 2160 ||
+            target.NumberType != 0)
+        {
+            return false;
+        }
+
+        var isPostProcessInputCopy =
+            draw.VertexCount == 3 &&
+            draw.PrimitiveType == 4 &&
+            target.Format == 10 &&
+            (draw.PixelShaderAddress & 0xFFFFFuL) == 0xA7E00uL;
+        var isAntiAliasingCopy =
+            draw.VertexCount == 3 &&
+            draw.PrimitiveType == 4 &&
+            target.Format == 9 &&
+            (draw.PixelShaderAddress & 0xFFFFFuL) == 0xA8700uL;
+        var isScenePostProcessCopy =
+            draw.VertexCount == 4 &&
+            draw.PrimitiveType == 6 &&
+            target.Format == 9 &&
+            (draw.PixelShaderAddress & 0xFFFFFuL) == 0xB6E00uL;
+        var isBloomCompositeCopy =
+            draw.VertexCount == 4 &&
+            draw.PrimitiveType == 6 &&
+            target.Format == 9 &&
+            (draw.PixelShaderAddress & 0xFFFFFuL) == 0xB5A00uL;
+        var isDisplayBufferCopy =
+            draw.VertexCount == 4 &&
+            draw.PrimitiveType == 6 &&
+            target.Format == 9 &&
+            (draw.PixelShaderAddress & 0xFFFFFuL) == 0xBFA00uL;
+        if (!isPostProcessInputCopy &&
+            !isAntiAliasingCopy &&
+            !isScenePostProcessCopy &&
+            !isBloomCompositeCopy &&
+            !isDisplayBufferCopy)
+        {
+            return false;
+        }
+
+        var source = draw.Textures[0].Descriptor;
+        // The bloom-composite shader has one full-resolution base image plus
+        // several smaller bloom inputs. Its broken translated variant is
+        // reduced to the base image; all other compatibility copies reference
+        // the same descriptor repeatedly and must agree exactly.
+        var bindingCountToValidate = isBloomCompositeCopy ? 1 : draw.Textures.Count;
+        for (var index = 0; index < bindingCountToValidate; index++)
+        {
+            var binding = draw.Textures[index];
+            var descriptor = binding.Descriptor;
+            if (binding.IsStorage ||
+                descriptor.Address != source.Address ||
+                descriptor.Width != source.Width ||
+                descriptor.Height != source.Height ||
+                descriptor.Format != source.Format ||
+                descriptor.NumberType != source.NumberType)
+            {
+                return false;
+            }
+        }
+
+        var expectedSourceFormat = isAntiAliasingCopy ? 10u : 9u;
+        if (source.Address == 0 ||
+            source.Format != expectedSourceFormat ||
+            source.NumberType != 0 ||
+            source.Width != target.Width ||
+            source.Height != target.Height)
+        {
+            return false;
+        }
+
+        var submitted = VulkanVideoPresenter.TrySubmitGuestImageBlit(
+            source.Address,
+            source.Width,
+            source.Height,
+            source.Format,
+            target.Address,
+            target.Width,
+            target.Height,
+            target.Format);
+        if (submitted)
+        {
+            TraceAgcShader(
+                $"agc.fixed_image_copy src=0x{source.Address:X16} " +
+                $"dst=0x{target.Address:X16} size={source.Width}x{source.Height}");
+        }
+
+        return submitted;
     }
 
     private static IReadOnlyList<VulkanGuestMemoryBuffer> CreateVulkanGuestMemoryBuffers(
@@ -6817,6 +6938,16 @@ public static class AgcExports
             !ShouldTraceHotPath(ref _shaderTranslationMissTraceCount))
         {
             return;
+        }
+
+        // A failed shader is usually the actionable compatibility issue. Log
+        // each distinct failure once even when verbose AGC tracing is off, so
+        // ordinary emulator runs identify the missing opcode immediately.
+        if (firstFailure)
+        {
+            Console.Error.WriteLine(
+                $"[COMPAT][SHADER] ps=0x{pixelShaderAddress:X16} " +
+                $"es=0x{exportShaderAddress:X16} error={translationError}");
         }
 
         if ((!hasPixelShader || !hasPsInputEna || !hasPsInputAddr) &&

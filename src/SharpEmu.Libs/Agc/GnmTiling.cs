@@ -71,23 +71,21 @@ internal static class GnmTiling
          X(2), Y(2), XY(6, 3), XY(3, 6)],
     ];
 
-    private static readonly AddressBit[][] RbPlus64KStandard =
+    // GFX10 4K_S has a separate micro-tile equation. It is not the generic
+    // x/y interleave used by the larger standard blocks; using the latter
+    // leaves a regular grid in Void Terrarium's text atlas.
+    private static readonly AddressBit[][] Standard4K =
     [
-        // GFX10_SW_64K_S_RBPLUS_PATINFO, 1 byte/element.
         [X(0), X(1), X(2), X(3), Y(0), Y(1), Y(2), Y(3),
-         Y(4), X(4), Y(5), X(5), Y(6), X(6), Y(7), X(7)],
-        // 2 bytes/element.
+         Y(4), X(4), Y(5), X(5)],
         [Zero, X(0), X(1), X(2), Y(0), Y(1), Y(2), X(3),
-         Y(3), X(4), Y(4), X(5), Y(5), X(6), Y(6), X(7)],
-        // 4 bytes/element.
+         Y(3), X(4), Y(4), X(5)],
         [Zero, Zero, X(0), X(1), Y(0), Y(1), Y(2), X(2),
-         Y(3), X(3), Y(4), X(4), Y(5), X(5), Y(6), X(6)],
-        // 8 bytes/element (also BC1/BC4 compressed blocks).
+         Y(3), X(3), Y(4), X(4)],
         [Zero, Zero, Zero, X(0), Y(0), Y(1), X(1), X(2),
-         Y(2), X(3), Y(3), X(4), Y(4), X(5), Y(5), X(6)],
-        // 16 bytes/element (also 16-byte BC compressed blocks).
+         Y(2), X(3), Y(3), X(4)],
         [Zero, Zero, Zero, Zero, Y(0), Y(1), X(0), X(1),
-         Y(2), X(2), Y(3), X(3), Y(4), X(4), Y(5), X(5)],
+         Y(2), X(2), Y(3), X(3)],
     ];
 
     private static readonly bool _enabled = string.Equals(
@@ -309,7 +307,7 @@ internal static class GnmTiling
 
         pattern = swizzleMode switch
         {
-            9 => RbPlus64KStandard[bytesPerElementLog2],
+            5 => Standard4K[bytesPerElementLog2],
             24 => RbPlus64KDepthX[bytesPerElementLog2],
             27 => RbPlus64KRenderX[bytesPerElementLog2],
             _ => [],

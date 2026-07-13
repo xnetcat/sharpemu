@@ -614,6 +614,10 @@ internal static class Gen5ShaderTranslator
             0x2B => "SXnorSaveexecB64",
             0x37 => "SAndn1SaveexecB64",
             0x38 => "SOrn1SaveexecB64",
+            // RDNA2 exposes the 32-bit SAVEEXEC operations in the upper
+            // SOP1 range. Void Terrarium uses this form to narrow EXEC while
+            // building its world-sprite passes.
+            0x3C => "SAndSaveexecB32",
             _ => string.Empty,
         };
 
@@ -1298,6 +1302,7 @@ internal static class Gen5ShaderTranslator
             0x47 => "ImageGather4Lz",
             0x48 => "ImageGather4C",
             0x4E => "ImageGather4CBCl",
+            0x57 => "ImageGather4LzO",
             0x5F => "ImageGather4CLzO",
             _ => string.Empty,
         };
@@ -2049,6 +2054,26 @@ internal static class Gen5ShaderTranslator
         value = BinaryPrimitives.ReadUInt32LittleEndian(bytes);
         return true;
     }
+
+    // Kept beside the production decoder so offline compatibility tools use
+    // precisely the same opcode tables and instruction-width rules as runtime
+    // shader translation.
+    internal static bool TryDecodeInstructionForPreflight(
+        CpuContext ctx,
+        uint pc,
+        uint word,
+        out string name,
+        out uint sizeDwords,
+        out string error) =>
+        TryDecodeInstruction(
+            ctx,
+            0,
+            pc,
+            word,
+            out _,
+            out name,
+            out sizeDwords,
+            out error);
 
     private readonly record struct ShaderDecodeInfo(
         int InstructionCount,

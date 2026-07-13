@@ -1006,6 +1006,27 @@ internal static class Gen5ShaderScalarEvaluator
             return true;
         }
 
+        if (instruction.Opcode == "SBfmB64")
+        {
+            if (instruction.Sources.Count < 2 ||
+                destination.Value >= ScalarRegisterCount - 1 ||
+                !TryEvaluateScalarOperand(instruction.Sources[0], registers, out var widthSource) ||
+                !TryEvaluateScalarOperand(instruction.Sources[1], registers, out var offsetSource))
+            {
+                error = $"scalar-source64 pc=0x{instruction.Pc:X} op={instruction.Opcode}";
+                return false;
+            }
+
+            var width = (int)widthSource & 63;
+            var offset = (int)offsetSource & 63;
+            var value = width == 0
+                ? 0UL
+                : (ulong.MaxValue >> (64 - width)) << offset;
+            WriteScalarPair(registers, destination.Value, value, ref execMask);
+            scalarConditionCode = value != 0;
+            return true;
+        }
+
         if (instruction.Opcode is
             "SCselectB64" or
             "SAndB64" or
@@ -1291,6 +1312,31 @@ internal static class Gen5ShaderScalarEvaluator
         out string error)
     {
         error = string.Empty;
+        if (instruction.Opcode == "SAndSaveexecB32")
+        {
+            if (instruction.Destinations.Count != 1 ||
+                instruction.Destinations[0] is not
+                {
+                    Kind: Gen5OperandKind.ScalarRegister,
+                    Value: < ScalarRegisterCount,
+                } destination32 ||
+                instruction.Sources.Count == 0 ||
+                !TryEvaluateScalarOperand(instruction.Sources[0], registers, out var source32))
+            {
+                error = $"scalar-source32 pc=0x{instruction.Pc:X} op={instruction.Opcode}";
+                return false;
+            }
+
+            var oldExec32 = (uint)execMask;
+            var newExec32 = oldExec32 & source32;
+            registers[destination32.Value] = oldExec32;
+            execMask = newExec32;
+            registers[126] = newExec32;
+            registers[127] = 0;
+            scalarConditionCode = newExec32 != 0;
+            return true;
+        }
+
         if (instruction.Opcode is not (
             "SAndSaveexecB64" or
             "SOrSaveexecB64" or

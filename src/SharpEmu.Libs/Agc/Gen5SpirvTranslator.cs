@@ -3649,8 +3649,16 @@ internal static partial class Gen5SpirvTranslator
             Store(VectorPointer(register), value);
         }
 
-        private uint Load(uint type, uint pointer) =>
-            _module.AddInstruction(SpirvOp.Load, type, pointer);
+        private uint Load(uint type, uint pointer)
+        {
+            if (pointer == 0)
+            {
+                throw new InvalidOperationException(
+                    "SPIR-V generator attempted OpLoad from id 0.");
+            }
+
+            return _module.AddInstruction(SpirvOp.Load, type, pointer);
+        }
 
         private void Store(uint pointer, uint value) =>
             _module.AddStatement(SpirvOp.Store, pointer, value);
@@ -3731,14 +3739,27 @@ internal static partial class Gen5SpirvTranslator
                     UInt(3),
                     condition);
 
-        private uint GuestWaveLane() =>
-            _waveLaneCount == 64 && _localInvocationIndexInput != 0
-                ? BitwiseAnd(
+        private uint GuestWaveLane()
+        {
+            if (_waveLaneCount == 64 && _localInvocationIndexInput != 0)
+            {
+                return BitwiseAnd(
                     Load(_uintType, _localInvocationIndexInput),
-                    UInt(63))
-                : BitwiseAnd(
+                    UInt(63));
+            }
+
+            if (_subgroupInvocationIdInput != 0)
+            {
+                return BitwiseAnd(
                     Load(_uintType, _subgroupInvocationIdInput),
                     UInt(31));
+            }
+
+            // Graphics stages without subgroup support have a single logical
+            // lane.  More importantly, they must not generate an OpLoad using
+            // the absent SubgroupLocalInvocationId input (SPIR-V ID 0).
+            return UInt(0);
+        }
 
         private uint CurrentLaneBit()
         {

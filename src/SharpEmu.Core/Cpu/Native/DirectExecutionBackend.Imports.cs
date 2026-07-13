@@ -29,6 +29,7 @@ public sealed partial class DirectExecutionBackend
 
 	private readonly object _importResultLogSampleGate = new();
 	private readonly Dictionary<string, int> _importResultLogSamples = new(StringComparer.Ordinal);
+	private readonly HashSet<string> _unresolvedImportNids = new(StringComparer.Ordinal);
 
 	private static ulong ImportDispatchGatewayManaged(nint backendHandle, int importIndex, nint argPackPtr)
 	{
@@ -401,9 +402,15 @@ public sealed partial class DirectExecutionBackend
 			if (!dispatchResolved)
 			{
 				LastError = "Missing HLE export for NID: " + importStubEntry.Nid;
-				Console.Error.WriteLine(
-					$"[LOADER][WARN] Import#{num} unresolved: nid={importStubEntry.Nid} ret=0x{num7:X16} " +
-					$"rdi=0x{value:X16} rsi=0x{value2:X16} rdx=0x{num3:X16} rcx=0x{num4:X16} r8=0x{num5:X16} r9=0x{num6:X16}");
+				lock (_importResultLogSampleGate)
+				{
+					if (_unresolvedImportNids.Add(importStubEntry.Nid))
+					{
+						Console.Error.WriteLine(
+							$"[COMPAT][ABI] missing_hle nid={importStubEntry.Nid} ret=0x{num7:X16} " +
+							$"rdi=0x{value:X16} rsi=0x{value2:X16} rdx=0x{num3:X16}");
+					}
+				}
 				if (importStubEntry.Nid == "L-Q3LEjIbgA")
 				{
 					string value18 = string.Join(" ", importStubEntry.Nid.Select(delegate (char c)
@@ -426,7 +433,8 @@ public sealed partial class DirectExecutionBackend
 				{
 					Console.Error.WriteLine(
 						$"[LOADER][WARN] Import#{num} result: {orbisGen2Result} ({importStubEntry.Nid}) " +
-						$"rdi=0x{value:X16} rsi=0x{value2:X16} rdx=0x{num3:X16} rcx=0x{num4:X16} ret=0x{num7:X16}");
+						$"rdi=0x{value:X16} rsi=0x{value2:X16} rdx=0x{num3:X16} rcx=0x{num4:X16} " +
+						$"r8=0x{cpuContext[CpuRegister.R8]:X16} r9=0x{cpuContext[CpuRegister.R9]:X16} ret=0x{num7:X16}");
 				}
 			}
 			cpuContext[CpuRegister.Rbx] = value3;
@@ -713,6 +721,9 @@ public sealed partial class DirectExecutionBackend
 		var expectedEqueueTimeout =
 			string.Equals(nid, "fzyMKs9kim0", StringComparison.Ordinal) &&
 			result == OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT;
+		var expectedEventFlagTimeout =
+			string.Equals(nid, "JTvBflhYazQ", StringComparison.Ordinal) &&
+			result == OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT;
 		var expectedMutexTrylockBusy =
 			string.Equals(nid, "K-jXhbt2gn4", StringComparison.Ordinal) &&
 			result == OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY;
@@ -725,6 +736,7 @@ public sealed partial class DirectExecutionBackend
 		if (!expectedFileProbeMiss &&
 			!expectedTimedWaitTimeout &&
 			!expectedEqueueTimeout &&
+			!expectedEventFlagTimeout &&
 			!expectedMutexTrylockBusy &&
 			!expectedUserServiceNoEvent &&
 			!expectedPrivacyInvalidParameter)

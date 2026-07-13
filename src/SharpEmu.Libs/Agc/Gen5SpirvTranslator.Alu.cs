@@ -1206,6 +1206,32 @@ internal static partial class Gen5SpirvTranslator
             uint result;
             switch (instruction.Opcode)
             {
+                case "SAndSaveexecB32":
+                {
+                    // Preserve the high half: the instruction updates
+                    // EXEC_LO only, even when a host subgroup represents a
+                    // 64-lane guest wave.  The destination receives the old
+                    // low mask before EXEC is narrowed.
+                    var oldExec = BooleanToWaveMask(Load(_boolType, _exec));
+                    var oldExecLow = _module.AddInstruction(
+                        SpirvOp.UConvert,
+                        _uintType,
+                        oldExec);
+                    var newExecLow = BitwiseAnd(oldExecLow, left);
+                    var preservedHigh = BitwiseAnd(
+                        oldExec,
+                        _module.Constant64(_ulongType, 0xFFFF_FFFF_0000_0000UL));
+                    var newExec = BitwiseOr64(
+                        preservedHigh,
+                        _module.AddInstruction(
+                            SpirvOp.UConvert,
+                            _ulongType,
+                            newExecLow));
+                    StoreS(destination, oldExecLow);
+                    StoreS64(126, newExec);
+                    Store(_scc, IsNotZero(newExecLow));
+                    return true;
+                }
                 case "SMovB32":
                     result = left;
                     break;
@@ -1883,6 +1909,47 @@ internal static partial class Gen5SpirvTranslator
 
                 StoreS64(destination, extracted);
                 Store(_scc, IsNotZero64(extracted));
+                return true;
+            }
+
+            if (instruction.Opcode == "SBfmB64")
+            {
+                if (instruction.Sources.Count < 2)
+                {
+                    error = "missing scalar 64-bit bitfield-mask source";
+                    return false;
+                }
+
+                var width = _module.AddInstruction(
+                    SpirvOp.UConvert,
+                    _ulongType,
+                    BitwiseAnd(GetRawSource(instruction, 0), UInt(63)));
+                var offset = _module.AddInstruction(
+                    SpirvOp.UConvert,
+                    _ulongType,
+                    BitwiseAnd(GetRawSource(instruction, 1), UInt(63)));
+                // SPIR-V's 64-bit OpBitFieldInsert is rejected by the
+                // MoltenVK/SPIRV-Cross path used on macOS. Generate the same
+                // mask from ordinary 64-bit shifts instead.
+                var shiftedMask = ShiftRightLogical64(
+                    _module.Constant64(_ulongType, ulong.MaxValue),
+                    _module.AddInstruction(
+                        SpirvOp.ISub,
+                        _ulongType,
+                        _module.Constant64(_ulongType, 64),
+                        width));
+                var maskValue = _module.AddInstruction(
+                    SpirvOp.Select,
+                    _ulongType,
+                    _module.AddInstruction(
+                        SpirvOp.IEqual,
+                        _boolType,
+                        width,
+                        _module.Constant64(_ulongType, 0)),
+                    _module.Constant64(_ulongType, 0),
+                    ShiftLeftLogical64(shiftedMask, offset));
+                StoreS64(destination, maskValue);
+                Store(_scc, IsNotZero64(maskValue));
                 return true;
             }
 

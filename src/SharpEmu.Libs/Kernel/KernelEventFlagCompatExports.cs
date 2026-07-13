@@ -239,7 +239,9 @@ public static class KernelEventFlagCompatExports
                 ? GuestThreadExecution.ComputeDeadlineTimestamp(TimeSpan.FromMicroseconds(timeoutUsec))
                 : 0;
             var hostDeadlineMs = timeoutAddress != 0
-                ? Environment.TickCount64 + Math.Max(0L, timeoutUsec / 1000L)
+                ? Environment.TickCount64 + (timeoutUsec == 0
+                    ? 0L
+                    : Math.Max(1L, (timeoutUsec + 999L) / 1000L))
                 : long.MaxValue;
 
             var currentGuestThread = GuestThreadExecution.CurrentGuestThreadHandle;
