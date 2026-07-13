@@ -26,9 +26,18 @@ public static class KernelRuntimeCompatExports
     private const int MallocReplaceSize = 0x70;
     private const int NewReplaceSize = 0x68;
     private const int OrbisTimesecSize = sizeof(long) + sizeof(uint) + sizeof(uint);
-    private const ulong ModuleInfoHandleOffset = 0x108;
-    private const ulong ModuleInfoNameOffset = 0x10;
-    private const int ModuleInfoNameMaxBytes = 64;
+    // PS4/PS5 libkernel module-info ABI. The extended form is consumed by
+    // sceKernelGetModuleInfoFromAddr and ends at byte 0x1A8; libc commonly
+    // places its stack canary immediately after that caller-owned buffer.
+    private const int ModuleInfoNameMaxBytes = 256;
+    private const int ModuleInfoSize = 0x160;
+    private const int ModuleInfoExSize = 0x1A8;
+    private const ulong ModuleInfoNameOffset = 0x08;
+    private const ulong ModuleInfoExHandleOffset = 0x108;
+    private const ulong ModuleInfoExInitProcOffset = 0x128;
+    private const ulong ModuleInfoExSegmentsOffset = 0x160;
+    private const ulong ModuleInfoExSegmentCountOffset = 0x1A0;
+    private const int ModuleInfoSegmentSize = 16;
     private const ulong DefaultKernelTscFrequency = 10_000_000UL;
     private const ulong PrtAreaStartAddress = 0x0000001000000000UL;
     private const ulong PrtAreaSize = 0x000000EC00000000UL;
@@ -834,22 +843,36 @@ public static class KernelRuntimeCompatExports
     public static int KernelGetModuleInfoFromAddr(CpuContext ctx)
     {
         var queriedAddress = ctx[CpuRegister.Rdi];
-        _ = ctx[CpuRegister.Rsi]; // mode
+        var flags = unchecked((int)ctx[CpuRegister.Rsi]);
         var outInfoAddress = ctx[CpuRegister.Rdx];
         if (outInfoAddress == 0)
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
-        var moduleHandle = ResolveModuleHandleByAddress(queriedAddress);
-        if (!TryWriteInt32(ctx, outInfoAddress + ModuleInfoHandleOffset, moduleHandle))
+        if (flags is < 0 or >= 3)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        if (!ctx.TryReadUInt64(outInfoAddress, out var callerSize))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
-        if (KernelModuleRegistry.TryGetModuleByHandle(moduleHandle, out var module))
+        if (callerSize != ModuleInfoExSize)
         {
-            _ = TryWriteModuleName(ctx, outInfoAddress, module.Name);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        if (!KernelModuleRegistry.TryGetModuleByAddress(queriedAddress, out var module))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+        }
+
+        if (!TryWriteModuleInfoEx(ctx, outInfoAddress, module))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
         ctx[CpuRegister.Rax] = 0;
@@ -864,22 +887,36 @@ public static class KernelRuntimeCompatExports
     public static int KernelGetModuleInfoForUnwind(CpuContext ctx)
     {
         var queriedAddress = ctx[CpuRegister.Rdi];
-        _ = ctx[CpuRegister.Rsi]; // flags
+        var flags = unchecked((int)ctx[CpuRegister.Rsi]);
         var outInfoAddress = ctx[CpuRegister.Rdx];
         if (outInfoAddress == 0)
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
-        var moduleHandle = ResolveModuleHandleByAddress(queriedAddress);
-        if (!TryWriteInt32(ctx, outInfoAddress + ModuleInfoHandleOffset, moduleHandle))
+        if (flags is < 0 or >= 3)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        if (!ctx.TryReadUInt64(outInfoAddress, out var callerSize))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
-        if (KernelModuleRegistry.TryGetModuleByHandle(moduleHandle, out var module))
+        if (callerSize < 0x130)
         {
-            _ = TryWriteModuleName(ctx, outInfoAddress, module.Name);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        if (!KernelModuleRegistry.TryGetModuleByAddress(queriedAddress, out var module))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+        }
+
+        if (!TryWriteModuleInfoForUnwind(ctx, outInfoAddress, module))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
         ctx[CpuRegister.Rax] = 0;
@@ -919,7 +956,7 @@ public static class KernelRuntimeCompatExports
         LibraryName = "libKernel")]
     public static int KernelGetModuleInfoInternal(CpuContext ctx)
     {
-        return KernelGetModuleInfoByHandleCore(
+        return KernelGetModuleInfoExByHandleCore(
             ctx,
             unchecked((int)ctx[CpuRegister.Rdi]),
             ctx[CpuRegister.Rsi]);
@@ -1381,22 +1418,6 @@ public static class KernelRuntimeCompatExports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
-    private static int ResolveModuleHandleByAddress(ulong queriedAddress)
-    {
-        if (queriedAddress != 0 &&
-            KernelModuleRegistry.TryGetModuleByAddress(queriedAddress, out var moduleFromAddress))
-        {
-            return moduleFromAddress.Handle;
-        }
-
-        if (KernelModuleRegistry.TryGetFirstModule(out var firstModule))
-        {
-            return firstModule.Handle;
-        }
-
-        return 1;
-    }
-
     private static int KernelGetModuleInfoByHandleCore(CpuContext ctx, int handle, ulong outInfoAddress)
     {
         if (outInfoAddress == 0)
@@ -1409,12 +1430,52 @@ public static class KernelRuntimeCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
         }
 
-        if (!TryWriteInt32(ctx, outInfoAddress + ModuleInfoHandleOffset, module.Handle))
+        if (!ctx.TryReadUInt64(outInfoAddress, out var callerSize))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
-        _ = TryWriteModuleName(ctx, outInfoAddress, module.Name);
+        if (callerSize != ModuleInfoSize)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        if (!TryWriteModuleInfo(ctx, outInfoAddress, module))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    private static int KernelGetModuleInfoExByHandleCore(CpuContext ctx, int handle, ulong outInfoAddress)
+    {
+        if (outInfoAddress == 0)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        if (!KernelModuleRegistry.TryGetModuleByHandle(handle, out var module))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+        }
+
+        if (!ctx.TryReadUInt64(outInfoAddress, out var callerSize))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        if (callerSize != ModuleInfoExSize)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        if (!TryWriteModuleInfoEx(ctx, outInfoAddress, module))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
@@ -1461,22 +1522,85 @@ public static class KernelRuntimeCompatExports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
-    private static bool TryWriteModuleName(CpuContext ctx, ulong outInfoAddress, string moduleName)
+    private static bool TryWriteModuleInfo(
+        CpuContext ctx,
+        ulong outInfoAddress,
+        KernelModuleRegistry.ModuleEntry module)
     {
-        if (outInfoAddress == 0 || string.IsNullOrWhiteSpace(moduleName))
+        var payload = new byte[ModuleInfoSize];
+        BinaryPrimitives.WriteUInt64LittleEndian(payload, ModuleInfoSize);
+        WriteModuleName(payload, module.Name);
+        WriteModuleSegment(payload, 0x108, module);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(0x148), 1);
+        return ctx.Memory.TryWrite(outInfoAddress, payload);
+    }
+
+    private static bool TryWriteModuleInfoEx(
+        CpuContext ctx,
+        ulong outInfoAddress,
+        KernelModuleRegistry.ModuleEntry module)
+    {
+        var payload = new byte[ModuleInfoExSize];
+        BinaryPrimitives.WriteUInt64LittleEndian(payload, ModuleInfoExSize);
+        WriteModuleName(payload, module.Name);
+        BinaryPrimitives.WriteInt32LittleEndian(
+            payload.AsSpan((int)ModuleInfoExHandleOffset),
+            module.Handle);
+        BinaryPrimitives.WriteUInt64LittleEndian(
+            payload.AsSpan((int)ModuleInfoExInitProcOffset),
+            module.EntryPoint);
+        WriteModuleSegment(payload, (int)ModuleInfoExSegmentsOffset, module);
+        BinaryPrimitives.WriteUInt32LittleEndian(
+            payload.AsSpan((int)ModuleInfoExSegmentCountOffset),
+            1);
+        return ctx.Memory.TryWrite(outInfoAddress, payload);
+    }
+
+    private static bool TryWriteModuleInfoForUnwind(
+        CpuContext ctx,
+        ulong outInfoAddress,
+        KernelModuleRegistry.ModuleEntry module)
+    {
+        const int unwindInfoSize = 0x130;
+        var payload = new byte[unwindInfoSize];
+        BinaryPrimitives.WriteUInt64LittleEndian(payload, unwindInfoSize);
+        WriteModuleName(payload, module.Name);
+        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(0x120), module.BaseAddress);
+        BinaryPrimitives.WriteUInt64LittleEndian(
+            payload.AsSpan(0x128),
+            module.EndAddress - module.BaseAddress);
+        return ctx.Memory.TryWrite(outInfoAddress, payload);
+    }
+
+    private static void WriteModuleName(Span<byte> payload, string moduleName)
+    {
+        if (string.IsNullOrWhiteSpace(moduleName))
         {
-            return false;
+            return;
         }
 
         var encoded = Encoding.UTF8.GetBytes(moduleName);
         var payloadLength = Math.Min(encoded.Length, ModuleInfoNameMaxBytes - 1);
-        var buffer = new byte[ModuleInfoNameMaxBytes];
         if (payloadLength > 0)
         {
-            Array.Copy(encoded, 0, buffer, 0, payloadLength);
+            encoded.AsSpan(0, payloadLength).CopyTo(
+                payload.Slice((int)ModuleInfoNameOffset, payloadLength));
         }
+    }
 
-        return ctx.Memory.TryWrite(outInfoAddress + ModuleInfoNameOffset, buffer);
+    private static void WriteModuleSegment(
+        Span<byte> payload,
+        int offset,
+        KernelModuleRegistry.ModuleEntry module)
+    {
+        Debug.Assert(offset >= 0 && offset + ModuleInfoSegmentSize <= payload.Length);
+        BinaryPrimitives.WriteUInt64LittleEndian(payload.Slice(offset), module.BaseAddress);
+        BinaryPrimitives.WriteUInt32LittleEndian(
+            payload.Slice(offset + sizeof(ulong)),
+            (uint)Math.Min(module.EndAddress - module.BaseAddress, uint.MaxValue));
+        // Loaded modules are represented as a single aggregate readable and
+        // executable range until per-program-header registry data is exposed.
+        BinaryPrimitives.WriteInt32LittleEndian(payload.Slice(offset + 12), 5);
     }
 
     private static bool TryReadUtf8Z(CpuContext ctx, ulong address, int maxLength, out string value)

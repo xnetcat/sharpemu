@@ -3042,6 +3042,12 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		{
 			LastError = null;
 			var exitReason = ExecuteGuestThreadEntry(context, entryPoint, reason, out var callbackReason);
+			if (exitReason == GuestNativeCallExitReason.Blocked &&
+				!ResumeBlockedNestedGuestCallback(context, reason, ref exitReason, ref callbackReason))
+			{
+				error = callbackReason ?? LastError ?? "guest callback could not resume after blocking";
+				return false;
+			}
 			if (exitReason is GuestNativeCallExitReason.Exception or GuestNativeCallExitReason.ForcedExit)
 			{
 				error = callbackReason ?? LastError ?? "guest callback failed";
@@ -3054,6 +3060,134 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		{
 			LastError = previousLastError;
 		}
+	}
+
+	/// <summary>
+	/// Completes a nested guest callback which blocked in an HLE import. The
+	/// outer guest entry is still executing managed HLE code, so returning a
+	/// successful callback result here would abandon the callback continuation
+	/// and let a noreturn operation such as pthread_exit unwind through live
+	/// libc cleanup state. Temporarily expose the owning guest thread as blocked,
+	/// let the normal scheduler wake it, and resume the callback continuation on
+	/// this executor until it either returns or fails.
+	/// </summary>
+	private bool ResumeBlockedNestedGuestCallback(
+		CpuContext callbackContext,
+		string reason,
+		ref GuestNativeCallExitReason exitReason,
+		ref string? callbackReason)
+	{
+		var guestThreadHandle = GuestThreadExecution.CurrentGuestThreadHandle;
+		if (guestThreadHandle == 0)
+		{
+			callbackReason = $"nested guest callback '{reason}' blocked without a schedulable guest thread";
+			exitReason = GuestNativeCallExitReason.Exception;
+			return false;
+		}
+
+		while (exitReason == GuestNativeCallExitReason.Blocked && !ActiveForcedGuestExit)
+		{
+			GuestThreadState? owner;
+			lock (_guestThreadGate)
+			{
+				if (!_guestThreads.TryGetValue(guestThreadHandle, out owner) ||
+					!owner.HasBlockedContinuation)
+				{
+					callbackReason =
+						$"nested guest callback '{reason}' blocked without a captured continuation";
+					exitReason = GuestNativeCallExitReason.Exception;
+					return false;
+				}
+
+				owner.State = GuestThreadRunState.Blocked;
+				owner.BlockReason = callbackReason ?? reason;
+				if (owner.BlockWakeHandler is not null && owner.BlockWakeHandler())
+				{
+					owner.State = GuestThreadRunState.Ready;
+					owner.BlockReason = null;
+					owner.BlockWakeHandler = null;
+					owner.BlockDeadlineTimestamp = 0;
+				}
+			}
+			if (_logGuestThreads)
+			{
+				Console.Error.WriteLine(
+					$"[LOADER][INFO] nested_callback.block name='{owner!.Name}' callback='{reason}' " +
+					$"wake={owner.BlockWakeKey ?? "none"} continuation=0x{owner.BlockedContinuation.Rip:X16}");
+			}
+
+			GuestCpuContinuation continuation = default;
+			Func<int>? resumeHandler = null;
+			while (!ActiveForcedGuestExit)
+			{
+				WakeExpiredBlockedGuestThreads();
+				var ready = false;
+				lock (_guestThreadGate)
+				{
+					if (!_guestThreads.TryGetValue(guestThreadHandle, out owner))
+					{
+						callbackReason =
+							$"nested guest callback '{reason}' lost its owning guest thread";
+						exitReason = GuestNativeCallExitReason.Exception;
+						return false;
+					}
+
+					if (owner.State == GuestThreadRunState.Ready && owner.HasBlockedContinuation)
+					{
+						continuation = owner.BlockedContinuation;
+						owner.BlockedContinuation = default;
+						owner.HasBlockedContinuation = false;
+						owner.BlockWakeKey = null;
+						resumeHandler = owner.BlockResumeHandler;
+						owner.BlockResumeHandler = null;
+						owner.BlockWakeHandler = null;
+						owner.BlockDeadlineTimestamp = 0;
+						owner.BlockReason = null;
+						owner.State = GuestThreadRunState.Running;
+						ready = true;
+					}
+				}
+
+				if (ready)
+				{
+					break;
+				}
+
+				Thread.Sleep(1);
+			}
+
+			if (ActiveForcedGuestExit)
+			{
+				callbackReason = LastError ?? $"nested guest callback '{reason}' was forced to exit";
+				exitReason = GuestNativeCallExitReason.ForcedExit;
+				return false;
+			}
+
+			if (resumeHandler is not null)
+			{
+				continuation = continuation with { Rax = unchecked((ulong)(long)resumeHandler()) };
+			}
+			if (_logGuestThreads)
+			{
+				Console.Error.WriteLine(
+					$"[LOADER][INFO] nested_callback.resume thread=0x{guestThreadHandle:X16} callback='{reason}' " +
+					$"continuation=0x{continuation.Rip:X16}");
+			}
+
+			exitReason = ExecuteBlockedGuestThreadContinuation(
+				callbackContext,
+				continuation,
+				reason,
+				out callbackReason);
+		}
+
+		if (exitReason == GuestNativeCallExitReason.Blocked && ActiveForcedGuestExit)
+		{
+			callbackReason = LastError ?? $"nested guest callback '{reason}' was forced to exit";
+			exitReason = GuestNativeCallExitReason.ForcedExit;
+		}
+
+		return exitReason == GuestNativeCallExitReason.Returned;
 	}
 
 	public bool TryCallGuestContinuation(

@@ -343,13 +343,26 @@ public sealed partial class DirectExecutionBackend
 		{
 			if (_logStackCheck)
 			{
-				var savedGuardAddress = value4 >= 0x10 ? value4 - 0x10 : 0;
-				var guardKnown = TryReadUInt64Compat(value3, out var guardValue);
-				var savedKnown = TryReadUInt64Compat(savedGuardAddress, out var savedGuardValue);
+				var rbxGuardKnown = TryReadUInt64Compat(value3, out var rbxGuardValue);
+				var r12GuardKnown = TryReadUInt64Compat(value5, out var r12GuardValue);
 				Console.Error.WriteLine(
-					$"[LOADER][TRACE] stack_chk_diag#{num}: ret=0x{num7:X16} guard_ptr=0x{value3:X16} " +
-					$"guard={(guardKnown ? $"0x{guardValue:X16}" : "?")} saved@0x{savedGuardAddress:X16}={(savedKnown ? $"0x{savedGuardValue:X16}" : "?")} " +
+					$"[LOADER][TRACE] stack_chk_diag#{num}: ret=0x{num7:X16} " +
+					$"rbx=0x{value3:X16}:{(rbxGuardKnown ? $"0x{rbxGuardValue:X16}" : "?")} " +
+					$"r12=0x{value5:X16}:{(r12GuardKnown ? $"0x{r12GuardValue:X16}" : "?")} " +
 					$"rbp=0x{value4:X16} rsp=0x{((ulong)argPackPtr + 96uL):X16}");
+
+				// Stack-protector layouts vary by compiler and function. Emit the
+				// bounded caller-frame tail instead of assuming a fixed canary
+				// offset; this also exposes an adjacent ABI output buffer overwrite.
+				for (var frameOffset = 0x10; frameOffset <= 0x80; frameOffset += sizeof(ulong))
+				{
+					var slotAddress = value4 >= (ulong)frameOffset ? value4 - (ulong)frameOffset : 0;
+					if (slotAddress != 0 && TryReadUInt64Compat(slotAddress, out var slotValue))
+					{
+						Console.Error.WriteLine(
+							$"[LOADER][TRACE] stack_chk_frame#{num}: [rbp-0x{frameOffset:X}]=0x{slotValue:X16}");
+					}
+				}
 			}
 			try
 			{
