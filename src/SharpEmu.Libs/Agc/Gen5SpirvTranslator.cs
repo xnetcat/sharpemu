@@ -1508,6 +1508,24 @@ internal static partial class Gen5SpirvTranslator
 
             switch (instruction.Opcode)
             {
+                case "DsAddU32":
+                {
+                    if (instruction.Sources.Count < 2)
+                    {
+                        error = "missing LDS atomic-add source";
+                        return false;
+                    }
+
+                    var address = GetRawSource(instruction, 0);
+                    _module.AddInstruction(
+                        SpirvOp.AtomicIAdd,
+                        _uintType,
+                        LdsPointer(address, control.Offset0),
+                        UInt(2), // Workgroup scope.
+                        UInt(0x108), // AcquireRelease | WorkgroupMemory.
+                        GetRawSource(instruction, 1));
+                    return true;
+                }
                 case "DsWriteB32":
                 {
                     if (instruction.Sources.Count < 2)
@@ -1896,13 +1914,6 @@ internal static partial class Gen5SpirvTranslator
                 return TryEmitVertexInputFetch(control, vertexInput, out error);
             }
 
-            if (_stage == Gen5SpirvStage.Vertex &&
-                IsFormatBufferLoad(instruction.Opcode))
-            {
-                error = $"missing vertex input for {instruction.Opcode} pc=0x{instruction.Pc:X}";
-                return false;
-            }
-
             if (!TryResolveDominatingBufferBinding(
                     instruction.Pc,
                     control.ScalarResource,
@@ -2029,7 +2040,12 @@ internal static partial class Gen5SpirvTranslator
             // swizzle from the GFX10 buffer descriptor.  Keep raw dword loads
             // on the byte-address >> 2 path below: unlike typed loads they do
             // not perform component conversion or dst_sel processing.
-            if (instruction.Opcode.StartsWith("BufferLoadFormat", StringComparison.Ordinal))
+            // Vertex shaders normally expose indexed format loads as Vulkan
+            // attributes. Loads with an additional per-lane byte offset cannot
+            // be represented by a fixed attribute description, so the scalar
+            // evaluator captures their descriptor as storage instead. Preserve
+            // typed conversion for both MUBUF and MTBUF in that fallback path.
+            if (IsFormatBufferLoad(instruction.Opcode))
             {
                 EmitBufferFormatLoad(
                     bindingIndex,

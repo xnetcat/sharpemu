@@ -21,7 +21,7 @@ namespace SharpEmu.Core.Runtime;
 
 public sealed class SharpEmuRuntime : ISharpEmuRuntime
 {
-    private readonly record struct LoadedModuleImage(string Path, SelfImage Image);
+    private readonly record struct LoadedModuleImage(string Path, SelfImage Image, int Handle, bool StartAtBoot);
 
     private static readonly HashSet<string> PreloadSkipModules = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -140,7 +140,7 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
         var image = LoadImage(normalizedEbootPath);
         VideoOutExports.ConfigureApplicationInfo(image.Title, image.TitleId, image.Version);
         SaveDataExports.ConfigureApplicationInfo(image.TitleId);
-        RegisterLoadedModule(normalizedEbootPath, image, isMain: true, isSystemModule: false);
+        _ = RegisterLoadedModule(normalizedEbootPath, image, isMain: true, isSystemModule: false);
         KernelRuntimeCompatExports.ConfigureProcessProcParamAddress(image.ProcParamAddress);
         Console.Error.WriteLine($"[RUNTIME] Entry: 0x{image.EntryPoint:X16}");
         var generation = image.ElfHeader.AbiVersion == 2 ? Generation.Gen5 : Generation.Gen4;
@@ -370,6 +370,20 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
             return null;
         }
 
+        // Dump tools commonly place decrypted executables in an app0/decrypted
+        // sidecar while leaving Unity data in the parent app0 directory. Keep
+        // loading code/modules beside the decrypted eboot, but mount /app0 at
+        // the content-bearing parent so boot.config, metadata and assets resolve.
+        if (string.Equals(Path.GetFileName(app0Root), "decrypted", StringComparison.OrdinalIgnoreCase))
+        {
+            var parentRoot = Path.GetDirectoryName(app0Root);
+            if (!string.IsNullOrWhiteSpace(parentRoot) &&
+                Directory.Exists(Path.Combine(parentRoot, "Media")))
+            {
+                app0Root = parentRoot;
+            }
+        }
+
         Environment.SetEnvironmentVariable(app0VariableName, app0Root);
         return new App0BindingScope(app0VariableName);
     }
@@ -415,6 +429,56 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
         return null;
     }
 
+    private bool TryGetEhFrameInfo(
+        SelfImage image,
+        ulong imageSize,
+        out ulong ehFrameHeaderAddress,
+        out ulong ehFrameAddress,
+        out ulong ehFrameSize)
+    {
+        ehFrameHeaderAddress = 0;
+        ehFrameAddress = 0;
+        ehFrameSize = 0;
+        var imageBase = image.EntryPoint >= image.ElfHeader.EntryPoint
+            ? image.EntryPoint - image.ElfHeader.EntryPoint
+            : 0UL;
+        for (var i = 0; i < image.ProgramHeaders.Count; i++)
+        {
+            var header = image.ProgramHeaders[i];
+            if (header.HeaderType != ProgramHeaderType.GnuEhFrame || header.MemorySize < 8)
+            {
+                continue;
+            }
+
+            var headerAddress = imageBase + header.VirtualAddress;
+            Span<byte> ehHeader = stackalloc byte[8];
+            if (!_virtualMemory.TryRead(headerAddress, ehHeader) ||
+                ehHeader[0] != 1 ||
+                ehHeader[1] != 0x1B)
+            {
+                continue;
+            }
+
+            var relativeOffset = BinaryPrimitives.ReadInt32LittleEndian(ehHeader[4..]);
+            ehFrameHeaderAddress = headerAddress;
+            ehFrameAddress = unchecked((ulong)((long)headerAddress + 4 + relativeOffset));
+            if (ehFrameAddress < 0x10000)
+            {
+                continue;
+            }
+
+            var relativeEhFrameAddress = ehFrameAddress - imageBase;
+            ehFrameSize = header.VirtualAddress > relativeEhFrameAddress
+                ? header.VirtualAddress - relativeEhFrameAddress
+                : imageSize > header.VirtualAddress
+                    ? imageSize - header.VirtualAddress
+                    : 0;
+            return true;
+        }
+
+        return false;
+    }
+
     private OrbisGen2Result? RunPreloadedModuleInitializers(
         IReadOnlyList<LoadedModuleImage> loadedModuleImages,
         Generation generation,
@@ -424,8 +488,18 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
         for (var i = 0; i < loadedModuleImages.Count; i++)
         {
             var loadedModule = loadedModuleImages[i];
+            if (!loadedModule.StartAtBoot)
+            {
+                continue;
+            }
+
             var initEntryPoint = loadedModule.Image.InitFunctionEntryPoint;
             if (initEntryPoint < 0x10000)
+            {
+                continue;
+            }
+
+            if (!KernelModuleRegistry.TryBeginModuleStart(loadedModule.Handle, out _))
             {
                 continue;
             }
@@ -446,6 +520,9 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
                 activeRuntimeSymbols,
                 moduleName,
                 _cpuExecutionOptions);
+            KernelModuleRegistry.CompleteModuleStart(
+                loadedModule.Handle,
+                result == OrbisGen2Result.ORBIS_GEN2_OK);
             if (result != OrbisGen2Result.ORBIS_GEN2_OK)
             {
                 Console.Error.WriteLine(
@@ -543,12 +620,17 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
 
         var moduleDirectories = new[]
         {
-            Path.Combine(ebootDirectory, "sce_module"),
-            Path.Combine(ebootDirectory, "sce_modules"),
-            Path.Combine(ebootDirectory, "Media", "Modules"),
+            (Path: Path.Combine(ebootDirectory, "sce_module"), StartAtBoot: true),
+            (Path: Path.Combine(ebootDirectory, "sce_modules"), StartAtBoot: true),
+            (Path: Path.Combine(ebootDirectory, "Media", "Modules"), StartAtBoot: true),
+            // Unity native plugins are loaded later through sceKernelLoadStartModule. Map
+            // them up front so the HLE loader can return a real module handle and dlsym
+            // can resolve their exports, but defer DT_INIT until the guest requests them.
+            (Path: Path.Combine(ebootDirectory, "Media", "Plugins"), StartAtBoot: false),
         }
-        .Distinct(StringComparer.OrdinalIgnoreCase)
-        .Where(Directory.Exists)
+        .GroupBy(entry => entry.Path, StringComparer.OrdinalIgnoreCase)
+        .Select(group => group.First())
+        .Where(entry => Directory.Exists(entry.Path))
         .ToArray();
 
         if (moduleDirectories.Length == 0)
@@ -558,23 +640,25 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
 
         var allModulePaths = moduleDirectories
             .SelectMany(directory => Directory
-                .EnumerateFiles(directory)
-                .OrderBy(path => path, StringComparer.OrdinalIgnoreCase))
-            .Where(path =>
+                .EnumerateFiles(directory.Path)
+                .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+                .Select(path => (Path: path, directory.StartAtBoot)))
+            .Where(entry =>
             {
-                var extension = Path.GetExtension(path);
+                var extension = Path.GetExtension(entry.Path);
                 return string.Equals(extension, ".prx", StringComparison.OrdinalIgnoreCase) ||
                        string.Equals(extension, ".sprx", StringComparison.OrdinalIgnoreCase);
             })
-            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .GroupBy(entry => entry.Path, StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.First())
             .ToArray();
 
         var modulePaths = allModulePaths
-            .Where(ShouldPreloadModule)
+            .Where(entry => ShouldPreloadModule(entry.Path))
             .ToArray();
         var skippedModules = allModulePaths
-            .Where(path => !ShouldPreloadModule(path))
-            .Select(Path.GetFileName)
+            .Where(entry => !ShouldPreloadModule(entry.Path))
+            .Select(entry => Path.GetFileName(entry.Path))
             .Where(name => !string.IsNullOrWhiteSpace(name))
             .ToArray();
         if (skippedModules.Length > 0)
@@ -587,14 +671,15 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
             return loadedImages;
         }
 
-        Console.Error.WriteLine($"[RUNTIME] Module search directories: {string.Join(", ", moduleDirectories)}");
+        Console.Error.WriteLine($"[RUNTIME] Module search directories: {string.Join(", ", moduleDirectories.Select(entry => entry.Path))}");
         Console.Error.WriteLine($"[RUNTIME] Loading {modulePaths.Length} module(s)...");
         var loadedModules = 0;
         var failedModules = 0;
         var mergedImportCount = 0;
         var mergedSymbolCount = 0;
-        foreach (var modulePath in modulePaths)
+        foreach (var moduleEntry in modulePaths)
         {
+            var modulePath = moduleEntry.Path;
             try
             {
                 var fileInfo = new FileInfo(modulePath);
@@ -619,8 +704,13 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
 
                 mergedImportCount += MergeImportStubs(importStubs, moduleImage.ImportStubs, modulePath);
                 mergedSymbolCount += MergeRuntimeSymbols(runtimeSymbols, moduleImage.RuntimeSymbols);
-                RegisterLoadedModule(modulePath, moduleImage, isMain: false, isSystemModule: false);
-                loadedImages.Add(new LoadedModuleImage(modulePath, moduleImage));
+                InstallNativePluginCompatibilityHooks(importStubs, moduleImage, modulePath);
+                var moduleHandle = RegisterLoadedModule(modulePath, moduleImage, isMain: false, isSystemModule: false);
+                var moduleName = Path.GetFileName(modulePath);
+                var startAtBoot = moduleEntry.StartAtBoot ||
+                    string.Equals(moduleName, "libfmod.prx", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(moduleName, "libfmodstudio.prx", StringComparison.OrdinalIgnoreCase);
+                loadedImages.Add(new LoadedModuleImage(modulePath, moduleImage, moduleHandle, startAtBoot));
                 loadedModules++;
 
                 Console.Error.WriteLine(
@@ -636,6 +726,28 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
         Console.Error.WriteLine(
             $"[RUNTIME] Module preload summary: loaded={loadedModules}, failed={failedModules}, merged_imports={mergedImportCount}, merged_symbols={mergedSymbolCount}");
         return loadedImages;
+    }
+
+    private static void InstallNativePluginCompatibilityHooks(
+        IDictionary<ulong, string> importStubs,
+        SelfImage moduleImage,
+        string modulePath)
+    {
+        if (!string.Equals(Path.GetFileName(modulePath), "libfmod.prx", StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        ReadOnlySpan<string> compatibilityNids = ["uPLTdl3psGk"];
+        foreach (var nid in compatibilityNids)
+        {
+            if (moduleImage.RuntimeSymbols.TryGetValue(nid, out var address) && address >= 0x10000)
+            {
+                importStubs[address] = nid;
+                Console.Error.WriteLine(
+                    $"[RUNTIME] Installed FMOD compatibility hook: {nid} -> 0x{address:X16}");
+            }
+        }
     }
 
     private void RebindImportedDataSymbols(
@@ -842,7 +954,7 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
         return !PreloadSkipModules.Contains(fileName);
     }
 
-    private static void RegisterLoadedModule(string modulePath, SelfImage image, bool isMain, bool isSystemModule)
+    private int RegisterLoadedModule(string modulePath, SelfImage image, bool isMain, bool isSystemModule)
     {
         if (!TryComputeImageRange(image, out var baseAddress, out var size))
         {
@@ -850,15 +962,27 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
             size = 0;
         }
 
+        _ = TryGetEhFrameInfo(
+            image,
+            size,
+            out var ehFrameHeaderAddress,
+            out var ehFrameAddress,
+            out var ehFrameSize);
         var handle = KernelModuleRegistry.RegisterModule(
             modulePath,
             baseAddress,
             size,
             image.EntryPoint,
+            image.InitFunctionEntryPoint,
+            ehFrameHeaderAddress,
+            ehFrameAddress,
+            ehFrameSize,
             isMain,
             isSystemModule);
+        KernelModuleRegistry.RegisterModuleSymbols(handle, image.RuntimeSymbols);
         Console.Error.WriteLine(
             $"[RUNTIME] Registered module handle={handle} name={Path.GetFileName(modulePath)} base=0x{baseAddress:X16} size=0x{size:X16}");
+        return handle;
     }
 
     private static bool TryComputeImageRange(SelfImage image, out ulong baseAddress, out ulong size)

@@ -1005,8 +1005,15 @@ internal static class Gen5ShaderTranslator
             0x14 => "VCmpxGtF32",
             0x15 => "VCmpxLgF32",
             0x16 => "VCmpxGeF32",
+            0x17 => "VCmpxOF32",
+            0x18 => "VCmpxUF32",
+            0x19 => "VCmpxNgeF32",
+            0x1A => "VCmpxNlgF32",
+            0x1B => "VCmpxNgtF32",
+            0x1C => "VCmpxNleF32",
             0x1D => "VCmpxNeqF32",
             0x1E => "VCmpxNltF32",
+            0x1F => "VCmpxTruF32",
             0x80 => "VCmpFI32",
             0x81 => "VCmpLtI32",
             0x82 => "VCmpEqI32",
@@ -1155,6 +1162,7 @@ internal static class Gen5ShaderTranslator
         error = string.Empty;
         name = opcode switch
         {
+            0x00 => "DsAddU32",
             0x0D => "DsWriteB32",
             0x0E => "DsWrite2B32",
             0x0F => "DsWrite2St64B32",
@@ -1770,6 +1778,10 @@ internal static class Gen5ShaderTranslator
                     ((word >> 17) & 1) != 0);
                 sources = opcode switch
                 {
+                    "DsAddU32" => [
+                        Gen5Operand.Vector(vectorAddress),
+                        Gen5Operand.Vector(vectorData0),
+                    ],
                     "DsWriteB32" => [
                         Gen5Operand.Vector(vectorAddress),
                         Gen5Operand.Vector(vectorData0),

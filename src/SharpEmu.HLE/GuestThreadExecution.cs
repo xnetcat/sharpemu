@@ -27,6 +27,14 @@ public interface IGuestThreadScheduler
 {
     bool SupportsGuestContextTransfer { get; }
 
+    /// <summary>
+    /// Associates a pthread identity created on the primary guest executor
+    /// with its live CPU context. Primary execution does not pass through
+    /// TryStartThread, but kernel exception delivery must still be able to
+    /// target it.
+    /// </summary>
+    void RegisterGuestThreadContext(ulong threadHandle, CpuContext context);
+
     bool TryStartThread(CpuContext creatorContext, GuestThreadStartRequest request, out string? error);
 
     bool TryJoinThread(
@@ -64,10 +72,35 @@ public interface IGuestThreadScheduler
         string reason,
         out string? error);
 
+    bool TryCallGuestFunction(
+        CpuContext callerContext,
+        ulong entryPoint,
+        ulong arg0,
+        ulong arg1,
+        ulong arg2,
+        ulong stackAddress,
+        ulong stackSize,
+        string reason,
+        out ulong returnValue,
+        out string? error);
+
     bool TryCallGuestContinuation(
         CpuContext callerContext,
         GuestCpuContinuation continuation,
         string reason,
+        out string? error);
+
+    /// <summary>
+    /// Asynchronously invokes an installed kernel exception handler as the
+    /// target guest thread. This is used by IL2CPP's stop-the-world collector:
+    /// the handler acknowledges suspension and may remain blocked until the
+    /// collecting thread resumes it.
+    /// </summary>
+    bool TryRaiseGuestException(
+        CpuContext callerContext,
+        ulong threadHandle,
+        ulong handler,
+        int exceptionType,
         out string? error);
 }
 

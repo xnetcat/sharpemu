@@ -4,6 +4,7 @@
 using System;
 using System.Runtime.InteropServices;
 using System.Threading;
+using SharpEmu.HLE;
 
 namespace SharpEmu.Core.Cpu.Native;
 

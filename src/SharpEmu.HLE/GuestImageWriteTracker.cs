@@ -249,6 +249,37 @@ public static unsafe class GuestImageWriteTracker
     }
 
     /// <summary>
+    /// Prepares pages touched by a managed HLE memory write. Native guest
+    /// stores fault and enter <see cref="TryHandleWriteFault"/> through the
+    /// POSIX signal bridge, but a managed Buffer.MemoryCopy into a protected
+    /// page is surfaced by the runtime as a fatal AccessViolation instead of
+    /// a resumable guest fault. Visit every page in the write span up front so
+    /// all overlapping texture owners are dirtied and made writable.
+    /// </summary>
+    public static void NotifyManagedWrite(ulong address, ulong byteCount)
+    {
+        if (!_enabled || address == 0 || byteCount == 0)
+        {
+            return;
+        }
+
+        var end = address > ulong.MaxValue - byteCount
+            ? ulong.MaxValue
+            : address + byteCount;
+        var candidate = address;
+        while (candidate < end)
+        {
+            _ = TryHandleWriteFault(candidate);
+            var nextPage = (candidate & ~0xFFFUL) + 0x1000UL;
+            if (nextPage <= candidate)
+            {
+                break;
+            }
+            candidate = nextPage;
+        }
+    }
+
+    /// <summary>
     /// Flushes scalar first-write records captured by the POSIX signal handler.
     /// Call only from ordinary managed execution, never from signal context.
     /// </summary>
@@ -281,6 +312,8 @@ public static unsafe class GuestImageWriteTracker
         }
 
         var ranges = Volatile.Read(ref _rangeSnapshot);
+        var writableStart = ulong.MaxValue;
+        var writableEnd = 0UL;
         for (var index = 0; index < ranges.Length; index++)
         {
             var range = ranges[index];
@@ -289,36 +322,93 @@ public static unsafe class GuestImageWriteTracker
                 continue;
             }
 
-            if (Interlocked.Exchange(ref range.Armed, 0) != 0)
+            writableStart = Math.Min(writableStart, range.Start);
+            writableEnd = Math.Max(writableEnd, range.End);
+        }
+
+        if (writableStart == ulong.MaxValue)
+        {
+            return false;
+        }
+
+        // Ranges are page-aligned and may overlap (font atlases and other
+        // suballocations commonly share pages). Unprotecting one range also
+        // makes every overlapping tracked page writable. Expand to the full
+        // transitive overlap and dirty/disarm every owner, otherwise only the
+        // first dictionary entry observes the write and the others retain a
+        // stale cached texture indefinitely.
+        var expanded = true;
+        while (expanded)
+        {
+            expanded = false;
+            for (var index = 0; index < ranges.Length; index++)
             {
-                if (Mprotect(
-                        (nint)range.Start,
-                        (nuint)(range.End - range.Start),
-                        ProtRead | ProtWrite) != 0)
+                var range = ranges[index];
+                if (range.Start >= writableEnd || range.End <= writableStart)
                 {
-                    return false;
+                    continue;
                 }
 
-                if (range.TraceLifetime &&
-                    Interlocked.CompareExchange(ref range.FirstCpuWriteSeen, 1, 0) == 0)
+                var start = Math.Min(writableStart, range.Start);
+                var end = Math.Max(writableEnd, range.End);
+                if (start != writableStart || end != writableEnd)
                 {
-                    // Signal context: capture preallocated scalar fields only.
-                    // Formatting and I/O are deferred to a locked safe path.
-                    range.FirstCpuWriteTraceSequence =
-                        Interlocked.Increment(ref _lifetimeTraceSequence);
-                    range.FirstCpuWriteTimestampNanoseconds = GetMonotonicNanoseconds();
-                    range.FirstCpuWriteAddress = faultAddress;
-                    range.FirstCpuWritePage = faultAddress & ~0xFFFUL;
-                    Volatile.Write(ref range.PendingFirstCpuWrite, 1);
-                    Volatile.Write(ref range.FirstCpuWriteSeen, 2);
+                    writableStart = start;
+                    writableEnd = end;
+                    expanded = true;
                 }
+            }
+        }
+
+        var needsUnprotect = false;
+        for (var index = 0; index < ranges.Length; index++)
+        {
+            var range = ranges[index];
+            if (range.Start < writableEnd && range.End > writableStart &&
+                Volatile.Read(ref range.Armed) != 0)
+            {
+                needsUnprotect = true;
+                break;
+            }
+        }
+
+        if (needsUnprotect &&
+            Mprotect(
+                (nint)writableStart,
+                (nuint)(writableEnd - writableStart),
+                ProtRead | ProtWrite) != 0)
+        {
+            return false;
+        }
+
+        for (var index = 0; index < ranges.Length; index++)
+        {
+            var range = ranges[index];
+            if (range.Start >= writableEnd || range.End <= writableStart)
+            {
+                continue;
+            }
+
+            var wasArmed = Interlocked.Exchange(ref range.Armed, 0) != 0;
+            if (wasArmed &&
+                range.TraceLifetime &&
+                Interlocked.CompareExchange(ref range.FirstCpuWriteSeen, 1, 0) == 0)
+            {
+                // Signal context: capture preallocated scalar fields only.
+                // Formatting and I/O are deferred to a locked safe path.
+                range.FirstCpuWriteTraceSequence =
+                    Interlocked.Increment(ref _lifetimeTraceSequence);
+                range.FirstCpuWriteTimestampNanoseconds = GetMonotonicNanoseconds();
+                range.FirstCpuWriteAddress = faultAddress;
+                range.FirstCpuWritePage = faultAddress & ~0xFFFUL;
+                Volatile.Write(ref range.PendingFirstCpuWrite, 1);
+                Volatile.Write(ref range.FirstCpuWriteSeen, 2);
             }
 
             Volatile.Write(ref range.Dirty, 1);
-            return true;
         }
 
-        return false;
+        return true;
     }
 
     private static void ArmLocked(TrackedRange range, string operation)

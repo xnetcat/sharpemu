@@ -17,6 +17,8 @@ public static class KernelPthreadExtendedCompatExports
     private const int DefaultDetachState = 0;
     private const ulong DefaultGuardSize = 0x1000UL;
     private const ulong DefaultStackSize = 0x1_00000UL;
+    private const ulong NativeGuestStackSize = 0x20_0000UL;
+    private const ulong NativeGuestStackStride = 0x100_0000UL;
     private const int DefaultInheritSched = 4;
     private const int DefaultSchedPolicy = 1;
     private const int DefaultSchedPriority = DefaultThreadPriority;
@@ -215,6 +217,13 @@ public static class KernelPthreadExtendedCompatExports
     }
 
     [SysAbiExport(
+        Nid = "+U1R4WtXvoc",
+        ExportName = "pthread_detach",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int PosixPthreadDetach(CpuContext ctx) => PthreadDetach(ctx);
+
+    [SysAbiExport(
         Nid = "How7B8Oet6k",
         ExportName = "scePthreadGetname",
         Target = Generation.Gen4 | Generation.Gen5,
@@ -389,6 +398,47 @@ public static class KernelPthreadExtendedCompatExports
     }
 
     [SysAbiExport(
+        Nid = "oIRFTjoILbg",
+        ExportName = "scePthreadSetschedparam",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int PthreadSetschedparam(CpuContext ctx) => PosixPthreadSetschedparam(ctx);
+
+    [SysAbiExport(
+        Nid = "P41kTWUS3EI",
+        ExportName = "scePthreadGetschedparam",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int PthreadGetschedparam(CpuContext ctx)
+    {
+        var thread = ctx[CpuRegister.Rdi];
+        var policyAddress = ctx[CpuRegister.Rsi];
+        var schedParamAddress = ctx[CpuRegister.Rdx];
+        if (thread == 0 || policyAddress == 0 || schedParamAddress == 0)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        int policy;
+        int priority;
+        lock (_stateGate)
+        {
+            var state = GetOrCreateThreadStateLocked(thread);
+            policy = state.Attributes.SchedPolicy;
+            priority = state.Priority;
+        }
+
+        if (!TryWriteInt32(ctx, policyAddress, policy) ||
+            !TryWriteInt32(ctx, schedParamAddress, priority))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
         Nid = "nsYoNRywwNg",
         ExportName = "scePthreadAttrInit",
         Target = Generation.Gen4 | Generation.Gen5,
@@ -482,12 +532,50 @@ public static class KernelPthreadExtendedCompatExports
         lock (_stateGate)
         {
             var threadState = GetOrCreateThreadStateLocked(thread);
+
+			// The native executor maps guest pthread stacks itself, after the
+			// kernel-facing thread object has been created.  Report that live
+			// mapping when a thread asks for its own attributes.  IL2CPP's
+			// conservative collector uses these two fields to register the stack;
+			// returning the default null address lets it recycle objects that are
+			// still reachable only from guest registers/stack frames.
+			if (thread == KernelPthreadState.GetCurrentThreadHandle() &&
+				TryInferNativeGuestStack(ctx[CpuRegister.Rsp], out var stackAddress))
+			{
+				threadState.Attributes = threadState.Attributes with
+				{
+					StackAddress = stackAddress,
+					StackSize = NativeGuestStackSize,
+				};
+			}
             _attrStates[outAttrAddress] = threadState.Attributes;
         }
 
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
+
+	private static bool TryInferNativeGuestStack(ulong stackPointer, out ulong stackAddress)
+	{
+		stackAddress = 0;
+		var candidate = stackPointer & ~(NativeGuestStackStride - 1);
+		if (stackPointer - candidate >= NativeGuestStackSize)
+		{
+			return false;
+		}
+
+		var highestStack = OperatingSystem.IsWindows()
+			? 0x00007FFF_F000_0000UL
+			: 0x00006FFF_F000_0000UL;
+		var lowestStack = highestStack - (63 * NativeGuestStackStride);
+		if (candidate < lowestStack || candidate > highestStack)
+		{
+			return false;
+		}
+
+		stackAddress = candidate;
+		return true;
+	}
 
     [SysAbiExport(
         Nid = "8+s5BzZjxSg",

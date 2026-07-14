@@ -249,6 +249,33 @@ public sealed partial class DirectExecutionBackend
 				Console.Error.WriteLine($"[LOADER][INFO]     [rsp+0x{i * 8:X2}] @0x{stackAddr:X16} = 0x{value:X16}");
 			}
 
+			if (string.Equals(
+					Environment.GetEnvironmentVariable("SHARPEMU_DUMP_FAULT_STACK_WINDOW"),
+					"1",
+					StringComparison.Ordinal))
+			{
+				Console.Error.WriteLine("[LOADER][INFO]   Full fault stack window (RSP-0x300..RSP+0x100):");
+				var windowStart = rsp >= 0x300 ? rsp - 0x300 : 0;
+				for (var stackAddr = windowStart; stackAddr < rsp + 0x100; stackAddr += 8)
+				{
+					if (!TryReadHostQword(stackAddr, out var value))
+					{
+						continue;
+					}
+
+					var relative = unchecked((long)(stackAddr - rsp));
+					var relativeText = relative >= 0
+						? $"+0x{relative:X}"
+						: $"-0x{-relative:X}";
+					var symbolText = TryFormatNearestRuntimeSymbol(value, out var stackSymbol)
+						? $" [{stackSymbol}]"
+						: string.Empty;
+					Console.Error.WriteLine(
+						$"[LOADER][INFO]     [rsp{relativeText}] " +
+						$"@0x{stackAddr:X16} = 0x{value:X16}{symbolText}");
+				}
+			}
+
 			DumpPointerWindow("fault-register-rbx", rbx, 0x60);
 			DumpPointerWindow("fault-register-rsi", rsi, 0x60);
 			DumpPointerWindow("fault-register-rdi", rdi, 0x60);

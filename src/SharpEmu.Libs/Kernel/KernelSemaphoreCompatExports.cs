@@ -115,7 +115,7 @@ public static class KernelSemaphoreCompatExports
                     _ = TryWriteUInt32(ctx, timeoutAddress, timeoutUsec);
                 }
 
-                TraceSemaphore($"wait handle=0x{handle:X8} name='{semaphore.Name}' need={needCount} count={semaphore.Count}");
+                TraceSemaphore($"wait handle=0x{handle:X8} name='{semaphore.Name}' need={needCount} count={semaphore.Count} timeout={(timeoutAddress == 0 ? "infinite" : timeoutUsec)}");
                 return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
             }
 
@@ -176,7 +176,7 @@ public static class KernelSemaphoreCompatExports
                 WakePredicate,
                 deadline))
         {
-            TraceSemaphore($"wait-block handle=0x{handle:X8} name='{semaphore.Name}' need={needCount} count={semaphore.Count} waiters={semaphore.WaitingThreads}");
+            TraceSemaphore($"wait-block handle=0x{handle:X8} name='{semaphore.Name}' need={needCount} count={semaphore.Count} timeout={(timeoutAddress == 0 ? "infinite" : timeoutUsec)} waiters={semaphore.WaitingThreads} {FormatCallSite(ctx)}");
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
         }
 
@@ -198,6 +198,9 @@ public static class KernelSemaphoreCompatExports
             : long.MaxValue;
         lock (semaphore.Gate)
         {
+            TraceSemaphore(
+                $"wait-host-block handle=0x{handle:X8} name='{semaphore.Name}' need={needCount} " +
+                $"count={semaphore.Count} timeout={(timeoutAddress == 0 ? "infinite" : timeoutUsec)} {FormatCallSite(ctx)}");
             while (semaphore.Count < needCount)
             {
                 var remaining = deadlineMs - Environment.TickCount64;
@@ -213,6 +216,8 @@ public static class KernelSemaphoreCompatExports
 
             semaphore.Count -= needCount;
             semaphore.WaitingThreads = Math.Max(0, semaphore.WaitingThreads - 1);
+            TraceSemaphore(
+                $"wait-host-wake handle=0x{handle:X8} name='{semaphore.Name}' need={needCount} count={semaphore.Count} {FormatCallSite(ctx)}");
             if (timeoutAddress != 0)
             {
                 _ = TryWriteUInt32(ctx, timeoutAddress, 0);
@@ -288,7 +293,7 @@ public static class KernelSemaphoreCompatExports
             semaphore.Count += signalCount;
             // Wake host-thread waiters parked in the fallback path.
             Monitor.PulseAll(semaphore.Gate);
-            TraceSemaphore($"signal handle=0x{handle:X8} name='{semaphore.Name}' signal={signalCount} count={semaphore.Count} waiters={semaphore.WaitingThreads}");
+            TraceSemaphore($"signal handle=0x{handle:X8} name='{semaphore.Name}' signal={signalCount} count={semaphore.Count} waiters={semaphore.WaitingThreads} {FormatCallSite(ctx)}");
         }
 
         // Wake cooperatively-blocked guest threads; their wake predicate
@@ -415,5 +420,11 @@ public static class KernelSemaphoreCompatExports
         {
             Console.Error.WriteLine($"[LOADER][TRACE] sema.{message}");
         }
+    }
+
+    private static string FormatCallSite(CpuContext ctx)
+    {
+        _ = ctx.TryReadUInt64(ctx[CpuRegister.Rsp], out var returnAddress);
+        return $"guest=0x{GuestThreadExecution.CurrentGuestThreadHandle:X16} ret=0x{returnAddress:X16}";
     }
 }

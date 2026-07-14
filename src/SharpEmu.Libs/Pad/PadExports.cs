@@ -14,10 +14,11 @@ public static class PadExports
     private const int OrbisPadErrorNotInitialized = unchecked((int)0x80920005);
     private const int OrbisPadErrorDeviceNotConnected = unchecked((int)0x80920007);
     private const int OrbisPadErrorDeviceNoHandle = unchecked((int)0x80920008);
-    private const int PrimaryUserId = 1;
+    private const int PrimaryUserId = 0x10000000;
     private const int StandardPortType = 0;
     private const int PrimaryPadHandle = 1;
     private const int ControllerInformationSize = 0x1C;
+    private const int DeviceClassExtendedInformationSize = 0x14;
     private const int PadDataSize = 0x78;
 
     private static bool _initialized;
@@ -30,6 +31,7 @@ public static class PadExports
     public static int PadInit(CpuContext ctx)
     {
         _initialized = true;
+        Trace("init result=0");
         return SetReturn(ctx, 0);
     }
 
@@ -46,19 +48,23 @@ public static class PadExports
         var parameterAddress = ctx[CpuRegister.Rcx];
         if (!_initialized)
         {
+            Trace($"open user={userId} type={type} index={index} result=0x{unchecked((uint)OrbisPadErrorNotInitialized):X8}");
             return SetReturn(ctx, OrbisPadErrorNotInitialized);
         }
 
         if (userId == -1)
         {
+            Trace($"open user={userId} type={type} index={index} result=0x{unchecked((uint)OrbisPadErrorDeviceNoHandle):X8}");
             return SetReturn(ctx, OrbisPadErrorDeviceNoHandle);
         }
 
         if (userId != PrimaryUserId || type != StandardPortType || index != 0 || parameterAddress != 0)
         {
+            Trace($"open user={userId} type={type} index={index} param=0x{parameterAddress:X16} result=0x{unchecked((uint)OrbisPadErrorDeviceNotConnected):X8}");
             return SetReturn(ctx, OrbisPadErrorDeviceNotConnected);
         }
 
+        Trace($"open user={userId} type={type} index={index} result={PrimaryPadHandle}");
         Console.Error.WriteLine("[LOADER][INFO] Keyboard controls: Arrow keys = D-pad, WASD = left stick, IJKL = right stick, Z/Enter = Cross, X/Esc = Circle, C = Square, V = Triangle, Q = L1, E = R1, R = L2, F = R2, Tab/Backspace = Options");
         return SetReturn(ctx, PrimaryPadHandle);
     }
@@ -77,6 +83,56 @@ public static class PadExports
     }
 
     [SysAbiExport(
+        Nid = "AcslpN1jHR8",
+        ExportName = "scePadDeviceClassGetExtendedInformation",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libScePad")]
+    public static int PadDeviceClassGetExtendedInformation(CpuContext ctx)
+    {
+        var handle = unchecked((int)ctx[CpuRegister.Rdi]);
+        var informationAddress = ctx[CpuRegister.Rsi];
+        if (handle != PrimaryPadHandle)
+        {
+            Trace($"get_device_class_extended_information handle={handle} result=0x{unchecked((uint)OrbisPadErrorInvalidHandle):X8}");
+            return SetReturn(ctx, OrbisPadErrorInvalidHandle);
+        }
+
+        if (informationAddress == 0)
+        {
+            Trace($"get_device_class_extended_information handle={handle} out=0 result=invalid_argument");
+            return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        // Standard controllers have device class 0 and no class-specific
+        // payload. Unity requires this call to succeed before it keeps the
+        // signed-in user's PS5 input slot alive.
+        Span<byte> information = stackalloc byte[DeviceClassExtendedInformationSize];
+        information.Clear();
+        if (!ctx.Memory.TryWrite(informationAddress, information))
+        {
+            Trace($"get_device_class_extended_information handle={handle} out=0x{informationAddress:X16} result=memory_fault");
+            return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        Trace($"get_device_class_extended_information handle={handle} out=0x{informationAddress:X16} result=0");
+        return SetReturn(ctx, 0);
+    }
+
+    [SysAbiExport(
+        Nid = "6ncge5+l5Qs",
+        ExportName = "scePadClose",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libScePad")]
+    public static int PadClose(CpuContext ctx)
+    {
+        var handle = unchecked((int)ctx[CpuRegister.Rdi]);
+        Trace($"close handle={handle}");
+        return handle == PrimaryPadHandle
+            ? SetReturn(ctx, 0)
+            : SetReturn(ctx, OrbisPadErrorInvalidHandle);
+    }
+
+    [SysAbiExport(
         Nid = "gjP9-KQzoUk",
         ExportName = "scePadGetControllerInformation",
         Target = Generation.Gen4 | Generation.Gen5,
@@ -87,6 +143,7 @@ public static class PadExports
         var informationAddress = ctx[CpuRegister.Rsi];
         if (handle != PrimaryPadHandle)
         {
+            Trace($"get_controller_information handle={handle} result=0x{unchecked((uint)OrbisPadErrorInvalidHandle):X8}");
             return SetReturn(ctx, OrbisPadErrorInvalidHandle);
         }
 
@@ -96,19 +153,25 @@ public static class PadExports
         }
 
         Span<byte> information = stackalloc byte[ControllerInformationSize];
-        BinaryPrimitives.WriteSingleLittleEndian(information[0x00..], 44.86f);
+        information.Clear();
+        BinaryPrimitives.WriteSingleLittleEndian(information[0x00..], 1.0f);
         BinaryPrimitives.WriteUInt16LittleEndian(information[0x04..], 1920);
-        BinaryPrimitives.WriteUInt16LittleEndian(information[0x06..], 943);
-        information[0x08] = 30;
-        information[0x09] = 30;
+        BinaryPrimitives.WriteUInt16LittleEndian(information[0x06..], 950);
+        information[0x08] = 1;
+        information[0x09] = 1;
         information[0x0A] = StandardPortType;
         information[0x0B] = 1;
         information[0x0C] = 1;
-        BinaryPrimitives.WriteInt32LittleEndian(information[0x10..], 0);
+        information[0x0D] = 0;
 
-        return ctx.Memory.TryWrite(informationAddress, information)
-            ? SetReturn(ctx, 0)
-            : SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        if (!ctx.Memory.TryWrite(informationAddress, information))
+        {
+            Trace($"get_controller_information handle={handle} out=0x{informationAddress:X16} result=memory_fault");
+            return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        Trace($"get_controller_information handle={handle} out=0x{informationAddress:X16} result=0");
+        return SetReturn(ctx, 0);
     }
 
     [SysAbiExport(
@@ -237,6 +300,16 @@ public static class PadExports
 
     private static readonly long PadStartTimestamp = Stopwatch.GetTimestamp();
     private static readonly double[] AutoCrossTimes = ParseAutoCrossTimes();
+    private static readonly double AutoCrossHoldSeconds = ParseAutoCrossHoldSeconds();
+    private static readonly bool AutoCrossCatchUp = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_AUTO_CROSS_CATCH_UP"),
+        "1",
+        StringComparison.Ordinal);
+    private static readonly object AutoCrossGate = new();
+    private static long _autoCrossLoggedMask;
+    private static int _autoCrossNextIndex;
+    private static double _autoCrossActiveUntil;
+    private static double _autoCrossReleaseUntil;
 
     private static double[] ParseAutoCrossTimes()
     {
@@ -269,15 +342,70 @@ public static class PadExports
         }
 
         var elapsed = (Stopwatch.GetTimestamp() - PadStartTimestamp) / (double)Stopwatch.Frequency;
-        foreach (var time in times)
+        if (AutoCrossCatchUp)
         {
-            if (elapsed >= time && elapsed < time + 0.4)
+            lock (AutoCrossGate)
             {
+                if (elapsed < _autoCrossActiveUntil)
+                {
+                    return true;
+                }
+                if (elapsed < _autoCrossReleaseUntil ||
+                    _autoCrossNextIndex >= times.Length ||
+                    elapsed < times[_autoCrossNextIndex])
+                {
+                    return false;
+                }
+
+                var index = _autoCrossNextIndex++;
+                _autoCrossActiveUntil = elapsed + AutoCrossHoldSeconds;
+                _autoCrossReleaseUntil = _autoCrossActiveUntil + 0.5;
+                LogAutoCross(index, times[index], elapsed, catchUp: true);
+                return true;
+            }
+        }
+
+        for (var index = 0; index < times.Length; index++)
+        {
+            var time = times[index];
+            if (elapsed >= time && elapsed < time + AutoCrossHoldSeconds)
+            {
+                LogAutoCross(index, time, elapsed, catchUp: false);
                 return true;
             }
         }
 
         return false;
+    }
+
+    private static void LogAutoCross(int index, double scheduled, double elapsed, bool catchUp)
+    {
+        if (index >= 64)
+        {
+            return;
+        }
+
+        var bit = 1L << index;
+        var previous = Interlocked.Or(ref _autoCrossLoggedMask, bit);
+        if ((previous & bit) == 0)
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] pad.auto_cross index={index} " +
+                $"scheduled={scheduled:F3}s elapsed={elapsed:F3}s catch_up={catchUp}");
+        }
+    }
+
+    private static double ParseAutoCrossHoldSeconds()
+    {
+        var raw = Environment.GetEnvironmentVariable("SHARPEMU_AUTO_CROSS_HOLD_MS");
+        return double.TryParse(
+                   raw,
+                   System.Globalization.NumberStyles.Float,
+                   System.Globalization.CultureInfo.InvariantCulture,
+                   out var milliseconds) &&
+               milliseconds is >= 1 and <= 10_000
+            ? milliseconds / 1000.0
+            : 0.4;
     }
 
     private static int SetReturn(CpuContext ctx, int result)
@@ -417,4 +545,19 @@ public static class PadExports
 
     private static byte RampToByte(int axis) =>
         (byte)Math.Clamp((int)MathF.Round(128f + _analogRamp[axis] * 127f), 0, 255);
+
+    private static void Trace(string message)
+    {
+        if (string.Equals(
+                Environment.GetEnvironmentVariable("SHARPEMU_LOG_PAD"),
+                "1",
+                StringComparison.Ordinal))
+        {
+            var returnRip = GuestThreadExecution.TryGetCurrentImportCallFrame(out var frame)
+                ? frame.ReturnRip
+                : 0;
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] pad.{message} ret=0x{returnRip:X16}");
+        }
+    }
 }

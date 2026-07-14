@@ -635,6 +635,9 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
 
     public bool TryWrite(ulong virtualAddress, ReadOnlySpan<byte> source)
     {
+        GuestImageWriteTracker.NotifyManagedWrite(
+            virtualAddress,
+            checked((ulong)source.Length));
         var requiresExclusiveAccess = false;
         _gate.EnterReadLock();
         try

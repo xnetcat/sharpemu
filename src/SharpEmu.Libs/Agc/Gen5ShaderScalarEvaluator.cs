@@ -3,6 +3,7 @@
 
 using SharpEmu.HLE;
 using SharpEmu.Libs.Kernel;
+using SharpEmu.Libs.VideoOut;
 using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Numerics;
@@ -113,7 +114,8 @@ internal static class Gen5ShaderScalarEvaluator
         Gen5ShaderState state,
         out Gen5ShaderEvaluation evaluation,
         out string error,
-        bool resolveVertexInputs = false)
+        bool resolveVertexInputs = false,
+        uint? requiredVertexRecordCount = null)
     {
         evaluation = default!;
         error = string.Empty;
@@ -450,29 +452,51 @@ internal static class Gen5ShaderScalarEvaluator
                 if (resolveVertexInputs &&
                     IsVertexFetchCandidate(instruction, bufferMemory, bufferDescriptor))
                 {
-                    if (!TryReadGlobalMemory(
-                            ctx,
-                            bufferDescriptor.BaseAddress,
-                            bufferDescriptor.SizeBytes,
-                            out var vertexData,
-                            out var vertexDataLength))
+                    if (instruction.Sources.Count <= 2 ||
+                        !TryEvaluateScalarOperand(
+                            instruction.Sources[2],
+                            scalarRegisters,
+                            out var scalarOffset))
                     {
                         error =
-                            $"vertex-buffer-read-failed pc=0x{instruction.Pc:X} " +
-                            $"address=0x{bufferDescriptor.BaseAddress:X16} " +
-                            $"bytes={bufferDescriptor.SizeBytes} " +
-                            $"stride={bufferDescriptor.Stride} records={bufferDescriptor.NumRecords}";
+                            $"vertex-input-offset-unresolved pc=0x{instruction.Pc:X} " +
+                            $"s{bufferMemory.ScalarResource}";
                         return false;
+                    }
+
+                    var bindingOffset = unchecked(
+                        (uint)bufferMemory.OffsetBytes + scalarOffset);
+                    var vertexReadBytes = bufferDescriptor.SizeBytes;
+                    if (requiredVertexRecordCount is > 0)
+                    {
+                        // Resource descriptors commonly span an entire UE vertex
+                        // arena (several MiB), while one draw references only a
+                        // few hundred records. Preserve the indexed draw's exact
+                        // reachable byte range instead of snapshotting the full
+                        // arena for every attribute of every draw.
+                        var lastRecordOffset =
+                            (ulong)(requiredVertexRecordCount.Value - 1) *
+                            bufferDescriptor.Stride;
+                        var elementBytes =
+                            (ulong)Math.Max(bufferMemory.DwordCount, 1u) * sizeof(uint);
+                        var recordSpan = Math.Max(
+                            (ulong)bufferDescriptor.Stride,
+                            SaturatingAdd(bindingOffset, elementBytes));
+                        var requiredBytes = SaturatingAdd(
+                            lastRecordOffset,
+                            recordSpan);
+                        vertexReadBytes = Math.Min(vertexReadBytes, requiredBytes);
                     }
 
                     if (!TryCreateVertexInputBinding(
                             instruction,
                             bufferMemory,
                             bufferDescriptor,
-                            vertexData,
-                            vertexDataLength,
+                            checked((int)Math.Min(
+                                vertexReadBytes,
+                                (ulong)MaxGlobalMemoryBindingBytes)),
                             (uint)vertexInputBindings.Count,
-                            scalarRegisters,
+                            scalarOffset,
                             out var vertexInputBinding))
                     {
                         error =
@@ -629,6 +653,20 @@ internal static class Gen5ShaderScalarEvaluator
             }
         }
 
+        if (vertexInputBindings.Count != 0)
+        {
+            if (!TryCaptureVertexInputData(
+                    ctx,
+                    vertexInputBindings,
+                    out var capturedVertexInputs,
+                    out error))
+            {
+                return false;
+            }
+
+            vertexInputBindings = capturedVertexInputs;
+        }
+
         evaluation = new Gen5ShaderEvaluation(
             initialScalarRegisters,
             finalScalarRegisters,
@@ -655,18 +693,14 @@ internal static class Gen5ShaderScalarEvaluator
         Gen5ShaderInstruction instruction,
         Gen5BufferMemoryControl control,
         BufferDescriptor descriptor,
-        byte[] data,
-        int dataLength,
+        int desiredDataLength,
         uint location,
-        uint[] scalarRegisters,
+        uint scalarOffset,
         out Gen5VertexInputBinding binding)
     {
         binding = default!;
-        if (!IsVertexFetchCandidate(instruction, control, descriptor) ||
-            instruction.Sources.Count <= 2 ||
-            !TryEvaluateScalarOperand(instruction.Sources[2], scalarRegisters, out var scalarOffset))
+        if (!IsVertexFetchCandidate(instruction, control, descriptor))
         {
-            System.Buffers.ArrayPool<byte>.Shared.Return(data);
             return false;
         }
 
@@ -683,11 +717,93 @@ internal static class Gen5ShaderScalarEvaluator
             descriptor.BaseAddress,
             bindingStride,
             bindingOffset,
-            data,
-            dataLength,
-            DataPooled: true);
+            Data: [],
+            DataLength: desiredDataLength,
+            DataPooled: false);
         return true;
     }
+
+    private static bool TryCaptureVertexInputData(
+        CpuContext ctx,
+        IReadOnlyList<Gen5VertexInputBinding> pending,
+        out List<Gen5VertexInputBinding> captured,
+        out string error)
+    {
+        captured = new List<Gen5VertexInputBinding>(pending.Count);
+        error = string.Empty;
+        var ordered = pending
+            .OrderBy(static binding => binding.Stride)
+            .ThenBy(static binding => binding.BaseAddress)
+            .ToArray();
+
+        for (var first = 0; first < ordered.Length;)
+        {
+            var stride = ordered[first].Stride;
+            var start = ordered[first].BaseAddress;
+            var end = SaturatingAdd(start, (ulong)ordered[first].DataLength);
+            var last = first + 1;
+            while (last < ordered.Length && ordered[last].Stride == stride)
+            {
+                var candidate = ordered[last];
+                // Attribute descriptors for an interleaved stream commonly
+                // point a few bytes into the same record. Merge overlapping
+                // spans (and one-record adjacency) so all attributes share one
+                // captured array and one host vertex buffer.
+                if (candidate.BaseAddress > SaturatingAdd(end, stride))
+                {
+                    break;
+                }
+
+                end = Math.Max(
+                    end,
+                    SaturatingAdd(candidate.BaseAddress, (ulong)candidate.DataLength));
+                last++;
+            }
+
+            var byteCount = end > start
+                ? Math.Min(end - start, (ulong)MaxGlobalMemoryBindingBytes)
+                : 0;
+            if (byteCount == 0 ||
+                !TryReadGlobalMemory(ctx, start, byteCount, out var data, out var dataLength))
+            {
+                foreach (var binding in captured)
+                {
+                    if (binding.DataPooled)
+                    {
+                        VulkanVideoPresenter.GuestDataPool.Return(binding.Data);
+                    }
+                }
+
+                error =
+                    $"vertex-buffer-read-failed address=0x{start:X16} " +
+                    $"bytes={byteCount} stride={stride}";
+                captured.Clear();
+                return false;
+            }
+
+            for (var index = first; index < last; index++)
+            {
+                var binding = ordered[index];
+                var delta = binding.BaseAddress - start;
+                captured.Add(binding with
+                {
+                    BaseAddress = start,
+                    OffsetBytes = checked((uint)(delta + binding.OffsetBytes)),
+                    Data = data,
+                    DataLength = dataLength,
+                    DataPooled = index == first,
+                });
+            }
+
+            first = last;
+        }
+
+        captured.Sort(static (left, right) => left.Location.CompareTo(right.Location));
+        return true;
+    }
+
+    private static ulong SaturatingAdd(ulong left, ulong right) =>
+        ulong.MaxValue - left < right ? ulong.MaxValue : left + right;
 
     private static bool IsVertexFetchCandidate(
         Gen5ShaderInstruction instruction,
@@ -806,7 +922,7 @@ internal static class Gen5ShaderScalarEvaluator
         out byte[] data,
         out int dataLength)
     {
-        var rented = System.Buffers.ArrayPool<byte>.Shared.Rent((int)MaxGlobalMemoryBindingBytes);
+        var rented = VulkanVideoPresenter.GuestDataPool.Rent((int)MaxGlobalMemoryBindingBytes);
         for (var size = MaxGlobalMemoryBindingBytes; size >= 4096; size >>= 1)
         {
             if (ctx.Memory.TryRead(baseAddress, rented.AsSpan(0, size)))
@@ -817,7 +933,7 @@ internal static class Gen5ShaderScalarEvaluator
             }
         }
 
-        System.Buffers.ArrayPool<byte>.Shared.Return(rented);
+        VulkanVideoPresenter.GuestDataPool.Return(rented);
         data = [];
         dataLength = 0;
         return false;
@@ -843,7 +959,7 @@ internal static class Gen5ShaderScalarEvaluator
             return false;
         }
 
-        var rented = System.Buffers.ArrayPool<byte>.Shared.Rent(
+        var rented = VulkanVideoPresenter.GuestDataPool.Rent(
             Math.Max((int)cappedSize, sizeof(uint)));
         if (cappedSize < sizeof(uint))
         {
@@ -857,7 +973,7 @@ internal static class Gen5ShaderScalarEvaluator
                 return true;
             }
 
-            System.Buffers.ArrayPool<byte>.Shared.Return(rented);
+            VulkanVideoPresenter.GuestDataPool.Return(rented);
             return false;
         }
 
@@ -881,7 +997,7 @@ internal static class Gen5ShaderScalarEvaluator
             candidateSize = Math.Max(candidateSize / 2, sizeof(uint));
         }
 
-        System.Buffers.ArrayPool<byte>.Shared.Return(rented);
+        VulkanVideoPresenter.GuestDataPool.Return(rented);
         return false;
     }
 

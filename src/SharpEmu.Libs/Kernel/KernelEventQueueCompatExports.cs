@@ -475,6 +475,60 @@ public static class KernelEventQueueCompatExports
         return triggeredCount;
     }
 
+    /// <summary>
+    /// Queues one event for every registration using <paramref name="filter"/>.
+    /// Unlike <see cref="TriggerRegisteredEvents"/>, this preserves distinct
+    /// event identifiers registered on the same queue. AGC driver completion
+    /// queues use this form because the driver, rather than a packet-provided
+    /// identifier, announces that the whole submission reached end-of-pipe.
+    /// </summary>
+    public static int TriggerRegisteredEventsDistinct(short filter)
+    {
+        HashSet<ulong>? wakeHandles = null;
+        var triggeredCount = 0;
+        lock (_eventQueueGate)
+        {
+            foreach (var (handle, registrations) in _registeredEvents)
+            {
+                foreach (var registration in registrations.Values)
+                {
+                    if (registration.Filter != filter)
+                    {
+                        continue;
+                    }
+
+                    if (!_pendingEvents.TryGetValue(handle, out var queue))
+                    {
+                        queue = new LinkedList<KernelQueuedEvent>();
+                        _pendingEvents[handle] = queue;
+                    }
+
+                    QueueOrUpdateEvent(
+                        queue,
+                        new KernelQueuedEvent(
+                            registration.Ident,
+                            registration.Filter,
+                            0,
+                            1,
+                            registration.Ident,
+                            registration.UserData));
+                    (wakeHandles ??= []).Add(handle);
+                    triggeredCount++;
+                }
+            }
+        }
+
+        if (wakeHandles is not null)
+        {
+            foreach (var handle in wakeHandles)
+            {
+                WakeEventQueue(handle);
+            }
+        }
+
+        return triggeredCount;
+    }
+
     public static bool TriggerDisplayEvent(
         ulong handle,
         ulong ident,

@@ -381,7 +381,9 @@ public static class KernelEventFlagCompatExports
             state.Bits = setPattern;
             state.WaitingThreads = 0;
             Monitor.PulseAll(state.Gate);
-            TraceEventFlag($"cancel handle=0x{handle:X16} bits=0x{setPattern:X16}");
+            TraceEventFlag(
+                $"cancel handle=0x{handle:X16} bits=0x{setPattern:X16} " +
+                $"guest_thread=0x{GuestThreadExecution.CurrentGuestThreadHandle:X16} ret=0x{GetCurrentReturnRip():X16}");
         }
 
         return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);

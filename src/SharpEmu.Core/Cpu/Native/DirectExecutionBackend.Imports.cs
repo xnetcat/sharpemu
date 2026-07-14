@@ -2,13 +2,17 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using System;
+using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Text;
 using System.Threading;
 using SharpEmu.Core.Cpu;
 using SharpEmu.HLE;
+using SharpEmu.Libs.Kernel;
 
 namespace SharpEmu.Core.Cpu.Native;
 
@@ -26,9 +30,12 @@ public sealed partial class DirectExecutionBackend
 	private const int ImportSavedFpuControlOffset = -148;
 	private const int ImportSavedXmmOffset = -128;
 	private const int ImportVectorRegisterCount = 8;
+	private const ulong StackCheckGuardValue = 0xC0DEC0DECAFEBA00UL;
+	private static long _canaryReturnRecoveries;
 
 	private readonly object _importResultLogSampleGate = new();
 	private readonly Dictionary<string, int> _importResultLogSamples = new(StringComparer.Ordinal);
+	private int _il2CppExceptionDiagnosticCount;
 
 	private static ulong ImportDispatchGatewayManaged(nint backendHandle, int importIndex, nint argPackPtr)
 	{
@@ -79,6 +86,10 @@ public sealed partial class DirectExecutionBackend
 		void* contextRecord = ((EXCEPTION_POINTERS*)exceptionInfo)->ContextRecord;
 		ulong value = ReadCtxU64(contextRecord, 248);
 		ulong value2 = (ulong)exceptionRecord->ExceptionAddress;
+		if (value == StackCheckGuardValue && TryRecoverCanaryReturn(contextRecord))
+		{
+			return -1;
+		}
 		if (!IsUnresolvedSentinel(value) && !IsUnresolvedSentinel(value2))
 		{
 			return 0;
@@ -93,6 +104,41 @@ public sealed partial class DirectExecutionBackend
 			return -1;
 		}
 		return 0;
+	}
+
+	private unsafe static bool TryRecoverCanaryReturn(void* contextRecord)
+	{
+		var rsp = ReadCtxU64(contextRecord, CTX_RSP);
+		var interruptedReturn = ReadCtxU64(contextRecord, CTX_RBP);
+		var interruptedFrame = rsp + 0x18;
+		if (!IsLikelyReturnAddress(interruptedReturn) ||
+			rsp < sizeof(ulong) ||
+			!TryReadStackU64(interruptedFrame, out var callerRbp) ||
+			!TryReadStackU64(rsp + 0x20, out var callerReturn) ||
+			callerRbp <= rsp || callerRbp - rsp > 0x10000 ||
+			!IsLikelyReturnAddress(callerReturn))
+		{
+			return false;
+		}
+
+		// The guest unwind reached this callback return one stack slot late: the
+		// final pop loaded the interrupted return into rbp and ret consumed the
+		// stack guard. Resume at that return with the outer frame pointer rebuilt
+		// from the still-intact caller frame on the stack.
+		WriteCtxU64(contextRecord, CTX_RBP, interruptedFrame);
+		WriteCtxU64(contextRecord, CTX_RSP, rsp - sizeof(ulong));
+		WriteCtxU64(contextRecord, CTX_RIP, interruptedReturn);
+		var recoveryCount = Interlocked.Increment(ref _canaryReturnRecoveries);
+		if (recoveryCount <= 4 || recoveryCount % 1000 == 0)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][WARN] Recovered malformed canary return #{recoveryCount}: " +
+				$"resume=0x{interruptedReturn:X16} rsp=0x{rsp - sizeof(ulong):X16} " +
+				$"rbp=0x{interruptedFrame:X16} caller_rbp=0x{callerRbp:X16} " +
+				$"caller=0x{callerReturn:X16}");
+			Console.Error.Flush();
+		}
+		return true;
 	}
 
 	private unsafe ulong DispatchImport(int importIndex, nint argPackPtr)
@@ -158,6 +204,25 @@ public sealed partial class DirectExecutionBackend
 		ulong value7 = cpuContext[CpuRegister.R14];
 		ulong value8 = cpuContext[CpuRegister.R15];
 		ulong num7 = *(ulong*)(argPackPtr + 96);
+		var importStackPointer = (ulong)argPackPtr + 96;
+		var probeTarget = (_probeImportReturnAddress != 0 && num7 == _probeImportReturnAddress) ||
+			(string.Equals(importStubEntry.Nid, "2Z+PpY6CaJg", StringComparison.Ordinal) &&
+			 importStackPointer >= 0x00006FFFAC1FF000UL &&
+			 importStackPointer < 0x00006FFFAC200000UL);
+		if (probeTarget &&
+			Interlocked.Increment(ref _probeImportReturnAddressCount) <= 2048)
+		{
+			var frameValue = TryReadStackU64(value4, out var savedRbp) ? savedRbp : 0;
+			var frameReturn = TryReadStackU64(value4 + sizeof(ulong), out var savedReturn)
+				? savedReturn
+				: 0;
+			Console.Error.WriteLine(
+				$"[LOADER][TRACE] import-return-address-probe " +
+				$"thread=0x{GuestThreadExecution.CurrentGuestThreadHandle:X16} " +
+				$"nid={importStubEntry.Nid} ret=0x{num7:X16} " +
+				$"rsp=0x{(ulong)argPackPtr + 96:X16} rbp=0x{value4:X16} " +
+				$"saved_rbp=0x{frameValue:X16} saved_ret=0x{frameReturn:X16}");
+		}
 		var isGuestWorker = GuestThreadExecution.IsGuestThread;
 		if (!IsLikelyReturnAddress(num7))
 		{
@@ -419,6 +484,9 @@ public sealed partial class DirectExecutionBackend
 			{
 				GuestThreadExecution.RestoreImportCallFrame(previousImportCallFrame);
 			}
+			DeliverPendingGuestExceptionAtSafePoint(
+				cpuContext,
+				CaptureImportBoundaryContinuation(cpuContext, argPackPtr, num7));
 			StoreImportVectorReturn(cpuContext, argPackPtr);
 			if (dispatchResolved &&
 				orbisGen2Result == OrbisGen2Result.ORBIS_GEN2_OK &&
@@ -429,6 +497,15 @@ public sealed partial class DirectExecutionBackend
 			if (!dispatchResolved)
 			{
 				LastError = "Missing HLE export for NID: " + importStubEntry.Nid;
+				if (string.Equals(importStubEntry.Nid, "cfwBSQyr5Ys", StringComparison.Ordinal) &&
+					string.Equals(
+						Environment.GetEnvironmentVariable("SHARPEMU_LOG_IL2CPP_EXCEPTION"),
+						"1",
+						StringComparison.Ordinal) &&
+					Interlocked.Increment(ref _il2CppExceptionDiagnosticCount) <= 4)
+				{
+					DumpIl2CppExceptionDiagnostic(cpuContext, value, num7);
+				}
 				Console.Error.WriteLine(
 					$"[LOADER][WARN] Import#{num} unresolved: nid={importStubEntry.Nid} ret=0x{num7:X16} " +
 					$"rdi=0x{value:X16} rsi=0x{value2:X16} rdx=0x{num3:X16} rcx=0x{num4:X16} r8=0x{num5:X16} r9=0x{num6:X16}");
@@ -539,6 +616,24 @@ public sealed partial class DirectExecutionBackend
 				}
 			}
 			var guestReturnValue = cpuContext[CpuRegister.Rax];
+			if (probeTarget)
+			{
+				ulong finalReturnSlot;
+				try
+				{
+					finalReturnSlot = *(ulong*)(argPackPtr + 96);
+				}
+				catch
+				{
+					finalReturnSlot = 0;
+				}
+				Console.Error.WriteLine(
+					$"[LOADER][TRACE] import-return-address-probe-exit " +
+					$"thread=0x{GuestThreadExecution.CurrentGuestThreadHandle:X16} " +
+					$"nid={importStubEntry.Nid} original=0x{num7:X16} " +
+					$"final=0x{finalReturnSlot:X16} rsp=0x{(ulong)argPackPtr + 96:X16} " +
+					$"yield={ActiveGuestThreadYieldRequested}");
+			}
 			if (_activeGuestThreadState is { } completedGuestThreadState)
 			{
 				Volatile.Write(ref completedGuestThreadState.LastImportRax, guestReturnValue);
@@ -559,6 +654,464 @@ public sealed partial class DirectExecutionBackend
 			}
 			return cpuContext[CpuRegister.Rax];
 		}
+	}
+
+	private static void DumpIl2CppExceptionDiagnostic(
+		CpuContext cpuContext,
+		ulong wrapperAddress,
+		ulong returnAddress)
+	{
+		Console.Error.WriteLine(
+			$"[LOADER][TRACE] il2cpp_exception.wrapper=0x{wrapperAddress:X16} " +
+			$"ret=0x{returnAddress:X16}");
+		Console.Error.WriteLine(
+			$"[LOADER][TRACE] il2cpp_exception.registers " +
+			$"rbx=0x{cpuContext[CpuRegister.Rbx]:X16} " +
+			$"r12=0x{cpuContext[CpuRegister.R12]:X16} " +
+			$"r13=0x{cpuContext[CpuRegister.R13]:X16} " +
+			$"r14=0x{cpuContext[CpuRegister.R14]:X16} " +
+			$"r15=0x{cpuContext[CpuRegister.R15]:X16}");
+		if (GuestThreadExecution.TryGetCurrentImportCallFrame(out var frame))
+		{
+			DumpGuestCodePointers(cpuContext, "stack", frame.ResumeRsp, 0x1000);
+		}
+		DumpGuestFramePointerChain(cpuContext, cpuContext[CpuRegister.Rbp]);
+		if (string.Equals(
+				Environment.GetEnvironmentVariable("SHARPEMU_LOG_PS5_USER_SLOTS"),
+				"1",
+				StringComparison.Ordinal))
+		{
+			for (var slot = 0; slot < 4; slot++)
+			{
+				DumpGuestQwords(
+					cpuContext,
+					$"ps5_user_slot[{slot}]",
+					0x0000000801A73110 + (ulong)(slot * 0x51C8),
+					0x60);
+			}
+		}
+
+		if (!TryReadGuestU64(cpuContext, wrapperAddress, out var exceptionAddress))
+		{
+			Console.Error.WriteLine("[LOADER][TRACE] il2cpp_exception.wrapper unreadable");
+			return;
+		}
+
+		Console.Error.WriteLine(
+			$"[LOADER][TRACE] il2cpp_exception.object=0x{exceptionAddress:X16}");
+		DumpGuestQwords(cpuContext, "exception", exceptionAddress, 0x90);
+
+		// Il2CppException begins with Il2CppObject (klass, monitor), followed by
+		// trace_ips, inner_ex and message.  Decode both the documented message
+		// slot and nearby object pointers because Unity revisions have appended
+		// fields without changing the wrapper itself.
+		for (var offset = 0; offset <= 0x80; offset += 8)
+		{
+			if (!TryReadGuestU64(cpuContext, exceptionAddress + (ulong)offset, out var candidate) ||
+				candidate < 0x10000)
+			{
+				continue;
+			}
+
+			if (TryReadIl2CppString(cpuContext, candidate, out var text))
+			{
+				Console.Error.WriteLine(
+					$"[LOADER][TRACE] il2cpp_exception.string+0x{offset:X2}=" +
+					$"'{text}'");
+			}
+		}
+
+		if (TryReadGuestU64(cpuContext, exceptionAddress + 0x38, out var traceIpsAddress))
+		{
+			DumpIl2CppPointerArray(cpuContext, "trace_ips", traceIpsAddress);
+		}
+
+		if (TryReadGuestU64(cpuContext, exceptionAddress, out var klassAddress))
+		{
+			DumpGuestQwords(cpuContext, "exception_class", klassAddress, 0x100);
+			for (var offset = 0; offset <= 0xF8; offset += 8)
+			{
+				if (!TryReadGuestU64(cpuContext, klassAddress + (ulong)offset, out var candidate) ||
+					candidate < 0x10000)
+				{
+					continue;
+				}
+
+				if (TryReadGuestCString(cpuContext, candidate, out var text))
+				{
+					Console.Error.WriteLine(
+						$"[LOADER][TRACE] il2cpp_exception.class_string+0x{offset:X2}=" +
+						$"'{text}'");
+				}
+			}
+		}
+	}
+
+	private static void DumpGuestCodePointers(
+		CpuContext cpuContext,
+		string label,
+		ulong address,
+		int byteCount)
+	{
+		var buffer = new byte[byteCount];
+		if (!cpuContext.Memory.TryRead(address, buffer))
+		{
+			return;
+		}
+
+		var logged = 0;
+		for (var offset = 0; offset <= buffer.Length - 8 && logged < 128; offset += 8)
+		{
+			var candidate = BinaryPrimitives.ReadUInt64LittleEndian(buffer.AsSpan(offset, 8));
+			if (candidate < 0x0000000800000000 || candidate >= 0x0000001000000000)
+			{
+				continue;
+			}
+
+			Console.Error.WriteLine(
+				$"[LOADER][TRACE] il2cpp_exception.{label}+0x{offset:X3}=0x{candidate:X16}");
+			logged++;
+		}
+	}
+
+	private static void DumpGuestFramePointerChain(CpuContext cpuContext, ulong framePointer)
+	{
+		for (var depth = 0; depth < 64 && framePointer >= 0x10000; depth++)
+		{
+			if (!TryReadGuestU64(cpuContext, framePointer, out var nextFrame) ||
+				!TryReadGuestU64(cpuContext, framePointer + 8, out var returnRip))
+			{
+				break;
+			}
+
+			Console.Error.WriteLine(
+				$"[LOADER][TRACE] il2cpp_exception.frame[{depth}] " +
+				$"rbp=0x{framePointer:X16} ret=0x{returnRip:X16}");
+			if (framePointer >= 0x40)
+			{
+				DumpGuestQwords(
+					cpuContext,
+					$"frame[{depth}]_locals",
+					framePointer - 0x40,
+					0x60);
+				if (depth <= 10 &&
+					TryReadGuestU64(cpuContext, framePointer - 0x20, out var savedRbx) &&
+					savedRbx >= 0x0000000100000000 &&
+					savedRbx < 0x0000000800000000)
+				{
+					DumpGuestQwords(
+						cpuContext,
+						$"frame[{depth}]_saved_rbx_object",
+						savedRbx,
+						0x50);
+					if (depth is >= 4 and <= 12)
+					{
+						DumpIl2CppObjectGraph(
+							cpuContext,
+							$"frame[{depth}]_saved_rbx",
+							savedRbx);
+					}
+				}
+				DumpIl2CppStringsInRange(
+					cpuContext,
+					$"frame[{depth}]",
+					framePointer >= 0x100 ? framePointer - 0x100 : 0,
+					0x140);
+				DumpIl2CppObjectsInRange(
+					cpuContext,
+					$"frame[{depth}]",
+					framePointer >= 0x100 ? framePointer - 0x100 : 0,
+					0x140);
+			}
+			if (nextFrame <= framePointer || nextFrame - framePointer > 0x100000)
+			{
+				break;
+			}
+
+			framePointer = nextFrame;
+		}
+	}
+
+	private static void DumpIl2CppObjectsInRange(
+		CpuContext cpuContext,
+		string label,
+		ulong address,
+		int byteCount)
+	{
+		var buffer = new byte[byteCount];
+		if (address == 0 || !cpuContext.Memory.TryRead(address, buffer))
+		{
+			return;
+		}
+
+		for (var offset = 0; offset <= buffer.Length - 8; offset += 8)
+		{
+			var candidate = BinaryPrimitives.ReadUInt64LittleEndian(buffer.AsSpan(offset, 8));
+			if (candidate < 0x0000000100000000 ||
+				candidate >= 0x0000000800000000 ||
+				!TryReadGuestU64(cpuContext, candidate, out var klass) ||
+				klass < 0x0000000100000000 ||
+				klass >= 0x0000000800000000 ||
+				!TryReadGuestU64(cpuContext, klass + 0x10, out var nameAddress) ||
+				!TryReadGuestCString(cpuContext, nameAddress, out var name))
+			{
+				continue;
+			}
+
+			var nameSpace = string.Empty;
+			if (TryReadGuestU64(cpuContext, klass + 0x18, out var namespaceAddress))
+			{
+				_ = TryReadGuestCString(cpuContext, namespaceAddress, out nameSpace);
+			}
+			Console.Error.WriteLine(
+				$"[LOADER][TRACE] il2cpp_exception.{label}_object@{offset:X3}=" +
+				$"0x{candidate:X16} {nameSpace}.{name}");
+			if (string.Equals(name, "ControllerMap_Editor", StringComparison.Ordinal))
+			{
+				DumpGuestQwords(cpuContext, $"{label}_controller_map", candidate, 0x40);
+				for (var fieldOffset = 0x20; fieldOffset <= 0x28; fieldOffset += 8)
+				{
+					if (TryReadGuestU64(cpuContext, candidate + (ulong)fieldOffset, out var stringAddress) &&
+						TryReadIl2CppString(cpuContext, stringAddress, out var fieldText))
+					{
+						Console.Error.WriteLine(
+							$"[LOADER][TRACE] il2cpp_exception.{label}_controller_map+0x{fieldOffset:X2}=" +
+							$"'{fieldText}'");
+					}
+				}
+			}
+		}
+	}
+
+	private static void DumpIl2CppStringsInRange(
+		CpuContext cpuContext,
+		string label,
+		ulong address,
+		int byteCount)
+	{
+		var buffer = new byte[byteCount];
+		if (address == 0 || !cpuContext.Memory.TryRead(address, buffer))
+		{
+			return;
+		}
+
+		for (var offset = 0; offset <= buffer.Length - 8; offset += 8)
+		{
+			var candidate = BinaryPrimitives.ReadUInt64LittleEndian(buffer.AsSpan(offset, 8));
+			if (candidate < 0x0000000100000000 ||
+				candidate >= 0x0000000800000000 ||
+				!TryReadIl2CppString(cpuContext, candidate, out var text) ||
+				text.Length == 0)
+			{
+				continue;
+			}
+
+			Console.Error.WriteLine(
+				$"[LOADER][TRACE] il2cpp_exception.{label}_string@{offset:X3}=" +
+				$"0x{candidate:X16} '{text}'");
+		}
+	}
+
+	private static void DumpIl2CppObjectGraph(
+		CpuContext cpuContext,
+		string label,
+		ulong objectAddress)
+	{
+		if (!TryReadGuestU64(cpuContext, objectAddress, out var klassAddress))
+		{
+			return;
+		}
+
+		DumpGuestQwords(cpuContext, $"{label}_class", klassAddress, 0x400);
+		for (var offset = 0; offset <= 0xF8; offset += 8)
+		{
+			if (TryReadGuestU64(cpuContext, klassAddress + (ulong)offset, out var candidate) &&
+				candidate >= 0x10000 &&
+				TryReadGuestCString(cpuContext, candidate, out var text))
+			{
+				Console.Error.WriteLine(
+					$"[LOADER][TRACE] il2cpp_exception.{label}_class_string+0x{offset:X2}='{text}'");
+			}
+		}
+		for (var offset = 0x10; offset <= 0x48; offset += 8)
+		{
+			if (!TryReadGuestU64(cpuContext, objectAddress + (ulong)offset, out var candidate) ||
+				candidate < 0x0000000100000000 ||
+				candidate >= 0x0000000800000000)
+			{
+				continue;
+			}
+
+			DumpGuestQwords(
+				cpuContext,
+				$"{label}_field+0x{offset:X2}",
+				candidate,
+				0x80);
+			if (TryReadGuestU64(cpuContext, candidate, out var candidateClass))
+			{
+				DumpGuestQwords(
+					cpuContext,
+					$"{label}_field+0x{offset:X2}_class",
+					candidateClass,
+					0x400);
+				for (var classOffset = 0; classOffset <= 0xF8; classOffset += 8)
+				{
+					if (TryReadGuestU64(
+							cpuContext,
+							candidateClass + (ulong)classOffset,
+							out var classCandidate) &&
+						classCandidate >= 0x10000 &&
+						TryReadGuestCString(cpuContext, classCandidate, out var text))
+					{
+						Console.Error.WriteLine(
+							$"[LOADER][TRACE] il2cpp_exception.{label}_field+0x{offset:X2}" +
+							$"_class_string+0x{classOffset:X2}='{text}'");
+					}
+				}
+			}
+		}
+	}
+
+	private static void DumpIl2CppPointerArray(
+		CpuContext cpuContext,
+		string label,
+		ulong address)
+	{
+		if (address < 0x10000 ||
+			!TryReadGuestU64(cpuContext, address + 0x18, out var rawLength))
+		{
+			return;
+		}
+
+		var length = (int)Math.Min(rawLength, 128);
+		Console.Error.WriteLine(
+			$"[LOADER][TRACE] il2cpp_exception.{label}=0x{address:X16} " +
+			$"length={rawLength}");
+		for (var index = 0; index < length; index++)
+		{
+			if (!TryReadGuestU64(cpuContext, address + 0x20 + (ulong)(index * 8), out var value))
+			{
+				break;
+			}
+
+			Console.Error.WriteLine(
+				$"[LOADER][TRACE] il2cpp_exception.{label}[{index}]=0x{value:X16}");
+		}
+	}
+
+	private static void DumpGuestQwords(
+		CpuContext cpuContext,
+		string label,
+		ulong address,
+		int byteCount)
+	{
+		var buffer = new byte[byteCount];
+		if (!cpuContext.Memory.TryRead(address, buffer))
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][TRACE] il2cpp_exception.{label}=unreadable@0x{address:X16}");
+			return;
+		}
+
+		for (var offset = 0; offset < buffer.Length; offset += 32)
+		{
+			var values = new string[Math.Min(4, (buffer.Length - offset) / 8)];
+			for (var i = 0; i < values.Length; i++)
+			{
+				values[i] = $"{BinaryPrimitives.ReadUInt64LittleEndian(buffer.AsSpan(offset + i * 8, 8)):X16}";
+			}
+
+			Console.Error.WriteLine(
+				$"[LOADER][TRACE] il2cpp_exception.{label}+0x{offset:X2}: " +
+				string.Join(" ", values));
+		}
+	}
+
+	private static bool TryReadGuestU64(CpuContext cpuContext, ulong address, out ulong value)
+	{
+		Span<byte> buffer = stackalloc byte[8];
+		if (!cpuContext.Memory.TryRead(address, buffer))
+		{
+			value = 0;
+			return false;
+		}
+
+		value = BinaryPrimitives.ReadUInt64LittleEndian(buffer);
+		return true;
+	}
+
+	private static bool TryReadIl2CppString(
+		CpuContext cpuContext,
+		ulong address,
+		out string text)
+	{
+		text = string.Empty;
+		Span<byte> header = stackalloc byte[20];
+		if (!cpuContext.Memory.TryRead(address, header))
+		{
+			return false;
+		}
+
+		var length = BinaryPrimitives.ReadInt32LittleEndian(header[16..]);
+		if (length <= 0 || length > 2048)
+		{
+			return false;
+		}
+
+		var bytes = new byte[length * 2];
+		if (!cpuContext.Memory.TryRead(address + 20, bytes))
+		{
+			return false;
+		}
+
+		text = SanitizeDiagnosticText(Encoding.Unicode.GetString(bytes));
+		return text.Length != 0;
+	}
+
+	private static bool TryReadGuestCString(
+		CpuContext cpuContext,
+		ulong address,
+		out string text)
+	{
+		text = string.Empty;
+		var buffer = new byte[256];
+		if (!cpuContext.Memory.TryRead(address, buffer))
+		{
+			return false;
+		}
+
+		var length = Array.IndexOf(buffer, (byte)0);
+		if (length <= 0)
+		{
+			return false;
+		}
+
+		for (var i = 0; i < length; i++)
+		{
+			if (buffer[i] is < 0x20 or > 0x7E)
+			{
+				return false;
+			}
+		}
+
+		text = Encoding.UTF8.GetString(buffer, 0, length);
+		return true;
+	}
+
+	private static string SanitizeDiagnosticText(string text)
+	{
+		var builder = new StringBuilder(Math.Min(text.Length, 512));
+		foreach (var character in text)
+		{
+			if (builder.Length >= 512)
+			{
+				break;
+			}
+
+			builder.Append(char.IsControl(character) ? ' ' : character);
+		}
+
+		return builder.ToString().Trim();
 	}
 
 	private unsafe static void LoadImportVolatileArguments(CpuContext cpuContext, nint argPackPtr)
@@ -597,6 +1150,36 @@ public sealed partial class DirectExecutionBackend
 		return TryReadHostQword(address, out var value) ? value : 0;
 	}
 
+	private static GuestCpuContinuation CaptureImportBoundaryContinuation(
+		CpuContext context,
+		nint argPackPtr,
+		ulong returnRip) =>
+		new(
+			Rip: returnRip,
+			Rsp: (ulong)argPackPtr + 104UL,
+			ReturnSlotAddress: (ulong)argPackPtr + 96UL,
+			Rflags: context.Rflags,
+			FsBase: context.FsBase,
+			GsBase: context.GsBase,
+			Rax: context[CpuRegister.Rax],
+			Rcx: context[CpuRegister.Rcx],
+			Rdx: context[CpuRegister.Rdx],
+			Rbx: context[CpuRegister.Rbx],
+			Rbp: context[CpuRegister.Rbp],
+			Rsi: context[CpuRegister.Rsi],
+			Rdi: context[CpuRegister.Rdi],
+			R8: context[CpuRegister.R8],
+			R9: context[CpuRegister.R9],
+			R10: context[CpuRegister.R10],
+			R11: context[CpuRegister.R11],
+			R12: context[CpuRegister.R12],
+			R13: context[CpuRegister.R13],
+			R14: context[CpuRegister.R14],
+			R15: context[CpuRegister.R15],
+			FpuControlWord: context.FpuControlWord,
+			Mxcsr: context.Mxcsr,
+			RestoreFullFpuState: false);
+
 	private unsafe bool TryDispatchLeafImport(
 		CpuContext cpuContext,
 		ImportStubEntry importStubEntry,
@@ -613,6 +1196,18 @@ public sealed partial class DirectExecutionBackend
 
 		var arg0 = *(ulong*)argPackPtr;
 		var returnRip = *(ulong*)(argPackPtr + 96);
+		var leafStackPointer = (ulong)argPackPtr + 96UL;
+		var probeLeafReturn = _logAllImports &&
+			string.Equals(importStubEntry.Nid, "2Z+PpY6CaJg", StringComparison.Ordinal) &&
+			leafStackPointer >= 0x00006FFFAC1FF000UL &&
+			leafStackPointer < 0x00006FFFAC200000UL;
+		if (probeLeafReturn)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][TRACE] leaf-return-probe-enter nid={importStubEntry.Nid} " +
+				$"ret=0x{returnRip:X16} rsp=0x{leafStackPointer:X16} " +
+				$"active_slot=0x{ActiveGuestReturnSlotAddress:X16}");
+		}
 		cpuContext.Rip = importStubEntry.Address;
 		LoadImportVolatileArguments(cpuContext, argPackPtr);
 		cpuContext[CpuRegister.Rdi] = arg0;
@@ -687,6 +1282,9 @@ public sealed partial class DirectExecutionBackend
 				GuestThreadExecution.RestoreImportCallFrame(previousImportCallFrame);
 			}
 		}
+		DeliverPendingGuestExceptionAtSafePoint(
+			cpuContext,
+			CaptureImportBoundaryContinuation(cpuContext, argPackPtr, returnRip));
 		StoreImportVectorReturn(cpuContext, argPackPtr);
 
 		if (returnValue != (int)OrbisGen2Result.ORBIS_GEN2_OK)
@@ -703,14 +1301,15 @@ public sealed partial class DirectExecutionBackend
 			}
 		}
 
-		if (GuestThreadExecution.TryConsumeCurrentThreadBlock(
+		var consumedThreadBlock = GuestThreadExecution.TryConsumeCurrentThreadBlock(
 				out var blockReason,
 				out var blockContinuation,
 				out var hasBlockContinuation,
 				out var blockWakeKey,
 				out var blockResumeHandler,
 				out var blockWakeHandler,
-				out var blockDeadlineTimestamp) &&
+				out var blockDeadlineTimestamp);
+		if (consumedThreadBlock &&
 			TryYieldGuestThreadToHostStub(argPackPtr, dispatchIndex, returnRip, importStubEntry.Nid, blockReason))
 		{
 			if (hasBlockContinuation)
@@ -725,6 +1324,14 @@ public sealed partial class DirectExecutionBackend
 			}
 
 			cpuContext[CpuRegister.Rax] = 0uL;
+		}
+		if (probeLeafReturn)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][TRACE] leaf-return-probe-exit nid={importStubEntry.Nid} " +
+				$"original=0x{returnRip:X16} final=0x{*(ulong*)(argPackPtr + 96):X16} " +
+				$"rsp=0x{leafStackPointer:X16} active_slot=0x{ActiveGuestReturnSlotAddress:X16} " +
+				$"block={consumedThreadBlock} yield={ActiveGuestThreadYieldRequested}");
 		}
 
 		result = cpuContext[CpuRegister.Rax];
@@ -784,6 +1391,9 @@ public sealed partial class DirectExecutionBackend
 		var expectedMutexTrylockBusy =
 			string.Equals(nid, "K-jXhbt2gn4", StringComparison.Ordinal) &&
 			result == OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY;
+		var expectedNetAcceptWouldBlock =
+			string.Equals(nid, "PIWqhn9oSxc", StringComparison.Ordinal) &&
+			resultValue == unchecked((int)0x80410123);
 		var expectedUserServiceNoEvent =
 			string.Equals(nid, "yH17Q6NWtVg", StringComparison.Ordinal) &&
 			resultValue == unchecked((int)0x80960007);
@@ -794,6 +1404,7 @@ public sealed partial class DirectExecutionBackend
 			!expectedTimedWaitTimeout &&
 			!expectedEqueueTimeout &&
 			!expectedMutexTrylockBusy &&
+			!expectedNetAcceptWouldBlock &&
 			!expectedUserServiceNoEvent &&
 			!expectedPrivacyInvalidParameter)
 		{
@@ -836,14 +1447,14 @@ public sealed partial class DirectExecutionBackend
 			return !_logUsleep;
 		}
 
-		// Only mutex/rwlock *lock* is excluded: it may block a contended acquire, which the
-		// leaf path can't. unlock never blocks and stays here — routing it off the fast path
-		// slows guest spinlocks enough to livelock (Demon's Souls).
+		// These leaf operations cannot park the current guest thread. Unlocks may
+		// wake another cooperative thread, but the scheduler drain is independent
+		// of the caller's import-boundary bookkeeping.
 		return nid is
 			"tn3VlD0hG60" or // scePthreadMutexUnlock
 			"2Z+PpY6CaJg" or // pthread_mutex_unlock
-			"EgmLo6EWgso" or // pthread_rwlock_unlock
-			"+L98PIbGttk" or // scePthreadRwlockUnlock
+			"EgmLo6EWgso" or // scePthreadRwlockUnlock
+			"+L98PIbGttk" or // pthread_rwlock_unlock
 			"8aI7R7WaOlc" or // sceAmprCommandBufferConstructor
 			"zgXifHT9ErY" or // sceVideoOutIsFlipPending
 			"V++UgBtQhn0" or // sceAgcGetDataPacketPayloadAddress
@@ -1354,13 +1965,21 @@ public sealed partial class DirectExecutionBackend
 			cpuContext[CpuRegister.Rax] = 18446744073709551615uL;
 			return OrbisGen2Result.ORBIS_GEN2_OK;
 		}
-		if (!TryResolveRuntimeSymbolAddress(symbolName, out var resolvedAddress) &&
+		var moduleHandle = unchecked((int)cpuContext[CpuRegister.Rdi]);
+		if (!TryResolveModuleSymbolAddress(moduleHandle, symbolName, out var resolvedAddress) &&
+			!TryResolveRuntimeSymbolAddress(symbolName, out resolvedAddress) &&
+			!TryResolveRuntimeSymbolAddress(ComputePsNid(symbolName), out resolvedAddress) &&
 			!TryResolveRuntimeSymbolAlias(symbolName, out resolvedAddress))
 		{
 			Console.Error.WriteLine(
 				$"[LOADER][WARN] sceKernelDlsym failed: handle=0x{cpuContext[CpuRegister.Rdi]:X} symbol='{symbolName}'");
 			cpuContext[CpuRegister.Rax] = 18446744073709551615uL;
 			return OrbisGen2Result.ORBIS_GEN2_OK;
+		}
+		if (string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_DLSYM"), "1", StringComparison.Ordinal))
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][TRACE] sceKernelDlsym: handle=0x{moduleHandle:X} symbol='{symbolName}' -> 0x{resolvedAddress:X16}");
 		}
 		if (outputAddress == 0L || !TryWriteUInt64Compat(outputAddress, resolvedAddress))
 		{
@@ -1369,6 +1988,36 @@ public sealed partial class DirectExecutionBackend
 		}
 		cpuContext[CpuRegister.Rax] = 0uL;
 		return OrbisGen2Result.ORBIS_GEN2_OK;
+	}
+
+	private static bool TryResolveModuleSymbolAddress(int moduleHandle, string symbolName, out ulong address)
+	{
+		if (KernelModuleRegistry.TryResolveModuleSymbol(moduleHandle, symbolName, out address))
+		{
+			return true;
+		}
+
+		var nid = ComputePsNid(symbolName);
+		return KernelModuleRegistry.TryResolveModuleSymbol(moduleHandle, nid, out address);
+	}
+
+	private static string ComputePsNid(string symbolName)
+	{
+		ReadOnlySpan<byte> salt =
+		[
+			0x51, 0x8D, 0x64, 0xA6, 0x35, 0xDE, 0xD8, 0xC1,
+			0xE6, 0xB0, 0x39, 0xB1, 0xC3, 0xE5, 0x52, 0x30,
+		];
+		var nameBytes = Encoding.UTF8.GetBytes(symbolName);
+		var input = new byte[nameBytes.Length + salt.Length];
+		nameBytes.CopyTo(input, 0);
+		salt.CopyTo(input.AsSpan(nameBytes.Length));
+		Span<byte> digest = stackalloc byte[20];
+		SHA1.HashData(input, digest);
+		var value = BinaryPrimitives.ReadUInt64LittleEndian(digest);
+		Span<byte> bigEndianValue = stackalloc byte[sizeof(ulong)];
+		BinaryPrimitives.WriteUInt64BigEndian(bigEndianValue, value);
+		return Convert.ToBase64String(bigEndianValue).TrimEnd('=').Replace('/', '-');
 	}
 
 	private bool TryResolveRuntimeSymbolAlias(string symbolName, out ulong address)

@@ -921,17 +921,34 @@ public static class VideoOutExports
             _ = TryDumpFrame(ctx, port, bufferIndex, flipMode, flipArg);
         }
 
-        foreach (var flipEvent in flipEvents)
+        void TriggerFlipEvents()
         {
-            _ = KernelEventQueueCompatExports.TriggerDisplayEvent(
-                flipEvent.Equeue,
-                SceVideoOutInternalEventFlip,
-                OrbisKernelEventFilterVideoOut,
-                eventHint,
-                flipEvent.UserData);
+            foreach (var flipEvent in flipEvents)
+            {
+                _ = KernelEventQueueCompatExports.TriggerDisplayEvent(
+                    flipEvent.Equeue,
+                    SceVideoOutInternalEventFlip,
+                    OrbisKernelEventFilterVideoOut,
+                    eventHint,
+                    flipEvent.UserData);
+            }
         }
 
-        TraceVideoOut($"videoout.submit_flip handle={handle} index={bufferIndex} mode={flipMode} arg={flipArg} events={flipEvents.Count}");
+        if (submitGpuImage)
+        {
+            TriggerFlipEvents();
+        }
+        else if (VulkanVideoPresenter.SubmitOrderedGuestAction(
+                     TriggerFlipEvents,
+                     $"videoout flip complete handle={handle} index={bufferIndex}") == 0)
+        {
+            // Headless startup has no render queue to order against.
+            TriggerFlipEvents();
+        }
+
+        TraceVideoOut(
+            $"videoout.submit_flip handle={handle} index={bufferIndex} mode={flipMode} " +
+            $"arg={flipArg} events={flipEvents.Count} ordered_completion={!submitGpuImage}");
         ReportFrameRate(presented: false);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }

@@ -1042,6 +1042,21 @@ internal static partial class Gen5SpirvTranslator
             {
                 condition = _module.ConstantBool(true);
             }
+            else if (opcode is
+                     "VCmpOF32" or "VCmpxOF32" or
+                     "VCmpUF32" or "VCmpxUF32")
+            {
+                var left = GetFloatSource(instruction, 0);
+                var right = GetFloatSource(instruction, 1);
+                var unordered = _module.AddInstruction(
+                    SpirvOp.LogicalOr,
+                    _boolType,
+                    _module.AddInstruction(SpirvOp.IsNan, _boolType, left),
+                    _module.AddInstruction(SpirvOp.IsNan, _boolType, right));
+                condition = opcode is "VCmpUF32" or "VCmpxUF32"
+                    ? unordered
+                    : _module.AddInstruction(SpirvOp.LogicalNot, _boolType, unordered);
+            }
             else if (opcode is not ("VCmpClassF32" or "VCmpxClassF32") &&
                      opcode.EndsWith("F32", StringComparison.Ordinal))
             {
@@ -1060,6 +1075,7 @@ internal static partial class Gen5SpirvTranslator
                     "VCmpNleF32" or "VCmpxNleF32" => SpirvOp.FUnordGreaterThan,
                     "VCmpNgtF32" or "VCmpxNgtF32" => SpirvOp.FUnordLessThanEqual,
                     "VCmpNgeF32" or "VCmpxNgeF32" => SpirvOp.FUnordLessThan,
+                    "VCmpNlgF32" or "VCmpxNlgF32" => SpirvOp.FUnordEqual,
                     _ => SpirvOp.Nop,
                 };
                 if (operation == SpirvOp.Nop)

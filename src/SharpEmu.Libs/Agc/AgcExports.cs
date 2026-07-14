@@ -100,11 +100,11 @@ public static class AgcExports
     private const uint PaClVportYOffset = 0x112;
     private const uint PaScVportZMin0 = 0xB4;
     private const uint PaScVportZMax0 = 0xB5;
+    private const uint CbColorControl = 0x202;
     private const uint CbBlendRed = 0x105;
     private const uint CbBlendGreen = 0x106;
     private const uint CbBlendBlue = 0x107;
     private const uint CbBlendAlpha = 0x108;
-    private const uint CbColorControl = 0x202;
     private const uint CbColor0Base = 0x318;
     private const uint CbColorRegisterStride = 15;
     private const uint CbColor0Info = 0x31C;
@@ -163,6 +163,7 @@ public static class AgcExports
     private const ulong CommandBufferCursorUpOffset = 0x10;
     private const ulong CommandBufferCursorDownOffset = 0x18;
     private const ulong CommandBufferCallbackOffset = 0x20;
+    private const ulong CommandBufferUserDataOffset = 0x28;
     private const ulong CommandBufferReservedDwOffset = 0x30;
     private const ulong ShaderSpecialGeCntlOffset = 0x00;
     private const ulong ShaderSpecialVgtShaderStagesEnOffset = 0x08;
@@ -222,6 +223,18 @@ public static class AgcExports
         Environment.GetEnvironmentVariable("SHARPEMU_TRACE_DRAWS"),
         "1",
         StringComparison.Ordinal);
+    private static readonly bool _traceFramePackets = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_TRACE_FRAME_PACKETS"),
+        "1",
+        StringComparison.Ordinal);
+    private static readonly bool _traceVertexRanges = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_TRACE_VERTEX_RANGES"),
+        "1",
+        StringComparison.Ordinal);
+    private static readonly bool _compatibilitySubmitCompletionEvent = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_AGC_SUBMIT_COMPLETION_EVENT"),
+        "1",
+        StringComparison.Ordinal);
     // Escape hatch for the cached-texture copy skip (per-draw texel copies
     // are re-enabled unconditionally when set), for A/B-ing rendering issues.
     private static readonly bool _textureCopySkipDisabled = string.Equals(
@@ -229,6 +242,7 @@ public static class AgcExports
         "1",
         StringComparison.Ordinal);
     private static long _dcbWriteDataTraceCount;
+    private static int _tracedVertexRangeCount;
     private static long _dcbWaitRegMemTraceCount;
     private static long _createShaderTraceCount;
     private static long _packetPayloadTraceCount;
@@ -242,6 +256,7 @@ public static class AgcExports
     private static long _shaderTranslationMissTraceCount;
     private static long _translatedDrawTraceCount;
     private static long _standardDmaTraceCount;
+    private static long _packetParseFailureTraceCount;
     private static readonly object _softwarePresenterGate = new();
     private static readonly Dictionary<(ulong Source, ulong Destination), ulong> _softwarePresenterFingerprints = new();
     private static readonly Dictionary<(ulong Shader, ulong Source, ulong Destination), ulong> _softwareComputeBlitFingerprints = new();
@@ -554,6 +569,8 @@ public static class AgcExports
         public TextureDescriptor? PresenterTexture { get; set; }
         public GuestDrawKind GuestDrawKind { get; set; }
         public TranslatedGuestDraw? TranslatedDraw { get; set; }
+        public TranslatedGuestDraw? PendingTargetlessDraw { get; set; }
+        public Dictionary<ulong, RenderTargetDescriptor> KnownRenderTargets { get; } = new();
         public Dictionary<ulong, RenderTargetWriter> RenderTargetWriters { get; } = new();
         public ulong IndirectArgsAddress { get; set; }
         public bool SawIndexedDraw { get; set; }
@@ -567,6 +584,12 @@ public static class AgcExports
         public Queue<PendingSubmission> PendingSubmissions { get; } = new();
         public bool HasActiveSubmission { get; set; }
         public bool IsSuspended { get; set; }
+        public ulong CompletionEventNotifiedSubmissionId { get; set; }
+        public Dictionary<(uint Op, uint Register), uint> FramePacketCounts { get; } = new();
+        public uint FramePacketCount { get; set; }
+        public uint FrameDrawCount { get; set; }
+        public uint FrameDispatchCount { get; set; }
+        public ulong FlipCount { get; set; }
     }
 
     private sealed class SubmittedGpuState
@@ -1449,12 +1472,18 @@ public static class AgcExports
             return ReturnPointer(ctx, 0);
         }
 
-        if (!TryAllocateCommandDwords(ctx, commandBufferAddress, 5, out var drawCommand) ||
-            !TryWriteUInt32(ctx, drawCommand, Pm4(5, ItDrawIndex2, 0)) ||
+        // DRAW_INDEX_2 is six dwords: header, maximum index count, the
+        // 64-bit index-buffer base, the draw count and the initiator.  The
+        // former five-dword packet omitted both the real base and the count
+        // field, so every call made by Unity looked like a zero-count draw to
+        // the submitted-command parser and the complete scene was discarded.
+        if (!TryAllocateCommandDwords(ctx, commandBufferAddress, 6, out var drawCommand) ||
+            !TryWriteUInt32(ctx, drawCommand, Pm4(6, ItDrawIndex2, 0)) ||
             !TryWriteUInt32(ctx, drawCommand + 4, indexCount) ||
-            !TryWriteUInt32(ctx, drawCommand + 8, 0) ||
-            !TryWriteUInt32(ctx, drawCommand + 12, 0) ||
-            !TryWriteUInt32(ctx, drawCommand + 16, 0))
+            !TryWriteUInt32(ctx, drawCommand + 8, (uint)indexAddress) ||
+            !TryWriteUInt32(ctx, drawCommand + 12, (uint)(indexAddress >> 32)) ||
+            !TryWriteUInt32(ctx, drawCommand + 16, indexCount) ||
+            !TryWriteUInt32(ctx, drawCommand + 20, 0))
         {
             return ReturnPointer(ctx, 0);
         }
@@ -2647,6 +2676,47 @@ public static class AgcExports
             }
 
             state.HasActiveSubmission = false;
+            NotifySubmittedDcbCompleted(gpuState, state, submission.SubmissionId);
+        }
+    }
+
+    private static void NotifySubmittedDcbCompleted(
+        SubmittedGpuState gpuState,
+        SubmittedDcbState state,
+        ulong submissionId)
+    {
+        if (!ReferenceEquals(state, gpuState.Graphics) ||
+            state.CompletionEventNotifiedSubmissionId == submissionId)
+        {
+            return;
+        }
+
+        state.CompletionEventNotifiedSubmissionId = submissionId;
+        void TriggerCompletionEvents()
+        {
+            var triggered = KernelEventQueueCompatExports.TriggerRegisteredEvents(
+                ident: 0,
+                KernelEventQueueCompatExports.KernelEventFilterGraphics,
+                data: 0);
+            if (_compatibilitySubmitCompletionEvent)
+            {
+                triggered += KernelEventQueueCompatExports.TriggerRegisteredEventsDistinct(
+                    KernelEventQueueCompatExports.KernelEventFilterGraphics);
+            }
+            TraceAgc(
+                $"agc.driver_submit_dcb completion submission={submissionId} " +
+                $"queues={triggered}");
+        }
+
+        // A DCB is complete only after its translated Vulkan work and ordered
+        // guest-memory writes have finished. Put the notification on that same
+        // logical graphics queue instead of approximating completion with a
+        // timer, which can wake Unity while its upload data is still stale.
+        if (VulkanVideoPresenter.SubmitOrderedGuestAction(
+                TriggerCompletionEvents,
+                $"agc submit completion {submissionId}") == 0)
+        {
+            TriggerCompletionEvents();
         }
     }
 
@@ -2670,7 +2740,7 @@ public static class AgcExports
             state.QueueName,
             state.ActiveSubmissionId);
         var windowByteCount = checked((int)(dwordCount * sizeof(uint)));
-        var rented = System.Buffers.ArrayPool<byte>.Shared.Rent(windowByteCount);
+        var rented = VulkanVideoPresenter.GuestDataPool.Rent(windowByteCount);
         try
         {
             if (ctx.Memory.TryRead(commandAddress, rented.AsSpan(0, windowByteCount)))
@@ -2692,7 +2762,7 @@ public static class AgcExports
         {
             _dcbWindowBuffer = null;
             _dcbWindowByteLength = 0;
-            System.Buffers.ArrayPool<byte>.Shared.Return(rented);
+            VulkanVideoPresenter.GuestDataPool.Return(rented);
         }
     }
 
@@ -2710,6 +2780,7 @@ public static class AgcExports
             var currentAddress = commandAddress + ((ulong)offset * sizeof(uint));
             if (!TryReadUInt32(ctx, currentAddress, out var header))
             {
+                TracePacketParseFailure(state, currentAddress, offset, 0, "header-read");
                 return false;
             }
 
@@ -2729,17 +2800,38 @@ public static class AgcExports
 
             if (packetType != 3)
             {
+                TracePacketParseFailure(
+                    state,
+                    currentAddress,
+                    offset,
+                    header,
+                    $"packet-type-{packetType}");
                 return false;
             }
 
             var length = Pm4Length(header);
             if (length == 0 || offset + length > dwordCount)
             {
+                TracePacketParseFailure(
+                    state,
+                    currentAddress,
+                    offset,
+                    header,
+                    $"length-{length}-remaining-{dwordCount - offset}");
                 return false;
             }
 
             var op = (header >> 8) & 0xFFu;
             var register = (header >> 2) & 0x3Fu;
+            if (_traceFramePackets && ReferenceEquals(state, gpuState.Graphics))
+            {
+                var packetKey = (op, op == ItNop ? register : uint.MaxValue);
+                state.FramePacketCounts[packetKey] =
+                    state.FramePacketCounts.TryGetValue(packetKey, out var packetCount)
+                        ? packetCount + 1
+                        : 1;
+                state.FramePacketCount++;
+            }
             if (tracePackets)
             {
                 TraceSubmittedPacket(ctx, currentAddress, offset, header, length, op, register);
@@ -2923,6 +3015,7 @@ public static class AgcExports
                     out var indexCount) &&
                 indexCount != 0)
             {
+                state.FrameDrawCount++;
                 if (_traceAgcShader)
                 {
                     lock (_submitTraceGate)
@@ -2949,6 +3042,7 @@ public static class AgcExports
                 TryReadUInt32(ctx, currentAddress + 4, out var autoIndexCount) &&
                 autoIndexCount != 0)
             {
+                state.FrameDrawCount++;
                 TryTranslateGuestDraw(
                     ctx,
                     gpuState,
@@ -2964,8 +3058,9 @@ public static class AgcExports
                     currentAddress,
                     length,
                     op,
-                    out var dispatch))
+                out var dispatch))
             {
+                state.FrameDispatchCount++;
                 ObserveComputeDispatch(ctx, gpuState, state, dispatch);
             }
 
@@ -2987,6 +3082,7 @@ public static class AgcExports
 
             if (op == ItNop && register == RFlip && length >= 6)
             {
+                TraceFramePacketSummary(state);
                 SyncCpuWrittenGuestImages(ctx);
                 if (!TryReadUInt32(ctx, currentAddress + 4, out var videoOutHandle) ||
                     !TryReadUInt32(ctx, currentAddress + 8, out var displayBufferIndexRaw) ||
@@ -3000,6 +3096,52 @@ public static class AgcExports
                 var flipArg = unchecked((long)(((ulong)flipArgHi << 32) | flipArgLo));
                 var displayBufferIndex = unchecked((int)displayBufferIndexRaw);
                 var handle = unchecked((int)videoOutHandle);
+                if (state.PendingTargetlessDraw is { } pendingComposite &&
+                    VideoOutExports.TryGetDisplayBufferInfo(
+                        handle,
+                        displayBufferIndex,
+                        out var pendingDisplayBuffer) &&
+                    state.KnownRenderTargets.TryGetValue(
+                        pendingDisplayBuffer.Address,
+                        out var pendingDisplayTarget))
+                {
+                    var textures = CreateVulkanGuestDrawTextures(
+                        ctx,
+                        pendingComposite.Textures,
+                        out _);
+                    var globalMemoryBuffers =
+                        CreateTranslatedDrawGlobalBuffers(pendingComposite);
+                    var vertexBuffers =
+                        CreateVulkanGuestVertexBuffers(pendingComposite.VertexInputs);
+                    ProvideRenderTargetInitialData(ctx, pendingDisplayTarget);
+                    VulkanVideoPresenter.SubmitOffscreenTranslatedDraw(
+                        pendingComposite.PixelSpirv,
+                        textures,
+                        globalMemoryBuffers,
+                        pendingComposite.AttributeCount,
+                        new VulkanGuestRenderTarget(
+                            pendingDisplayTarget.Address,
+                            pendingDisplayTarget.Width,
+                            pendingDisplayTarget.Height,
+                            pendingDisplayTarget.Format,
+                            pendingDisplayTarget.NumberType),
+                        pendingComposite.VertexSpirv,
+                        pendingComposite.VertexCount,
+                        pendingComposite.InstanceCount,
+                        pendingComposite.PrimitiveType,
+                        pendingComposite.IndexBuffer,
+                        vertexBuffers,
+                        pendingComposite.RenderState,
+                        pendingComposite.DepthTarget);
+                    TraceAgcShader(
+                        $"agc.deferred_composite ps=0x{pendingComposite.PixelShaderAddress:X16} " +
+                        $"src=0x{pendingComposite.Textures.FirstOrDefault()?.Descriptor.Address ?? 0:X16} " +
+                        $"dst=0x{pendingDisplayTarget.Address:X16} " +
+                        $"size={pendingDisplayTarget.Width}x{pendingDisplayTarget.Height}");
+                    state.PendingTargetlessDraw = null;
+                    state.TranslatedDraw = null;
+                }
+
                 if (VideoOutExports.TryGetDisplayBufferInfo(
                         handle,
                         displayBufferIndex,
@@ -3086,6 +3228,15 @@ public static class AgcExports
                 _ = VideoOutExports.SubmitFlipFromAgc(ctx, handle, displayBufferIndex, unchecked((int)flipMode), flipArg);
                 state.SawIndexedDraw = false;
                 state.GuestDrawKind = GuestDrawKind.None;
+                if (state.PendingTargetlessDraw is { } unusedPendingDraw)
+                {
+                    ReturnPooledDrawArrays(
+                        unusedPendingDraw,
+                        globals: true,
+                        vertex: true,
+                        index: true);
+                    state.PendingTargetlessDraw = null;
+                }
                 state.TranslatedDraw = null;
             }
 
@@ -3093,6 +3244,56 @@ public static class AgcExports
         }
 
         return false;
+    }
+
+    private static void TraceFramePacketSummary(SubmittedDcbState state)
+    {
+        if (!_traceFramePackets)
+        {
+            return;
+        }
+
+        var flip = ++state.FlipCount;
+        if (flip <= 8 || flip % 60 == 0 || state.FrameDrawCount == 0)
+        {
+            var opcodes = string.Join(
+                ',',
+                state.FramePacketCounts
+                    .OrderByDescending(entry => entry.Value)
+                    .ThenBy(entry => entry.Key.Op)
+                    .Take(32)
+                    .Select(entry => entry.Key.Register == uint.MaxValue
+                        ? $"0x{entry.Key.Op:X2}:{entry.Value}"
+                        : $"0x{entry.Key.Op:X2}/r{entry.Key.Register}:{entry.Value}"));
+            Console.Error.WriteLine(
+                $"[FRAMEPKT] flip={flip} submission={state.ActiveSubmissionId} " +
+                $"packets={state.FramePacketCount} draws={state.FrameDrawCount} " +
+                $"dispatches={state.FrameDispatchCount} opcodes=[{opcodes}]");
+        }
+
+        state.FramePacketCounts.Clear();
+        state.FramePacketCount = 0;
+        state.FrameDrawCount = 0;
+        state.FrameDispatchCount = 0;
+    }
+
+    private static void TracePacketParseFailure(
+        SubmittedDcbState state,
+        ulong address,
+        uint offset,
+        uint header,
+        string reason)
+    {
+        if (!_traceFramePackets ||
+            Interlocked.Increment(ref _packetParseFailureTraceCount) > 128)
+        {
+            return;
+        }
+
+        Console.Error.WriteLine(
+            $"[FRAMEPKT] parse-failure queue={state.QueueName} " +
+            $"submission={state.ActiveSubmissionId} offset={offset} " +
+            $"address=0x{address:X16} header=0x{header:X8} reason={reason}");
     }
 
     private static void TraceDisplayBuffer(
@@ -3199,7 +3400,10 @@ public static class AgcExports
                     var (resumeContext, resumeGpuState) = state;
                     lock (resumeGpuState.Gate)
                     {
-                        DrainResumableDcbs(resumeContext, resumeGpuState, tracePackets: false);
+                        DrainResumableDcbs(
+                            resumeContext,
+                            resumeGpuState,
+                            tracePackets: _traceAgc);
                     }
                 },
                 (ctx, gpuState),
@@ -4290,7 +4494,7 @@ public static class AgcExports
                     return;
                 }
 
-                DrainResumableDcbs(ctx, gpuState, tracePackets: false);
+                DrainResumableDcbs(ctx, gpuState, tracePackets: _traceAgc);
                 var after = GpuWaitRegistry.CountForMemory(ctx.Memory);
                 madeProgress = after < before;
                 if (madeProgress)
@@ -4438,6 +4642,7 @@ public static class AgcExports
         {
             state.IsSuspended = false;
             state.HasActiveSubmission = false;
+            NotifySubmittedDcbCompleted(gpuState, state, waiter.SubmissionId);
             PumpSubmittedQueue(ctx, gpuState, state);
             return;
         }
@@ -4467,6 +4672,7 @@ public static class AgcExports
         }
 
         state.HasActiveSubmission = false;
+        NotifySubmittedDcbCompleted(gpuState, state, waiter.SubmissionId);
         PumpSubmittedQueue(ctx, gpuState, state);
     }
 
@@ -4593,17 +4799,29 @@ public static class AgcExports
         var dataSelection = (control >> 16) & 0xFFu;
         var destinationAddress = ((ulong)destinationHi << 32) | destinationLo;
         var data = ((ulong)dataHi << 32) | dataLo;
+        var writeLength = dataSelection switch
+        {
+            1 => (ulong)sizeof(uint),
+            2 or 3 => (ulong)sizeof(ulong),
+            _ => 0UL,
+        };
         SubmitOrderedGpuSideEffect(
             ctx,
             gpuState,
             state,
             () =>
             {
-                InvalidateDcbWindowIfOverlaps(destinationAddress, sizeof(ulong));
+                InvalidateDcbWindowIfOverlaps(destinationAddress, writeLength);
                 var wroteData = dataSelection switch
                 {
-                    1 or 2 => TryWriteUInt32(ctx, destinationAddress, dataLo),
-                    3 => ctx.TryWriteUInt64(destinationAddress, data),
+                    1 => TryWriteUInt32(ctx, destinationAddress, dataLo),
+                    2 => ctx.TryWriteUInt64(destinationAddress, data),
+                    // Data selection 3 samples the GPU clock at the release
+                    // point. The packet payload is ignored by hardware; Unity
+                    // uses the nonzero timestamp as submit-completion state.
+                    3 => ctx.TryWriteUInt64(
+                        destinationAddress,
+                        unchecked((ulong)System.Diagnostics.Stopwatch.GetTimestamp())),
                     _ => false,
                 };
 
@@ -4617,8 +4835,7 @@ public static class AgcExports
             $"release_mem dst=0x{destinationAddress:X16} data=0x{data:X16}",
             packetAddress,
             dataSelection is 1 or 2 or 3 ? destinationAddress : 0,
-            dataSelection == 3 ? (ulong)sizeof(ulong) :
-                dataSelection is 1 or 2 ? sizeof(uint) : 0UL);
+            writeLength);
     }
 
     private static void ApplySubmittedRegisters(
@@ -4683,10 +4900,11 @@ public static class AgcExports
                 return;
             }
 
-            if (registerOffset != 0)
-            {
-                destination[registerOffset] = value;
-            }
+            // The indirect table has an explicit count; offset zero is a real
+            // context-register index (DB_RENDER_CONTROL), not a terminator.
+            // Dropping it leaves stale depth/render-control state active in
+            // later passes.
+            destination[registerOffset] = value;
         }
     }
 
@@ -4760,10 +4978,20 @@ public static class AgcExports
         state.UcRegisters.TryGetValue(VgtPrimitiveType, out var primitiveType);
         var renderTargets = GetRenderTargets(state.CxRegisters);
         var drawSequence = ++gpuState.WorkSequence;
+        if (state.PendingTargetlessDraw is { } stalePendingDraw)
+        {
+            ReturnPooledDrawArrays(
+                stalePendingDraw,
+                globals: true,
+                vertex: true,
+                index: true);
+            state.PendingTargetlessDraw = null;
+        }
         state.TranslatedDraw = null;
         state.GuestDrawKind = GuestDrawKind.None;
         foreach (var target in renderTargets)
         {
+            state.KnownRenderTargets[target.Address] = target;
             // Colour exports originate in the pixel stage.  A depth-only draw
             // can leave old CB registers bound, but it must not become the
             // advertised writer of those surfaces merely because they remain
@@ -4883,6 +5111,56 @@ public static class AgcExports
                 out translationError))
         {
             state.TranslatedDraw = translatedDraw;
+            if (TryGetHardwareColorResolveTargets(
+                    state.CxRegisters,
+                    out var resolveSource,
+                    out var resolveDestination))
+            {
+                state.KnownRenderTargets[resolveSource.Address] = resolveSource;
+                state.KnownRenderTargets[resolveDestination.Address] = resolveDestination;
+                ProvideRenderTargetInitialData(ctx, resolveSource);
+                if (VulkanVideoPresenter.TrySubmitGuestImageBlit(
+                        resolveSource.Address,
+                        resolveSource.Width,
+                        resolveSource.Height,
+                        resolveSource.Format,
+                        resolveSource.NumberType,
+                        resolveDestination.Address,
+                        resolveDestination.Width,
+                        resolveDestination.Height,
+                        resolveDestination.Format,
+                        resolveDestination.NumberType))
+                {
+                    state.RenderTargetWriters[resolveDestination.Address] =
+                        new RenderTargetWriter(
+                            drawSequence,
+                            exportShaderAddress,
+                            pixelShaderAddress,
+                            vertexCount,
+                            primitiveType);
+                    TraceAgcShader(
+                        $"agc.hardware_color_resolve seq={drawSequence} " +
+                        $"src=0x{resolveSource.Address:X16}:" +
+                        $"{resolveSource.Width}x{resolveSource.Height}:" +
+                        $"fmt{resolveSource.Format}/num{resolveSource.NumberType} " +
+                        $"dst=0x{resolveDestination.Address:X16}:" +
+                        $"{resolveDestination.Width}x{resolveDestination.Height}:" +
+                        $"fmt{resolveDestination.Format}/num{resolveDestination.NumberType}");
+                    ReturnPooledDrawArrays(
+                        translatedDraw,
+                        globals: true,
+                        vertex: true,
+                        index: true);
+                    state.TranslatedDraw = null;
+                    return;
+                }
+
+                TraceAgcShader(
+                    $"agc.hardware_color_resolve_unavailable seq={drawSequence} " +
+                    $"src=0x{resolveSource.Address:X16} " +
+                    $"dst=0x{resolveDestination.Address:X16}");
+            }
+
             var firstTarget = translatedDraw.RenderTargets.FirstOrDefault();
             if (firstTarget.Address != 0)
             {
@@ -4890,10 +5168,31 @@ public static class AgcExports
                 // writes several targets in one guest pass; we render one bound
                 // target per Vulkan pass, each with the pixel variant that
                 // routes that target's MRT export slot to the fragment output.
-                // Secondary targets get fresh (per-submit) buffers and a
-                // non-pooled index copy so they never share a pooled array with
-                // the primary submit, whose fence may recycle it independently.
+                // Every pass is enqueued in order on the same guest render
+                // queue. Share the immutable snapshots between those passes
+                // and let only the final pass return pooled arrays after its
+                // host upload. Copying the full vertex/global payload for each
+                // secondary target made deferred G-buffer draws allocate
+                // hundreds of MiB per second on the managed large-object heap.
                 var drawRenderTargets = translatedDraw.RenderTargets;
+                var lastTargetIndex = 0;
+                for (var targetIndex = 1; targetIndex < drawRenderTargets.Count; targetIndex++)
+                {
+                    if (drawRenderTargets[targetIndex].Address != 0)
+                    {
+                        lastTargetIndex = targetIndex;
+                    }
+                }
+
+                var sharedTextures = CreateVulkanGuestDrawTextures(
+                    ctx,
+                    translatedDraw.Textures,
+                    out _);
+                var sharedGlobalMemoryBuffers =
+                    CreateTranslatedDrawGlobalBuffers(translatedDraw);
+                var sharedVertexBuffers =
+                    CreateVulkanGuestVertexBuffers(translatedDraw.VertexInputs);
+                var sharedIndexBuffer = translatedDraw.IndexBuffer;
                 for (var targetIndex = 0; targetIndex < drawRenderTargets.Count; targetIndex++)
                 {
                     var renderTarget = drawRenderTargets[targetIndex];
@@ -4906,23 +5205,25 @@ public static class AgcExports
                         ? translatedDraw.PixelSpirvByTarget[targetIndex]
                         : translatedDraw.PixelSpirv;
                     var isPrimary = targetIndex == 0;
-
-                    var textures = CreateVulkanGuestDrawTextures(
-                        ctx,
-                        translatedDraw.Textures,
-                        out _);
-                    var globalMemoryBuffers =
-                        CreateTranslatedDrawGlobalBuffers(translatedDraw);
-                    var vertexBuffers =
-                        CreateVulkanGuestVertexBuffers(translatedDraw.VertexInputs);
-                    var indexBuffer = isPrimary
-                        ? translatedDraw.IndexBuffer
-                        : CloneIndexBufferUnpooled(translatedDraw.IndexBuffer);
+                    var ownsPooledData = targetIndex == lastTargetIndex;
+                    var globalMemoryBuffers = CreateGlobalBufferOwnershipView(
+                        sharedGlobalMemoryBuffers,
+                        ownsPooledData);
+                    var vertexBuffers = CreateVertexBufferOwnershipView(
+                        sharedVertexBuffers,
+                        ownsPooledData);
+                    var indexBuffer = CreateIndexBufferOwnershipView(
+                        sharedIndexBuffer,
+                        ownsPooledData);
                     if (isPrimary)
                     {
                         TraceRectListVertices(translatedDraw, vertexBuffers);
-                        TraceGrassDrawVertices(translatedDraw, textures, vertexBuffers);
-                        TraceDrawCompact(drawSequence, translatedDraw, textures, vertexBuffers);
+                        TraceGrassDrawVertices(translatedDraw, sharedTextures, vertexBuffers);
+                        TraceDrawCompact(
+                            drawSequence,
+                            translatedDraw,
+                            sharedTextures,
+                            vertexBuffers);
                     }
 
                     ProvideRenderTargetInitialData(ctx, renderTarget);
@@ -4949,7 +5250,7 @@ public static class AgcExports
 
                     VulkanVideoPresenter.SubmitOffscreenTranslatedDraw(
                         pixelSpirv,
-                        textures,
+                        sharedTextures,
                         globalMemoryBuffers,
                         translatedDraw.AttributeCount,
                         new VulkanGuestRenderTarget(
@@ -5039,14 +5340,25 @@ public static class AgcExports
                     }
                     else
                     {
-                        // No render target and no storage sink: nothing was
-                        // handed to the presenter, so every pooled array on the
-                        // draw is this branch's to return.
-                        ReturnPooledDrawArrays(
-                            translatedDraw,
-                            globals: true,
-                            vertex: true,
-                            index: true);
+                        if (translatedDraw.Textures.Count != 0)
+                        {
+                            // Unity's PS5 final blit can omit CB registers and
+                            // rely on the following AGC flip to name the scanout
+                            // target. Retain that sampled draw until RFlip, then
+                            // enqueue it against the known display surface before
+                            // the ordered capture.
+                            state.PendingTargetlessDraw = translatedDraw;
+                        }
+                        else
+                        {
+                            // No render target, storage sink or sampled source:
+                            // nothing can consume this draw.
+                            ReturnPooledDrawArrays(
+                                translatedDraw,
+                                globals: true,
+                                vertex: true,
+                                index: true);
+                        }
                     }
                 }
             }
@@ -5143,7 +5455,15 @@ public static class AgcExports
                 exportState,
                 out var exportEvaluation,
                 out error,
-                resolveVertexInputs: true))
+                resolveVertexInputs: true,
+                requiredVertexRecordCount: TryGetRequiredVertexRecordCount(
+                    ctx,
+                    state,
+                    vertexCount,
+                    indexed,
+                    out var depthVertexRecords)
+                        ? depthVertexRecords
+                        : null))
         {
             return false;
         }
@@ -5321,7 +5641,15 @@ public static class AgcExports
                 exportState,
                 out var exportEvaluation,
                 out error,
-                resolveVertexInputs: true))
+                resolveVertexInputs: true,
+                requiredVertexRecordCount: TryGetRequiredVertexRecordCount(
+                    ctx,
+                    state,
+                    vertexCount,
+                    indexed,
+                    out var vertexRecords)
+                        ? vertexRecords
+                        : null))
         {
             return false;
         }
@@ -5661,7 +5989,7 @@ public static class AgcExports
         var bytesPerIndex = is32Bit ? sizeof(uint) : sizeof(ushort);
         var byteOffset = checked((ulong)state.DrawIndexOffset * (uint)bytesPerIndex);
         var byteCount = checked((int)(indexCount * (uint)bytesPerIndex));
-        var data = System.Buffers.ArrayPool<byte>.Shared.Rent(byteCount);
+        var data = VulkanVideoPresenter.GuestDataPool.Rent(byteCount);
         var span = data.AsSpan(0, byteCount);
         var address = state.IndexBufferAddress + byteOffset;
         if (ctx.Memory.TryRead(address, span) ||
@@ -5670,8 +5998,92 @@ public static class AgcExports
             return new VulkanGuestIndexBuffer(data, byteCount, is32Bit, Pooled: true);
         }
 
-        System.Buffers.ArrayPool<byte>.Shared.Return(data);
+        VulkanVideoPresenter.GuestDataPool.Return(data);
         return null;
+    }
+
+    private static bool TryGetRequiredVertexRecordCount(
+        CpuContext ctx,
+        SubmittedDcbState state,
+        uint drawCount,
+        bool indexed,
+        out uint recordCount)
+    {
+        recordCount = Math.Max(drawCount, Math.Max(state.InstanceCount, 1u));
+        if (!indexed)
+        {
+            return true;
+        }
+
+        if (state.IndexBufferAddress == 0 || drawCount == 0)
+        {
+            return false;
+        }
+
+        var is32Bit = state.IndexSize != 0;
+        var bytesPerIndex = is32Bit ? sizeof(uint) : sizeof(ushort);
+        var byteOffset = checked((ulong)state.DrawIndexOffset * (uint)bytesPerIndex);
+        var address = state.IndexBufferAddress + byteOffset;
+        const int chunkBytes = 64 * 1024;
+        var scratch = VulkanVideoPresenter.GuestDataPool.Rent(chunkBytes);
+        var remaining = drawCount;
+        var maxIndex = 0u;
+        var sawIndex = false;
+        try
+        {
+            while (remaining != 0)
+            {
+                var chunkIndices = (int)Math.Min(
+                    remaining,
+                    (uint)(chunkBytes / bytesPerIndex));
+                var bytes = chunkIndices * bytesPerIndex;
+                var span = scratch.AsSpan(0, bytes);
+                if (!ctx.Memory.TryRead(address, span) &&
+                    !KernelMemoryCompatExports.TryReadTrackedLibcHeap(address, span))
+                {
+                    return false;
+                }
+
+                for (var index = 0; index < chunkIndices; index++)
+                {
+                    var value = is32Bit
+                        ? BinaryPrimitives.ReadUInt32LittleEndian(
+                            span.Slice(index * sizeof(uint), sizeof(uint)))
+                        : BinaryPrimitives.ReadUInt16LittleEndian(
+                            span.Slice(index * sizeof(ushort), sizeof(ushort)));
+                    if (value == (is32Bit ? uint.MaxValue : ushort.MaxValue))
+                    {
+                        // Primitive-restart markers do not address vertex data.
+                        continue;
+                    }
+
+                    maxIndex = Math.Max(maxIndex, value);
+                    sawIndex = true;
+                }
+
+                address += (uint)bytes;
+                remaining -= (uint)chunkIndices;
+            }
+        }
+        finally
+        {
+            VulkanVideoPresenter.GuestDataPool.Return(scratch);
+        }
+
+        var indexedRecords = sawIndex && maxIndex != uint.MaxValue
+            ? maxIndex + 1
+            : 1u;
+        recordCount = Math.Max(indexedRecords, Math.Max(state.InstanceCount, 1u));
+        if (_traceVertexRanges &&
+            Interlocked.Increment(ref _tracedVertexRangeCount) <= 512)
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] agc.vertex_range indexed=1 draw_count={drawCount} " +
+                $"max_index={(sawIndex ? maxIndex : 0)} records={recordCount} " +
+                $"instances={state.InstanceCount} index_size={(is32Bit ? 32 : 16)} " +
+                $"index_addr=0x{state.IndexBufferAddress:X16} offset={state.DrawIndexOffset}");
+        }
+        return true;
     }
 
     private static Gen5PixelOutputKind GetPixelOutputKind(uint numberType) =>
@@ -5681,25 +6093,6 @@ public static class AgcExports
             5 => Gen5PixelOutputKind.Sint,
             _ => Gen5PixelOutputKind.Float,
         };
-
-    /// <summary>
-    /// Copies an index buffer into a fresh, non-pooled array. Multi-render-
-    /// target draws submit the same geometry once per bound target; the pooled
-    /// index buffer belongs to the primary submit (whose fence recycles it), so
-    /// each additional target draws from an independent copy.
-    /// </summary>
-    private static VulkanGuestIndexBuffer? CloneIndexBufferUnpooled(
-        VulkanGuestIndexBuffer? indexBuffer)
-    {
-        if (indexBuffer is not { } source)
-        {
-            return null;
-        }
-
-        var copy = new byte[source.Data.Length];
-        Array.Copy(source.Data, copy, source.Data.Length);
-        return new VulkanGuestIndexBuffer(copy, source.Length, source.Is32Bit, Pooled: false);
-    }
 
     private static bool HasPixelColorExport(Gen5ShaderState state, uint target) =>
         state.Program.Instructions.Any(instruction =>
@@ -5821,8 +6214,36 @@ public static class AgcExports
         return hash;
     }
 
+    private static bool TryGetHardwareColorResolveTargets(
+        IReadOnlyDictionary<uint, uint> registers,
+        out RenderTargetDescriptor source,
+        out RenderTargetDescriptor destination)
+    {
+        source = default;
+        destination = default;
+        if (!registers.TryGetValue(CbColorControl, out var colorControl) ||
+            ((colorControl >> 4) & 0x7u) != 3u)
+        {
+            return false;
+        }
+
+        // CB_COLOR_CONTROL.MODE=RESOLVE uses color slot 0 as the multisampled
+        // source and slot 1 as the single-sample destination. CB_TARGET_MASK
+        // still enables only slot 0, so treating this like a normal MRT draw
+        // rewrites the source and leaves the following composite's input blank.
+        var boundTargets = GetRenderTargets(registers, includeMaskedTargets: true);
+        source = boundTargets.FirstOrDefault(target => target.Slot == 0);
+        destination = boundTargets.FirstOrDefault(target => target.Slot == 1);
+        return source.Address != 0 &&
+            destination.Address != 0 &&
+            source.Width == destination.Width &&
+            source.Height == destination.Height &&
+            source.Format == destination.Format;
+    }
+
     private static IReadOnlyList<RenderTargetDescriptor> GetRenderTargets(
-        IReadOnlyDictionary<uint, uint> registers)
+        IReadOnlyDictionary<uint, uint> registers,
+        bool includeMaskedTargets = false)
     {
         var hasTargetMask = registers.TryGetValue(CbTargetMask, out var targetMask);
         var targets = new List<RenderTargetDescriptor>(ColorTargetCount);
@@ -5840,7 +6261,8 @@ public static class AgcExports
 
             var address = ((ulong)(baseHigh & 0xFFu) << 40) | ((ulong)baseLow << 8);
             var writeMask = (targetMask >> ((int)slot * 4)) & 0xFu;
-            if (address == 0 || (hasTargetMask && writeMask == 0))
+            if (address == 0 ||
+                (!includeMaskedTargets && hasTargetMask && writeMask == 0))
             {
                 continue;
             }
@@ -6023,7 +6445,19 @@ public static class AgcExports
             windowOffsetY = (short)(windowOffset >> 16);
         }
 
-        IntersectScissorPair(registers, PaScScreenScissorTl, PaScScreenScissorBr, ref left, ref top, ref right, ref bottom);
+        // AGC reset-state blocks can carry an all-zero screen-scissor pair as
+        // an unpatched placeholder while the generic/viewport scissors hold
+        // the active bounds. Treat only that exact reset value as absent. A
+        // nonzero empty rectangle remains meaningful and still clips the draw.
+        IntersectScissorPair(
+            registers,
+            PaScScreenScissorTl,
+            PaScScreenScissorBr,
+            ref left,
+            ref top,
+            ref right,
+            ref bottom,
+            ignoreAllZeroPair: true);
         IntersectScissorPair(
             registers,
             PaScWindowScissorTl,
@@ -6155,9 +6589,19 @@ public static class AgcExports
         ref int right,
         ref int bottom,
         int offsetX = 0,
-        int offsetY = 0)
+        int offsetY = 0,
+        bool ignoreAllZeroPair = false)
     {
-        if (!TryDecodeScissorPair(registers, tlRegister, brRegister, out var pairLeft, out var pairTop, out var pairRight, out var pairBottom))
+        if (!TryDecodeScissorPair(
+                registers,
+                tlRegister,
+                brRegister,
+                out var pairLeft,
+                out var pairTop,
+                out var pairRight,
+                out var pairBottom,
+                out var allZero) ||
+            (ignoreAllZeroPair && allZero))
         {
             return;
         }
@@ -6180,18 +6624,21 @@ public static class AgcExports
         out int left,
         out int top,
         out int right,
-        out int bottom)
+        out int bottom,
+        out bool allZero)
     {
         left = 0;
         top = 0;
         right = 0;
         bottom = 0;
+        allZero = false;
         if (!registers.TryGetValue(tlRegister, out var tl) ||
             !registers.TryGetValue(brRegister, out var br))
         {
             return false;
         }
 
+        allZero = tl == 0 && br == 0;
         left = (int)(tl & 0x7FFFu);
         top = (int)((tl >> 16) & 0x7FFFu);
         right = (int)(br & 0x7FFFu);
@@ -6378,6 +6825,24 @@ public static class AgcExports
         return combined;
     }
 
+    private static IReadOnlyList<VulkanGuestMemoryBuffer>
+        CreateGlobalBufferOwnershipView(
+            IReadOnlyList<VulkanGuestMemoryBuffer> buffers,
+            bool ownsPooledData)
+    {
+        var view = new VulkanGuestMemoryBuffer[buffers.Count];
+        for (var index = 0; index < buffers.Count; index++)
+        {
+            var buffer = buffers[index];
+            view[index] = buffer with
+            {
+                Pooled = ownsPooledData && buffer.Pooled,
+            };
+        }
+
+        return view;
+    }
+
     /// <summary>
     /// Present-time variant: the flip path can reuse the same translated
     /// draw across several flips and swapchain retries, so it must not wrap
@@ -6439,7 +6904,7 @@ public static class AgcExports
         IReadOnlyList<uint> registers,
         IReadOnlyList<Gen5GlobalMemoryBinding> bindings)
     {
-        var bytes = System.Buffers.ArrayPool<byte>.Shared.Rent(
+        var bytes = VulkanVideoPresenter.GuestDataPool.Rent(
             GetRuntimeScalarBufferLength(bindings.Count));
         PackRuntimeScalarStateInto(bytes, registers, bindings);
         return bytes;
@@ -6506,7 +6971,7 @@ public static class AgcExports
         {
             if (binding.DataPooled)
             {
-                System.Buffers.ArrayPool<byte>.Shared.Return(binding.Data);
+                VulkanVideoPresenter.GuestDataPool.Return(binding.Data);
             }
         }
 
@@ -6516,7 +6981,7 @@ public static class AgcExports
             {
                 if (binding.DataPooled)
                 {
-                    System.Buffers.ArrayPool<byte>.Shared.Return(binding.Data);
+                    VulkanVideoPresenter.GuestDataPool.Return(binding.Data);
                 }
             }
         }
@@ -6540,7 +7005,7 @@ public static class AgcExports
             {
                 if (binding.DataPooled)
                 {
-                    System.Buffers.ArrayPool<byte>.Shared.Return(binding.Data);
+                    VulkanVideoPresenter.GuestDataPool.Return(binding.Data);
                 }
             }
         }
@@ -6551,14 +7016,14 @@ public static class AgcExports
             {
                 if (binding.DataPooled)
                 {
-                    System.Buffers.ArrayPool<byte>.Shared.Return(binding.Data);
+                    VulkanVideoPresenter.GuestDataPool.Return(binding.Data);
                 }
             }
         }
 
         if (index && draw.IndexBuffer is { Pooled: true } indexBuffer)
         {
-            System.Buffers.ArrayPool<byte>.Shared.Return(indexBuffer.Data);
+            VulkanVideoPresenter.GuestDataPool.Return(indexBuffer.Data);
         }
     }
 
@@ -6628,6 +7093,31 @@ public static class AgcExports
 
         return buffers;
     }
+
+    private static IReadOnlyList<VulkanGuestVertexBuffer>
+        CreateVertexBufferOwnershipView(
+            IReadOnlyList<VulkanGuestVertexBuffer> buffers,
+            bool ownsPooledData)
+    {
+        var view = new VulkanGuestVertexBuffer[buffers.Count];
+        for (var index = 0; index < buffers.Count; index++)
+        {
+            var buffer = buffers[index];
+            view[index] = buffer with
+            {
+                Pooled = ownsPooledData && buffer.Pooled,
+            };
+        }
+
+        return view;
+    }
+
+    private static VulkanGuestIndexBuffer? CreateIndexBufferOwnershipView(
+        VulkanGuestIndexBuffer? buffer,
+        bool ownsPooledData) =>
+        buffer is null
+            ? null
+            : buffer with { Pooled = ownsPooledData && buffer.Pooled };
 
     // BCn block-compressed guest formats and the bytes per 4x4 block.
     private static int GetBlockCompressedBlockBytes(uint format) => format switch
@@ -8264,10 +8754,12 @@ public static class AgcExports
                         cachedSourceTexture.Width,
                         cachedSourceTexture.Height,
                         cachedSourceTexture.Format,
+                        cachedSourceTexture.NumberType,
                         texture.Address,
                         texture.Width,
                         texture.Height,
-                        texture.Format))
+                        texture.Format,
+                        texture.NumberType))
                 {
                     blits++;
                     TraceAgcShader(
@@ -9232,19 +9724,52 @@ public static class AgcExports
             !TryReadUInt64(ctx, commandBufferAddress + CommandBufferCursorUpOffset, out var cursorUp) ||
             !TryReadUInt64(ctx, commandBufferAddress + CommandBufferCursorDownOffset, out var cursorDown) ||
             !TryReadUInt64(ctx, commandBufferAddress + CommandBufferCallbackOffset, out var callback) ||
+            !TryReadUInt64(ctx, commandBufferAddress + CommandBufferUserDataOffset, out var userData) ||
             !TryReadUInt32(ctx, commandBufferAddress + CommandBufferReservedDwOffset, out var reservedDwords))
         {
             return false;
         }
 
-        var availableDwords = cursorDown >= cursorUp
-            ? Math.Min((cursorDown - cursorUp) / sizeof(uint), uint.MaxValue)
-            : 0;
-        var remainingDwords = (uint)Math.Max(availableDwords, reservedDwords) - reservedDwords;
+        var remainingDwords = GetRemainingCommandDwords(cursorUp, cursorDown, reservedDwords);
         if (sizeDwords > remainingDwords)
         {
             TraceAgc($"agc.cmd_alloc_full buf=0x{commandBufferAddress:X16} need={sizeDwords} remaining={remainingDwords} callback=0x{callback:X16}");
-            return false;
+            var scheduler = GuestThreadExecution.Scheduler;
+            ulong callbackResult = 0;
+            string? callbackError = null;
+            if (callback == 0 ||
+                scheduler is null ||
+                !scheduler.TryCallGuestFunction(
+                    ctx,
+                    callback,
+                    commandBufferAddress,
+                    (ulong)sizeDwords + reservedDwords,
+                    userData,
+                    0,
+                    0,
+                    "agc_command_buffer_full",
+                    out callbackResult,
+                    out callbackError))
+            {
+                TraceAgc(
+                    $"agc.cmd_alloc_callback_failed buf=0x{commandBufferAddress:X16} " +
+                    $"callback=0x{callback:X16} result=0x{callbackResult:X16} " +
+                    $"error={callbackError ?? "none"}");
+                return false;
+            }
+
+            TraceAgc(
+                $"agc.cmd_alloc_callback_complete buf=0x{commandBufferAddress:X16} " +
+                $"callback=0x{callback:X16} result=0x{callbackResult:X16}");
+
+            if (!TryReadUInt64(ctx, commandBufferAddress + CommandBufferCursorUpOffset, out cursorUp) ||
+                !TryReadUInt64(ctx, commandBufferAddress + CommandBufferCursorDownOffset, out cursorDown) ||
+                !TryReadUInt32(ctx, commandBufferAddress + CommandBufferReservedDwOffset, out reservedDwords) ||
+                sizeDwords > GetRemainingCommandDwords(cursorUp, cursorDown, reservedDwords))
+            {
+                TraceAgc($"agc.cmd_alloc_callback_no_space buf=0x{commandBufferAddress:X16} need={sizeDwords}");
+                return false;
+            }
         }
 
         var nextCursor = cursorUp + ((ulong)sizeDwords * sizeof(uint));
@@ -9255,6 +9780,19 @@ public static class AgcExports
 
         commandAddress = cursorUp;
         return true;
+    }
+
+    private static uint GetRemainingCommandDwords(
+        ulong cursorUp,
+        ulong cursorDown,
+        uint reservedDwords)
+    {
+        var availableDwords = cursorDown >= cursorUp
+            ? Math.Min((cursorDown - cursorUp) / sizeof(uint), uint.MaxValue)
+            : 0;
+        return availableDwords > reservedDwords
+            ? (uint)availableDwords - reservedDwords
+            : 0;
     }
 
     private static bool CopyShaderRegister(CpuContext ctx, ulong sourceAddress, ulong destinationAddress)

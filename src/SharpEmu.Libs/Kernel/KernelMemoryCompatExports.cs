@@ -1545,6 +1545,13 @@ public static partial class KernelMemoryCompatExports
     }
 
     [SysAbiExport(
+        Nid = "E6ao34wPw+U",
+        ExportName = "stat",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int PosixStat(CpuContext ctx) => KernelStat(ctx);
+
+    [SysAbiExport(
         Nid = "gEpBkcwxUjw",
         ExportName = "sceKernelAprResolveFilepathsToIdsAndFileSizes",
         Target = Generation.Gen4 | Generation.Gen5,
@@ -2668,20 +2675,21 @@ public static partial class KernelMemoryCompatExports
     {
         var start = ctx[CpuRegister.Rdi];
         var length = ctx[CpuRegister.Rsi];
-        if (length == 0)
+        if (!IsAligned(start, OrbisPageSize) || !IsAligned(length, OrbisPageSize))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
+        if (length == 0)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+
         lock (_memoryGate)
         {
-            if (!_directAllocations.TryGetValue(start, out var allocation) || allocation.Length != length)
-            {
-                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
-            }
-
-            _directAllocations.Remove(start);
-            _nextPhysicalAddress = GetDirectMemoryHighWaterMarkLocked();
+            // The unchecked API ignores an unallocated range, matching the
+            // kernel contract used by guest pool allocators during teardown.
+            _ = TryReleaseDirectMemoryRangeLocked(start, length);
         }
 
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
@@ -2697,21 +2705,22 @@ public static partial class KernelMemoryCompatExports
         var start = ctx[CpuRegister.Rdi];
         var length = ctx[CpuRegister.Rsi];
 
-        if (length == 0)
+        if (!IsAligned(start, OrbisPageSize) || !IsAligned(length, OrbisPageSize))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
+        if (length == 0)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+
         lock (_memoryGate)
         {
-            if (!_directAllocations.TryGetValue(start, out var allocation) ||
-                allocation.Length != length)
+            if (!TryReleaseDirectMemoryRangeLocked(start, length))
             {
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
             }
-
-            _directAllocations.Remove(start);
-            _nextPhysicalAddress = GetDirectMemoryHighWaterMarkLocked();
         }
 
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
@@ -2950,6 +2959,31 @@ public static partial class KernelMemoryCompatExports
     }
 
     [SysAbiExport(
+        Nid = "yDBwVAolDgg",
+        ExportName = "sceKernelIsStack",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int KernelIsStack(CpuContext ctx)
+    {
+        _ = ctx[CpuRegister.Rdi];
+        var startAddress = ctx[CpuRegister.Rsi];
+        var endAddress = ctx[CpuRegister.Rdx];
+
+        // The queried ranges used by libc's VM allocator are ordinary heap
+        // mappings. The kernel still initializes both outputs when a mapping
+        // is not a pthread stack; leaving them untouched makes libc consume
+        // stale stack values and issue invalid fixed-range reservations.
+        if ((startAddress != 0 && !ctx.TryWriteUInt64(startAddress, 0)) ||
+            (endAddress != 0 && !ctx.TryWriteUInt64(endAddress, 0)))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
         Nid = "cQke9UuBQOk",
         ExportName = "sceKernelMunmap",
         Target = Generation.Gen4 | Generation.Gen5,
@@ -2958,25 +2992,43 @@ public static partial class KernelMemoryCompatExports
     {
         var address = ctx[CpuRegister.Rdi];
         var length = ctx[CpuRegister.Rsi];
-        if (address == 0 || length == 0)
+        if (address == 0 || length == 0 || ulong.MaxValue - address < length)
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
+        var rangeEnd = address + length;
+        var physicallyBacked = IsGuestRangeBacked(ctx, address, length);
+        var removedAny = false;
         lock (_memoryGate)
         {
-            if (!_mappedRegions.TryGetValue(address, out var mappedRegion) || mappedRegion.Length != length)
+            var removedRegions = _mappedRegions.Values
+                .Where(region =>
+                    region.Address >= address &&
+                    region.Address < rangeEnd &&
+                    region.Length <= rangeEnd - region.Address)
+                .ToArray();
+
+            if (removedRegions.Length == 0 && !physicallyBacked)
             {
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
             }
 
-            _mappedRegions.Remove(address);
-            if (mappedRegion.IsFlexible)
+            foreach (var mappedRegion in removedRegions)
             {
-                _allocatedFlexibleBytes = mappedRegion.Length >= _allocatedFlexibleBytes
-                    ? 0
-                    : _allocatedFlexibleBytes - mappedRegion.Length;
+                removedAny |= _mappedRegions.Remove(mappedRegion.Address);
+                if (mappedRegion.IsFlexible)
+                {
+                    _allocatedFlexibleBytes = mappedRegion.Length >= _allocatedFlexibleBytes
+                        ? 0
+                        : _allocatedFlexibleBytes - mappedRegion.Length;
+                }
             }
+        }
+
+        if (physicallyBacked || removedAny)
+        {
+            KernelRuntimeCompatExports.RegisterReleasedVirtualRange(address, length);
         }
 
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
@@ -4280,7 +4332,7 @@ public static partial class KernelMemoryCompatExports
             out _);
     }
 
-    private static bool IsGuestRangeBacked(CpuContext ctx, ulong address, ulong length)
+    internal static bool IsGuestRangeBacked(CpuContext ctx, ulong address, ulong length)
     {
         if (address == 0 || length == 0 || ulong.MaxValue - address < length - 1)
         {
@@ -5524,6 +5576,56 @@ public static partial class KernelMemoryCompatExports
     {
         return string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_DIRECT_MEMORY"), "1", StringComparison.Ordinal);
     }
+
+    private static bool TryReleaseDirectMemoryRangeLocked(ulong start, ulong length)
+    {
+        if (!TryAddU64(start, length, out var releaseEnd))
+        {
+            return false;
+        }
+
+        DirectAllocation? owner = null;
+        ulong ownerEnd = 0;
+        foreach (var allocation in _directAllocations.Values)
+        {
+            if (TryAddU64(allocation.Start, allocation.Length, out var allocationEnd) &&
+                start >= allocation.Start &&
+                releaseEnd <= allocationEnd)
+            {
+                owner = allocation;
+                ownerEnd = allocationEnd;
+                break;
+            }
+        }
+
+        if (owner is not { } releasedFrom)
+        {
+            return false;
+        }
+
+        _directAllocations.Remove(releasedFrom.Start);
+        if (start > releasedFrom.Start)
+        {
+            _directAllocations[releasedFrom.Start] = releasedFrom with
+            {
+                Length = start - releasedFrom.Start,
+            };
+        }
+
+        if (releaseEnd < ownerEnd)
+        {
+            _directAllocations[releaseEnd] = new DirectAllocation(
+                releaseEnd,
+                ownerEnd - releaseEnd,
+                releasedFrom.MemoryType);
+        }
+
+        _nextPhysicalAddress = GetDirectMemoryHighWaterMarkLocked();
+        return true;
+    }
+
+    private static bool IsAligned(ulong value, ulong alignment) =>
+        alignment != 0 && value % alignment == 0;
 
     private static bool TryAllocateDirectMemoryLocked(
         ulong searchStart,

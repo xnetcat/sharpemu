@@ -375,7 +375,7 @@ public sealed class CpuDispatcher : ICpuDispatcher, IDisposable
         if (!context.TryWriteUInt64(tlsBase - 0xF0, 0) ||
             !context.TryWriteUInt64(tlsBase + 0x00, tlsBase) ||
             !context.TryWriteUInt64(tlsBase + 0x10, tlsBase) ||
-            !context.TryWriteUInt64(tlsBase + 0x28, 0xC0DEC0DECAFEBABEUL) ||
+            !context.TryWriteUInt64(tlsBase + 0x28, 0xC0DEC0DECAFEBA00UL) ||
             !context.TryWriteUInt64(tlsBase + 0x60, tlsBase))
         {
             return false;

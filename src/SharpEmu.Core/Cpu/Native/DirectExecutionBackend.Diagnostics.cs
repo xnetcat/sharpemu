@@ -283,6 +283,28 @@ public sealed partial class DirectExecutionBackend
 		return value == 65534 || value == 4294967294u || value == 18446744073709551614uL;
 	}
 
+	private static ulong ParseOptionalHexAddress(string? value)
+	{
+		if (string.IsNullOrWhiteSpace(value))
+		{
+			return 0;
+		}
+
+		var text = value.Trim();
+		if (text.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+		{
+			text = text[2..];
+		}
+
+		return ulong.TryParse(
+			text,
+			System.Globalization.NumberStyles.HexNumber,
+			System.Globalization.CultureInfo.InvariantCulture,
+			out var address)
+			? address
+			: 0;
+	}
+
 	private static bool IsPlausibleReturnAddress(ulong address)
 	{
 		return address >= 12884901888L && address < 17592186044416L && !IsUnresolvedSentinel(address);

@@ -11,12 +11,16 @@ namespace SharpEmu.Libs.Audio;
 
 public static class AudioOut2Exports
 {
-    private const int AudioOut2ContextParamSize = 0x80;
+    // FMOD's PS5 backend allocates this ABI structure as four 16-byte lanes.
+    // Clearing 0x80 bytes here overwrote the caller's stack canary immediately
+    // following the 0x40-byte parameter block.
+    private const int AudioOut2ContextParamSize = 0x40;
     private const int AudioOut2ContextMemorySize = 0x10000;
     private const int AudioOut2ContextMemoryAlignment = 0x10000;
     private static long _nextContextHandle = 1;
     private static long _nextUserHandle = 1;
     private static int _nextPortId;
+    private static long _pushTraceCount;
 
     // Per-context audio parameters captured at ContextCreate so ContextAdvance
     // can pace to the real playback cadence (grain samples at the sample rate).
@@ -147,7 +151,7 @@ public static class AudioOut2Exports
         uint channels = 2;
         uint frequency = 48000;
         uint grain = 256;
-        Span<byte> param = stackalloc byte[0x10];
+        Span<byte> param = stackalloc byte[AudioOut2ContextParamSize];
         if (ctx.Memory.TryRead(paramAddress, param))
         {
             var pc = BinaryPrimitives.ReadUInt32LittleEndian(param[0x04..]);
@@ -155,11 +159,15 @@ public static class AudioOut2Exports
             var pg = BinaryPrimitives.ReadUInt32LittleEndian(param[0x0C..]);
             if (pc is > 0 and <= 8) channels = pc;
             if (pf is >= 8000 and <= 192000) frequency = pf;
-            if (pg is > 0 and <= 0x4000) grain = pg;
+            // Values below one cache line are flags/counts in observed PS5
+            // callers, not audio grains. Keep the hardware-sized default.
+            if (pg is >= 64 and <= 0x4000) grain = pg;
+            TraceAudioOut2($"context-param address=0x{paramAddress:X} bytes={Convert.ToHexString(param)}");
         }
 
         var handle = (ulong)Interlocked.Increment(ref _nextContextHandle);
         Contexts[handle] = new ContextState(frequency, channels, grain);
+        TraceAudioOut2($"context-create handle=0x{handle:X} frequency={frequency} channels={channels} grain={grain} memory=0x{memoryAddress:X} size=0x{memorySize:X}");
         return TryWriteUInt64(ctx, outContextAddress, handle)
             ? SetReturn(ctx, 0)
             : SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
@@ -188,7 +196,25 @@ public static class AudioOut2Exports
         ExportName = "sceAudioOut2ContextPush",
         Target = Generation.Gen5,
         LibraryName = "libSceAudioOut2")]
-    public static int AudioOut2ContextPush(CpuContext ctx) => SetReturn(ctx, 0);
+    public static int AudioOut2ContextPush(CpuContext ctx)
+    {
+        var handle = ctx[CpuRegister.Rdi];
+        var traceCount = Interlocked.Increment(ref _pushTraceCount);
+        if (traceCount <= 16)
+        {
+            TraceAudioOut2($"context-push count={traceCount} rdi=0x{handle:X} rsi=0x{ctx[CpuRegister.Rsi]:X} rdx=0x{ctx[CpuRegister.Rdx]:X} rcx=0x{ctx[CpuRegister.Rcx]:X}");
+        }
+
+        if (Contexts.TryGetValue(handle, out var context))
+        {
+            // FMOD's PS5 output path uses ContextPush as the submission clock
+            // and does not call ContextAdvance. Pace pushes to one hardware
+            // grain so the feeder cannot outrun playback and starve the game.
+            context.PaceAdvance();
+        }
+
+        return SetReturn(ctx, 0);
+    }
 
     [SysAbiExport(
         Nid = "PE2zHMqLSHs",
@@ -246,6 +272,13 @@ public static class AudioOut2Exports
             ? SetReturn(ctx, 0)
             : SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
     }
+
+    [SysAbiExport(
+        Nid = "8XTArSPyWHk",
+        ExportName = "sceAudioOut2PortSetAttributes",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAudioOut2")]
+    public static int AudioOut2PortSetAttributes(CpuContext ctx) => SetReturn(ctx, 0);
 
     [SysAbiExport(
         Nid = "gatEUKG+Ea4",
@@ -322,7 +355,7 @@ public static class AudioOut2Exports
     {
         var userId = unchecked((int)ctx[CpuRegister.Rdi]);
         var outUserAddress = ctx[CpuRegister.Rsi];
-        if ((userId != 0 && userId != 1 && userId != 255) || outUserAddress == 0)
+        if ((userId != 0 && userId != 0x10000000 && userId != 255) || outUserAddress == 0)
         {
             return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
@@ -344,5 +377,13 @@ public static class AudioOut2Exports
     {
         ctx[CpuRegister.Rax] = unchecked((ulong)result);
         return result;
+    }
+
+    private static void TraceAudioOut2(string message)
+    {
+        if (string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_AUDIO_OUT2"), "1", StringComparison.Ordinal))
+        {
+            Console.Error.WriteLine($"[LOADER][TRACE] audio_out2.{message}");
+        }
     }
 }

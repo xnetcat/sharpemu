@@ -51,7 +51,7 @@ public static class KernelRuntimeCompatExports
     private static readonly long _processStartCounter = Stopwatch.GetTimestamp();
     private static readonly RdtscDelegate? _rdtscReader = CreateRdtscReader();
     private static readonly ulong _kernelTscFrequency = ResolveKernelTscFrequency();
-    private static readonly ulong _stackChkGuardValue = 0xC0DEC0DECAFEBABEUL;
+    private static readonly ulong _stackChkGuardValue = 0xC0DEC0DECAFEBA00UL;
     private static readonly nint _stackChkGuardObjectAddress =
         HleDataSymbols.TryGetAddress("f7uOxY9mM1U", out var stackChkGuardAddress)
             ? unchecked((nint)stackChkGuardAddress)
@@ -59,6 +59,7 @@ public static class KernelRuntimeCompatExports
     private static ulong _applicationHeapApiAddress;
     private static ulong _processProcParamAddress;
     private static ulong _nextReservedVirtualBase = 0x6000_0000_0UL;
+    private static readonly List<ReleasedVirtualRange> _releasedVirtualRanges = new();
     private static uint _gpoStateBits;
     private static readonly HashSet<int> _loadedSysmodules = new();
     private static readonly object _prtApertureGate = new();
@@ -75,6 +76,8 @@ public static class KernelRuntimeCompatExports
 
     private static readonly bool _stopwatchTicksAreNanoseconds =
         Stopwatch.Frequency == 1_000_000_000L;
+
+    private readonly record struct ReleasedVirtualRange(ulong Address, ulong Length);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate ulong RdtscDelegate();
@@ -757,7 +760,27 @@ public static class KernelRuntimeCompatExports
                 : AlignUp(_nextReservedVirtualBase, effectiveAlignment);
         }
 
-        if (!TryReserveVirtualRange(ctx, desiredAddress, length, effectiveAlignment, allowSearch: !fixedMapping, out var mappedAddress))
+        ulong releasedAddress = 0;
+        var reusedReleasedRange = !fixedMapping && requestedAddress == 0 &&
+            TryTakeReleasedVirtualRange(length, effectiveAlignment, out releasedAddress);
+        var alreadyBacked = fixedMapping && requestedAddress != 0 &&
+            KernelMemoryCompatExports.IsGuestRangeBacked(ctx, requestedAddress, length);
+        ulong mappedAddress;
+        if (reusedReleasedRange)
+        {
+            mappedAddress = releasedAddress;
+        }
+        else if (alreadyBacked)
+        {
+            mappedAddress = requestedAddress;
+        }
+        else if (!TryReserveVirtualRange(
+                     ctx,
+                     desiredAddress,
+                     length,
+                     effectiveAlignment,
+                     allowSearch: !fixedMapping,
+                     out mappedAddress))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
         }
@@ -765,7 +788,7 @@ public static class KernelRuntimeCompatExports
         if (ShouldTraceVirtualMemory())
         {
             Console.Error.WriteLine(
-                $"[LOADER][TRACE] reserve_virtual_range: req=0x{requestedAddress:X16} desired=0x{desiredAddress:X16} mapped=0x{mappedAddress:X16} len=0x{length:X16} flags=0x{flags:X8} align=0x{effectiveAlignment:X16}");
+                $"[LOADER][TRACE] reserve_virtual_range: req=0x{requestedAddress:X16} desired=0x{desiredAddress:X16} mapped=0x{mappedAddress:X16} len=0x{length:X16} flags=0x{flags:X8} align=0x{effectiveAlignment:X16} already_backed={alreadyBacked} reused={reusedReleasedRange}");
         }
 
         if (!ctx.TryWriteUInt64(inOutAddressPointer, mappedAddress))
@@ -780,6 +803,75 @@ public static class KernelRuntimeCompatExports
 
         KernelMemoryCompatExports.RegisterReservedVirtualRange(mappedAddress, length);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    internal static void RegisterReleasedVirtualRange(ulong address, ulong length)
+    {
+        if (address == 0 || length == 0 || ulong.MaxValue - address < length)
+        {
+            return;
+        }
+
+        lock (_stateGate)
+        {
+            var start = address;
+            var end = address + length;
+            for (var i = _releasedVirtualRanges.Count - 1; i >= 0; i--)
+            {
+                var existing = _releasedVirtualRanges[i];
+                var existingEnd = existing.Address + existing.Length;
+                if (end < existing.Address || existingEnd < start)
+                {
+                    continue;
+                }
+
+                start = Math.Min(start, existing.Address);
+                end = Math.Max(end, existingEnd);
+                _releasedVirtualRanges.RemoveAt(i);
+            }
+
+            _releasedVirtualRanges.Add(new ReleasedVirtualRange(start, end - start));
+        }
+    }
+
+    private static bool TryTakeReleasedVirtualRange(
+        ulong length,
+        ulong alignment,
+        out ulong address)
+    {
+        address = 0;
+        lock (_stateGate)
+        {
+            for (var i = 0; i < _releasedVirtualRanges.Count; i++)
+            {
+                var range = _releasedVirtualRanges[i];
+                var rangeEnd = range.Address + range.Length;
+                var aligned = AlignUp(range.Address, alignment);
+                if (aligned >= rangeEnd || length > rangeEnd - aligned)
+                {
+                    continue;
+                }
+
+                _releasedVirtualRanges.RemoveAt(i);
+                if (aligned > range.Address)
+                {
+                    _releasedVirtualRanges.Add(
+                        new ReleasedVirtualRange(range.Address, aligned - range.Address));
+                }
+
+                var allocationEnd = aligned + length;
+                if (allocationEnd < rangeEnd)
+                {
+                    _releasedVirtualRanges.Add(
+                        new ReleasedVirtualRange(allocationEnd, rangeEnd - allocationEnd));
+                }
+
+                address = aligned;
+                return true;
+            }
+        }
+
+        return false;
     }
 
     [SysAbiExport(
@@ -1127,6 +1219,8 @@ public static class KernelRuntimeCompatExports
     public static int KernelLoadStartModule(CpuContext ctx)
     {
         var modulePathAddress = ctx[CpuRegister.Rdi];
+        var argumentSize = ctx[CpuRegister.Rsi];
+        var argumentAddress = ctx[CpuRegister.Rdx];
         var resultAddress = ctx[CpuRegister.R9];
         if (resultAddress != 0 && !TryWriteInt32(ctx, resultAddress, 0))
         {
@@ -1152,6 +1246,40 @@ public static class KernelRuntimeCompatExports
         else
         {
             handle = KernelModuleRegistry.RegisterSyntheticModule("module.sprx", isSystemModule: false);
+        }
+
+        if (KernelModuleRegistry.TryBeginModuleStart(handle, out var moduleToStart))
+        {
+            var scheduler = GuestThreadExecution.Scheduler;
+            string? startError = null;
+            var started = scheduler is not null && scheduler.TryCallGuestFunction(
+                ctx,
+                moduleToStart.InitEntryPoint,
+                argumentSize,
+                argumentAddress,
+                0,
+                0,
+                $"sceKernelLoadStartModule:{moduleToStart.Name}",
+                out startError);
+            KernelModuleRegistry.CompleteModuleStart(handle, started);
+            if (!started)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][ERROR] sceKernelLoadStartModule failed to start '{moduleToStart.Name}' " +
+                    $"at 0x{moduleToStart.InitEntryPoint:X16}: {startError ?? "guest scheduler unavailable"}");
+                var error = (int)OrbisGen2Result.ORBIS_GEN2_ERROR_CPU_TRAP;
+                if (resultAddress != 0)
+                {
+                    _ = TryWriteInt32(ctx, resultAddress, error);
+                }
+
+                ctx[CpuRegister.Rax] = unchecked((ulong)(long)error);
+                return error;
+            }
+
+            Console.Error.WriteLine(
+                $"[LOADER][INFO] sceKernelLoadStartModule started '{moduleToStart.Name}' " +
+                $"at 0x{moduleToStart.InitEntryPoint:X16}");
         }
 
         ctx[CpuRegister.Rax] = unchecked((uint)handle);
@@ -1565,6 +1693,9 @@ public static class KernelRuntimeCompatExports
         var payload = new byte[unwindInfoSize];
         BinaryPrimitives.WriteUInt64LittleEndian(payload, unwindInfoSize);
         WriteModuleName(payload, module.Name);
+        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(0x108), module.EhFrameHeaderAddress);
+        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(0x110), module.EhFrameAddress);
+        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(0x118), module.EhFrameSize);
         BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(0x120), module.BaseAddress);
         BinaryPrimitives.WriteUInt64LittleEndian(
             payload.AsSpan(0x128),
