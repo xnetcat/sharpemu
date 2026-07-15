@@ -3641,6 +3641,7 @@ internal static unsafe class VulkanVideoPresenter
                 Check(result, $"vkWaitForFences(guest: {oldest.DebugName})");
             }
 
+            var anyRetired = false;
             while (_pendingGuestSubmissions.TryPeek(out var submission))
             {
                 var status = _vk.GetFenceStatus(_device, submission.Fence);
@@ -3674,6 +3675,20 @@ internal static unsafe class VulkanVideoPresenter
                 {
                     _completedTimeline = submission.Timeline;
                 }
+
+                anyRetired = true;
+            }
+
+            if (anyRetired)
+            {
+                // Publish retired GPU buffer stores to guest memory as they
+                // complete, not only at rare structural sync points. The
+                // guest CPU polls GPU results through ordinary memory (UE5
+                // reads the eye-adaptation exposure back and writes it into
+                // the next frame's view constants); values that only ever
+                // live in host allocations leave it reading zeros forever,
+                // and the whole scene chain multiplies to black.
+                WriteBackAllDirtyGuestBuffers();
             }
 
             ProcessDeferredTextureDestroys();
@@ -6137,21 +6152,76 @@ internal static unsafe class VulkanVideoPresenter
             if (!source.SequenceEqual(shadow))
             {
                 // HOST_COHERENT does not permit racing a mapped CPU write with
-                // an in-flight shader access. Retire prior users, publish their
-                // dirty ranges to guest memory, then upload the current guest
-                // bytes (which may be newer than the parser's captured array).
+                // an in-flight shader access. Retire prior users and publish
+                // their dirty ranges to guest memory before touching the
+                // mapped view.
                 WaitForAllGuestSubmissionsForCpuVisibility();
                 WriteBackAllDirtyGuestBuffers();
-                var live = new byte[guestBuffer.Length];
-                if (_guestMemory?.TryRead(guestBuffer.BaseAddress, live) == true)
+                if (source.IndexOfAnyExcept((byte)0) < 0)
                 {
-                    source = live;
+                    // Only an all-zero parse snapshot re-reads live guest
+                    // bytes: the guest had not written the range when the
+                    // command list was parsed (queues parse ahead of the
+                    // CPU's late writes). A NON-zero snapshot is the value
+                    // the draw was recorded with — by execution time the
+                    // guest has often recycled the transient constant slot
+                    // for a later frame (and UE5's exposure-copy input reads
+                    // zero), so an unconditional re-read hands this dispatch
+                    // a different draw's constants.
+                    var live = new byte[guestBuffer.Length];
+                    if (_guestMemory?.TryRead(guestBuffer.BaseAddress, live) == true)
+                    {
+                        source = live;
+                    }
                 }
 
                 source.CopyTo(new Span<byte>(
                     (void*)(allocation.Mapped + checked((nint)guestOffset)),
                     source.Length));
                 source.CopyTo(shadow);
+            }
+            else if (!guestBuffer.Writable &&
+                     source.IndexOfAnyExcept((byte)0) < 0 &&
+                     new ReadOnlySpan<byte>(
+                         (void*)(allocation.Mapped + checked((nint)guestOffset)),
+                         guestBuffer.Length).IndexOfAnyExcept((byte)0) < 0)
+            {
+                // All-zero parse snapshot, shadow, AND mapped bytes: the guest
+                // had not written this range when the command list was parsed
+                // (queues parse ahead of the CPU's late writes), no upload has
+                // seeded the shared allocation since, and no GPU store has
+                // produced it in place, so the bind would hand the shader
+                // stale zeros (UE5's exposure copy then multiplies the whole
+                // frame to black). Nonzero mapped bytes mean a GPU producer
+                // already stored the value into this shared allocation — bind
+                // as-is. Otherwise refresh from live guest bytes, publishing
+                // pending GPU write-backs first so a producer's value that
+                // only exists on the ordered timeline is not missed. A
+                // recycled transient ring entry is never all-zero at parse,
+                // so this cannot reintroduce stale-ring corruption.
+                var live = new byte[guestBuffer.Length];
+                var haveLive =
+                    _guestMemory?.TryRead(guestBuffer.BaseAddress, live) == true &&
+                    live.AsSpan().IndexOfAnyExcept((byte)0) >= 0;
+                if (!haveLive && allocation.DirtyRanges.Count != 0)
+                {
+                    WaitForAllGuestSubmissionsForCpuVisibility();
+                    WriteBackAllDirtyGuestBuffers();
+                    haveLive =
+                        _guestMemory?.TryRead(guestBuffer.BaseAddress, live) == true &&
+                        live.AsSpan().IndexOfAnyExcept((byte)0) >= 0;
+                }
+
+                if (haveLive)
+                {
+                    WaitForAllGuestSubmissionsForCpuVisibility();
+                    WriteBackAllDirtyGuestBuffers();
+                    _ = _guestMemory?.TryRead(guestBuffer.BaseAddress, live);
+                    live.AsSpan().CopyTo(new Span<byte>(
+                        (void*)(allocation.Mapped + checked((nint)guestOffset)),
+                        live.Length));
+                    live.AsSpan().CopyTo(shadow);
+                }
             }
 
             if (ShouldTraceVulkanResources() &&
@@ -6248,9 +6318,30 @@ internal static unsafe class VulkanVideoPresenter
             };
         }
 
+        // Diagnostic: SHARPEMU_REREAD_CBS=1 re-reads every small read-only
+        // binding from live guest memory at execution time instead of
+        // uploading the parse snapshot. Discriminates late-written constant
+        // buffers (snapshot captured a stale generation) from genuinely
+        // wrong values.
+        private static readonly bool _rereadTransientCbs = string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_REREAD_CBS"),
+            "1",
+            StringComparison.Ordinal);
+
         private GlobalBufferResource CreateTransientGlobalBufferResource(
             VulkanGuestMemoryBuffer guestBuffer)
         {
+            if (_rereadTransientCbs &&
+                guestBuffer.BaseAddress != 0 &&
+                guestBuffer.Length <= SnapshotGlobalBufferLimit)
+            {
+                var live = new byte[guestBuffer.Length];
+                if (_guestMemory?.TryRead(guestBuffer.BaseAddress, live) == true)
+                {
+                    live.AsSpan().CopyTo(guestBuffer.Data.AsSpan(0, guestBuffer.Length));
+                }
+            }
+
             var buffer = CreateHostBuffer(
                 guestBuffer.Data.AsSpan(0, guestBuffer.Length),
                 BufferUsageFlags.StorageBufferBit,
@@ -6371,7 +6462,14 @@ internal static unsafe class VulkanVideoPresenter
             {
                 // Growing/merging an aliased allocation is rare. Synchronize
                 // only this structural transition so no in-flight descriptor
-                // can observe storage being replaced underneath it.
+                // can observe storage being replaced underneath it. The open
+                // recording batch must be submitted first: a batched producer
+                // (UE5's eye-adaptation buffer store) still references the
+                // allocation being replaced, and only submission marks its
+                // writable ranges dirty — without it the write-back below
+                // publishes nothing and the producer's value dies with the
+                // destroyed allocation (consumers then read zero exposure).
+                FlushBatchedGuestCommands();
                 WaitForAllGuestSubmissionsForCpuVisibility();
                 WriteBackAllDirtyGuestBuffers();
             }
@@ -7320,6 +7418,27 @@ internal static unsafe class VulkanVideoPresenter
                     $"addr=0x{image.Address:X16} init={image.Initialized} " +
                     $"pendingInit={image.InitialUploadPending}");
                 TraceGuestImageContents(image);
+            }
+
+            // Input provenance for the store above: each global binding's
+            // guest address, its parse snapshot head, and the live guest
+            // bytes now — pins whether a zero store came in through a stale
+            // input buffer (and which one).
+            for (var index = 0; index < work.GlobalMemoryBuffers.Count; index++)
+            {
+                var binding = work.GlobalMemoryBuffers[index];
+                var headLength = Math.Min(binding.Length, 16);
+                var parseHead = Convert.ToHexString(
+                    binding.Data.AsSpan(0, headLength));
+                var liveBytes = new byte[headLength];
+                var liveHead =
+                    _guestMemory?.TryRead(binding.BaseAddress, liveBytes) == true
+                        ? Convert.ToHexString(liveBytes)
+                        : "unreadable";
+                Console.Error.WriteLine(
+                    $"[LOADER][TRACE] dbg.post_dispatch_input[{index}] " +
+                    $"base=0x{binding.BaseAddress:X16} bytes={binding.Length} " +
+                    $"writable={binding.Writable} parse={parseHead} live={liveHead}");
             }
         }
 
