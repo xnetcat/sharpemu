@@ -1174,9 +1174,15 @@ internal static class Gen5ShaderTranslator
             0x365 => "VMbcntLoU32B32",
             0x366 => "VMbcntHiU32B32",
             0x369 => "VCvtPknormU16F32",
-            0x360 => "VMadU32U16",
-            0x361 => "VMulLoU32",
+            // 0x360/0x361 are V_READLANE_B32/V_WRITELANE_B32 on RDNA2. They
+            // were previously misdecoded as multiply-adds, silently corrupting
+            // every wave reduction (UE5 auto-exposure, histogram and light
+            // culling reduce loops end with a readlane of the accumulated
+            // total).
+            0x360 => "VReadlaneB32",
+            0x361 => "VWritelaneB32",
             0x362 => "VLdexpF32",
+            0x373 => "VMadU32U16",
             0x346 => "VLshlAddU32",
             0x347 => "VAddLshlU32",
             0x36D => "VAdd3U32",

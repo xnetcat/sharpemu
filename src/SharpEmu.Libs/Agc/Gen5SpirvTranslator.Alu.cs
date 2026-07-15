@@ -88,6 +88,11 @@ internal static partial class Gen5SpirvTranslator
                 return true;
             }
 
+            if (instruction.Opcode == "VReadlaneB32")
+            {
+                return TryEmitReadlane(instruction, out error);
+            }
+
             if (!TryGetVectorDestination(instruction, out var destination))
             {
                 error = "missing vector destination";
@@ -98,9 +103,35 @@ internal static partial class Gen5SpirvTranslator
             switch (instruction.Opcode)
             {
                 case "VMovB32":
-                case "VReadlaneB32":
                     result = GetRawSource(instruction, 0);
                     break;
+                case "VWritelaneB32":
+                {
+                    // vdst[lane(src1)] = src0: only the selected lane takes
+                    // the new value; every other lane keeps its own. Writes
+                    // ignore EXEC on hardware.
+                    var oldValue = LoadV(destination);
+                    var newValue = GetRawSource(instruction, 0);
+                    var laneSelect = BitwiseAnd(
+                        GetRawSource(instruction, 1),
+                        UInt(RdnaWaveLaneCount - 1));
+                    var currentLane = _subgroupInvocationIdInput != 0
+                        ? Load(_uintType, _subgroupInvocationIdInput)
+                        : UInt(0);
+                    var isTargetLane = _module.AddInstruction(
+                        SpirvOp.IEqual,
+                        _boolType,
+                        currentLane,
+                        laneSelect);
+                    var selected = _module.AddInstruction(
+                        SpirvOp.Select,
+                        _uintType,
+                        isTargetLane,
+                        newValue,
+                        oldValue);
+                    StoreV(destination, selected, guardWithExec: false);
+                    return true;
+                }
                 case "VCndmaskB32":
                 {
                     var condition = instruction.Sources.Count > 2
@@ -3560,6 +3591,39 @@ internal static partial class Gen5SpirvTranslator
             var result = Load(_uintType, WaveBroadcastScratchPointer());
             EmitWave64Barrier();
             return result;
+        }
+
+        private bool TryEmitReadlane(
+            Gen5ShaderInstruction instruction,
+            out string error)
+        {
+            error = string.Empty;
+            if (instruction.Destinations.Count == 0 ||
+                instruction.Destinations[0].Kind != Gen5OperandKind.ScalarRegister ||
+                instruction.Sources.Count < 2)
+            {
+                error = "invalid read-lane operands";
+                return false;
+            }
+
+            // sdst = vsrc0[lane(src1)]. GroupNonUniformShuffle accepts a
+            // dynamic lane index (Broadcast requires a uniform one).
+            var value = GetRawSource(instruction, 0);
+            if (_subgroupInvocationIdInput != 0)
+            {
+                var laneSelect = BitwiseAnd(
+                    GetRawSource(instruction, 1),
+                    UInt(RdnaWaveLaneCount - 1));
+                value = _module.AddInstruction(
+                    SpirvOp.GroupNonUniformShuffle,
+                    _uintType,
+                    UInt(3),
+                    value,
+                    laneSelect);
+            }
+
+            StoreS(instruction.Destinations[0].Value, value);
+            return true;
         }
 
         private void StoreCarryOut(

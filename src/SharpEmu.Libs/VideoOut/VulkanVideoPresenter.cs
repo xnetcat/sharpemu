@@ -4965,6 +4965,54 @@ internal static unsafe class VulkanVideoPresenter
                 };
             }
 
+            // Deferred/compute pipelines (Silent Hill's title screen) render the
+            // scene into offscreen render targets, then sample those targets in a
+            // composite/lighting pass. When the sampled descriptor's size or exact
+            // format does not match the cached image (a common alias miss), the
+            // old code fell back to reading GUEST MEMORY - which the GPU never
+            // wrote, so the composite sampled zeros and presented a black frame.
+            // A live GPU-produced image (a real render target, RenderPass set, or
+            // already initialized) is authoritative: prefer sampling it through a
+            // format-compatible view over zero guest memory, using the image's own
+            // dimensions. Guarded to genuine GPU-written images so an unrelated
+            // resource that merely collided on the address is not aliased.
+            if (texture.Address != 0 &&
+                !texture.IsStorage &&
+                _guestImages.TryGetValue(texture.Address, out var liveImage) &&
+                (liveImage.RenderPass.Handle != 0 || liveImage.Initialized) &&
+                IsCompatibleViewFormat(liveImage.Format, vkFormat) &&
+                TryGetOrCreateGuestImageView(
+                    liveImage,
+                    vkFormat,
+                    mipLevel: Math.Min(texture.BaseMipLevel, liveImage.MipLevels - 1),
+                    levelCount: 1,
+                    dstSelect: texture.DstSelect,
+                    out var liveView))
+            {
+                if (ShouldTraceVulkanResources() &&
+                    _tracedTextureCacheHits.Add(
+                        (texture.Address, texture.Width, texture.Height, vkFormat)))
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] vk.live_image_alias addr=0x{texture.Address:X16} " +
+                        $"tex={texture.Width}x{texture.Height} img={liveImage.Width}x{liveImage.Height} " +
+                        $"rt={liveImage.RenderPass.Handle != 0} init={liveImage.Initialized} vk={vkFormat}");
+                }
+
+                return new TextureResource
+                {
+                    Address = texture.Address,
+                    Image = liveImage.Image,
+                    View = liveView,
+                    Width = liveImage.Width,
+                    Height = liveImage.Height,
+                    RowLength = liveImage.Width,
+                    DstSelect = texture.DstSelect,
+                    SamplerState = texture.Sampler,
+                    GuestImage = liveImage,
+                };
+            }
+
             if (ShouldTraceVulkanResources() && texture.Address != 0)
             {
                 if (_guestImages.TryGetValue(texture.Address, out var missImage))
@@ -7027,12 +7075,90 @@ internal static unsafe class VulkanVideoPresenter
             try
             {
                 ExecuteComputeDispatchCore(work);
+                DebugReadbackAfterComputeStore(work);
             }
             finally
             {
                 Interlocked.Add(
                     ref _perfDrawTicks,
                     Stopwatch.GetTimestamp() - perfStart);
+            }
+        }
+
+        // SHARPEMU_READBACK_IMAGE=<hex guest address>|lut: after every compute
+        // dispatch that binds a matching storage image ("lut" matches any 1x1
+        // storage image), drain the GPU and log the live image contents.
+        // Diagnostic-only; pins down where a compute-written image loses its
+        // data (store never landing vs a later upload/recreate clobbering it).
+        private static readonly string? _debugReadbackImageSpec =
+            Environment.GetEnvironmentVariable("SHARPEMU_READBACK_IMAGE");
+        private static int _debugReadbackCount;
+
+        private void DebugReadbackAfterComputeStore(VulkanComputeGuestDispatch work)
+        {
+            if (_debugReadbackImageSpec is not { Length: > 0 } spec ||
+                _deviceLost ||
+                _debugReadbackCount > 400)
+            {
+                return;
+            }
+
+            var matchAnyLut = spec.Equals("lut", StringComparison.OrdinalIgnoreCase);
+            // "lut8": only 1x1 guest-format-10 (RGBA8) images — the UE5
+            // exposure copy targets — so early high-frequency R32F LUT
+            // copies don't exhaust the readback budget first.
+            var matchRgba8Lut = spec.Equals("lut8", StringComparison.OrdinalIgnoreCase);
+            var address = 0UL;
+            if (!matchAnyLut &&
+                !matchRgba8Lut &&
+                !ulong.TryParse(
+                    spec.Replace("0x", string.Empty),
+                    System.Globalization.NumberStyles.HexNumber,
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    out address))
+            {
+                return;
+            }
+
+            List<GuestImageResource>? images = null;
+            foreach (var texture in work.Textures)
+            {
+                if (texture.IsStorage &&
+                    texture.Address != 0 &&
+                    (matchAnyLut
+                        ? texture.Width == 1 && texture.Height == 1
+                        : matchRgba8Lut
+                            ? texture.Width == 1 && texture.Height == 1 &&
+                              texture.Format == 10
+                            : texture.Address == address) &&
+                    _guestImages.TryGetValue(texture.Address, out var image))
+                {
+                    images ??= [];
+                    if (!images.Contains(image))
+                    {
+                        images.Add(image);
+                    }
+                }
+            }
+
+            if (images is null)
+            {
+                return;
+            }
+
+            _debugReadbackCount++;
+            _commandBuffer = _presentationCommandBuffer;
+            FlushBatchedGuestCommands();
+            Check(
+                _vk.QueueWaitIdle(_queue),
+                "vkQueueWaitIdle(debug compute readback)");
+            foreach (var image in images)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][TRACE] dbg.post_dispatch_readback cs=0x{work.ShaderAddress:X16} " +
+                    $"addr=0x{image.Address:X16} init={image.Initialized} " +
+                    $"pendingInit={image.InitialUploadPending}");
+                TraceGuestImageContents(image);
             }
         }
 

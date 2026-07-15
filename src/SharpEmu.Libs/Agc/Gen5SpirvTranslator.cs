@@ -4614,7 +4614,8 @@ internal static partial class Gen5SpirvTranslator
         private bool UsesSubgroupShuffle() =>
             _state.Program.Instructions.Any(instruction =>
                 instruction.Control is Gen5DppControl or Gen5Dpp8Control ||
-                instruction.Opcode is "VPermlane16B32" or "VPermlanex16B32");
+                instruction.Opcode is "VPermlane16B32" or "VPermlanex16B32"
+                    or "VReadlaneB32" or "VWritelaneB32");
 
         private bool UsesSubgroupBroadcast() =>
             _state.Program.Instructions.Any(instruction =>

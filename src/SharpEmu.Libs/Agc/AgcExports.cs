@@ -7552,12 +7552,13 @@ public static class AgcExports
                 // Keep the zero-filled buffer; layout must match the shader.
             }
 
+            var promoted = !binding.Writable && ShouldPromoteToLiveGpuBuffer(binding);
             combined.Add(new VulkanGuestMemoryBuffer(
                 binding.BaseAddress,
                 data,
                 data.Length,
                 Pooled: false,
-                Writable: binding.Writable,
+                Writable: binding.Writable || promoted,
                 WriteBackToGuest: binding.WriteBackToGuest && guestMemoryBacked));
         }
 
@@ -7714,19 +7715,129 @@ public static class AgcExports
     private static IReadOnlyList<VulkanGuestMemoryBuffer> CreateVulkanGuestMemoryBuffers(
         IReadOnlyList<Gen5GlobalMemoryBinding> bindings)
     {
+        for (var index = 0; index < bindings.Count; index++)
+        {
+            if (bindings[index].Writable)
+            {
+                RegisterGpuWrittenBufferRange(
+                    bindings[index].BaseAddress,
+                    (ulong)bindings[index].DataLength);
+            }
+        }
+
         var buffers = new VulkanGuestMemoryBuffer[bindings.Count];
         for (var index = 0; index < bindings.Count; index++)
         {
+            // A promoted binding aliases the live GPU allocation so it reads
+            // fresh GPU-produced bytes, but must NOT write back: the shader
+            // does not write it, and publishing the allocation's bytes over
+            // guest memory the CPU may have updated since would corrupt it.
+            var promoted = !bindings[index].Writable &&
+                ShouldPromoteToLiveGpuBuffer(bindings[index]);
             buffers[index] = new VulkanGuestMemoryBuffer(
                 bindings[index].BaseAddress,
                 bindings[index].Data,
                 bindings[index].DataLength,
                 bindings[index].DataPooled,
-                bindings[index].Writable,
+                bindings[index].Writable || promoted,
                 bindings[index].WriteBackToGuest);
         }
 
         return buffers;
+    }
+
+    // GPU-written global-buffer ranges. A shader that stores to a buffer
+    // leaves the freshest bytes in the shared GPU allocation; guest memory
+    // only catches up when the work retires and is written back. A later
+    // binding that merely READS such a range must alias the same live
+    // allocation instead of taking a parse-time snapshot of guest memory,
+    // or it observes stale bytes. UE5's auto-exposure chain breaks exactly
+    // this way: a reduce pass stores the exposure into a buffer and a tiny
+    // copy dispatch reads it into a 1x1 texture; a snapshot binding reads
+    // zeros, and every lit pass then multiplies the scene to black.
+    private static readonly object _gpuWrittenBufferRangeGate = new();
+    private static readonly List<(ulong Start, ulong End)> _gpuWrittenBufferRanges = new();
+    private static long _liveGpuBufferPromotionTraceCount;
+
+    private static readonly bool _liveGpuBufferAliasEnabled =
+        !string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_LIVE_GPU_BUFFER_ALIAS"),
+            "0",
+            StringComparison.Ordinal);
+
+    private static bool ShouldPromoteToLiveGpuBuffer(Gen5GlobalMemoryBinding binding)
+    {
+        if (!_liveGpuBufferAliasEnabled ||
+            binding.BaseAddress == 0 ||
+            binding.DataLength <= 0 ||
+            !IntersectsGpuWrittenBufferRange(
+                binding.BaseAddress,
+                (ulong)binding.DataLength))
+        {
+            return false;
+        }
+
+        if (_traceAgcShader && ShouldTraceHotPath(ref _liveGpuBufferPromotionTraceCount))
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] agc.buffer_live_alias base=0x{binding.BaseAddress:X16} " +
+                $"bytes={binding.DataLength} — read-only binding overlaps a GPU-written " +
+                "range; bound live instead of snapshotting guest memory");
+        }
+
+        return true;
+    }
+
+    private static void RegisterGpuWrittenBufferRange(ulong start, ulong length)
+    {
+        if (start == 0 || length == 0)
+        {
+            return;
+        }
+
+        var end = start + Math.Min(length, ulong.MaxValue - start);
+        lock (_gpuWrittenBufferRangeGate)
+        {
+            var ranges = _gpuWrittenBufferRanges;
+            var index = ranges.FindIndex(range => range.End >= start);
+            if (index < 0)
+            {
+                ranges.Add((start, end));
+                return;
+            }
+
+            if (ranges[index].Start > end)
+            {
+                ranges.Insert(index, (start, end));
+                return;
+            }
+
+            var mergedStart = Math.Min(ranges[index].Start, start);
+            var mergedEnd = Math.Max(ranges[index].End, end);
+            var last = index;
+            while (last + 1 < ranges.Count && ranges[last + 1].Start <= mergedEnd)
+            {
+                last++;
+                mergedEnd = Math.Max(mergedEnd, ranges[last].End);
+            }
+
+            ranges[index] = (mergedStart, mergedEnd);
+            if (last > index)
+            {
+                ranges.RemoveRange(index + 1, last - index);
+            }
+        }
+    }
+
+    private static bool IntersectsGpuWrittenBufferRange(ulong start, ulong length)
+    {
+        var end = start + Math.Min(length, ulong.MaxValue - start);
+        lock (_gpuWrittenBufferRangeGate)
+        {
+            var ranges = _gpuWrittenBufferRanges;
+            var index = ranges.FindIndex(range => range.End > start);
+            return index >= 0 && ranges[index].Start < end;
+        }
     }
 
     /// <summary>
