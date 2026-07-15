@@ -45,6 +45,85 @@ public static class KernelPthreadCompatExports
         Environment.GetEnvironmentVariable("SHARPEMU_LOG_PTHREAD_MUTEX_FILTER"));
     private static readonly HashSet<ulong>? _tracePthreadCondFilter = ParseTraceAddressFilter(
         Environment.GetEnvironmentVariable("SHARPEMU_LOG_PTHREAD_COND_FILTER"));
+    // FEvent flag watcher: uncapped (rate-limited) dump of the UE FEvent object
+    // triggered-flag region on every wait/broadcast/signal of a filtered cond.
+    // Purpose-built for the Silent Hill RHI stall: observe whether a broadcast
+    // that fails to advance the RHI thread actually set the object's flag.
+    private static readonly string? _watchFEventRaw =
+        Environment.GetEnvironmentVariable("SHARPEMU_WATCH_FEVENT");
+    // "auto" watches every cond touched by the render/RHI/interrupt threads, so
+    // the run-varying RHI FEvent cond need not be known in advance.
+    private static readonly bool _watchFEventAuto =
+        string.Equals(_watchFEventRaw, "auto", StringComparison.OrdinalIgnoreCase);
+    private static readonly HashSet<ulong>? _watchFEventCondFilter =
+        _watchFEventAuto ? null : ParseTraceAddressFilter(_watchFEventRaw);
+    private static long _watchFEventCount;
+    // Per-cond wait/signal balance tracker. A cond whose waits keep growing while
+    // signals stall is the deadlock's unsatisfied wait. Dumped periodically so
+    // the culprit is obvious without hand-diffing millions of lines.
+    private sealed class CondBalance
+    {
+        public long Waits;
+        public long Signals;
+        public long LastWaitCount;
+        public long LastSignalCount;
+        public string LastWaitThread = "";
+        public string LastSignalThread = "";
+    }
+    private static readonly ConcurrentDictionary<ulong, CondBalance> _condBalance =
+        string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_COND_BALANCE"), "1", StringComparison.Ordinal)
+            ? new ConcurrentDictionary<ulong, CondBalance>()
+            : null!;
+    private static long _condBalanceLastDumpTicks;
+
+    private static void RecordCondBalance(ulong condAddress, string operation, string threadName, bool timed = false)
+    {
+        if (_condBalance is null)
+        {
+            return;
+        }
+
+        var entry = _condBalance.GetOrAdd(condAddress, static _ => new CondBalance());
+        if (operation is "signal" or "broadcast")
+        {
+            Interlocked.Increment(ref entry.Signals);
+            entry.LastSignalThread = threadName;
+        }
+        else
+        {
+            Interlocked.Increment(ref entry.Waits);
+            // A plain (non-timed) wait blocks until signalled; a timed wait polls
+            // and self-releases, so only plain waits indicate a real starve.
+            entry.LastWaitThread = timed ? threadName + "(timed)" : threadName;
+        }
+
+        var now = System.Diagnostics.Stopwatch.GetTimestamp();
+        var last = Interlocked.Read(ref _condBalanceLastDumpTicks);
+        if (now - last < System.Diagnostics.Stopwatch.Frequency * 15 ||
+            Interlocked.CompareExchange(ref _condBalanceLastDumpTicks, now, last) != last)
+        {
+            return;
+        }
+
+        // Report conds whose wait count advanced since the last window but whose
+        // signal count did not — i.e. a thread parked with no producer waking it.
+        foreach (var (cond, bal) in _condBalance)
+        {
+            var waits = Interlocked.Read(ref bal.Waits);
+            var signals = Interlocked.Read(ref bal.Signals);
+            var waitDelta = waits - bal.LastWaitCount;
+            var signalDelta = signals - bal.LastSignalCount;
+            bal.LastWaitCount = waits;
+            bal.LastSignalCount = signals;
+            if (waitDelta > 0 && signalDelta == 0 && waits - signals > 0)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][DIAG] cond_balance STARVED cond=0x{cond:X16} " +
+                    $"waits={waits} signals={signals} wait_delta=+{waitDelta} " +
+                    $"last_waiter='{bal.LastWaitThread}' last_signaler='{bal.LastSignalThread}'");
+            }
+        }
+    }
     private static readonly bool _enableMutexLockBlocking =
         string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_MUTEX_LOCK_BLOCKING"), "1", StringComparison.Ordinal);
     private static readonly bool _enableCondSignalLatch =
@@ -1308,6 +1387,13 @@ public static class KernelPthreadCompatExports
             timed,
             timeoutUsec,
             broadcast: false);
+        WatchFEventFlag(ctx, timed ? "wait-timed" : "wait", condAddress);
+        if (_condBalance is not null)
+        {
+            var wn = KernelPthreadState.TryGetThreadIdentity(currentThreadId, out var wid)
+                ? wid.Name : "<unknown>";
+            RecordCondBalance(condAddress, "wait", wn, timed);
+        }
         var latchMissedSignals = ShouldLatchSignal(condAddress, resolvedCondAddress) ||
             ShouldLatchCurrentThread(currentThreadId);
         lock (mutexState)
@@ -1490,6 +1576,13 @@ public static class KernelPthreadCompatExports
                 broadcast);
             TracePthreadCondSignalCallsite(ctx, condAddress, broadcast);
             TracePthreadCondGuestState(ctx, broadcast ? "broadcast" : "signal", condAddress, 0, resolvedCondAddress, 0);
+            WatchFEventFlag(ctx, broadcast ? "broadcast" : "signal", condAddress);
+            if (_condBalance is not null)
+            {
+                var sn = KernelPthreadState.TryGetThreadIdentity(
+                    KernelPthreadState.GetCurrentThreadHandle(), out var sid) ? sid.Name : "<unknown>";
+                RecordCondBalance(condAddress, broadcast ? "broadcast" : "signal", sn);
+            }
             for (var node = state.Waiters.First; node is not null;)
             {
                 var next = node.Next;
@@ -2184,6 +2277,66 @@ public static class KernelPthreadCompatExports
             $"thread=0x{KernelPthreadState.GetCurrentThreadHandle():X16} " +
             $"import_ret=0x{importReturn:X16} rbp=0x{ctx[CpuRegister.Rbp]:X16} " +
             $"frames=[{string.Join(',', frames)}]");
+    }
+
+    // Dumps the FEvent object region [cond-0x20 .. cond+0x30] on each op of a
+    // watched cond, tagged with thread name. UE's FPThreadEvent lays out
+    // { pthread_mutex_t; pthread_cond_t; bool bInitialized; bool bManualReset;
+    //   volatile bool bTriggered; volatile int WaitingThreads; }, so the
+    // trigger flag sits a few bytes past the cond pointer passed here. Comparing
+    // the flag across a wait (RHI) and the broadcasts that fail to wake it shows
+    // whether the interrupt thread's trigger reached this exact object.
+    private static void WatchFEventFlag(
+        CpuContext ctx,
+        string operation,
+        ulong condAddress)
+    {
+        if (!_watchFEventAuto &&
+            (_watchFEventCondFilter is null ||
+             _watchFEventCondFilter.Count == 0 ||
+             !MatchesTraceAddressFilter(_watchFEventCondFilter, condAddress)))
+        {
+            return;
+        }
+
+        var threadId = KernelPthreadState.GetCurrentThreadHandle();
+        var threadName = KernelPthreadState.TryGetThreadIdentity(threadId, out var identity)
+            ? identity.Name
+            : "<unknown>";
+
+        // Auto mode: the render/RHI/GPU-interrupt threads' own ops (the FEvent
+        // hand-off chain that wedges Silent Hill's pre-title screen), PLUS every
+        // signal/broadcast from any thread so the waiter's off-set-producer is
+        // caught even when it runs on an unexpected thread.
+        var isRenderChain = threadName is "RHIThread" or "RenderThread 0"
+            or "RenderThread 1" or "AgcInterruptThread" or "AgcSubmissionThread"
+            or "Thread-2";
+        var isWake = operation is "signal" or "broadcast";
+        if (_watchFEventAuto && !isRenderChain && !isWake)
+        {
+            return;
+        }
+
+        // Rate-limit to keep the log bounded while still sampling the stall.
+        var count = Interlocked.Increment(ref _watchFEventCount);
+        if (count > 4000 && count % 512 != 0)
+        {
+            return;
+        }
+
+        var words = new List<string>(20);
+        var start = condAddress >= 0x40 ? condAddress - 0x40 : 0;
+        for (var offset = 0UL; offset <= 0x60; offset += sizeof(ulong))
+        {
+            var address = start + offset;
+            words.Add(KernelMemoryCompatExports.TryReadUInt64Compat(ctx, address, out var value)
+                ? $"{(long)(address - condAddress):+#;-#;0}=0x{value:X16}"
+                : "????");
+        }
+
+        Console.Error.WriteLine(
+            $"[LOADER][DIAG] fevent_watch op={operation} cond=0x{condAddress:X16} " +
+            $"thread=0x{threadId:X16} name='{threadName}' n={count} obj[{string.Join(',', words)}]");
     }
 
     private static void TracePthreadCondGuestState(
