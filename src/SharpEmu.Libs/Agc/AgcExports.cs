@@ -136,6 +136,7 @@ public static class AgcExports
     private const uint Gen5TextureFormatR8G8B8A8Unorm = 10;
     private const uint Gen5TextureFormatR16G16B16A16Float = 12;
     private const uint Gen5TextureType2D = 9;
+    private const uint Gen5TextureType2DArray = 13;
     private const ulong MaxPresentedTextureBytes = 128UL * 1024UL * 1024UL;
     private const ulong VideoOutPixelFormatA8R8G8B8Srgb = 0x80000000;
     private const ulong VideoOutPixelFormatA8B8G8R8Srgb = 0x80002200;
@@ -7971,7 +7972,9 @@ public static class AgcExports
                 binding.OffsetBytes,
                 binding.Data,
                 binding.DataLength,
-                binding.DataPooled);
+                binding.DataPooled,
+                binding.DeferredDescriptorAddress,
+                binding.RequiredRecords);
         }
 
         return buffers;
@@ -8059,10 +8062,22 @@ public static class AgcExports
     /// </summary>
     internal static bool IsPlausibleTextureDescriptor(IReadOnlyList<uint> words) =>
         TryDecodeTextureDescriptor(words, out var descriptor) &&
-        descriptor.Type == Gen5TextureType2D &&
+        IsBindable2DTextureType(descriptor) &&
         descriptor.Address != 0 &&
         descriptor.Width != 0 &&
         descriptor.Height != 0;
+
+    /// <summary>
+    /// Descriptor types the presenter can bind as a host 2D image. UE5 on
+    /// PS5 allocates many render-chain resources (eye-adaptation exposure,
+    /// TSR depth/velocity, bloom intermediates) as single-slice 2D ARRAYS;
+    /// slice 0 of those is layout-identical to a plain 2D texture, and
+    /// rejecting them binds a zero fallback that multiplies the whole
+    /// scene chain to black. Slices above 0 have no host backing yet.
+    /// </summary>
+    private static bool IsBindable2DTextureType(in TextureDescriptor descriptor) =>
+        descriptor.Type == Gen5TextureType2D ||
+        (descriptor.Type == Gen5TextureType2DArray && descriptor.BaseArray == 0);
 
     /// <summary>
     /// Execution-time resolution for a texture whose T# read zero at parse
@@ -8078,7 +8093,7 @@ public static class AgcExports
     {
         texture = default!;
         if (!TryDecodeTextureDescriptor(descriptorWords, out var descriptor) ||
-            descriptor.Type != Gen5TextureType2D ||
+            !IsBindable2DTextureType(descriptor) ||
             descriptor.Address == 0 ||
             descriptor.Width == 0 ||
             descriptor.Height == 0 ||
@@ -8126,7 +8141,7 @@ public static class AgcExports
         out VulkanGuestDrawTexture texture)
     {
         texture = default!;
-        if (descriptor.Type != Gen5TextureType2D ||
+        if (!IsBindable2DTextureType(descriptor) ||
             descriptor.Width == 0 ||
             descriptor.Height == 0 ||
             descriptor.Width > 8192 ||

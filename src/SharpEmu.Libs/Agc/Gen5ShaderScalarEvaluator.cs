@@ -633,6 +633,35 @@ internal static class Gen5ShaderScalarEvaluator
                             out var vertexData,
                             out var vertexDataLength))
                     {
+                        // Per-frame UI vertex rings (Slate/UMG text) are written
+                        // after the command list is parsed, so the V# read here
+                        // is stale garbage. When the descriptor's own guest
+                        // address is known, emit a deferred binding the presenter
+                        // refreshes on the ordered GPU timeline instead of
+                        // dropping the whole draw.
+                        if (!path.Supplemental &&
+                            scalarLoadSources.TryGetValue(
+                                bufferMemory.ScalarResource,
+                                out var vertexDescriptorSource) &&
+                            vertexDescriptorSource != 0)
+                        {
+                            vertexInputBindings.Add(new Gen5VertexInputBinding(
+                                instruction.Pc,
+                                (uint)vertexInputBindings.Count,
+                                bufferMemory.DwordCount,
+                                bufferDescriptor.DataFormat,
+                                bufferDescriptor.NumberFormat,
+                                bufferDescriptor.BaseAddress,
+                                bufferDescriptor.Stride,
+                                unchecked((uint)bufferMemory.OffsetBytes + scalarOffset),
+                                new byte[sizeof(uint)],
+                                sizeof(uint),
+                                DataPooled: false,
+                                DeferredDescriptorAddress: vertexDescriptorSource,
+                                RequiredRecords: (int)(requiredVertexRecordCount ?? 0)));
+                            continue;
+                        }
+
                         error =
                             $"vertex-buffer-read-failed pc=0x{instruction.Pc:X} " +
                             $"address=0x{bufferDescriptor.BaseAddress:X16} " +
@@ -2277,6 +2306,40 @@ internal static class Gen5ShaderScalarEvaluator
                     NumberFormat: 0,
                     DataFormat: 0)),
             "A non-empty buffer at a valid GPU address must remain bound.");
+    }
+
+    /// <summary>
+    /// Decodes four V# words re-read from guest memory on the ordered GPU
+    /// timeline (execution-time refresh of a vertex descriptor written after
+    /// the command list was parsed).
+    /// </summary>
+    internal static bool TryDecodeDeferredVertexDescriptor(
+        IReadOnlyList<uint> words,
+        out ulong baseAddress,
+        out uint stride,
+        out ulong sizeBytes,
+        out uint dataFormat,
+        out uint numberFormat)
+    {
+        baseAddress = 0;
+        stride = 0;
+        sizeBytes = 0;
+        dataFormat = 0;
+        numberFormat = 0;
+        if (!TryDecodeBufferDescriptor(words, 0, strictType: true, out var descriptor) ||
+            descriptor.BaseAddress == 0 ||
+            descriptor.Stride == 0 ||
+            descriptor.SizeBytes == 0)
+        {
+            return false;
+        }
+
+        baseAddress = descriptor.BaseAddress;
+        stride = descriptor.Stride;
+        sizeBytes = descriptor.SizeBytes;
+        dataFormat = descriptor.DataFormat;
+        numberFormat = descriptor.NumberFormat;
+        return true;
     }
 
     private static bool TryDecodeBufferDescriptor(

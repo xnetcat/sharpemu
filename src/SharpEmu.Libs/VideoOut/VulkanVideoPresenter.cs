@@ -76,7 +76,9 @@ internal sealed record VulkanGuestVertexBuffer(
     uint OffsetBytes,
     byte[] Data,
     int Length,
-    bool Pooled);
+    bool Pooled,
+    ulong DeferredDescriptorAddress = 0,
+    int RequiredRecords = 0);
 
 internal sealed record VulkanGuestIndexBuffer(
     byte[] Data,
@@ -6435,9 +6437,117 @@ internal static unsafe class VulkanVideoPresenter
             _vk.FreeMemory(_device, allocation.Memory, null);
         }
 
+        private long _deferredVertexResolveCount;
+        private long _deferredVertexFailCount;
+
+        // Vertex buffers whose V# read garbage at parse carry the guest
+        // address the descriptor was loaded from (per-frame Slate/UMG vertex
+        // rings are written after the command list is parsed). By execution
+        // time the table holds the real V#: re-read it and snapshot the live
+        // vertex data in place of the empty parse-time placeholder.
+        private VulkanGuestVertexBuffer RefreshDeferredVertexBuffer(
+            VulkanGuestVertexBuffer guestBuffer)
+        {
+            if (guestBuffer.DeferredDescriptorAddress == 0 || _guestMemory is null)
+            {
+                return guestBuffer;
+            }
+
+            var descriptorBytes = new byte[16];
+            if (!_guestMemory.TryRead(
+                    guestBuffer.DeferredDescriptorAddress,
+                    descriptorBytes))
+            {
+                if (Interlocked.Increment(ref _deferredVertexFailCount) <= 32)
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] vk.deferred_vertex_unreadable " +
+                        $"table=0x{guestBuffer.DeferredDescriptorAddress:X16}");
+                }
+
+                return guestBuffer;
+            }
+
+            var descriptorWords = new uint[4];
+            for (var word = 0; word < 4; word++)
+            {
+                descriptorWords[word] = System.Buffers.Binary.BinaryPrimitives
+                    .ReadUInt32LittleEndian(descriptorBytes.AsSpan(word * 4, 4));
+            }
+
+            if (!Gen5ShaderScalarEvaluator.TryDecodeDeferredVertexDescriptor(
+                    descriptorWords,
+                    out var baseAddress,
+                    out var stride,
+                    out var sizeBytes,
+                    out var dataFormat,
+                    out var numberFormat))
+            {
+                if (Interlocked.Increment(ref _deferredVertexFailCount) <= 32)
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] vk.deferred_vertex_unresolved " +
+                        $"table=0x{guestBuffer.DeferredDescriptorAddress:X16} " +
+                        $"words=[{string.Join(',', descriptorWords.Select(word => $"{word:X8}"))}]");
+                }
+
+                return guestBuffer;
+            }
+
+            var elementBytes =
+                (ulong)Math.Max(guestBuffer.ComponentCount, 1u) * sizeof(uint);
+            var recordSpan = Math.Max(stride, guestBuffer.OffsetBytes + elementBytes);
+            var requiredBytes = guestBuffer.RequiredRecords > 0
+                ? ((ulong)(guestBuffer.RequiredRecords - 1) * stride) + recordSpan
+                : sizeBytes;
+            var readBytes = (int)Math.Min(
+                Math.Min(requiredBytes, sizeBytes),
+                16UL * 1024 * 1024);
+            var vertexData = new byte[Math.Max(readBytes, sizeof(uint))];
+            if (readBytes > 0 &&
+                !_guestMemory.TryRead(baseAddress, vertexData.AsSpan(0, readBytes)))
+            {
+                if (Interlocked.Increment(ref _deferredVertexFailCount) <= 32)
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] vk.deferred_vertex_data_unreadable " +
+                        $"base=0x{baseAddress:X16} bytes={readBytes}");
+                }
+
+                return guestBuffer;
+            }
+
+            if (Interlocked.Increment(ref _deferredVertexResolveCount) <= 64)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][TRACE] vk.deferred_vertex_resolved " +
+                    $"table=0x{guestBuffer.DeferredDescriptorAddress:X16} " +
+                    $"base=0x{baseAddress:X16} stride={stride} bytes={readBytes} " +
+                    $"fmt={dataFormat}/n{numberFormat}");
+            }
+
+            if (guestBuffer.Pooled)
+            {
+                System.Buffers.ArrayPool<byte>.Shared.Return(guestBuffer.Data);
+            }
+
+            return guestBuffer with
+            {
+                BaseAddress = baseAddress,
+                Stride = stride,
+                DataFormat = dataFormat,
+                NumberFormat = numberFormat,
+                Data = vertexData,
+                Length = vertexData.Length,
+                Pooled = false,
+                DeferredDescriptorAddress = 0,
+            };
+        }
+
         private VertexBufferResource CreateVertexBufferResource(
             VulkanGuestVertexBuffer guestBuffer)
         {
+            guestBuffer = RefreshDeferredVertexBuffer(guestBuffer);
             var buffer = CreateHostBuffer(
                 guestBuffer.Data.AsSpan(0, guestBuffer.Length),
                 BufferUsageFlags.VertexBufferBit,
