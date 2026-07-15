@@ -9216,8 +9216,29 @@ internal static unsafe class VulkanVideoPresenter
                     _presentNotTakenLoggedSequence != _presentedSequence)
                 {
                     _presentNotTakenLoggedSequence = _presentedSequence;
+                    long headRequired = -1, headSeq = -1;
+                    int pendingCount;
+                    long enqueued, completed;
+                    int queued;
+                    lock (_gate)
+                    {
+                        pendingCount = _pendingGuestImagePresentations.Count;
+                        if (pendingCount > 0)
+                        {
+                            var head = _pendingGuestImagePresentations.Peek();
+                            headRequired = head.RequiredGuestWorkSequence;
+                            headSeq = head.Sequence;
+                        }
+
+                        enqueued = _enqueuedGuestWorkSequence;
+                        completed = _completedGuestWorkSequence;
+                        queued = _pendingGuestWork.Count;
+                    }
+
                     Console.Error.WriteLine(
                         $"[LOADER][WARN] vk.present_not_taken seq={_presentedSequence} " +
+                        $"pending={pendingCount} head_seq={headSeq} head_req={headRequired} " +
+                        $"enqueued={enqueued} completed={completed} queued={queued} " +
                         "— presentation submitted but its required guest work isn't complete; nothing shown.");
                 }
 
