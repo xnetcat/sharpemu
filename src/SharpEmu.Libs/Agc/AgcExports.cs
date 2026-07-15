@@ -3689,15 +3689,23 @@ public static class AgcExports
             }
         }
 
+        // Label/fence writes are tiny; anything larger is bulk data. Bulk data
+        // must always apply eagerly: a queue-time application can land after
+        // the guest unmapped or reused the destination (observed as a fatal
+        // host AV in TryCopyGuestMemory) and stale data corrupts live
+        // allocations. Only label-sized writes keep strict queue ordering so
+        // GPU completion values are never signalled early.
+        const ulong labelWriteMaxBytes = 64;
         if (eagerGuestMemoryApply is not null &&
             _eagerGpuDataWritesEnabled &&
             producerAddress != 0 &&
             producerLength != 0 &&
             producerLength <= MaxEagerGpuDataWriteBytes &&
-            GpuWaitRegistry.SnapshotInRange(
-                GetCpuMemoryStateKey(ctx.Memory),
-                producerAddress,
-                producerLength).Count == 0)
+            (producerLength > labelWriteMaxBytes ||
+             GpuWaitRegistry.SnapshotInRange(
+                 GetCpuMemoryStateKey(ctx.Memory),
+                 producerAddress,
+                 producerLength).Count == 0))
         {
             eagerGuestMemoryApply();
         }
