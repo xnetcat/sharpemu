@@ -5194,6 +5194,41 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					var guestContextText =
 						$" guest_rip=0x{guestContext.Rip:X16} guest_rsp=0x{guestContext[CpuRegister.Rsp]:X16} " +
 						$"guest_rbp=0x{guestContext[CpuRegister.Rbp]:X16}";
+					// The RHI/render bring-up deadlock investigation needs the
+					// callee-saved registers of the parked wait (they hold the
+					// fence-ring object and slot index in the guest's frames).
+					if (thread.Name is "RHIThread" or "RenderThread 1" or "AgcInterruptThread")
+					{
+						guestContextText +=
+							$" guest_rbx=0x{guestContext[CpuRegister.Rbx]:X16}" +
+							$" guest_r12=0x{guestContext[CpuRegister.R12]:X16}" +
+							$" guest_r13=0x{guestContext[CpuRegister.R13]:X16}" +
+							$" guest_r14=0x{guestContext[CpuRegister.R14]:X16}" +
+							$" guest_r15=0x{guestContext[CpuRegister.R15]:X16}";
+						foreach (var (label, baseAddress) in new[]
+						{
+							("r12", guestContext[CpuRegister.R12]),
+							("r14", guestContext[CpuRegister.R14]),
+						})
+						{
+							if (baseAddress is < 0x10000 or > 0xF000000000)
+							{
+								continue;
+							}
+
+							var words = new System.Text.StringBuilder();
+							for (var offset = 0UL; offset < 0x60; offset += 8)
+							{
+								words.Append(
+									thread.Context.TryReadUInt64(baseAddress + offset, out var word)
+										? $" +{offset:X2}=0x{word:X16}"
+										: $" +{offset:X2}=????");
+							}
+
+							Console.Error.WriteLine(
+								$"[LOADER][ERROR] Stall {thread.Name} {label} window @0x{baseAddress:X16}:{words}");
+						}
+					}
 					if (thread.HasBlockedContinuation)
 					{
 						guestContextText +=

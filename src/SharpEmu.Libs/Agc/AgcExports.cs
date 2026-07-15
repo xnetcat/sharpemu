@@ -2745,6 +2745,7 @@ public static class AgcExports
                 dwordCount,
                 submissionId,
                 tracePackets);
+            ArmGpuWaitSweeper(ctx, gpuState);
             DrainResumableDcbs(ctx, gpuState, tracePackets);
         }
 
@@ -2865,6 +2866,7 @@ public static class AgcExports
                 dwordCount,
                 ++gpuState.SubmissionSequence,
                 tracePackets);
+            ArmGpuWaitSweeper(ctx, gpuState);
             DrainResumableDcbs(ctx, gpuState, tracePackets);
         }
 
@@ -4810,6 +4812,78 @@ public static class AgcExports
         else
         {
             TryWriteUInt32(ctx, address, unchecked((uint)newValue));
+        }
+    }
+
+    // Lost-wake backstop. Wait re-checks normally run on each submit and after
+    // each ordered label write, but those triggers race wait registration (a
+    // waiter registered after the producer's post-write drain is never
+    // re-checked when the game stops submitting — observed once as the Silent
+    // Hill pre-title deadlock: label written to the awaited value with the
+    // deferral never released). A low-frequency sweeper converts any such lost
+    // wake into a bounded delay instead of a permanent stall.
+    private static Timer? _gpuWaitSweepTimer;
+    private static CpuContext? _gpuWaitSweepContext;
+    private static SubmittedGpuState? _gpuWaitSweepGpuState;
+    private static int _gpuWaitSweepInFlight;
+
+    private static void ArmGpuWaitSweeper(CpuContext ctx, SubmittedGpuState gpuState)
+    {
+        Volatile.Write(ref _gpuWaitSweepContext, ctx);
+        Volatile.Write(ref _gpuWaitSweepGpuState, gpuState);
+        if (_gpuWaitSweepTimer is not null)
+        {
+            return;
+        }
+
+        var timer = new Timer(
+            static _ =>
+            {
+                if (GpuWaitRegistry.Count == 0 ||
+                    Interlocked.Exchange(ref _gpuWaitSweepInFlight, 1) != 0)
+                {
+                    return;
+                }
+
+                try
+                {
+                    var sweepContext = Volatile.Read(ref _gpuWaitSweepContext);
+                    var sweepGpuState = Volatile.Read(ref _gpuWaitSweepGpuState);
+                    if (sweepContext is null || sweepGpuState is null)
+                    {
+                        return;
+                    }
+
+                    var pendingBefore = GpuWaitRegistry.Count;
+                    lock (sweepGpuState.Gate)
+                    {
+                        DrainResumableDcbs(sweepContext, sweepGpuState, tracePackets: false);
+                    }
+
+                    var pendingAfter = GpuWaitRegistry.Count;
+                    if (pendingAfter < pendingBefore)
+                    {
+                        Console.Error.WriteLine(
+                            $"[LOADER][DIAG] agc.wait_sweep resumed={pendingBefore - pendingAfter} " +
+                            $"remaining={pendingAfter}");
+                    }
+                }
+                catch
+                {
+                    // The sweep is a redundancy layer; a transient fault here
+                    // must never take down the interrupt path.
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref _gpuWaitSweepInFlight, 0);
+                }
+            },
+            null,
+            dueTime: TimeSpan.FromMilliseconds(20),
+            period: TimeSpan.FromMilliseconds(20));
+        if (Interlocked.CompareExchange(ref _gpuWaitSweepTimer, timer, null) is not null)
+        {
+            timer.Dispose();
         }
     }
 
