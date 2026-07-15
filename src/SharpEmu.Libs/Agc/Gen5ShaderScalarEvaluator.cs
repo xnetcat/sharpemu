@@ -163,6 +163,21 @@ internal static class Gen5ShaderScalarEvaluator
         // the per-load additions the loop used to make are redundant.
         var runtimeScalarRegisters = state.Program.RuntimeScalarRegisters;
         var scalarLoadSources = new Dictionary<uint, ulong>();
+        var scalarLoadChains = new Dictionary<uint, Gen5DescriptorChain>();
+        if (state.UserDataSources is { } userDataSources)
+        {
+            // Seed provenance for user-data SGPRs delivered via indirect
+            // SH-register patch tables: their values live in guest memory
+            // that may be written only after the command list is parsed.
+            for (var index = 0; index < userDataSources.Count; index++)
+            {
+                if (userDataSources[index] != 0)
+                {
+                    scalarLoadSources[state.UserDataScalarRegisterBase + (uint)index] =
+                        userDataSources[index];
+                }
+            }
+        }
         var resolvedImageByPc = new Dictionary<uint, int>();
         var finalScalarRegisters = (uint[])scalarRegisters.Clone();
         var pendingPaths = new Stack<ScalarPathState>();
@@ -382,7 +397,7 @@ internal static class Gen5ShaderScalarEvaluator
                 var recordBinding =
                     !path.Supplemental ||
                     !HasGlobalMemoryBindingForPc(globalMemoryBindings, instruction.Pc);
-                if (!TryExecuteScalarLoad(ctx, state, instruction, scalarMemory, scalarRegisters, globalMemoryBindings, globalMemoryByAddress, runtimeScalarRegisters, recordBinding, out error, scalarLoadSources))
+                if (!TryExecuteScalarLoad(ctx, state, instruction, scalarMemory, scalarRegisters, globalMemoryBindings, globalMemoryByAddress, runtimeScalarRegisters, recordBinding, out error, scalarLoadSources, scalarLoadChains))
                 {
                     if (path.Supplemental)
                     {
@@ -859,6 +874,11 @@ internal static class Gen5ShaderScalarEvaluator
                         out var descriptorSource)
                         ? descriptorSource
                         : 0,
+                    DeferredChain = scalarLoadChains.TryGetValue(
+                        image.ScalarResource,
+                        out var descriptorChain)
+                        ? descriptorChain
+                        : null,
                 };
                 if (resolvedImageByPc.TryGetValue(instruction.Pc, out var existingIndex))
                 {
@@ -1960,7 +1980,8 @@ internal static class Gen5ShaderScalarEvaluator
         IReadOnlySet<uint> runtimeScalarRegisters,
         bool recordBinding,
         out string error,
-        Dictionary<uint, ulong>? scalarLoadSources = null)
+        Dictionary<uint, ulong>? scalarLoadSources = null,
+        Dictionary<uint, Gen5DescriptorChain>? scalarLoadChains = null)
     {
         error = string.Empty;
         if (instruction.Sources.Count == 0 ||
@@ -2153,6 +2174,48 @@ internal static class Gen5ShaderScalarEvaluator
                 // after the command list is parsed.
                 scalarLoadSources[destination.Value] =
                     address + (ulong)(index * sizeof(uint));
+                scalarLoadChains?.Remove(destination.Value);
+            }
+            else if (scalarLoadChains is not null &&
+                     scalarLoadSources is not null &&
+                     baseAddress == 0)
+            {
+                // The base pointer (raw 64-bit for S_LOAD, V# buffer
+                // descriptor for SBufferLoad) is itself late-written and
+                // read zero at parse. Extend the provenance chain so
+                // execution-time refresh can re-walk the pointers first,
+                // then read the descriptor behind them.
+                Gen5DescriptorChain? parentChain = null;
+                if (scalarLoadSources.TryGetValue(
+                        scalarBase.Value,
+                        out var pointerSource) &&
+                    pointerSource != 0)
+                {
+                    parentChain = new Gen5DescriptorChain(
+                        pointerSource,
+                        scalarLoadSources.TryGetValue(
+                            scalarBase.Value + 1,
+                            out var pointerSourceHigh) &&
+                        pointerSourceHigh != 0
+                            ? pointerSourceHigh
+                            : pointerSource + sizeof(uint),
+                        []);
+                }
+                else
+                {
+                    scalarLoadChains.TryGetValue(scalarBase.Value, out parentChain);
+                }
+
+                if (parentChain is not null)
+                {
+                    var steps = new List<(ulong Offset, bool ViaBufferDescriptor)>(
+                        parentChain.Steps.Count + 1);
+                    steps.AddRange(parentChain.Steps);
+                    steps.Add((componentOffset, isBufferLoad));
+                    scalarLoadChains[destination.Value] =
+                        parentChain with { Steps = steps };
+                    scalarLoadSources.Remove(destination.Value);
+                }
             }
 
             if (bufferUnbound ||

@@ -46,6 +46,7 @@ internal sealed record VulkanGuestDrawTexture(
     uint DstSelect = 0xFAC,
     VulkanGuestSampler Sampler = default,
     ulong DeferredDescriptorAddress = 0,
+    SharpEmu.Libs.Agc.Gen5DescriptorChain? DeferredChain = null,
     // Slice count for a volume (SQ_RSRC_IMG_3D) texture; 1 for ordinary 2D.
     // Drives Type3D image/view creation in the presenter.
     uint Depth = 1);
@@ -8449,6 +8450,8 @@ internal static unsafe class VulkanVideoPresenter
 
         private long _deferredDescriptorResolveCount;
         private long _deferredDescriptorFailCount;
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<ulong, byte>
+            _deferredUnresolvedTracedTables = new();
 
         // Textures whose T# descriptor read zero at parse carry the guest
         // address the descriptor was loaded from. By execution time the
@@ -8463,21 +8466,88 @@ internal static unsafe class VulkanVideoPresenter
             for (var index = 0; index < textures.Count; index++)
             {
                 var texture = textures[index];
-                if (!texture.IsFallback || texture.DeferredDescriptorAddress == 0)
+                var descriptorAddress = texture.DeferredDescriptorAddress;
+                if (texture.IsFallback &&
+                    descriptorAddress == 0 &&
+                    texture.DeferredChain is { } chain)
                 {
+                    // Multi-hop provenance: base pointers (indirect-patched
+                    // user data, V#s in late-written tables) read zero at
+                    // parse. Walk the chain on the ordered timeline: each
+                    // step dereferences the pointer pair and advances by the
+                    // recorded load offset; the final step yields the
+                    // descriptor's own address.
+                    var wordBytes = new byte[4];
+                    var address0 = chain.Anchor0;
+                    var address1 = chain.Anchor1;
+                    foreach (var (stepOffset, viaBufferDescriptor) in chain.Steps)
+                    {
+                        ulong pointerLow;
+                        ulong pointerHigh;
+                        if (_guestMemory?.TryRead(address0, wordBytes) != true)
+                        {
+                            address0 = 0;
+                            break;
+                        }
+                        pointerLow = System.Buffers.Binary.BinaryPrimitives
+                            .ReadUInt32LittleEndian(wordBytes);
+                        if (_guestMemory?.TryRead(address1, wordBytes) != true)
+                        {
+                            address0 = 0;
+                            break;
+                        }
+                        pointerHigh = System.Buffers.Binary.BinaryPrimitives
+                            .ReadUInt32LittleEndian(wordBytes);
+
+                        var pointer = pointerLow | (pointerHigh << 32);
+                        if (viaBufferDescriptor)
+                        {
+                            // V#: word1's low bits extend the base address;
+                            // the rest of the dword holds the stride.
+                            pointer &= 0x0000_FFFF_FFFF_FFFFUL;
+                        }
+
+                        if (pointer == 0)
+                        {
+                            address0 = 0;
+                            break;
+                        }
+
+                        address0 = unchecked(pointer + stepOffset) & ~3UL;
+                        address1 = address0 + sizeof(uint);
+                    }
+
+                    descriptorAddress = address0;
+                }
+
+                if (!texture.IsFallback || descriptorAddress == 0)
+                {
+                    if (texture.IsFallback &&
+                        work.Target.Width >= 1280 &&
+                        _deferredUnresolvedTracedTables.TryAdd(
+                            (ulong)work.Draw.PixelSpirv.Length << 8 | (uint)index,
+                            0))
+                    {
+                        Console.Error.WriteLine(
+                            $"[LOADER][TRACE] vk.fallback_without_source " +
+                            $"ps={work.Draw.PixelSpirv.Length} slot={index} " +
+                            $"storage={(texture.IsStorage ? 1 : 0)} " +
+                            $"chain={(texture.DeferredChain is { } c ? $"0x{c.Anchor0:X}+{c.Steps.Count}steps" : "none")}");
+                    }
+
                     continue;
                 }
 
                 var descriptorBytes = new byte[32];
                 if (_guestMemory?.TryRead(
-                        texture.DeferredDescriptorAddress,
+                        descriptorAddress,
                         descriptorBytes) != true)
                 {
                     if (Interlocked.Increment(ref _deferredDescriptorFailCount) <= 32)
                     {
                         Console.Error.WriteLine(
                             $"[LOADER][TRACE] vk.deferred_texture_unreadable " +
-                            $"table=0x{texture.DeferredDescriptorAddress:X16}");
+                            $"table=0x{descriptorAddress:X16}");
                     }
 
                     continue;
@@ -8496,11 +8566,15 @@ internal static unsafe class VulkanVideoPresenter
                         texture.MipLevel,
                         out var resolvedTexture))
                 {
-                    if (Interlocked.Increment(ref _deferredDescriptorFailCount) <= 32)
+                    if (_deferredUnresolvedTracedTables.TryAdd(
+                            descriptorAddress ^ descriptorWords[0],
+                            0) &&
+                        Interlocked.Increment(ref _deferredDescriptorFailCount) <= 512)
                     {
                         Console.Error.WriteLine(
                             $"[LOADER][TRACE] vk.deferred_texture_unresolved " +
-                            $"table=0x{texture.DeferredDescriptorAddress:X16} " +
+                            $"table=0x{descriptorAddress:X16} " +
+                            $"ps={work.Draw.PixelSpirv.Length} " +
                             $"words=[{string.Join(',', descriptorWords.Select(word => $"{word:X8}"))}]");
                     }
 
@@ -8513,7 +8587,7 @@ internal static unsafe class VulkanVideoPresenter
                 {
                     Console.Error.WriteLine(
                         $"[LOADER][TRACE] vk.deferred_texture_resolved " +
-                        $"table=0x{texture.DeferredDescriptorAddress:X16} " +
+                        $"table=0x{descriptorAddress:X16} " +
                         $"tex=0x{resolvedTexture.Address:X16}:" +
                         $"{resolvedTexture.Width}x{resolvedTexture.Height}:" +
                         $"f{resolvedTexture.Format}/n{resolvedTexture.NumberType}");

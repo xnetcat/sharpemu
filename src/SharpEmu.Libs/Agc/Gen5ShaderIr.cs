@@ -133,7 +133,24 @@ internal sealed record Gen5ShaderState(
     IReadOnlyList<uint> UserData,
     Gen5ShaderMetadata? Metadata,
     Gen5ComputeSystemRegisters? ComputeSystemRegisters = null,
-    uint UserDataScalarRegisterBase = 0);
+    uint UserDataScalarRegisterBase = 0,
+    // Guest addresses each user-data SGPR's VALUE was sourced from (indirect
+    // SH-register patch tables), zero when set directly. Late-written tables
+    // read zero at parse; provenance lets execution-time refresh re-read them.
+    IReadOnlyList<ulong>? UserDataSources = null);
+
+/// <summary>
+/// Recipe for recomputing the guest address of a descriptor whose loads read
+/// zero at parse. The anchor pair holds the addresses of the two dwords of
+/// the deepest reachable base pointer (possibly non-contiguous when seeded
+/// from an indirect register-patch table); each step dereferences the pointer
+/// (masking V# base bits when the hop went through a buffer descriptor) and
+/// advances by the recorded load offset.
+/// </summary>
+internal sealed record Gen5DescriptorChain(
+    ulong Anchor0,
+    ulong Anchor1,
+    IReadOnlyList<(ulong Offset, bool ViaBufferDescriptor)> Steps);
 
 internal readonly record struct Gen5Operand(Gen5OperandKind Kind, uint Value)
 {
@@ -292,6 +309,15 @@ internal sealed record Gen5ImageBinding(
     /// execution time on the ordered GPU timeline.
     /// </summary>
     public ulong DescriptorSourceAddress { get; init; }
+
+    /// <summary>
+    /// Multi-hop provenance for T#s whose descriptor loads read zero at
+    /// parse because one or more base pointers (user-data SGPRs fed by
+    /// late-written indirect register-patch tables, V#s in late-written
+    /// resource tables) were still unwritten. Execution-time refresh walks
+    /// the chain on the ordered GPU timeline.
+    /// </summary>
+    public Gen5DescriptorChain? DeferredChain { get; init; }
 }
 
 // Data arrays may be rented from ArrayPool (oversized): always slice with

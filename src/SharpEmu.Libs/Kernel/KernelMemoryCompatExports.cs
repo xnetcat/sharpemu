@@ -2854,9 +2854,19 @@ public static partial class KernelMemoryCompatExports
 
         if (!ctx.TryWriteUInt64(inOutAddressPointer, mappedAddress))
         {
+            if (ShouldTraceDirectMemory())
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][TRACE] map_direct result: mapped=0x{mappedAddress:X16} write_ok=0 result=MEMORY_FAULT");
+            }
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
+        if (ShouldTraceDirectMemory())
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] map_direct result: mapped=0x{mappedAddress:X16} write_ok=1 result=OK");
+        }
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 

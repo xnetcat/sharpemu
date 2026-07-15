@@ -198,7 +198,8 @@ internal static class Gen5ShaderTranslator
         out Gen5ShaderState state,
         out string error,
         Gen5ComputeSystemRegisters? computeSystemRegisters = null,
-        uint userDataScalarRegisterBase = 0)
+        uint userDataScalarRegisterBase = 0,
+        IReadOnlyDictionary<uint, ulong>? shaderRegisterSources = null)
     {
         ValidateUserSgprCountDecoding();
         state = default!;
@@ -263,9 +264,19 @@ internal static class Gen5ShaderTranslator
         }
 
         var userData = new uint[userSgprCount];
+        ulong[]? userDataSources = null;
         for (uint index = 0; index < userData.Length; index++)
         {
             shaderRegisters.TryGetValue(userDataBaseRegister + index, out userData[index]);
+            if (shaderRegisterSources is not null &&
+                shaderRegisterSources.TryGetValue(
+                    userDataBaseRegister + index,
+                    out var source) &&
+                source != 0)
+            {
+                userDataSources ??= new ulong[userSgprCount];
+                userDataSources[index] = source;
+            }
         }
 
         state = new Gen5ShaderState(
@@ -273,7 +284,8 @@ internal static class Gen5ShaderTranslator
             userData,
             metadata,
             computeSystemRegisters,
-            userDataScalarRegisterBase);
+            userDataScalarRegisterBase,
+            userDataSources);
         return true;
     }
 

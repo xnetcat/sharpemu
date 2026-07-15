@@ -500,7 +500,8 @@ public static class AgcExports
         bool IsStorage,
         uint MipLevel,
         IReadOnlyList<uint> SamplerDescriptor,
-        ulong DeferredDescriptorAddress = 0);
+        ulong DeferredDescriptorAddress = 0,
+        Gen5DescriptorChain? DeferredChain = null);
 
     private readonly record struct RenderTargetWriter(
         ulong Sequence,
@@ -543,6 +544,10 @@ public static class AgcExports
 
         public Dictionary<uint, uint> CxRegisters { get; } = new();
         public Dictionary<uint, uint> ShRegisters { get; } = new();
+        // Guest address each SH register VALUE was read from when it arrived
+        // via an indirect register-patch table (late-written per-frame data);
+        // absent for registers set directly in the command stream.
+        public Dictionary<uint, ulong> ShRegisterSources { get; } = new();
         public Dictionary<uint, uint> UcRegisters { get; } = new();
         public TextureDescriptor? PresenterTexture { get; set; }
         public GuestDrawKind GuestDrawKind { get; set; }
@@ -5533,6 +5538,12 @@ public static class AgcExports
                 }
 
                 directDestination[startRegister + index] = value;
+                if (op == ItSetShReg)
+                {
+                    // A direct value supersedes any earlier indirect-table
+                    // provenance for this register.
+                    state.ShRegisterSources.Remove(startRegister + index);
+                }
             }
 
             return;
@@ -5562,9 +5573,19 @@ public static class AgcExports
                 return;
             }
 
-            if (registerOffset != 0)
+            // The indirect table has an explicit count; offset zero is a real
+            // context-register index (DB_RENDER_CONTROL), not a terminator.
+            // Dropping it leaves stale depth/render-control state active in
+            // later passes.
+            destination[registerOffset] = value;
+            if (register == RShRegsIndirect)
             {
-                destination[registerOffset] = value;
+                // The table itself is per-frame guest memory that may be
+                // written after this parse; remember where each value came
+                // from so shader evaluation can defer descriptor loads whose
+                // user-data pointers still read zero here.
+                state.ShRegisterSources[registerOffset] =
+                    entryAddress + sizeof(uint);
             }
         }
     }
@@ -6099,7 +6120,8 @@ public static class AgcExports
                 SelectExportUserDataRegister(state.ShRegisters),
                 out var exportState,
                 out error,
-                userDataScalarRegisterBase: NggUserDataScalarRegisterBase) ||
+                userDataScalarRegisterBase: NggUserDataScalarRegisterBase,
+                shaderRegisterSources: state.ShRegisterSources) ||
             !Gen5ShaderScalarEvaluator.TryEvaluate(
                 ctx,
                 exportState,
@@ -6281,7 +6303,8 @@ public static class AgcExports
                 SelectExportUserDataRegister(state.ShRegisters),
                 out var exportState,
                 out error,
-                userDataScalarRegisterBase: NggUserDataScalarRegisterBase))
+                userDataScalarRegisterBase: NggUserDataScalarRegisterBase,
+                shaderRegisterSources: state.ShRegisterSources))
         {
             return false;
         }
@@ -6311,7 +6334,8 @@ public static class AgcExports
                 state.ShRegisters,
                 PsTextureUserDataRegister,
                 out var pixelState,
-                out error))
+                out error,
+                shaderRegisterSources: state.ShRegisterSources))
         {
             ReturnPooledEvaluationArrays(exportEvaluation);
             return false;
@@ -6593,18 +6617,42 @@ public static class AgcExports
                     $"raw=[{string.Join(',', binding.ResourceDescriptor.Select(word => $"{word:X8}"))}]");
             }
 
+            // Descriptors that do not decode to a usable 2D texture resolve
+            // late at execution. Per-frame descriptor tables are written
+            // after the command list is parsed, so the parse-time read can
+            // see all-zero words OR a partially written/garbage entry
+            // (non-zero address with an invalid type); both classes re-read
+            // the table on the ordered GPU timeline. When the table POINTER
+            // itself was unwritten at parse, the two-hop chain re-reads the
+            // pointer first.
+            var descriptorUnusable =
+                texture.Address == 0 ||
+                texture.Type != Gen5TextureType2D ||
+                texture.Width == 0 ||
+                texture.Height == 0;
+            if (descriptorUnusable &&
+                binding.DescriptorSourceAddress == 0 &&
+                binding.DeferredChain is null &&
+                _zeroDescriptorTracedShaders.TryAdd(
+                    (pixelShaderAddress << 20) ^ 0xDEADUL ^ binding.Pc,
+                    0) &&
+                Interlocked.Increment(ref _zeroDescriptorTraceCount) <= 256)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][TRACE] agc.unanchored_texture ps=0x{pixelShaderAddress:X} " +
+                    $"pc=0x{binding.Pc:X} op={binding.Opcode} " +
+                    $"sreg=s{binding.Control.ScalarResource} " +
+                    $"raw=[{string.Join(',', binding.ResourceDescriptor.Select(word => $"{word:X8}"))}] " +
+                    Gen5ShaderTranslator.DescribeState(pixelState));
+            }
             textures.Add(
                 new TranslatedImageBinding(
                     texture,
                     Gen5ShaderTranslator.IsStorageImageOperation(binding.Opcode),
                     binding.MipLevel ?? 0,
                     binding.SamplerDescriptor,
-                    // Descriptors that decode to no texture resolve late at
-                    // execution (per-frame RT/exposure tables are not yet
-                    // written when the command list is parsed).
-                    texture.Address == 0
-                        ? binding.DescriptorSourceAddress
-                        : 0));
+                    descriptorUnusable ? binding.DescriptorSourceAddress : 0,
+                    descriptorUnusable ? binding.DeferredChain : null));
         }
 
         DumpNv12ShaderIfRequested(
@@ -7558,11 +7606,14 @@ public static class AgcExports
                     binding.SamplerDescriptor,
                     out var texture))
             {
-                if (texture.IsFallback && binding.DeferredDescriptorAddress != 0)
+                if (texture.IsFallback &&
+                    (binding.DeferredDescriptorAddress != 0 ||
+                     binding.DeferredChain is not null))
                 {
                     texture = texture with
                     {
                         DeferredDescriptorAddress = binding.DeferredDescriptorAddress,
+                        DeferredChain = binding.DeferredChain,
                     };
                 }
 
@@ -8168,6 +8219,32 @@ public static class AgcExports
         out VulkanGuestDrawTexture texture)
     {
         texture = default!;
+        // A 1x1 source of any dimensionality (neutral 1x1x1 grading LUTs,
+        // default reflection-probe cubes, exposure planes) samples to its
+        // single stored texel for every coordinate, so bind it as a 1x1 2D
+        // texture instead of dropping to a zero fallback: Unity's post
+        // "uber" pass multiplies the scene by these, and a zero turns the
+        // whole frame black.
+        if (!IsBindableTextureType(descriptor) &&
+            !isStorage &&
+            descriptor.Address != 0 &&
+            descriptor.Width == 1 &&
+            descriptor.Height == 1)
+        {
+            descriptor = descriptor with
+            {
+                Type = Gen5TextureType2D,
+                Depth = 1,
+                BaseArray = 0,
+                ArrayPitch = 0,
+                BaseLevel = 0,
+                LastLevel = 0,
+                MaxMip = 0,
+                Pitch = 1,
+                TileMode = 0,
+            };
+        }
+
         if (!IsBindableTextureType(descriptor) ||
             descriptor.Width == 0 ||
             descriptor.Height == 0 ||
@@ -9075,7 +9152,8 @@ public static class AgcExports
                 ComputeUserDataRegister,
                 out var shaderState,
                 out var error,
-                computeSystemRegisters) ||
+                computeSystemRegisters,
+                shaderRegisterSources: state.ShRegisterSources) ||
             !Gen5ShaderScalarEvaluator.TryEvaluate(
                 ctx,
                 shaderState,

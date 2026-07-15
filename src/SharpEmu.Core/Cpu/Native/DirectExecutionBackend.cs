@@ -827,6 +827,14 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		return nativeEntry();
 	}
 
+	// Full-width variant for guest callbacks whose 64-bit RAX return value
+	// matters (e.g. AvPlayer texture allocators returning pointers).
+	private unsafe static ulong CallNativeEntryU64(void* entry)
+	{
+		var nativeEntry = (delegate* unmanaged[Cdecl]<ulong>)entry;
+		return nativeEntry();
+	}
+
 	private unsafe static void WriteCtxU64(void* contextRecord, int offset, ulong value)
 	{
 		*(ulong*)((byte*)contextRecord + offset) = value;
@@ -2162,16 +2170,17 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 		byte* code = (byte*)ptr;
 		int offset = 0;
-		// TlsGetValue returns its TLS pointer in RAX. Preserve the guest return value
-		// above the 32-byte Windows shadow space while keeping the call site aligned.
-		EmitByte(code, ref offset, 0x48); // sub rsp, 0x30
+		// The guest's 64-bit return value is still live in RAX here, but the
+		// TlsGetValue call below clobbers it. Park it in R12 (callee-saved on
+		// both ABIs; the host R12 is restored from the host stack afterwards)
+		// and publish it to the second slot of the per-call host-RSP storage
+		// so the managed side can recover callback return values.
+		EmitByte(code, ref offset, 0x49); // mov r12, rax
+		EmitByte(code, ref offset, 0x89);
+		EmitByte(code, ref offset, 0xC4);
+		EmitByte(code, ref offset, 0x48); // sub rsp, 0x20
 		EmitByte(code, ref offset, 0x83);
 		EmitByte(code, ref offset, 0xEC);
-		EmitByte(code, ref offset, 0x30);
-		EmitByte(code, ref offset, 0x48); // mov [rsp+0x20], rax
-		EmitByte(code, ref offset, 0x89);
-		EmitByte(code, ref offset, 0x44);
-		EmitByte(code, ref offset, 0x24);
 		EmitByte(code, ref offset, 0x20);
 		EmitByte(code, ref offset, 0xB9); // mov ecx, tlsIndex
 		EmitUInt32(code, ref offset, _hostRspSlotTlsIndex);
@@ -2181,21 +2190,17 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		offset += sizeof(ulong);
 		EmitByte(code, ref offset, 0xFF); // call rax
 		EmitByte(code, ref offset, 0xD0);
-		EmitByte(code, ref offset, 0x49); // mov r11, rax
-		EmitByte(code, ref offset, 0x89);
-		EmitByte(code, ref offset, 0xC3);
-		EmitByte(code, ref offset, 0x48); // mov rax, [rsp+0x20]
-		EmitByte(code, ref offset, 0x8B);
-		EmitByte(code, ref offset, 0x44);
-		EmitByte(code, ref offset, 0x24);
-		EmitByte(code, ref offset, 0x20);
-		EmitByte(code, ref offset, 0x48); // add rsp, 0x30
+		EmitByte(code, ref offset, 0x48); // add rsp, 0x20
 		EmitByte(code, ref offset, 0x83);
 		EmitByte(code, ref offset, 0xC4);
-		EmitByte(code, ref offset, 0x30);
-		EmitByte(code, ref offset, 0x49); // mov rsp, [r11]
+		EmitByte(code, ref offset, 0x20);
+		EmitByte(code, ref offset, 0x4C); // mov [rax+8], r12 (guest RAX)
+		EmitByte(code, ref offset, 0x89);
+		EmitByte(code, ref offset, 0x60);
+		EmitByte(code, ref offset, 0x08);
+		EmitByte(code, ref offset, 0x48); // mov rsp, [rax]
 		EmitByte(code, ref offset, 0x8B);
-		EmitByte(code, ref offset, 0x23);
+		EmitByte(code, ref offset, 0x20);
 		EmitHostNonvolatileXmmRestore(code, ref offset);
 		EmitByte(code, ref offset, 0x41); EmitByte(code, ref offset, 0x5F);
 		EmitByte(code, ref offset, 0x41); EmitByte(code, ref offset, 0x5E);
@@ -3280,6 +3285,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		{
 			LastError = null;
 			var exitReason = ExecuteGuestThreadEntry(context, entryPoint, reason, out var callbackReason);
+			var everBlocked = exitReason == GuestNativeCallExitReason.Blocked;
 			if (exitReason == GuestNativeCallExitReason.Blocked &&
 				!ResumeBlockedNestedGuestCallback(context, reason, ref exitReason, ref callbackReason))
 			{
@@ -3293,6 +3299,13 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			}
 
 			returnValue = context[CpuRegister.Rax];
+			if (reason == "avplayer_allocate_texture")
+			{
+				Console.Error.WriteLine(
+					$"[LOADER][TRACE] guest_callback_exit reason='{reason}' exit={exitReason} " +
+					$"blocked={everBlocked} rax=0x{returnValue:X16} rip=0x{context.Rip:X16} " +
+					$"rbx=0x{context[CpuRegister.Rbx]:X16} rsp=0x{context[CpuRegister.Rsp]:X16}");
+			}
 			return true;
 		}
 		finally
@@ -4141,7 +4154,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			reason = "failed to allocate executable memory for guest thread stub";
 			return GuestNativeCallExitReason.Exception;
 		}
-		void* hostRspStorage = NativeMemory.Alloc((nuint)sizeof(ulong));
+		void* hostRspStorage = NativeMemory.AllocZeroed((nuint)(2 * sizeof(ulong)));
 		if (hostRspStorage == null)
 		{
 			VirtualFree(ptr, 0u, 32768u);
@@ -4303,7 +4316,15 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					reason = LastError ?? "guest thread forced exit";
 					return GuestNativeCallExitReason.ForcedExit;
 				}
-				reason = $"returned 0x{nativeReturn:X8}";
+				// The context's registers were last synced at an import
+				// boundary; the guest's actual 64-bit return value survives
+				// only in the second slot of the per-call host-RSP storage
+				// (the return stub parks guest RAX there; the managed worker
+				// return carries just EAX). Publish it so callback callers
+				// observe the real result.
+				var guestRax = *(ulong*)(hostRspSlot + sizeof(ulong));
+				context[CpuRegister.Rax] = guestRax;
+				reason = $"returned 0x{guestRax:X8}";
 				return GuestNativeCallExitReason.Returned;
 			}
 			catch (AccessViolationException ex)
@@ -4353,7 +4374,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			reason = "failed to allocate executable memory for guest thread stub";
 			return GuestNativeCallExitReason.Exception;
 		}
-		void* hostRspStorage = NativeMemory.Alloc((nuint)sizeof(ulong));
+		void* hostRspStorage = NativeMemory.AllocZeroed((nuint)(2 * sizeof(ulong)));
 		if (hostRspStorage == null)
 		{
 			VirtualFree(ptr, 0u, 32768u);
@@ -4471,6 +4492,11 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					reason = LastError ?? "guest thread forced exit";
 					return GuestNativeCallExitReason.ForcedExit;
 				}
+				// Continuations return through the shared guest-return stub,
+				// which parks the guest's RAX in the storage's second slot
+				// (its TlsGetValue call clobbers the live register). Restore
+				// it into the context for callback return-value consumers.
+				context[CpuRegister.Rax] = *((ulong*)hostRspStorage + 1);
 				reason = $"returned 0x{nativeReturn:X8}";
 				return GuestNativeCallExitReason.Returned;
 			}
@@ -4588,7 +4614,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			result = OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
 			return false;
 		}
-		void* hostRspStorage = NativeMemory.Alloc((nuint)sizeof(ulong));
+		void* hostRspStorage = NativeMemory.AllocZeroed((nuint)(2 * sizeof(ulong)));
 		if (hostRspStorage == null)
 		{
 			VirtualFree(ptr, 0u, 32768u);
