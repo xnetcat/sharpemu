@@ -3115,11 +3115,27 @@ public static class AgcExports
         }
     }
 
+    // The GPU EOP event delivered to the AGC interrupt thread carries a
+    // completion counter in its kevent `data` field. The interrupt handler
+    // compares it against each queue record's expected value to decide which
+    // records (and their RHI fences) have retired. Delivering the constant
+    // event id there makes every completion look identical, so the handler can
+    // never advance past the first outstanding fence — the RHI thread then
+    // waits forever (Silent Hill pre-title deadlock). Deliver the monotonically
+    // increasing submission id instead. Opt-in
+    // (SHARPEMU_AGC_COMPLETION_DATA=submission) because it did not change the
+    // Silent Hill pre-title stall and its effect on other titles is unverified;
+    // the default keeps the historical constant-event-id payload.
+    private static readonly bool _completionDataIsSubmissionId = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_AGC_COMPLETION_DATA"),
+        "submission",
+        StringComparison.OrdinalIgnoreCase);
+
     private static int TriggerCompletionEvent(in PendingCompletionEvent completion) =>
         KernelEventQueueCompatExports.TriggerRegisteredEvents(
             completion.EventId,
             KernelEventQueueCompatExports.KernelEventFilterGraphics,
-            completion.EventId);
+            _completionDataIsSubmissionId ? completion.SubmissionId : completion.EventId);
 
     private static int GetSubmitCompletionEventDelayMs()
     {
