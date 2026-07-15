@@ -3,6 +3,8 @@
 
 namespace SharpEmu.Libs.Agc;
 
+using SharpEmu.Libs.VideoOut;
+
 internal static partial class Gen5SpirvTranslator
 {
     private const uint ScalarRegisterCount = 256;
@@ -27,6 +29,7 @@ internal static partial class Gen5SpirvTranslator
         int imageBindingBase = 0,
         int initialScalarBufferIndex = -1,
         int pixelRenderTargetSlot = 0,
+        IReadOnlyDictionary<uint, uint>? pixelInputLocations = null,
         ulong storageBufferOffsetAlignment = 1)
     {
         var context = new CompilationContext(
@@ -42,6 +45,7 @@ internal static partial class Gen5SpirvTranslator
             imageBindingBase,
             initialScalarBufferIndex,
             pixelRenderTargetSlot,
+            pixelInputLocations: pixelInputLocations,
             storageBufferOffsetAlignment: storageBufferOffsetAlignment);
         return context.TryCompile(out shader, out error);
     }
@@ -137,6 +141,16 @@ internal static partial class Gen5SpirvTranslator
                 out var maxSteps) && maxSteps >= 0
                 ? maxSteps
                 : 100_000;
+        private static readonly bool _straightLineShaders =
+            !string.Equals(
+                Environment.GetEnvironmentVariable("SHARPEMU_STRAIGHT_LINE_SHADERS"),
+                "0",
+                StringComparison.Ordinal);
+        private static readonly bool _graphicsWaveMaskSgprs =
+            !string.Equals(
+                Environment.GetEnvironmentVariable("SHARPEMU_GRAPHICS_WAVE_MASK_SGPRS"),
+                "0",
+                StringComparison.Ordinal);
 
         // Diagnostic coverage probe. When enabled, every selected MRT export
         // writes opaque magenta while preserving the shader's control flow,
@@ -148,12 +162,155 @@ internal static partial class Gen5SpirvTranslator
                 "1",
                 StringComparison.Ordinal);
 
+        // Diagnostic sample probe. The selected zero-based pixel IMAGE_SAMPLE
+        // result is copied to scratch VGPRs and exported as RGBA at the end of
+        // the shader. This preserves the real texture binding, coordinates,
+        // sampler and control flow while bypassing all later pixel arithmetic.
+        private static readonly int _tracePixelSampleOrdinal =
+            int.TryParse(
+                Environment.GetEnvironmentVariable("SHARPEMU_TRACE_PIXEL_SAMPLE"),
+                out var sampleOrdinal) && sampleOrdinal >= 0
+                ? sampleOrdinal
+                : -1;
+        private static readonly uint? _tracePixelSamplePc = ParsePixelSamplePc();
+        private static readonly uint? _tracePixelAluPc = ParsePixelAluPc();
+        private static readonly bool _tracePixelAluPacked =
+            string.Equals(
+                Environment.GetEnvironmentVariable(
+                    "SHARPEMU_TRACE_PIXEL_ALU_PACKED"),
+                "1",
+                StringComparison.Ordinal);
+        private static readonly bool _tracePixelAluBiased =
+            string.Equals(
+                Environment.GetEnvironmentVariable(
+                    "SHARPEMU_TRACE_PIXEL_ALU_BIASED"),
+                "1",
+                StringComparison.Ordinal);
+        private static readonly ulong? _tracePixelProgramAddress =
+            ParsePixelProgramAddress();
+        private static readonly bool _tracePixelSampleCoordinates =
+            string.Equals(
+                Environment.GetEnvironmentVariable(
+                    "SHARPEMU_TRACE_PIXEL_SAMPLE_COORDS"),
+                "1",
+                StringComparison.Ordinal);
+        private static readonly bool _tracePixelSampleCoordinatesBiased =
+            string.Equals(
+                Environment.GetEnvironmentVariable(
+                    "SHARPEMU_TRACE_PIXEL_SAMPLE_COORDS_BIASED"),
+                "1",
+                StringComparison.Ordinal);
+        private static readonly bool _tracePixelSampleFixedCenter =
+            string.Equals(
+                Environment.GetEnvironmentVariable(
+                    "SHARPEMU_TRACE_PIXEL_SAMPLE_FIXED_CENTER"),
+                "1",
+                StringComparison.Ordinal);
+        private static readonly bool _tracePixelSampleSize =
+            string.Equals(
+                Environment.GetEnvironmentVariable(
+                    "SHARPEMU_TRACE_PIXEL_SAMPLE_SIZE"),
+                "1",
+                StringComparison.Ordinal);
+        private static readonly bool _tracePixelSampleFetch =
+            string.Equals(
+                Environment.GetEnvironmentVariable(
+                    "SHARPEMU_TRACE_PIXEL_SAMPLE_FETCH"),
+                "1",
+                StringComparison.Ordinal);
+        private static readonly int _traceVertexScalarBase =
+            int.TryParse(
+                Environment.GetEnvironmentVariable(
+                    "SHARPEMU_TRACE_VERTEX_SCALAR_BASE"),
+                out var scalarBase) && scalarBase >= 0 && scalarBase <= 124
+                ? scalarBase
+                : -1;
+        private const uint PixelSampleTraceVgpr = 252;
+
+        private static uint? ParsePixelSamplePc()
+        {
+            var text = Environment.GetEnvironmentVariable(
+                "SHARPEMU_TRACE_PIXEL_SAMPLE_PC");
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return null;
+            }
+
+            var digits = text.StartsWith("0x", StringComparison.OrdinalIgnoreCase)
+                ? text[2..]
+                : text;
+            return uint.TryParse(
+                digits,
+                System.Globalization.NumberStyles.HexNumber,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out var pc)
+                ? pc
+                : null;
+        }
+
+        private static ulong? ParsePixelProgramAddress()
+        {
+            var text = Environment.GetEnvironmentVariable(
+                "SHARPEMU_TRACE_PIXEL_PROGRAM");
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return null;
+            }
+
+            var digits = text.StartsWith("0x", StringComparison.OrdinalIgnoreCase)
+                ? text[2..]
+                : text;
+            return ulong.TryParse(
+                digits,
+                System.Globalization.NumberStyles.HexNumber,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out var address)
+                ? address
+                : null;
+        }
+
+        private static uint? ParsePixelAluPc()
+        {
+            var text = Environment.GetEnvironmentVariable(
+                "SHARPEMU_TRACE_PIXEL_ALU_PC");
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return null;
+            }
+
+            var digits = text.StartsWith("0x", StringComparison.OrdinalIgnoreCase)
+                ? text[2..]
+                : text;
+            return uint.TryParse(
+                digits,
+                System.Globalization.NumberStyles.HexNumber,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out var pc)
+                ? pc
+                : null;
+        }
+
+        private bool IsPixelTraceProgramSelected() =>
+            !_tracePixelProgramAddress.HasValue ||
+            _state.Program.Address == _tracePixelProgramAddress.Value;
+
+        private bool IsPixelSampleTraceActive() =>
+            (_tracePixelSampleOrdinal >= 0 || _tracePixelSamplePc.HasValue) &&
+            IsPixelTraceProgramSelected();
+
+        private bool IsPixelAluTraceActive() =>
+            _tracePixelAluPc.HasValue && IsPixelTraceProgramSelected();
+
         // Which pixel-shader MRT export target (EXP_MRT0..7 == render-target
         // slot) is routed to the single fragment output. The offscreen draw
         // path renders one bound color target per pass, so a multi-render-target
         // (deferred G-buffer) draw compiles one pixel variant per slot, each
         // selecting that slot's export here.
         private readonly int _pixelRenderTargetSlot;
+        // Pixel shader interpolation instructions address logical input slots.
+        // SPI_PS_INPUT_CNTL remaps each one to the vertex parameter location
+        // that carries the matching semantic.
+        private readonly IReadOnlyDictionary<uint, uint>? _pixelInputLocations;
         // Vertex stage only: the fragment shader paired with this vertex shader
         // declares interpolated inputs for locations 0..(this-1). Metal requires
         // every fragment input location to be written by the vertex shader, so
@@ -177,6 +334,7 @@ internal static partial class Gen5SpirvTranslator
         private readonly Dictionary<uint, int> _imageBindingByPc = [];
         private readonly Dictionary<uint, int> _bufferBindingByPc = [];
         private readonly Dictionary<uint, long[]> _scalarDefinitionsBeforePc = [];
+        private int _pixelImageSampleOrdinal;
         private uint _voidType;
         private uint _boolType;
         private uint _uintType;
@@ -244,6 +402,7 @@ internal static partial class Gen5SpirvTranslator
         private readonly record struct SpirvVertexInput(
             uint Variable,
             uint Type,
+            uint ComponentType,
             uint ComponentCount);
 
         public CompilationContext(
@@ -259,6 +418,7 @@ internal static partial class Gen5SpirvTranslator
             int imageBindingBase,
             int initialScalarBufferIndex,
             int pixelRenderTargetSlot = 0,
+            IReadOnlyDictionary<uint, uint>? pixelInputLocations = null,
             int requiredVertexOutputCount = 0,
             uint waveLaneCount = 32,
             ulong storageBufferOffsetAlignment = 1)
@@ -274,6 +434,7 @@ internal static partial class Gen5SpirvTranslator
                 _waveLaneCount == 64 &&
                 (ulong)localSizeX * localSizeY * localSizeZ == 64;
             _pixelRenderTargetSlot = pixelRenderTargetSlot;
+            _pixelInputLocations = pixelInputLocations;
             _localSizeX = localSizeX;
             _localSizeY = localSizeY;
             _localSizeZ = localSizeZ;
@@ -318,78 +479,91 @@ internal static partial class Gen5SpirvTranslator
                 _module.AddLabel();
                 EmitInitialState();
 
-                var loopHeader = _module.AllocateId();
-                var switchHeader = _module.AllocateId();
-                var switchMerge = _module.AllocateId();
-                var loopContinue = _module.AllocateId();
-                var loopMerge = _module.AllocateId();
-                var defaultLabel = _module.AllocateId();
-                var caseLabels = new uint[blocks.Count];
-                for (var index = 0; index < caseLabels.Length; index++)
+                // A branch-free guest shader does not need the generic
+                // program-counter dispatcher. Direct structured flow is also
+                // required for well-defined implicit fragment derivatives.
+                if (CanEmitStraightLine(blocks, _state.Program.Instructions))
                 {
-                    caseLabels[index] = _module.AllocateId();
-                }
-
-                _module.AddStatement(SpirvOp.Branch, loopHeader);
-                _module.AddLabel(loopHeader);
-                _module.AddStatement(SpirvOp.LoopMerge, loopMerge, loopContinue, 0);
-                _module.AddStatement(SpirvOp.Branch, switchHeader);
-
-                _module.AddLabel(switchHeader);
-                var selector = Load(_uintType, _programCounter);
-                _module.AddStatement(SpirvOp.SelectionMerge, switchMerge, 0);
-                var switchOperands = new uint[2 + (blocks.Count * 2)];
-                switchOperands[0] = selector;
-                switchOperands[1] = defaultLabel;
-                for (var index = 0; index < blocks.Count; index++)
-                {
-                    switchOperands[2 + (index * 2)] = (uint)index;
-                    switchOperands[3 + (index * 2)] = caseLabels[index];
-                }
-
-                _module.AddStatement(SpirvOp.Switch, switchOperands);
-                for (var index = 0; index < blocks.Count; index++)
-                {
-                    _module.AddLabel(caseLabels[index]);
-                    if (!TryEmitBlock(blocks, index, out error))
+                    if (!TryEmitStraightLineProgram(out error))
                     {
-                        error = $"block=0x{blocks[index].StartPc:X}: {error}";
                         return false;
                     }
-
-                    _module.AddStatement(SpirvOp.Branch, switchMerge);
                 }
-
-                _module.AddLabel(defaultLabel);
-                Store(_programActive, _module.ConstantBool(false));
-                _module.AddStatement(SpirvOp.Branch, switchMerge);
-
-                _module.AddLabel(switchMerge);
-                _module.AddStatement(SpirvOp.Branch, loopContinue);
-                _module.AddLabel(loopContinue);
-                var active = Load(_boolType, _programActive);
-                if (_maxDispatcherSteps > 0)
+                else
                 {
-                    var steps = IAdd(Load(_uintType, _iterationGuard), UInt(1));
-                    Store(_iterationGuard, steps);
-                    var withinLimit = _module.AddInstruction(
-                        SpirvOp.ULessThan,
-                        _boolType,
-                        steps,
-                        UInt((uint)_maxDispatcherSteps));
-                    active = _module.AddInstruction(
-                        SpirvOp.LogicalAnd,
-                        _boolType,
-                        active,
-                        withinLimit);
-                }
+                    var loopHeader = _module.AllocateId();
+                    var switchHeader = _module.AllocateId();
+                    var switchMerge = _module.AllocateId();
+                    var loopContinue = _module.AllocateId();
+                    var loopMerge = _module.AllocateId();
+                    var defaultLabel = _module.AllocateId();
+                    var caseLabels = new uint[blocks.Count];
+                    for (var index = 0; index < caseLabels.Length; index++)
+                    {
+                        caseLabels[index] = _module.AllocateId();
+                    }
 
-                _module.AddStatement(
-                    SpirvOp.BranchConditional,
-                    active,
-                    loopHeader,
-                    loopMerge);
-                _module.AddLabel(loopMerge);
+                    _module.AddStatement(SpirvOp.Branch, loopHeader);
+                    _module.AddLabel(loopHeader);
+                    _module.AddStatement(SpirvOp.LoopMerge, loopMerge, loopContinue, 0);
+                    _module.AddStatement(SpirvOp.Branch, switchHeader);
+
+                    _module.AddLabel(switchHeader);
+                    var selector = Load(_uintType, _programCounter);
+                    _module.AddStatement(SpirvOp.SelectionMerge, switchMerge, 0);
+                    var switchOperands = new uint[2 + (blocks.Count * 2)];
+                    switchOperands[0] = selector;
+                    switchOperands[1] = defaultLabel;
+                    for (var index = 0; index < blocks.Count; index++)
+                    {
+                        switchOperands[2 + (index * 2)] = (uint)index;
+                        switchOperands[3 + (index * 2)] = caseLabels[index];
+                    }
+
+                    _module.AddStatement(SpirvOp.Switch, switchOperands);
+                    for (var index = 0; index < blocks.Count; index++)
+                    {
+                        _module.AddLabel(caseLabels[index]);
+                        if (!TryEmitBlock(blocks, index, out error))
+                        {
+                            error = $"block=0x{blocks[index].StartPc:X}: {error}";
+                            return false;
+                        }
+
+                        _module.AddStatement(SpirvOp.Branch, switchMerge);
+                    }
+
+                    _module.AddLabel(defaultLabel);
+                    Store(_programActive, _module.ConstantBool(false));
+                    _module.AddStatement(SpirvOp.Branch, switchMerge);
+
+                    _module.AddLabel(switchMerge);
+                    _module.AddStatement(SpirvOp.Branch, loopContinue);
+                    _module.AddLabel(loopContinue);
+                    var active = Load(_boolType, _programActive);
+                    if (_maxDispatcherSteps > 0)
+                    {
+                        var steps = IAdd(Load(_uintType, _iterationGuard), UInt(1));
+                        Store(_iterationGuard, steps);
+                        var withinLimit = _module.AddInstruction(
+                            SpirvOp.ULessThan,
+                            _boolType,
+                            steps,
+                            UInt((uint)_maxDispatcherSteps));
+                        active = _module.AddInstruction(
+                            SpirvOp.LogicalAnd,
+                            _boolType,
+                            active,
+                            withinLimit);
+                    }
+
+                    _module.AddStatement(
+                        SpirvOp.BranchConditional,
+                        active,
+                        loopHeader,
+                        loopMerge);
+                    _module.AddLabel(loopMerge);
+                }
                 if (_stage == Gen5SpirvStage.Pixel)
                 {
                     // A fragment lane removed from EXEC is not a request to
@@ -973,6 +1147,7 @@ internal static partial class Gen5SpirvTranslator
             {
                 var inputVec4Pointer =
                     _module.TypePointer(SpirvStorageClass.Input, _vec4Type);
+                var inputsByLocation = new Dictionary<uint, uint>();
                 var attributes = _state.Program.Instructions
                     .Select(instruction => instruction.Control)
                     .OfType<Gen5InterpolationControl>()
@@ -982,10 +1157,26 @@ internal static partial class Gen5SpirvTranslator
                     .ToArray();
                 foreach (var attribute in attributes)
                 {
+                    var location = _pixelInputLocations is not null &&
+                        _pixelInputLocations.TryGetValue(attribute, out var mappedLocation)
+                            ? mappedLocation
+                            : attribute;
+                    // Multiple logical pixel interpolants may select the same
+                    // vertex parameter. SPIR-V/Metal permits only one stage
+                    // input variable at a location, so alias the logical
+                    // attributes to that variable instead of declaring
+                    // duplicate [[user(locnN)]] inputs.
+                    if (inputsByLocation.TryGetValue(location, out var existing))
+                    {
+                        _pixelInputs.Add(attribute, existing);
+                        continue;
+                    }
+
                     var variable = _module.AddGlobalVariable(
                         inputVec4Pointer,
                         SpirvStorageClass.Input);
-                    _module.AddDecoration(variable, SpirvDecoration.Location, attribute);
+                    _module.AddDecoration(variable, SpirvDecoration.Location, location);
+                    inputsByLocation.Add(location, variable);
                     _pixelInputs.Add(attribute, variable);
                     _interfaces.Add(variable);
                 }
@@ -1040,12 +1231,21 @@ internal static partial class Gen5SpirvTranslator
         {
             foreach (var input in _evaluation.VertexInputs ?? [])
             {
+                // Vulkan integer vertex formats must feed integer shader
+                // inputs. Normalized, scaled and floating formats all arrive
+                // as floats, while UINT/SINT preserve their integer bits.
+                var componentType = input.NumberFormat switch
+                {
+                    4u => _uintType,
+                    5u => _intType,
+                    _ => _floatType,
+                };
                 var type = input.ComponentCount switch
                 {
-                    1u => _floatType,
-                    2u => _vec2Type,
-                    3u => _vec3Type,
-                    4u => _vec4Type,
+                    1u => componentType,
+                    2u => _module.TypeVector(componentType, 2),
+                    3u => _module.TypeVector(componentType, 3),
+                    4u => _module.TypeVector(componentType, 4),
                     _ => 0u,
                 };
                 if (type == 0)
@@ -1067,6 +1267,7 @@ internal static partial class Gen5SpirvTranslator
                     new SpirvVertexInput(
                         variable,
                         type,
+                        componentType,
                         input.ComponentCount));
                 _interfaces.Add(variable);
             }
@@ -1123,7 +1324,11 @@ internal static partial class Gen5SpirvTranslator
             }
 
             Store(_scc, _module.ConstantBool(false));
-            if (_subgroupInvocationIdInput != 0)
+            // VCC and EXEC are architectural SGPR pairs as well as the cached
+            // per-lane booleans used by this lowering. Graphics shaders can
+            // save and restore s106:s107 / s126:s127 around WQM operations even
+            // without subgroup inputs, so initialize both representations.
+            if (_subgroupInvocationIdInput != 0 || _graphicsWaveMaskSgprs)
             {
                 StoreWaveMask(106, _module.ConstantBool(false));
                 StoreWaveMask(126, _module.ConstantBool(true));
@@ -1260,6 +1465,34 @@ internal static partial class Gen5SpirvTranslator
                 workGroupId,
                 component);
             StoreS(register.Value, value);
+        }
+
+        private bool TryEmitStraightLineProgram(out string error)
+        {
+            error = string.Empty;
+            foreach (var instruction in _state.Program.Instructions)
+            {
+                if (instruction.Opcode == "SEndpgm")
+                {
+                    continue;
+                }
+
+                if (IsBranch(instruction.Opcode))
+                {
+                    error =
+                        $"pc=0x{instruction.Pc:X} unexpected branch " +
+                        $"{instruction.Opcode} in straight-line shader";
+                    return false;
+                }
+
+                if (!TryEmitInstruction(instruction, out error))
+                {
+                    error = $"pc=0x{instruction.Pc:X} {instruction.Opcode}: {error}";
+                    return false;
+                }
+            }
+
+            return true;
         }
 
         private bool TryEmitBlock(
@@ -1414,8 +1647,7 @@ internal static partial class Gen5SpirvTranslator
                 "SNop" or
                 "SWaitcnt" or
                 "SInstPrefetch" or
-                "STtraceData" or
-                "VInterpMovF32")
+                "STtraceData")
             {
                 return true;
             }
@@ -1896,13 +2128,6 @@ internal static partial class Gen5SpirvTranslator
                 return TryEmitVertexInputFetch(control, vertexInput, out error);
             }
 
-            if (_stage == Gen5SpirvStage.Vertex &&
-                IsFormatBufferLoad(instruction.Opcode))
-            {
-                error = $"missing vertex input for {instruction.Opcode} pc=0x{instruction.Pc:X}";
-                return false;
-            }
-
             if (!TryResolveDominatingBufferBinding(
                     instruction.Pc,
                     control.ScalarResource,
@@ -1934,17 +2159,24 @@ internal static partial class Gen5SpirvTranslator
             byteAddress = ApplyGuestBufferByteBias(bindingIndex, byteAddress);
             var dwordAddress = ShiftRightLogical(byteAddress, UInt(2));
 
-            if (instruction.Opcode is "BufferAtomicAdd" or "BufferAtomicUMax")
+            if (instruction.Opcode is
+                "BufferAtomicSwap" or
+                "BufferAtomicAdd" or
+                "BufferAtomicUMax")
             {
                 EmitExecConditional(() =>
                 {
                     var inRange = IsBufferWordInRange(bindingIndex, dwordAddress);
                     EmitConditional(inRange, () =>
                     {
+                        var operation = instruction.Opcode switch
+                        {
+                            "BufferAtomicSwap" => SpirvOp.AtomicExchange,
+                            "BufferAtomicAdd" => SpirvOp.AtomicIAdd,
+                            _ => SpirvOp.AtomicUMax,
+                        };
                         var original = _module.AddInstruction(
-                            instruction.Opcode == "BufferAtomicAdd"
-                                ? SpirvOp.AtomicIAdd
-                                : SpirvOp.AtomicUMax,
+                            operation,
                             _uintType,
                             BufferWordPointer(bindingIndex, dwordAddress),
                             UInt(1),
@@ -2029,7 +2261,12 @@ internal static partial class Gen5SpirvTranslator
             // swizzle from the GFX10 buffer descriptor.  Keep raw dword loads
             // on the byte-address >> 2 path below: unlike typed loads they do
             // not perform component conversion or dst_sel processing.
-            if (instruction.Opcode.StartsWith("BufferLoadFormat", StringComparison.Ordinal))
+            // Indexed format loads normally become Vulkan vertex attributes.
+            // A format load which cannot be represented by a fixed attribute
+            // (for example one with a per-lane byte offset) is captured by the
+            // scalar evaluator as an ordinary storage buffer. Preserve typed
+            // conversion for both MUBUF and MTBUF in that fallback path.
+            if (IsFormatBufferLoad(instruction.Opcode))
             {
                 EmitBufferFormatLoad(
                     bindingIndex,
@@ -2751,10 +2988,14 @@ internal static partial class Gen5SpirvTranslator
                     ? loaded
                     : _module.AddInstruction(
                         SpirvOp.CompositeExtract,
-                        _floatType,
+                        input.ComponentType,
                         loaded,
                         component);
-                StoreV(control.VectorData + component, Bitcast(_uintType, value));
+                StoreV(
+                    control.VectorData + component,
+                    input.ComponentType == _uintType
+                        ? value
+                        : Bitcast(_uintType, value));
             }
 
             return true;
@@ -2922,6 +3163,12 @@ internal static partial class Gen5SpirvTranslator
                          "ImageSample",
                          StringComparison.Ordinal))
             {
+                var imageSampleOrdinal = _pixelImageSampleOrdinal++;
+                var traceThisSample =
+                    _stage == Gen5SpirvStage.Pixel &&
+                    IsPixelSampleTraceActive() &&
+                    (imageSampleOrdinal == _tracePixelSampleOrdinal ||
+                     instruction.Pc == _tracePixelSamplePc);
                 var hasOffset =
                     instruction.Opcode.EndsWith("O", StringComparison.Ordinal);
                 var hasCompare =
@@ -2980,6 +3227,14 @@ internal static partial class Gen5SpirvTranslator
                 }
 
                 var coordinates = BuildFloatCoordinates(image, addressCursor);
+                if (traceThisSample && _tracePixelSampleFixedCenter)
+                {
+                    coordinates = _module.AddInstruction(
+                        SpirvOp.CompositeConstruct,
+                        _vec2Type,
+                        Float(0.5f),
+                        Float(0.5f));
+                }
                 var explicitLod = hasGradients || hasZeroLod || hasLod;
                 var lod = hasZeroLod
                     ? Float(0)
@@ -3037,9 +3292,116 @@ internal static partial class Gen5SpirvTranslator
                         : SpirvOp.ImageSampleImplicitLod,
                     resource.VectorType,
                     [.. operands]);
+                if (traceThisSample && _tracePixelSampleFetch)
+                {
+                    // Diagnostic split: query/fetch bypass the sampler while
+                    // addressing the same image view. If this returns texels
+                    // but the sample above does not, the image contents and
+                    // layout are visible and the remaining fault is confined
+                    // to sampler state or MIMG sample lowering.
+                    var fetchedImage = _module.AddInstruction(
+                        SpirvOp.Image,
+                        resource.ImageType,
+                        imageObject);
+                    var fetchCoordinates = _module.AddInstruction(
+                        SpirvOp.CompositeConstruct,
+                        _module.TypeVector(_intType, 2),
+                        _module.Constant(_intType, 0),
+                        _module.Constant(_intType, 0));
+                    sampled = _module.AddInstruction(
+                        SpirvOp.ImageFetch,
+                        resource.VectorType,
+                        fetchedImage,
+                        fetchCoordinates,
+                        2,
+                        UInt(0));
+                }
                 if (hasCompare)
                 {
                     sampled = EmitManualDepthCompare(resource, sampled, reference);
+                }
+
+                if (traceThisSample)
+                {
+                    if (_tracePixelSampleSize)
+                    {
+                        var queriedImage = _module.AddInstruction(
+                            SpirvOp.Image,
+                            resource.ImageType,
+                            imageObject);
+                        var queriedSize = _module.AddInstruction(
+                            SpirvOp.ImageQuerySizeLod,
+                            _module.TypeVector(_intType, 2),
+                            queriedImage,
+                            UInt(0));
+                        for (uint component = 0; component < 2; component++)
+                        {
+                            var value = _module.AddInstruction(
+                                SpirvOp.CompositeExtract,
+                                _intType,
+                                queriedSize,
+                                component);
+                            var converted = _module.AddInstruction(
+                                SpirvOp.ConvertSToF,
+                                _floatType,
+                                value);
+                            StoreV(
+                                PixelSampleTraceVgpr + component,
+                                Bitcast(_uintType, converted));
+                        }
+                        StoreV(PixelSampleTraceVgpr + 2, UInt(0));
+                        StoreV(
+                            PixelSampleTraceVgpr + 3,
+                            Bitcast(_uintType, Float(1)));
+                    }
+                    else if (_tracePixelSampleCoordinates)
+                    {
+                        for (uint component = 0; component < 2; component++)
+                        {
+                            var value = _module.AddInstruction(
+                                SpirvOp.CompositeExtract,
+                                _floatType,
+                                coordinates,
+                                component);
+                            if (_tracePixelSampleCoordinatesBiased)
+                            {
+                                value = _module.AddInstruction(
+                                    SpirvOp.FAdd,
+                                    _floatType,
+                                    _module.AddInstruction(
+                                        SpirvOp.FMul,
+                                        _floatType,
+                                        value,
+                                        Float(0.5f)),
+                                    Float(0.5f));
+                            }
+                            StoreV(
+                                PixelSampleTraceVgpr + component,
+                                Bitcast(_uintType, value));
+                        }
+                        StoreV(PixelSampleTraceVgpr + 2, UInt(0));
+                        StoreV(
+                            PixelSampleTraceVgpr + 3,
+                            Bitcast(_uintType, Float(1)));
+                    }
+                    else
+                    {
+                        for (uint component = 0; component < 4; component++)
+                        {
+                            var value = _module.AddInstruction(
+                                SpirvOp.CompositeExtract,
+                                resource.ComponentType,
+                                sampled,
+                                component);
+                            var raw = resource.ComponentKind switch
+                            {
+                                ImageComponentKind.Uint => value,
+                                ImageComponentKind.Sint => Bitcast(_uintType, value),
+                                _ => Bitcast(_uintType, value),
+                            };
+                            StoreV(PixelSampleTraceVgpr + component, raw);
+                        }
+                    }
                 }
             }
             else if (instruction.Opcode.StartsWith(
@@ -3655,7 +4017,26 @@ internal static partial class Gen5SpirvTranslator
                     SpirvOp.CompositeConstruct,
                     outputType,
                     values);
-                if (_forcePixelMagenta)
+                if (IsPixelSampleTraceActive() || IsPixelAluTraceActive())
+                {
+                    var sampleValues = new uint[4];
+                    for (var component = 0; component < sampleValues.Length; component++)
+                    {
+                        var raw = LoadV(PixelSampleTraceVgpr + (uint)component);
+                        sampleValues[component] = _outputKind switch
+                        {
+                            Gen5PixelOutputKind.Uint => raw,
+                            Gen5PixelOutputKind.Sint => Bitcast(_intType, raw),
+                            _ => Bitcast(_floatType, raw),
+                        };
+                    }
+
+                    vector = _module.AddInstruction(
+                        SpirvOp.CompositeConstruct,
+                        outputType,
+                        sampleValues);
+                }
+                if (_forcePixelMagenta && IsPixelTraceProgramSelected())
                 {
                     vector = _outputKind switch
                     {
@@ -3736,6 +4117,21 @@ internal static partial class Gen5SpirvTranslator
                 SpirvOp.CompositeConstruct,
                 _vec4Type,
                 components);
+            if (export.Target == 32 && _traceVertexScalarBase >= 0)
+            {
+                var scalarComponents = new uint[4];
+                for (var component = 0; component < scalarComponents.Length; component++)
+                {
+                    scalarComponents[component] = Bitcast(
+                        _floatType,
+                        LoadS((uint)(_traceVertexScalarBase + component)));
+                }
+
+                outputValue = _module.AddInstruction(
+                    SpirvOp.CompositeConstruct,
+                    _vec4Type,
+                    scalarComponents);
+            }
             outputValue = _module.AddInstruction(
                 SpirvOp.Select,
                 _vec4Type,
@@ -3796,6 +4192,17 @@ internal static partial class Gen5SpirvTranslator
                 return byteAddress;
             }
 
+            var guestBinding =
+                _evaluation.GlobalMemoryBindings[evaluationBinding];
+            if (VulkanVideoPresenter.UseTransientReadOnlyGuestBuffers &&
+                !guestBinding.Writable)
+            {
+                // Read-only resources are uploaded as draw-local snapshots
+                // beginning at descriptor byte zero. Only writable guest-VA
+                // aliases need an aligned-descriptor address bias.
+                return byteAddress;
+            }
+
             if (_initialScalarBufferIndex >= 0)
             {
                 // Descriptor offsets must satisfy Vulkan's storage-buffer
@@ -3818,8 +4225,7 @@ internal static partial class Gen5SpirvTranslator
             // bits below. Adding them here keeps scalar, MUBUF and GLOBAL paths
             // byte-exact, including atomics and resources that overlap another
             // descriptor at an unaligned guest address.
-            var byteBias =
-                _evaluation.GlobalMemoryBindings[evaluationBinding].BaseAddress &
+            var byteBias = guestBinding.BaseAddress &
                 (_storageBufferOffsetAlignment - 1);
             return byteBias == 0
                 ? byteAddress
@@ -4253,6 +4659,13 @@ internal static partial class Gen5SpirvTranslator
         private static bool IsBranch(string opcode) =>
             opcode == "SBranch" ||
             opcode.StartsWith("SCbranch", StringComparison.Ordinal);
+
+        private static bool CanEmitStraightLine(
+            IReadOnlyList<ShaderBlock> blocks,
+            IReadOnlyList<Gen5ShaderInstruction> instructions) =>
+            _straightLineShaders &&
+            blocks.Count == 1 &&
+            !instructions.Any(instruction => IsBranch(instruction.Opcode));
 
         private static bool TryGetBranchTargetPc(
             Gen5ShaderInstruction instruction,

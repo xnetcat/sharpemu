@@ -320,6 +320,8 @@ internal static partial class Gen5SpirvTranslator
                 case "VFmaF32":
                 case "VMadMkF32":
                 case "VMadAkF32":
+                case "VFmamkF32":
+                case "VFmaakF32":
                     result = EmitFloatResult(
                         instruction,
                         Ext(
@@ -330,6 +332,7 @@ internal static partial class Gen5SpirvTranslator
                             GetFloatSource(instruction, 2)));
                     break;
                 case "VMacF32":
+                case "VFmacF32":
                 {
                     var addend = Bitcast(_floatType, LoadV(destination));
                     result = EmitFloatResult(
@@ -406,6 +409,7 @@ internal static partial class Gen5SpirvTranslator
                     result = EmitSubtractWithBorrow(instruction, reverse: true);
                     break;
                 case "VMulLoU32":
+                case "VMulLoI32":
                 case "VMulU32U24":
                     result = EmitIntegerBinary(instruction, SpirvOp.IMul);
                     break;
@@ -892,6 +896,32 @@ internal static partial class Gen5SpirvTranslator
                     result = Ext(58, _uintType, vector);
                     break;
                 }
+                case "VCvtPknormU16F32":
+                {
+                    uint PackUnorm16(int sourceIndex)
+                    {
+                        var normalized = Ext(
+                            43,
+                            _floatType,
+                            GetFloatSource(instruction, sourceIndex),
+                            Float(0),
+                            Float(1));
+                        var scaled = _module.AddInstruction(
+                            SpirvOp.FMul,
+                            _floatType,
+                            normalized,
+                            Float(65535));
+                        return _module.AddInstruction(
+                            SpirvOp.ConvertFToU,
+                            _uintType,
+                            Ext(2, _floatType, scaled));
+                    }
+
+                    result = BitwiseOr(
+                        PackUnorm16(0),
+                        ShiftLeftLogical(PackUnorm16(1), UInt(16)));
+                    break;
+                }
                 case "VAddF16":
                 case "VSubF16":
                 case "VSubrevF16":
@@ -1239,7 +1269,68 @@ internal static partial class Gen5SpirvTranslator
             }
 
             StoreV(destination, result);
+            TracePixelAluResult(instruction, destination);
             return true;
+        }
+
+        private void TracePixelAluResult(
+            Gen5ShaderInstruction instruction,
+            uint destination)
+        {
+            if (_stage != Gen5SpirvStage.Pixel ||
+                !IsPixelAluTraceActive() ||
+                instruction.Pc != _tracePixelAluPc)
+            {
+                return;
+            }
+
+            if (_tracePixelAluPacked)
+            {
+                for (uint registerOffset = 0; registerOffset < 2; registerOffset++)
+                {
+                    var register = destination + registerOffset;
+                    var packed = register < VectorRegisterCount
+                        ? LoadV(register)
+                        : UInt(0);
+                    var unpacked = Ext(62, _vec2Type, packed);
+                    for (uint half = 0; half < 2; half++)
+                    {
+                        var value = _module.AddInstruction(
+                            SpirvOp.CompositeExtract,
+                            _floatType,
+                            unpacked,
+                            half);
+                        StoreV(
+                            PixelSampleTraceVgpr + registerOffset * 2 + half,
+                            Bitcast(_uintType, value));
+                    }
+                }
+
+                return;
+            }
+
+            for (uint component = 0; component < 4; component++)
+            {
+                var register = destination + component;
+                var raw = register < VectorRegisterCount ? LoadV(register) : UInt(0);
+                if (_tracePixelAluBiased)
+                {
+                    var value = Bitcast(_floatType, raw);
+                    value = _module.AddInstruction(
+                        SpirvOp.FAdd,
+                        _floatType,
+                        _module.AddInstruction(
+                            SpirvOp.FMul,
+                            _floatType,
+                            value,
+                            Float(0.5f)),
+                        Float(0.5f));
+                    raw = Bitcast(_uintType, value);
+                }
+                StoreV(
+                    PixelSampleTraceVgpr + component,
+                    raw);
+            }
         }
 
         private bool TryEmitVectorCompare(
@@ -1477,16 +1568,41 @@ internal static partial class Gen5SpirvTranslator
                     "VCmpNltF32" or "VCmpxNltF32" => SpirvOp.FUnordGreaterThanEqual,
                     "VCmpNleF32" or "VCmpxNleF32" => SpirvOp.FUnordGreaterThan,
                     "VCmpNgtF32" or "VCmpxNgtF32" => SpirvOp.FUnordLessThanEqual,
+                    "VCmpNlgF32" or "VCmpxNlgF32" => SpirvOp.FUnordEqual,
                     "VCmpNgeF32" or "VCmpxNgeF32" => SpirvOp.FUnordLessThan,
                     _ => SpirvOp.Nop,
                 };
-                if (operation == SpirvOp.Nop)
+                if (operation != SpirvOp.Nop)
+                {
+                    condition = _module.AddInstruction(operation, _boolType, left, right);
+                }
+                else if (opcode is "VCmpOF32" or "VCmpxOF32")
+                {
+                    condition = _module.AddInstruction(
+                        SpirvOp.LogicalAnd,
+                        _boolType,
+                        _module.AddInstruction(
+                            SpirvOp.LogicalNot,
+                            _boolType,
+                            _module.AddInstruction(SpirvOp.IsNan, _boolType, left)),
+                        _module.AddInstruction(
+                            SpirvOp.LogicalNot,
+                            _boolType,
+                            _module.AddInstruction(SpirvOp.IsNan, _boolType, right)));
+                }
+                else if (opcode is "VCmpUF32" or "VCmpxUF32")
+                {
+                    condition = _module.AddInstruction(
+                        SpirvOp.LogicalOr,
+                        _boolType,
+                        _module.AddInstruction(SpirvOp.IsNan, _boolType, left),
+                        _module.AddInstruction(SpirvOp.IsNan, _boolType, right));
+                }
+                else
                 {
                     error = $"unsupported float compare {opcode}";
                     return false;
                 }
-
-                condition = _module.AddInstruction(operation, _boolType, left, right);
             }
             else if (opcode is not ("VCmpClassF32" or "VCmpxClassF32"))
             {
@@ -1846,6 +1962,29 @@ internal static partial class Gen5SpirvTranslator
                                 _uintType,
                                 ShiftRightLogical64(
                                     product,
+                                    _module.Constant64(_ulongType, 32)));
+                            break;
+                        }
+                        case "SMulHiI32":
+                        {
+                            var wideLeft = _module.AddInstruction(
+                                SpirvOp.SConvert,
+                                _longType,
+                                Bitcast(_intType, left));
+                            var wideRight = _module.AddInstruction(
+                                SpirvOp.SConvert,
+                                _longType,
+                                Bitcast(_intType, right));
+                            var product = _module.AddInstruction(
+                                SpirvOp.IMul,
+                                _longType,
+                                wideLeft,
+                                wideRight);
+                            result = _module.AddInstruction(
+                                SpirvOp.UConvert,
+                                _uintType,
+                                ShiftRightLogical64(
+                                    Bitcast(_ulongType, product),
                                     _module.Constant64(_ulongType, 32)));
                             break;
                         }
@@ -2544,6 +2683,12 @@ internal static partial class Gen5SpirvTranslator
                 Gen5OperandKind.VectorRegister => LoadV(operand.Value),
                 Gen5OperandKind.ScalarRegister => LoadS(operand.Value),
                 Gen5OperandKind.LiteralConstant => UInt(operand.Value),
+                Gen5OperandKind.EncodedConstant when operand.Value == 251 =>
+                    BooleanToUInt(LogicalNot(SubgroupAny(Load(_boolType, _vcc)))),
+                Gen5OperandKind.EncodedConstant when operand.Value == 252 =>
+                    BooleanToUInt(LogicalNot(SubgroupAny(Load(_boolType, _exec)))),
+                Gen5OperandKind.EncodedConstant when operand.Value == 253 =>
+                    BooleanToUInt(Load(_boolType, _scc)),
                 Gen5OperandKind.EncodedConstant when TryDecodeInlineConstant(
                     operand.Value,
                     out var inline) => UInt(inline),
@@ -2959,6 +3104,14 @@ internal static partial class Gen5SpirvTranslator
 
             return value;
         }
+
+        private uint BooleanToUInt(uint condition) =>
+            _module.AddInstruction(
+                SpirvOp.Select,
+                _uintType,
+                condition,
+                UInt(1),
+                UInt(0));
 
         private uint GetRawSource64(
             Gen5ShaderInstruction instruction,

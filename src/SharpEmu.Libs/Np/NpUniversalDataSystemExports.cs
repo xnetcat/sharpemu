@@ -78,6 +78,58 @@ public static class NpUniversalDataSystemExports
         return SetReturn(ctx, 0);
     }
 
+    [SysAbiExport(
+        Nid = "AUIHb7jUX3I",
+        ExportName = "sceNpUniversalDataSystemDestroyHandle",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNpUniversalDataSystem")]
+    public static int NpUniversalDataSystemDestroyHandle(CpuContext ctx)
+    {
+        return SetReturn(ctx, 0);
+    }
+
+    [SysAbiExport(
+        Nid = "MfDb+4Nln64",
+        ExportName = "sceNpUniversalDataSystemEventPropertyObjectSetString",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNpUniversalDataSystem")]
+    public static int NpUniversalDataSystemEventPropertyObjectSetString(CpuContext ctx)
+    {
+        var propertyObjectAddress = ctx[CpuRegister.Rsi];
+        var valueAddress = ctx[CpuRegister.Rdx];
+        if (propertyObjectAddress == 0 || valueAddress == 0)
+        {
+            return SetReturn(ctx, NpUniversalDataSystemErrorInvalidArgument);
+        }
+
+        Span<byte> probe = stackalloc byte[1];
+        return ctx.Memory.TryRead(propertyObjectAddress, probe) &&
+               ctx.Memory.TryRead(valueAddress, probe)
+            ? SetReturn(ctx, 0)
+            : SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    [SysAbiExport(
+        Nid = "Wxbg5x3pTXA",
+        ExportName = "sceNpUniversalDataSystemEventPropertyObjectSetArray",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNpUniversalDataSystem")]
+    public static int NpUniversalDataSystemEventPropertyObjectSetArray(CpuContext ctx)
+    {
+        var propertyObjectAddress = ctx[CpuRegister.Rsi];
+        var valueAddress = ctx[CpuRegister.Rdx];
+        if (propertyObjectAddress == 0 || valueAddress == 0)
+        {
+            return SetReturn(ctx, NpUniversalDataSystemErrorInvalidArgument);
+        }
+
+        Span<byte> probe = stackalloc byte[1];
+        return ctx.Memory.TryRead(propertyObjectAddress, probe) &&
+               ctx.Memory.TryRead(valueAddress, probe)
+            ? SetReturn(ctx, 0)
+            : SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
     private static bool TryWriteInt32(CpuContext ctx, ulong address, int value)
     {
         if (address == 0)

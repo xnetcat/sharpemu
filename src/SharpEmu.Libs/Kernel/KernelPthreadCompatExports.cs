@@ -39,12 +39,24 @@ public static class KernelPthreadCompatExports
         string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_PTHREAD_TIMEDWAIT"), "1", StringComparison.Ordinal);
     private static readonly bool _tracePthreadCondCallsites =
         string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_PTHREAD_COND_CALLSITES"), "1", StringComparison.Ordinal);
+    private static readonly bool _tracePthreadCondActivity =
+        string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_PTHREAD_COND_ACTIVITY"), "1", StringComparison.Ordinal);
     private static readonly HashSet<ulong>? _tracePthreadMutexFilter = ParseTraceAddressFilter(
         Environment.GetEnvironmentVariable("SHARPEMU_LOG_PTHREAD_MUTEX_FILTER"));
     private static readonly HashSet<ulong>? _tracePthreadCondFilter = ParseTraceAddressFilter(
         Environment.GetEnvironmentVariable("SHARPEMU_LOG_PTHREAD_COND_FILTER"));
+    private static readonly bool _enableMutexLockBlocking =
+        string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_MUTEX_LOCK_BLOCKING"), "1", StringComparison.Ordinal);
+    private static readonly bool _enableCondSignalLatch =
+        string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_PTHREAD_COND_LATCH"), "1", StringComparison.Ordinal);
+    private static readonly HashSet<ulong>? _condSignalLatchFilter = ParseTraceAddressFilter(
+        Environment.GetEnvironmentVariable("SHARPEMU_PTHREAD_COND_LATCH_FILTER"));
+    private static readonly string[] _condSignalLatchThreads = ParseNameFilter(
+        Environment.GetEnvironmentVariable("SHARPEMU_PTHREAD_COND_LATCH_THREADS"));
     private static readonly ConcurrentDictionary<ulong, int> _tracePthreadCondDumpCounts = new();
     private static readonly ConcurrentDictionary<ulong, int> _tracePthreadCondCallsiteCounts = new();
+    private static readonly ConcurrentDictionary<ulong, int> _tracePthreadCondSignalCallsiteCounts = new();
+    private static readonly ConcurrentDictionary<ulong, PthreadCondActivity> _pthreadCondActivity = new();
     private static readonly TimeSpan? _condCompatibilityRecheck = ParsePositiveMilliseconds(
         Environment.GetEnvironmentVariable("SHARPEMU_PTHREAD_COND_RECHECK_MS"));
     private static readonly HashSet<ulong>? _condCompatibilityRecheckFilter = ParseTraceAddressFilter(
@@ -74,20 +86,17 @@ public static class KernelPthreadCompatExports
     {
         public object SyncRoot { get; } = new();
         public LinkedList<PthreadCondWaiter> Waiters { get; } = new();
-
-        // Unreal Engine can signal its worker condition before the worker has
-        // entered the emulated wait. Preserve such a signal as compatibility
-        // state so the worker does not fall into a timed-wait polling loop.
         public int PendingSignals { get; set; }
+        public bool LatchMissedSignals { get; set; }
 
         public bool TryConsumePendingSignal()
         {
-            if (PendingSignals <= 0)
+            if (PendingSignals == 0)
             {
                 return false;
             }
 
-            PendingSignals--;
+            PendingSignals = 0;
             return true;
         }
     }
@@ -98,12 +107,26 @@ public static class KernelPthreadCompatExports
         public required PthreadMutexState MutexState { get; init; }
         public required string WakeKey { get; init; }
         public required bool Cooperative { get; init; }
+        public ulong CondAddress { get; init; }
+        public ulong ResolvedCondAddress { get; init; }
+        public ulong MutexAddress { get; init; }
+        public ulong ImportReturnRip { get; init; }
+        public bool CompatibilityRecheck { get; init; }
         public bool PosixErrors { get; init; }
         public LinkedListNode<PthreadCondWaiter>? Node { get; set; }
         public PthreadMutexWaiter? MutexWaiter { get; set; }
         public Timer? TimeoutTimer { get; set; }
         // 0 = waiting, 1 = signaled, 2 = timed out.
         public int CompletionState { get; set; }
+    }
+
+    private sealed class PthreadCondActivity
+    {
+        public long WaitCount;
+        public long TimedWaitCount;
+        public long SignalCount;
+        public long BroadcastCount;
+        public long RecheckCount;
     }
 
     private readonly record struct PthreadMutexAttrState(int Type, int Protocol);
@@ -355,6 +378,14 @@ public static class KernelPthreadCompatExports
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libKernel")]
     public static int PthreadCondDestroy(CpuContext ctx) => PthreadCondDestroyCore(ctx, ctx[CpuRegister.Rdi]);
+
+    [SysAbiExport(
+        Nid = "RXXqi4CtF8w",
+        ExportName = "pthread_cond_destroy",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int PosixPthreadCondDestroy(CpuContext ctx) =>
+        PthreadCondDestroyCore(ctx, ctx[CpuRegister.Rdi]);
 
     [SysAbiExport(
         Nid = "WKAXJ4XBPQ4",
@@ -681,7 +712,8 @@ public static class KernelPthreadCompatExports
         }
 
         var currentThreadId = KernelPthreadState.GetCurrentThreadHandle();
-        var canCooperativelyBlock = !tryOnly &&
+        var canCooperativelyBlock = _enableMutexLockBlocking &&
+            !tryOnly &&
             GuestThreadExecution.IsGuestThread &&
             GuestThreadExecution.TryGetCurrentImportCallFrame(out _);
         PthreadMutexWaiter? waiter = null;
@@ -1266,6 +1298,18 @@ public static class KernelPthreadCompatExports
         }
 
         var currentThreadId = KernelPthreadState.GetCurrentThreadHandle();
+        TracePthreadCondActivity(
+            ctx,
+            timed ? "wait-timed" : "wait",
+            condAddress,
+            mutexAddress,
+            resolvedCondAddress,
+            currentThreadId,
+            timed,
+            timeoutUsec,
+            broadcast: false);
+        var latchMissedSignals = ShouldLatchSignal(condAddress, resolvedCondAddress) ||
+            ShouldLatchCurrentThread(currentThreadId);
         lock (mutexState)
         {
             if (mutexState.OwnerThreadId != currentThreadId || mutexState.RecursionCount != 1)
@@ -1276,10 +1320,69 @@ public static class KernelPthreadCompatExports
             }
         }
 
+        var cooperative = GuestThreadExecution.IsGuestThread &&
+            GuestThreadExecution.TryGetCurrentImportCallFrame(out _);
+        var compatibilityRecheck = !timed &&
+            ShouldCompatibilityRecheck(condAddress, resolvedCondAddress);
+        var importReturnRip = GuestThreadExecution.TryGetCurrentImportCallFrame(out var importFrame)
+            ? importFrame.ReturnRip
+            : 0;
+        var waiter = new PthreadCondWaiter
+        {
+            ThreadId = currentThreadId,
+            MutexState = mutexState,
+            Cooperative = cooperative,
+            CondAddress = condAddress,
+            ResolvedCondAddress = resolvedCondAddress,
+            MutexAddress = mutexAddress,
+            ImportReturnRip = importReturnRip,
+            CompatibilityRecheck = compatibilityRecheck,
+            PosixErrors = posixErrors,
+            WakeKey = cooperative
+                ? $"pthread_cond_waiter:{Interlocked.Increment(ref _nextSynchronizationWaiterId)}"
+                : string.Empty,
+        };
+
         var consumedPendingSignal = false;
         lock (state.SyncRoot)
         {
-            consumedPendingSignal = state.TryConsumePendingSignal();
+            if (latchMissedSignals)
+            {
+                state.LatchMissedSignals = true;
+                consumedPendingSignal = state.TryConsumePendingSignal();
+            }
+
+            if (!consumedPendingSignal)
+            {
+                waiter.Node = state.Waiters.AddLast(waiter);
+                TracePthreadCond("wait-enter", condAddress, mutexAddress, state, timed, (int)OrbisGen2Result.ORBIS_GEN2_OK);
+                TracePthreadCondCallsite(ctx, condAddress);
+                TracePthreadCondGuestState(ctx, "wait-enter", condAddress, mutexAddress, resolvedCondAddress, resolvedMutexAddress);
+
+                var unlockResult = PthreadMutexUnlockCore(ctx, mutexAddress, requireOwner: true);
+                if (unlockResult != (int)OrbisGen2Result.ORBIS_GEN2_OK)
+                {
+                    RemoveCondWaiterLocked(state, waiter);
+                    TracePthreadCond("wait-unlock-fail", condAddress, mutexAddress, state, timed, unlockResult);
+                    return unlockResult;
+                }
+
+                // Cooperative guest workers normally remain signal-driven.  A
+                // caller can opt into compatibility polling globally or narrow it
+                // to known queue conditions with the address filter.
+                if (cooperative && (timed || compatibilityRecheck))
+                {
+                    waiter.TimeoutTimer = new Timer(
+                        static callbackState =>
+                        {
+                            var (condState, condWaiter, isTimed) = ((PthreadCondState, PthreadCondWaiter, bool))callbackState!;
+                            CompleteCondWaiter(condState, condWaiter, timedOut: isTimed);
+                        },
+                        (state, waiter, timed),
+                        timed ? GetCondWaitTimeout(timeoutUsec) : _condCompatibilityRecheck!.Value,
+                        Timeout.InfiniteTimeSpan);
+                }
+            }
         }
 
         if (consumedPendingSignal)
@@ -1292,53 +1395,6 @@ public static class KernelPthreadCompatExports
             }
 
             return PthreadMutexLockCore(ctx, mutexAddress, tryOnly: false);
-        }
-
-        var cooperative = GuestThreadExecution.IsGuestThread &&
-            GuestThreadExecution.TryGetCurrentImportCallFrame(out _);
-        var waiter = new PthreadCondWaiter
-        {
-            ThreadId = currentThreadId,
-            MutexState = mutexState,
-            Cooperative = cooperative,
-            PosixErrors = posixErrors,
-            WakeKey = cooperative
-                ? $"pthread_cond_waiter:{Interlocked.Increment(ref _nextSynchronizationWaiterId)}"
-                : string.Empty,
-        };
-
-        lock (state.SyncRoot)
-        {
-            waiter.Node = state.Waiters.AddLast(waiter);
-            TracePthreadCond("wait-enter", condAddress, mutexAddress, state, timed, (int)OrbisGen2Result.ORBIS_GEN2_OK);
-            TracePthreadCondCallsite(ctx, condAddress);
-            TracePthreadCondGuestState(ctx, "wait-enter", condAddress, mutexAddress, resolvedCondAddress, resolvedMutexAddress);
-
-            var unlockResult = PthreadMutexUnlockCore(ctx, mutexAddress, requireOwner: true);
-            if (unlockResult != (int)OrbisGen2Result.ORBIS_GEN2_OK)
-            {
-                RemoveCondWaiterLocked(state, waiter);
-                TracePthreadCond("wait-unlock-fail", condAddress, mutexAddress, state, timed, unlockResult);
-                return unlockResult;
-            }
-
-            // Cooperative guest workers normally remain signal-driven.  A
-            // caller can opt into compatibility polling globally or narrow it
-            // to known queue conditions with the address filter.
-            var compatibilityRecheck = !timed &&
-                ShouldCompatibilityRecheck(condAddress, resolvedCondAddress);
-            if (cooperative && (timed || compatibilityRecheck))
-            {
-                waiter.TimeoutTimer = new Timer(
-                    static callbackState =>
-                    {
-                        var (condState, condWaiter, isTimed) = ((PthreadCondState, PthreadCondWaiter, bool))callbackState!;
-                        CompleteCondWaiter(condState, condWaiter, timedOut: isTimed);
-                    },
-                    (state, waiter, timed),
-                    timed ? GetCondWaitTimeout(timeoutUsec) : _condCompatibilityRecheck!.Value,
-                    Timeout.InfiniteTimeSpan);
-            }
         }
 
         if (cooperative &&
@@ -1367,18 +1423,26 @@ public static class KernelPthreadCompatExports
             {
                 if (!timed)
                 {
-                    if (!_condCompatibilityRecheck.HasValue ||
-                        Monitor.Wait(state.SyncRoot, _condCompatibilityRecheck.Value))
+                    if (!compatibilityRecheck)
+                    {
+                        Monitor.Wait(state.SyncRoot);
+                        continue;
+                    }
+
+                    if (Monitor.Wait(state.SyncRoot, _condCompatibilityRecheck.GetValueOrDefault()))
                     {
                         continue;
                     }
 
-                    _ = CompleteCondWaiterLocked(state, waiter, timedOut: false);
+                    if (CompleteCondWaiterLocked(state, waiter, timedOut: false))
+                    {
+                        TracePthreadCondCompatibilityRecheck(waiter);
+                    }
                     continue;
                 }
 
                 var remaining = GetRemainingTimeout(deadline);
-                if (remaining <= TimeSpan.Zero || !Monitor.Wait(state.SyncRoot, remaining))
+                if (remaining <= TimeSpan.Zero || !WaitForMonitorSignal(state.SyncRoot, remaining))
                 {
                     CompleteCondWaiterLocked(state, waiter, timedOut: true);
                     break;
@@ -1414,6 +1478,17 @@ public static class KernelPthreadCompatExports
         List<PthreadCondWaiter>? completedWaiters = null;
         lock (state.SyncRoot)
         {
+            TracePthreadCondActivity(
+                ctx,
+                broadcast ? "broadcast" : "signal",
+                condAddress,
+                mutexAddress: 0,
+                resolvedCondAddress,
+                KernelPthreadState.GetCurrentThreadHandle(),
+                timed: false,
+                timeoutUsec: 0,
+                broadcast);
+            TracePthreadCondSignalCallsite(ctx, condAddress, broadcast);
             TracePthreadCondGuestState(ctx, broadcast ? "broadcast" : "signal", condAddress, 0, resolvedCondAddress, 0);
             for (var node = state.Waiters.First; node is not null;)
             {
@@ -1431,9 +1506,12 @@ public static class KernelPthreadCompatExports
                 node = next;
             }
 
-            if (completedWaiters is null || completedWaiters.Count == 0)
+            if ((ShouldLatchSignal(condAddress, resolvedCondAddress) || state.LatchMissedSignals) &&
+                completedWaiters is null)
             {
-                state.PendingSignals++;
+                // A binary latch is enough to bridge the UE startup race and
+                // cannot build an unbounded backlog of stale condition wakes.
+                state.PendingSignals = 1;
             }
 
             TracePthreadCond(broadcast ? "broadcast" : "signal", condAddress, mutexAddress: 0, state, timed: false, (int)OrbisGen2Result.ORBIS_GEN2_OK);
@@ -1623,6 +1701,11 @@ public static class KernelPthreadCompatExports
 
         if (completed)
         {
+            if (waiter.CompatibilityRecheck && !timedOut)
+            {
+                TracePthreadCondCompatibilityRecheck(waiter);
+            }
+
             WakeCooperativeWaiter(waiter);
         }
     }
@@ -1710,6 +1793,18 @@ public static class KernelPthreadCompatExports
         return TimeSpan.FromSeconds(remainingTicks / (double)Stopwatch.Frequency);
     }
 
+    private static bool WaitForMonitorSignal(object syncRoot, TimeSpan timeout)
+    {
+        // Monitor.Wait(TimeSpan) has millisecond host resolution.  Positive
+        // sub-millisecond guest deadlines otherwise collapse into a zero-time
+        // poll and can execute millions of timed waits before the wall clock
+        // reaches the absolute deadline.
+        var timeoutMilliseconds = (int)Math.Min(
+            int.MaxValue,
+            Math.Max(1D, Math.Ceiling(timeout.TotalMilliseconds)));
+        return Monitor.Wait(syncRoot, timeoutMilliseconds);
+    }
+
     private static TimeSpan? ParsePositiveMilliseconds(string? value)
     {
         return int.TryParse(value, out var milliseconds) && milliseconds > 0
@@ -1720,8 +1815,34 @@ public static class KernelPthreadCompatExports
     private static bool ShouldCompatibilityRecheck(ulong condAddress, ulong resolvedCondAddress) =>
         _condCompatibilityRecheck.HasValue &&
         (_condCompatibilityRecheckFilter is null ||
-         _condCompatibilityRecheckFilter.Contains(condAddress) ||
-         _condCompatibilityRecheckFilter.Contains(resolvedCondAddress));
+         MatchesTraceAddressFilter(_condCompatibilityRecheckFilter, condAddress) ||
+         MatchesTraceAddressFilter(_condCompatibilityRecheckFilter, resolvedCondAddress));
+
+    private static bool ShouldLatchSignal(ulong condAddress, ulong resolvedCondAddress) =>
+        _enableCondSignalLatch &&
+        (_condSignalLatchFilter is null ||
+         MatchesTraceAddressFilter(_condSignalLatchFilter, condAddress) ||
+         MatchesTraceAddressFilter(_condSignalLatchFilter, resolvedCondAddress));
+
+    private static bool ShouldLatchCurrentThread(ulong currentThreadId)
+    {
+        if (!_enableCondSignalLatch ||
+            _condSignalLatchThreads.Length == 0 ||
+            !KernelPthreadState.TryGetThreadIdentity(currentThreadId, out var identity))
+        {
+            return false;
+        }
+
+        foreach (var prefix in _condSignalLatchThreads)
+        {
+            if (identity.Name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
 
     private static int NormalizeMutexType(int type)
     {
@@ -1920,6 +2041,151 @@ public static class KernelPthreadCompatExports
             $"frames=[{string.Join(',', frames)}]");
     }
 
+    private static void TracePthreadCondActivity(
+        CpuContext ctx,
+        string operation,
+        ulong condAddress,
+        ulong mutexAddress,
+        ulong resolvedCondAddress,
+        ulong currentThreadId,
+        bool timed,
+        uint timeoutUsec,
+        bool broadcast)
+    {
+        if (!_tracePthreadCondActivity)
+        {
+            return;
+        }
+
+        var activity = _pthreadCondActivity.GetOrAdd(resolvedCondAddress, static _ => new PthreadCondActivity());
+        long operationCount;
+        if (operation.StartsWith("wait", StringComparison.Ordinal))
+        {
+            operationCount = Interlocked.Increment(ref activity.WaitCount);
+            if (timed)
+            {
+                Interlocked.Increment(ref activity.TimedWaitCount);
+            }
+        }
+        else if (broadcast)
+        {
+            operationCount = Interlocked.Increment(ref activity.BroadcastCount);
+        }
+        else
+        {
+            operationCount = Interlocked.Increment(ref activity.SignalCount);
+        }
+
+        if (!ShouldReportPthreadCondActivity(operationCount))
+        {
+            return;
+        }
+
+        var threadName = KernelPthreadState.TryGetThreadIdentity(currentThreadId, out var identity)
+            ? identity.Name
+            : "<unknown>";
+        var importReturn = GuestThreadExecution.TryGetCurrentImportCallFrame(out var frame)
+            ? frame.ReturnRip
+            : 0;
+        var frames = new List<string>(8);
+        var rbp = ctx[CpuRegister.Rbp];
+        for (var index = 0; index < 8 && rbp >= 0x10000; index++)
+        {
+            if (!ctx.TryReadUInt64(rbp, out var nextRbp) ||
+                !ctx.TryReadUInt64(rbp + sizeof(ulong), out var returnRip))
+            {
+                break;
+            }
+
+            frames.Add($"0x{returnRip:X16}");
+            if (nextRbp <= rbp || nextRbp - rbp > 0x100000)
+            {
+                break;
+            }
+
+            rbp = nextRbp;
+        }
+
+        Console.Error.WriteLine(
+            $"[LOADER][DIAG] pthread_cond_activity: op={operation} count={operationCount} " +
+            $"cond=0x{condAddress:X16} resolved=0x{resolvedCondAddress:X16} mutex=0x{mutexAddress:X16} " +
+            $"thread=0x{currentThreadId:X16} name='{threadName}' timed={timed} timeout_us={timeoutUsec} " +
+            $"waits={Interlocked.Read(ref activity.WaitCount)} timed_waits={Interlocked.Read(ref activity.TimedWaitCount)} " +
+            $"signals={Interlocked.Read(ref activity.SignalCount)} broadcasts={Interlocked.Read(ref activity.BroadcastCount)} " +
+            $"import_ret=0x{importReturn:X16} frames=[{string.Join(',', frames)}]");
+    }
+
+    private static bool ShouldReportPthreadCondActivity(long count) =>
+        count == 1 || count == 8 || (count >= 32 && (count & (count - 1)) == 0);
+
+    private static void TracePthreadCondCompatibilityRecheck(PthreadCondWaiter waiter)
+    {
+        if (!_tracePthreadCondActivity)
+        {
+            return;
+        }
+
+        var activity = _pthreadCondActivity.GetOrAdd(
+            waiter.ResolvedCondAddress,
+            static _ => new PthreadCondActivity());
+        var recheckCount = Interlocked.Increment(ref activity.RecheckCount);
+        if (!ShouldReportPthreadCondActivity(recheckCount))
+        {
+            return;
+        }
+
+        var threadName = KernelPthreadState.TryGetThreadIdentity(waiter.ThreadId, out var identity)
+            ? identity.Name
+            : "<unknown>";
+        Console.Error.WriteLine(
+            $"[LOADER][DIAG] pthread_cond_activity: op=compat-recheck count={recheckCount} " +
+            $"cond=0x{waiter.CondAddress:X16} resolved=0x{waiter.ResolvedCondAddress:X16} " +
+            $"mutex=0x{waiter.MutexAddress:X16} thread=0x{waiter.ThreadId:X16} name='{threadName}' " +
+            $"waits={Interlocked.Read(ref activity.WaitCount)} signals={Interlocked.Read(ref activity.SignalCount)} " +
+            $"broadcasts={Interlocked.Read(ref activity.BroadcastCount)} import_ret=0x{waiter.ImportReturnRip:X16}");
+    }
+
+    private static void TracePthreadCondSignalCallsite(CpuContext ctx, ulong condAddress, bool broadcast)
+    {
+        if (!ShouldTracePthreadCond(condAddress) ||
+            _tracePthreadCondSignalCallsiteCounts.AddOrUpdate(
+                condAddress,
+                1,
+                static (_, count) => count + 1) > 16)
+        {
+            return;
+        }
+
+        var importReturn = GuestThreadExecution.TryGetCurrentImportCallFrame(out var frame)
+            ? frame.ReturnRip
+            : 0;
+        var frames = new List<string>(8);
+        var rbp = ctx[CpuRegister.Rbp];
+        for (var index = 0; index < 8 && rbp >= 0x10000; index++)
+        {
+            if (!ctx.TryReadUInt64(rbp, out var nextRbp) ||
+                !ctx.TryReadUInt64(rbp + sizeof(ulong), out var returnRip))
+            {
+                break;
+            }
+
+            frames.Add($"0x{returnRip:X16}");
+            if (nextRbp <= rbp || nextRbp - rbp > 0x100000)
+            {
+                break;
+            }
+
+            rbp = nextRbp;
+        }
+
+        Console.Error.WriteLine(
+            $"[LOADER][TRACE] pthread_cond_signal_callsite: op={(broadcast ? "broadcast" : "signal")} " +
+            $"cond=0x{condAddress:X16} guest=0x{GuestThreadExecution.CurrentGuestThreadHandle:X16} " +
+            $"thread=0x{KernelPthreadState.GetCurrentThreadHandle():X16} " +
+            $"import_ret=0x{importReturn:X16} rbp=0x{ctx[CpuRegister.Rbp]:X16} " +
+            $"frames=[{string.Join(',', frames)}]");
+    }
+
     private static void TracePthreadCondGuestState(
         CpuContext ctx,
         string operation,
@@ -1948,6 +2214,19 @@ public static class KernelPthreadCompatExports
         _ = ctx.TryReadUInt64(wrapperRbp - 0x10, out var savedR14);
         _ = ctx.TryReadUInt64(wrapperRbp - 0x18, out var savedR13);
         _ = ctx.TryReadUInt64(wrapperRbp - 0x20, out var savedR12);
+
+        var cpuR13 = ctx[CpuRegister.R13];
+        var cpuR13Words = new List<string>(9);
+        if (operation == "wait-enter" && cpuR13 >= 0x10000)
+        {
+            for (var offset = 0UL; offset <= 0x40; offset += sizeof(ulong))
+            {
+                var address = cpuR13 + offset;
+                cpuR13Words.Add(KernelMemoryCompatExports.TryReadUInt64Compat(ctx, address, out var value)
+                    ? $"{address:X16}:{value:X16}"
+                    : $"{address:X16}:????????????????");
+            }
+        }
 
         var ownerWords = new List<string>(32);
         if (operation == "wait-enter" && savedR13 >= 0x10000)
@@ -1982,6 +2261,9 @@ public static class KernelPthreadCompatExports
             $"mutex=0x{mutexAddress:X16} resolved_cond=0x{resolvedCondAddress:X16} " +
             $"resolved_mutex=0x{resolvedMutexAddress:X16} saved_r12=0x{savedR12:X16} " +
             $"saved_r13=0x{savedR13:X16} saved_r14=0x{savedR14:X16} " +
+            $"cpu_rbx=0x{ctx[CpuRegister.Rbx]:X16} cpu_r12=0x{ctx[CpuRegister.R12]:X16} " +
+            $"cpu_r13=0x{cpuR13:X16} cpu_r14=0x{ctx[CpuRegister.R14]:X16} " +
+            $"cpu_r15=0x{ctx[CpuRegister.R15]:X16} cpu_r13_words=[{string.Join(',', cpuR13Words)}] " +
             $"words=[{string.Join(',', words)}] owner=[{string.Join(',', ownerWords)}] " +
             $"queue=[{string.Join(',', queueWords)}]");
     }
@@ -1998,8 +2280,8 @@ public static class KernelPthreadCompatExports
             return _tracePthreads;
         }
 
-        return _tracePthreadMutexFilter.Contains(mutexAddress) ||
-            _tracePthreadMutexFilter.Contains(resolvedAddress);
+        return MatchesTraceAddressFilter(_tracePthreadMutexFilter, mutexAddress) ||
+            MatchesTraceAddressFilter(_tracePthreadMutexFilter, resolvedAddress);
     }
 
     private static bool ShouldTracePthreadCond(ulong condAddress)
@@ -2011,7 +2293,22 @@ public static class KernelPthreadCompatExports
 
         return _tracePthreadCondFilter is null ||
             _tracePthreadCondFilter.Count == 0 ||
-            _tracePthreadCondFilter.Contains(condAddress);
+            MatchesTraceAddressFilter(_tracePthreadCondFilter, condAddress);
+    }
+
+    private static bool MatchesTraceAddressFilter(HashSet<ulong> filter, ulong address)
+    {
+        foreach (var candidate in filter)
+        {
+            if (candidate <= ushort.MaxValue
+                ? (address & ushort.MaxValue) == candidate
+                : address == candidate)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static HashSet<ulong>? ParseTraceAddressFilter(string? filter)
@@ -2041,4 +2338,11 @@ public static class KernelPthreadCompatExports
 
         return addresses.Count == 0 ? null : addresses;
     }
+
+    private static string[] ParseNameFilter(string? filter) =>
+        string.IsNullOrWhiteSpace(filter)
+            ? []
+            : filter.Split(
+                new[] { ',', ';' },
+                StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 }

@@ -138,6 +138,10 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
         KernelModuleRegistry.Reset();
         var image = LoadImage(normalizedEbootPath);
         VideoOutExports.ConfigureApplicationInfo(image.Title, image.TitleId, image.Version);
+        // Show the host window as soon as the title is known. Waiting until
+        // the guest registers its first display buffers leaves long-loading
+        // titles looking hung even though their engine is actively booting.
+        VideoOutExports.EnsurePresenterStarted();
         SaveDataExports.ConfigureApplicationInfo(image.TitleId);
         RegisterLoadedModule(normalizedEbootPath, image, isMain: true, isSystemModule: false);
         KernelRuntimeCompatExports.ConfigureProcessProcParamAddress(image.ProcParamAddress);

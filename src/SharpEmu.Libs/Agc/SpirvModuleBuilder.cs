@@ -142,6 +142,7 @@ internal enum SpirvOp : ushort
     BitCount = 205,
     ControlBarrier = 224,
     MemoryBarrier = 225,
+    AtomicExchange = 229,
     AtomicIAdd = 234,
     AtomicUMax = 239,
     Phi = 245,

@@ -38,6 +38,31 @@ public static unsafe class GuestImageWriteTracker
     private static readonly bool _enabled = !OperatingSystem.IsWindows() &&
         Environment.GetEnvironmentVariable("SHARPEMU_GUEST_IMAGE_CPU_SYNC") != "0";
 
+    /// <summary>
+    /// Keeps a managed guest-memory write disarmed until the caller finishes
+    /// copying. Without holding the tracker gate across the copy, the video
+    /// thread can re-arm the same image after <see cref="PrepareWrite"/> but
+    /// before <c>memcpy</c>, turning an otherwise checked HLE write into a host
+    /// access violation.
+    /// </summary>
+    public readonly ref struct ManagedWriteScope
+    {
+        private readonly bool _holdsGate;
+
+        internal ManagedWriteScope(bool holdsGate)
+        {
+            _holdsGate = holdsGate;
+        }
+
+        public void Dispose()
+        {
+            if (_holdsGate)
+            {
+                Monitor.Exit(_gate);
+            }
+        }
+    }
+
     [DllImport("libc", EntryPoint = "mprotect", SetLastError = true)]
     private static extern int Mprotect(nint address, nuint length, int protection);
 
@@ -205,6 +230,83 @@ public static unsafe class GuestImageWriteTracker
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// Managed HLE memory writes do not pass through the native guest signal
+    /// bridge. Disarm every tracked range touched by such a write before the
+    /// managed copy runs, and mark it dirty just like the fault path would.
+    /// </summary>
+    public static bool PrepareWrite(ulong address, ulong byteCount)
+    {
+        if (!TryBeginManagedWrite(address, byteCount, out var scope))
+        {
+            return false;
+        }
+
+        scope.Dispose();
+        return true;
+    }
+
+    /// <summary>
+    /// Disarms every tracked image touched by a managed write and holds the
+    /// tracker gate until the returned scope is disposed. Callers must keep
+    /// the scope alive for the entire native copy.
+    /// </summary>
+    public static bool TryBeginManagedWrite(
+        ulong address,
+        ulong byteCount,
+        out ManagedWriteScope scope)
+    {
+        scope = default;
+        if (!_enabled || address == 0 || byteCount == 0)
+        {
+            return true;
+        }
+
+        if (ulong.MaxValue - address < byteCount)
+        {
+            return false;
+        }
+
+        Monitor.Enter(_gate);
+        var success = false;
+        try
+        {
+            var end = address + byteCount;
+            var ranges = Volatile.Read(ref _rangeSnapshot);
+            for (var index = 0; index < ranges.Length; index++)
+            {
+                var range = ranges[index];
+                if (address >= range.End || end <= range.Start)
+                {
+                    continue;
+                }
+
+                if (Interlocked.Exchange(ref range.Armed, 0) != 0 &&
+                    Mprotect(
+                        (nint)range.Start,
+                        (nuint)(range.End - range.Start),
+                        ProtRead | ProtWrite) != 0)
+                {
+                    Volatile.Write(ref range.Armed, 1);
+                    return false;
+                }
+
+                Volatile.Write(ref range.Dirty, 1);
+            }
+
+            scope = new ManagedWriteScope(holdsGate: true);
+            success = true;
+            return true;
+        }
+        finally
+        {
+            if (!success)
+            {
+                Monitor.Exit(_gate);
+            }
+        }
     }
 
     private static int _armTraceCount;

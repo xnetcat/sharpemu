@@ -201,6 +201,19 @@ public sealed partial class DirectExecutionBackend
 			// the preceding import's argument snapshot.
 			Volatile.Write(ref activeGuestThreadState.LastImportNid, importStubEntry.Nid);
 		}
+		var traceGuestThreadImportFast =
+			_activeGuestThreadState is { } tracedFastGuestThreadState &&
+			!string.IsNullOrWhiteSpace(_guestThreadImportFilter) &&
+			tracedFastGuestThreadState.Name.Contains(_guestThreadImportFilter, StringComparison.OrdinalIgnoreCase);
+		if (traceGuestThreadImportFast)
+		{
+			var tracedExport = importStubEntry.Export;
+			Console.Error.WriteLine(
+				$"[LOADER][TRACE] guest_thread_import.fast_call name='{_activeGuestThreadState!.Name}' " +
+				$"nid={importStubEntry.Nid} export={tracedExport?.LibraryName ?? "<unresolved>"}:" +
+				$"{tracedExport?.Name ?? "<unresolved>"} ret=0x{num7:X16} " +
+				$"rdi=0x{value:X16} rsi=0x{value2:X16} rdx=0x{num3:X16} rcx=0x{num4:X16}");
+		}
 		if (_logStrlenBursts)
 		{
 			TrackDistinctImportNid(importStubEntry.Nid);
@@ -307,6 +320,16 @@ public sealed partial class DirectExecutionBackend
 				cpuContext[CpuRegister.Rdi],
 				cpuContext[CpuRegister.Rsi],
 				cpuContext[CpuRegister.Rdx]);
+			if (_logRootImportTransitions)
+			{
+				RecordRootImportTransition(
+					num,
+					importStubEntry.Nid,
+					num7,
+					cpuContext[CpuRegister.Rdi],
+					cpuContext[CpuRegister.Rsi],
+					cpuContext[CpuRegister.Rdx]);
+			}
 		}
 		if (importStubEntry.Nid == "8zTFvBIAIN8" && num <= 256)
 		{
@@ -436,23 +459,26 @@ public sealed partial class DirectExecutionBackend
 			if (!dispatchResolved)
 			{
 				LastError = "Missing HLE export for NID: " + importStubEntry.Nid;
-				Console.Error.WriteLine(
-					$"[LOADER][WARN] Import#{num} unresolved: nid={importStubEntry.Nid} ret=0x{num7:X16} " +
-					$"rdi=0x{value:X16} rsi=0x{value2:X16} rdx=0x{num3:X16} rcx=0x{num4:X16} r8=0x{num5:X16} r9=0x{num6:X16}");
-				if (importStubEntry.Nid == "L-Q3LEjIbgA")
+				if (ShouldLogUnresolvedImport(importStubEntry.Nid))
 				{
-					string value18 = string.Join(" ", importStubEntry.Nid.Select(delegate (char c)
+					Console.Error.WriteLine(
+						$"[LOADER][WARN] Import#{num} unresolved: nid={importStubEntry.Nid} ret=0x{num7:X16} " +
+						$"rdi=0x{value:X16} rsi=0x{value2:X16} rdx=0x{num3:X16} rcx=0x{num4:X16} r8=0x{num5:X16} r9=0x{num6:X16}");
+					if (importStubEntry.Nid == "L-Q3LEjIbgA")
 					{
-						int num10 = c;
-						return num10.ToString("X2");
-					}));
-					Console.Error.WriteLine($"[LOADER][WARN] map_direct nid raw len={importStubEntry.Nid.Length} chars=[{value18}]");
-					Delegate function;
-					bool value19 = _moduleManager.TryGetFunction(importStubEntry.Nid, out function);
-					ExportedFunction export2;
-					bool value20 = _moduleManager.TryGetExport(importStubEntry.Nid, out export2);
-					Console.Error.WriteLine($"[LOADER][WARN] map_direct lookup with import nid: function={value19}, export={value20}");
-					Console.Error.WriteLine(_moduleManager.TryGetExport("L-Q3LEjIbgA", out ExportedFunction export3) ? $"[LOADER][WARN] Canonical map_direct exists as {export3.LibraryName}:{export3.Name}, target={export3.Target}, ctx_target={cpuContext.TargetGeneration}" : "[LOADER][WARN] Canonical map_direct export lookup also missing");
+						string value18 = string.Join(" ", importStubEntry.Nid.Select(delegate (char c)
+						{
+							int num10 = c;
+							return num10.ToString("X2");
+						}));
+						Console.Error.WriteLine($"[LOADER][WARN] map_direct nid raw len={importStubEntry.Nid.Length} chars=[{value18}]");
+						Delegate function;
+						bool value19 = _moduleManager.TryGetFunction(importStubEntry.Nid, out function);
+						ExportedFunction export2;
+						bool value20 = _moduleManager.TryGetExport(importStubEntry.Nid, out export2);
+						Console.Error.WriteLine($"[LOADER][WARN] map_direct lookup with import nid: function={value19}, export={value20}");
+						Console.Error.WriteLine(_moduleManager.TryGetExport("L-Q3LEjIbgA", out ExportedFunction export3) ? $"[LOADER][WARN] Canonical map_direct exists as {export3.LibraryName}:{export3.Name}, target={export3.Target}, ctx_target={cpuContext.TargetGeneration}" : "[LOADER][WARN] Canonical map_direct export lookup also missing");
+					}
 				}
 			}
 			else if (orbisGen2Result != OrbisGen2Result.ORBIS_GEN2_OK)
@@ -655,6 +681,18 @@ public sealed partial class DirectExecutionBackend
 			Volatile.Write(ref activeGuestThreadState.LastReturnRip, returnRip);
 			Volatile.Write(ref activeGuestThreadState.LastImportNid, importStubEntry.Nid);
 		}
+		var traceGuestThreadImport =
+			_activeGuestThreadState is { } tracedGuestThreadState &&
+			!string.IsNullOrWhiteSpace(_guestThreadImportFilter) &&
+			tracedGuestThreadState.Name.Contains(_guestThreadImportFilter, StringComparison.OrdinalIgnoreCase);
+		if (traceGuestThreadImport)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][TRACE] guest_thread_import.call name='{_activeGuestThreadState!.Name}' " +
+				$"nid={importStubEntry.Nid} export={export.LibraryName}:{export.Name} ret=0x{returnRip:X16} " +
+				$"rdi=0x{arg0:X16} rsi=0x{cpuContext[CpuRegister.Rsi]:X16} " +
+				$"rdx=0x{cpuContext[CpuRegister.Rdx]:X16} rcx=0x{cpuContext[CpuRegister.Rcx]:X16}");
+		}
 		if (dispatchIndex % 100000 == 0)
 		{
 			Console.Error.WriteLine(
@@ -735,6 +773,12 @@ public sealed partial class DirectExecutionBackend
 		}
 
 		result = cpuContext[CpuRegister.Rax];
+		if (traceGuestThreadImport)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][TRACE] guest_thread_import.return name='{_activeGuestThreadState!.Name}' " +
+				$"nid={importStubEntry.Nid} result=0x{result:X16}");
+		}
 		if (_activeGuestThreadState is { } completedGuestThreadState)
 		{
 			Volatile.Write(ref completedGuestThreadState.LastImportRax, result);
@@ -745,6 +789,12 @@ public sealed partial class DirectExecutionBackend
 
 	private static bool IsNoBlockLeafImport(string nid) =>
 		nid is
+			"aI+OeCz8xrQ" or // scePthreadSelf
+			"EotR8a3ASf4" or // pthread_self
+			"eoht7mQOCmo" or // scePthreadGetspecific
+			"0-KXaS70xy4" or // pthread_getspecific
+			"+BzXYkqYeLE" or // scePthreadSetspecific
+			"WrOLvHU0yQM" or // pthread_setspecific
 			"8aI7R7WaOlc" or // sceAmprCommandBufferConstructor
 			"a8uLzYY--tM" or // sceAmprAprCommandBufferConstructor
 			"Qs1xtplKo0U" or // sceAmprAprCommandBufferDestructor
@@ -762,10 +812,13 @@ public sealed partial class DirectExecutionBackend
 			"sJXyWHjP-F8" or // sceAmprCommandBufferWriteAddressOnCompletion
 			"ASoW5WE-UPo" or // sceKernelAprSubmitCommandBufferAndGetResult
 			"rqwFKI4PAiM" or // sceKernelAprWaitCommandBuffer
-			"eE4Szl8sil8" or // sceKernelAprSubmitCommandBuffer
-			"qvMUCyyaCSI" or // sceKernelAprSubmitCommandBufferAndGetId
-			"Q2V+iqvjgC0" or // vsnprintf
-			"q1cHNfGycLI" or // scePadRead
+				"eE4Szl8sil8" or // sceKernelAprSubmitCommandBuffer
+				"qvMUCyyaCSI" or // sceKernelAprSubmitCommandBufferAndGetId
+				"Q2V+iqvjgC0" or // vsnprintf
+				"AV6ipCNa4Rw" or // strcasecmp
+				"q1cHNfGycLI" or // scePadRead
+			"YndgXqQVV7c" or // scePadReadState
+			"znaWI0gpuo8" or // scePadGetTriggerEffectState
 			"xk0AcarP3V4" or // scePadOpen
 			"yH17Q6NWtVg" or // sceUserServiceGetEvent
 			"D-CzAxQL0XI" or // sceUserServiceGetPlatformPrivacySetting
@@ -829,6 +882,28 @@ public sealed partial class DirectExecutionBackend
 			Environment.GetEnvironmentVariable("SHARPEMU_LOG_EXPECTED_IMPORT_RESULTS"),
 			"1",
 			StringComparison.Ordinal);
+
+	private bool ShouldLogUnresolvedImport(string nid)
+	{
+		if (string.Equals(
+				Environment.GetEnvironmentVariable("SHARPEMU_LOG_ALL_UNRESOLVED_IMPORTS"),
+				"1",
+				StringComparison.Ordinal))
+		{
+			return true;
+		}
+
+		var key = "unresolved\0" + nid;
+		int count;
+		lock (_importResultLogSampleGate)
+		{
+			_importResultLogSamples.TryGetValue(key, out count);
+			count++;
+			_importResultLogSamples[key] = count;
+		}
+
+		return count <= 8 || count % 10000 == 0;
+	}
 
 	private static bool IsExpectedFileProbeNotFoundNid(string nid) =>
 		nid is
@@ -917,9 +992,10 @@ public sealed partial class DirectExecutionBackend
 			"5jNubw4vlAA" or // strnlen
 			"LHMrG7e8G78" or // wcslen
 			"WkkeywLJcgU" or // wcslen
-			"Ovb2dSJOAuE" or // strcmp
-			"aesyjrHVWy4" or // strncmp
-			"pNtJdE3x49E" or // wcscmp
+				"Ovb2dSJOAuE" or // strcmp
+				"aesyjrHVWy4" or // strncmp
+				"AV6ipCNa4Rw" or // strcasecmp
+				"pNtJdE3x49E" or // wcscmp
 			"fV2xHER+bKE" or // wcscoll
 			"E8wCoUEbfzk" or // wcsncmp
 			"Q3VBxCXhUHs" or // memcpy
@@ -1114,8 +1190,12 @@ public sealed partial class DirectExecutionBackend
 		ActiveGuestThreadYieldReason = string.IsNullOrWhiteSpace(reason) ? nid : reason;
 		if (_logGuestThreads)
 		{
+			var context = ActiveCpuContext;
 			Console.Error.WriteLine(
-				$"[LOADER][INFO] Guest thread yield at import#{dispatchIndex}: nid={nid} ret=0x{returnRip:X16} reason={ActiveGuestThreadYieldReason}");
+				$"[LOADER][INFO] Guest thread yield at import#{dispatchIndex}: nid={nid} " +
+				$"ret=0x{returnRip:X16} reason={ActiveGuestThreadYieldReason} " +
+				$"r12=0x{context?[CpuRegister.R12] ?? 0:X16} r13=0x{context?[CpuRegister.R13] ?? 0:X16} " +
+				$"r14=0x{context?[CpuRegister.R14] ?? 0:X16} r15=0x{context?[CpuRegister.R15] ?? 0:X16}");
 		}
 		return true;
 	}

@@ -19,6 +19,7 @@ public static class PadExports
     private const int PrimaryPadHandle = 1;
     private const int ControllerInformationSize = 0x1C;
     private const int PadDataSize = 0x78;
+    private const int TriggerEffectStateSize = 8;
 
     private static bool _initialized;
 
@@ -54,13 +55,41 @@ public static class PadExports
             return SetReturn(ctx, OrbisPadErrorDeviceNoHandle);
         }
 
-        if (userId != PrimaryUserId || type != StandardPortType || index != 0 || parameterAddress != 0)
+        // pParam is a valid optional argument (touchpad resolution etc.);
+        // rejecting non-null params made UE titles fall back to handle 0 and
+        // poll scePadReadState(0) forever on their input screens.
+        if (userId != PrimaryUserId || type != StandardPortType || index != 0)
         {
             return SetReturn(ctx, OrbisPadErrorDeviceNotConnected);
         }
 
         Console.Error.WriteLine("[LOADER][INFO] Keyboard controls: Arrow keys = D-pad, WASD = left stick, IJKL = right stick, Z/Enter = Cross, X/Esc = Circle, C = Square, V = Triangle, Q = L1, E = R1, R = L2, F = R2, Tab/Backspace = Options");
         return SetReturn(ctx, PrimaryPadHandle);
+    }
+
+    [SysAbiExport(
+        Nid = "u1GRHp+oWoY",
+        ExportName = "scePadGetHandle",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libScePad")]
+    public static int PadGetHandle(CpuContext ctx)
+    {
+        var userId = unchecked((int)ctx[CpuRegister.Rdi]);
+        var type = unchecked((int)ctx[CpuRegister.Rsi]);
+        var index = unchecked((int)ctx[CpuRegister.Rdx]);
+        if (!_initialized)
+        {
+            return SetReturn(ctx, OrbisPadErrorNotInitialized);
+        }
+
+        if (userId == -1)
+        {
+            return SetReturn(ctx, OrbisPadErrorDeviceNoHandle);
+        }
+
+        return userId == PrimaryUserId && type == StandardPortType && index == 0
+            ? SetReturn(ctx, PrimaryPadHandle)
+            : SetReturn(ctx, OrbisPadErrorDeviceNoHandle);
     }
 
     [SysAbiExport(
@@ -161,6 +190,32 @@ public static class PadExports
     }
 
     [SysAbiExport(
+        Nid = "znaWI0gpuo8",
+        ExportName = "scePadGetTriggerEffectState",
+        Target = Generation.Gen5,
+        LibraryName = "libScePad")]
+    public static int PadGetTriggerEffectState(CpuContext ctx)
+    {
+        var handle = unchecked((int)ctx[CpuRegister.Rdi]);
+        var stateAddress = ctx[CpuRegister.Rsi];
+        if (handle != PrimaryPadHandle)
+        {
+            return SetReturn(ctx, OrbisPadErrorInvalidHandle);
+        }
+
+        if (stateAddress == 0)
+        {
+            return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        Span<byte> state = stackalloc byte[TriggerEffectStateSize];
+        state.Clear();
+        return ctx.Memory.TryWrite(stateAddress, state)
+            ? SetReturn(ctx, 0)
+            : SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    [SysAbiExport(
     Nid = "W2G-yoyMF5U",
     ExportName = "scePadSetVibrationMode",
     Target = Generation.Gen4 | Generation.Gen5,
@@ -237,6 +292,20 @@ public static class PadExports
 
     private static readonly long PadStartTimestamp = Stopwatch.GetTimestamp();
     private static readonly double[] AutoCrossTimes = ParseAutoCrossTimes();
+    private static readonly double AutoCrossHoldSeconds = ParseAutoCrossHoldSeconds();
+    private static readonly bool AutoCrossCatchUp = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_AUTO_CROSS_CATCH_UP"),
+        "1",
+        StringComparison.Ordinal);
+    private static readonly bool TraceAutoCross = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_LOG_AUTO_CROSS"),
+        "1",
+        StringComparison.Ordinal);
+    private static readonly object AutoCrossGate = new();
+    private static long _autoCrossLoggedMask;
+    private static int _autoCrossNextIndex;
+    private static double _autoCrossActiveUntil;
+    private static double _autoCrossReleaseUntil;
 
     private static double[] ParseAutoCrossTimes()
     {
@@ -269,15 +338,71 @@ public static class PadExports
         }
 
         var elapsed = (Stopwatch.GetTimestamp() - PadStartTimestamp) / (double)Stopwatch.Frequency;
-        foreach (var time in times)
+        if (AutoCrossCatchUp)
         {
-            if (elapsed >= time && elapsed < time + 0.4)
+            lock (AutoCrossGate)
             {
+                if (elapsed < _autoCrossActiveUntil)
+                {
+                    return true;
+                }
+
+                if (elapsed < _autoCrossReleaseUntil ||
+                    _autoCrossNextIndex >= times.Length ||
+                    elapsed < times[_autoCrossNextIndex])
+                {
+                    return false;
+                }
+
+                var index = _autoCrossNextIndex++;
+                _autoCrossActiveUntil = elapsed + AutoCrossHoldSeconds;
+                _autoCrossReleaseUntil = _autoCrossActiveUntil + 0.5;
+                LogAutoCross(index, times[index], elapsed, catchUp: true);
+                return true;
+            }
+        }
+
+        for (var index = 0; index < times.Length; index++)
+        {
+            var time = times[index];
+            if (elapsed >= time && elapsed < time + AutoCrossHoldSeconds)
+            {
+                LogAutoCross(index, time, elapsed, catchUp: false);
                 return true;
             }
         }
 
         return false;
+    }
+
+    private static void LogAutoCross(int index, double scheduled, double elapsed, bool catchUp)
+    {
+        if (!TraceAutoCross || index >= 64)
+        {
+            return;
+        }
+
+        var bit = 1L << index;
+        var previous = Interlocked.Or(ref _autoCrossLoggedMask, bit);
+        if ((previous & bit) == 0)
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][DIAG] pad.auto_cross_consumed index={index} " +
+                $"scheduled={scheduled:F3}s elapsed={elapsed:F3}s catch_up={catchUp}");
+        }
+    }
+
+    private static double ParseAutoCrossHoldSeconds()
+    {
+        var raw = Environment.GetEnvironmentVariable("SHARPEMU_AUTO_CROSS_HOLD_MS");
+        return double.TryParse(
+                   raw,
+                   System.Globalization.NumberStyles.Float,
+                   System.Globalization.CultureInfo.InvariantCulture,
+                   out var milliseconds) &&
+               milliseconds is >= 1 and <= 10_000
+            ? milliseconds / 1000.0
+            : 0.4;
     }
 
     private static int SetReturn(CpuContext ctx, int result)

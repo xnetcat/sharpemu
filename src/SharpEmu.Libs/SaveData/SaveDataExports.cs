@@ -288,6 +288,93 @@ public static class SaveDataExports
     }
 
     [SysAbiExport(
+        Nid = "sDCBrmc61XU",
+        ExportName = "sceSaveDataPrepare",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceSaveData")]
+    public static int SaveDataPrepare(CpuContext ctx)
+    {
+        var mountPointAddress = ctx[CpuRegister.Rdi];
+        var resource = unchecked((int)ctx[CpuRegister.Rdx]);
+        if (mountPointAddress == 0)
+        {
+            return SetReturn(ctx, OrbisSaveDataErrorParameter);
+        }
+
+        if (!TryReadFixedAscii(ctx, mountPointAddress, 16, out var mountPoint))
+        {
+            return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        if (string.IsNullOrWhiteSpace(mountPoint))
+        {
+            return SetReturn(ctx, OrbisSaveDataErrorParameter);
+        }
+
+        TraceSaveData($"prepare mount_point={mountPoint} resource={resource}");
+        return SetReturn(ctx, 0);
+    }
+
+    [SysAbiExport(
+        Nid = "ie7qhZ4X0Cc",
+        ExportName = "sceSaveDataCommit",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceSaveData")]
+    public static int SaveDataCommit(CpuContext ctx)
+    {
+        // Writes performed through the mounted /savedata0 overlay land directly
+        // on the host filesystem, so a commit has nothing extra to flush;
+        // acknowledge success so the guest's save transaction completes.
+        TraceSaveData($"commit rdi=0x{ctx[CpuRegister.Rdi]:X} rsi=0x{ctx[CpuRegister.Rsi]:X} rdx=0x{ctx[CpuRegister.Rdx]:X}");
+        return SetReturn(ctx, 0);
+    }
+
+    [SysAbiExport(
+        Nid = "85zul--eGXs",
+        ExportName = "sceSaveDataSetParam",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceSaveData")]
+    public static int SaveDataSetParam(CpuContext ctx)
+    {
+        var mountPointAddress = ctx[CpuRegister.Rdi];
+        var paramType = unchecked((uint)ctx[CpuRegister.Rsi]);
+        var paramAddress = ctx[CpuRegister.Rdx];
+        var paramSize = ctx[CpuRegister.Rcx];
+        if (mountPointAddress == 0 || (paramAddress == 0 && paramSize != 0))
+        {
+            return SetReturn(ctx, OrbisSaveDataErrorParameter);
+        }
+
+        // Titles use this to attach display metadata (title/subtitle/detail)
+        // to the mounted save; the stub filesystem has nowhere to surface it,
+        // so validate the buffer and acknowledge.
+        if (paramAddress != 0 && paramSize > 0)
+        {
+            Span<byte> probe = stackalloc byte[1];
+            if (!ctx.Memory.TryRead(paramAddress, probe))
+            {
+                return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            }
+        }
+
+        TraceSaveData($"set_param type={paramType} size={paramSize}");
+        return SetReturn(ctx, 0);
+    }
+
+    [SysAbiExport(
+        Nid = "c88Yy54Mx0w",
+        ExportName = "sceSaveDataSaveIcon",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceSaveData")]
+    public static int SaveDataSaveIcon(CpuContext ctx)
+    {
+        // Icon PNGs only matter for the console's save-data browser, which the
+        // emulator does not present; acknowledge so the save flow continues.
+        TraceSaveData($"save_icon rdi=0x{ctx[CpuRegister.Rdi]:X} rsi=0x{ctx[CpuRegister.Rsi]:X}");
+        return SetReturn(ctx, 0);
+    }
+
+    [SysAbiExport(
         Nid = "lJUQuaKqoKY",
         ExportName = "sceSaveDataDeleteTransactionResource",
         Target = Generation.Gen4 | Generation.Gen5,

@@ -105,6 +105,9 @@ public static class VideoOutExports
         }
     }
 
+    public static void EnsurePresenterStarted(uint width = 1920, uint height = 1080) =>
+        VulkanVideoPresenter.EnsureStarted(width, height);
+
     private sealed class VideoOutPortState
     {
         public required int Handle { get; init; }

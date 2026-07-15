@@ -36,12 +36,12 @@ internal static class Gen5ShaderScalarEvaluator
     private static readonly object _scalarFallbackTraceGate = new();
     private static readonly HashSet<(ulong Shader, uint Pc)> _tracedScalarFallbacks = [];
 
-    // Uniform forward branches select material/resource bodies that remain
-    // statically present in the translated shader. Discover the skipped body's
-    // descriptors by default; SHARPEMU_CFG_RESOURCE_DISCOVERY=0 is a diagnostic
-    // opt-out. Conditional branches are deliberately not forked because their
-    // fall-through is already scanned and forking vector-mask conditions grows
-    // exponentially without adding descriptor coverage.
+    // Forward branches select material/resource bodies that remain statically
+    // present in the translated shader. Discover both conditional targets and
+    // otherwise-unreachable unconditional fall-through bodies by default;
+    // SHARPEMU_CFG_RESOURCE_DISCOVERY=0 is a diagnostic opt-out. Path states are
+    // deduplicated below so a branch target observes the SGPR values from a real
+    // predecessor instead of values written by a block that jumped over it.
     private static readonly bool _cfgResourceDiscovery =
         !string.Equals(
             Environment.GetEnvironmentVariable("SHARPEMU_CFG_RESOURCE_DISCOVERY"),
@@ -52,6 +52,16 @@ internal static class Gen5ShaderScalarEvaluator
     private const int ImageDescriptorDwords = 8;
     private const int SamplerDescriptorDwords = 4;
     private const int MaxGlobalMemoryBindingBytes = 16 * 1024 * 1024;
+    // RDNA buffer descriptors store the byte address in bits 47:0 and reuse
+    // bits 61:48 for stride. Scalar loads can consume that first SGPR pair as
+    // a pointer, so mask descriptor metadata out before accessing guest VA.
+    private const ulong GpuVirtualAddressMask = 0x0000_FFFF_FFFF_FFFFUL;
+    private static readonly bool _maskScalarGpuVirtualAddresses =
+        !string.Equals(
+            Environment.GetEnvironmentVariable(
+                "SHARPEMU_MASK_SCALAR_GPU_VA"),
+            "0",
+            StringComparison.Ordinal);
     private const ulong RdnaWaveMask = 0xFFFF_FFFFUL;
 
     static Gen5ShaderScalarEvaluator()
@@ -113,7 +123,8 @@ internal static class Gen5ShaderScalarEvaluator
         Gen5ShaderState state,
         out Gen5ShaderEvaluation evaluation,
         out string error,
-        bool resolveVertexInputs = false)
+        bool resolveVertexInputs = false,
+        uint? requiredVertexRecordCount = null)
     {
         evaluation = default!;
         error = string.Empty;
@@ -149,6 +160,14 @@ internal static class Gen5ShaderScalarEvaluator
         var finalScalarRegisters = (uint[])scalarRegisters.Clone();
         var pendingPaths = new Stack<ScalarPathState>();
         var visitedPaths = new HashSet<ScalarPathKey>();
+        var forwardBranchTargets = state.Program.Instructions
+            .Select(static instruction =>
+                TryGetSoppBranchTargetPc(instruction, out var targetPc) &&
+                targetPc > instruction.Pc
+                    ? targetPc
+                    : uint.MaxValue)
+            .Where(static targetPc => targetPc != uint.MaxValue)
+            .ToHashSet();
 
         void QueuePath(
             uint pc,
@@ -184,6 +203,7 @@ internal static class Gen5ShaderScalarEvaluator
         while (pendingPaths.Count != 0)
         {
             var path = pendingPaths.Pop();
+            var supplementalPathFailed = false;
             scalarRegisters = path.ScalarRegisters;
             execMask = path.ExecMask;
             var scalarConditionCode = path.ScalarConditionCode;
@@ -212,18 +232,16 @@ internal static class Gen5ShaderScalarEvaluator
                     if (targetPc > instruction.Pc)
                     {
                         // The regular scalar evaluation follows the uniform
-                        // branch. Evaluate its skipped fall-through region once
-                        // as supplemental resource discovery: large shaders use
-                        // forward S_BRANCH to select one material/resource body,
-                        // and SPIR-V still needs descriptors for every body that
-                        // remains in the statically translated CFG. Do not fork
-                        // SC_BRANCH targets here; their fall-through regions are
-                        // already visited linearly and forking every vector-mask
-                        // condition causes exponential state growth.
-                        if (_cfgResourceDiscovery)
+                        // branch. Evaluate an otherwise-unreachable fall-through
+                        // region once so its statically translated resource body
+                        // still receives descriptors. If another forward branch
+                        // reaches that PC, its real predecessor state is queued
+                        // separately and must win over this synthetic path.
+                        var fallthroughPc = instruction.Pc +
+                            (uint)(instruction.Words.Count * sizeof(uint));
+                        if (_cfgResourceDiscovery &&
+                            !forwardBranchTargets.Contains(fallthroughPc))
                         {
-                            var fallthroughPc = instruction.Pc +
-                                (uint)(instruction.Words.Count * sizeof(uint));
                             QueuePath(
                                 fallthroughPc,
                                 (uint[])scalarRegisters.Clone(),
@@ -247,6 +265,24 @@ internal static class Gen5ShaderScalarEvaluator
                     }
                 }
 
+                if (_cfgResourceDiscovery &&
+                    instruction.Opcode != "SBranch" &&
+                    instruction.Opcode.StartsWith("SCbranch", StringComparison.Ordinal) &&
+                    TryGetSoppBranchTargetPc(instruction, out var conditionalTargetPc) &&
+                    conditionalTargetPc > instruction.Pc)
+                {
+                    // Keep evaluating the fall-through path, but also discover
+                    // the target using the SGPR/EXEC state at the actual branch.
+                    // This matters when the fall-through overwrites a descriptor
+                    // register before jumping around the target block.
+                    QueuePath(
+                        conditionalTargetPc,
+                        (uint[])scalarRegisters.Clone(),
+                        execMask,
+                        scalarConditionCode,
+                        supplemental: true);
+                }
+
                 if (instruction.Encoding == Gen5ShaderEncoding.Sopc)
                 {
                 if (!TryExecuteScalarCompare(
@@ -255,6 +291,15 @@ internal static class Gen5ShaderScalarEvaluator
                         out scalarConditionCode,
                         out error))
                 {
+                    if (path.Supplemental)
+                    {
+                        // Speculative resource-discovery paths may run with
+                        // register state that never occurs on real execution;
+                        // abandon the path instead of failing the translation.
+                        supplementalPathFailed = true;
+                        break;
+                    }
+
                     return false;
                 }
 
@@ -270,6 +315,15 @@ internal static class Gen5ShaderScalarEvaluator
                         out scalarConditionCode,
                         out error))
                 {
+                    if (path.Supplemental)
+                    {
+                        // Speculative resource-discovery paths may run with
+                        // register state that never occurs on real execution;
+                        // abandon the path instead of failing the translation.
+                        supplementalPathFailed = true;
+                        break;
+                    }
+
                     return false;
                 }
 
@@ -294,6 +348,15 @@ internal static class Gen5ShaderScalarEvaluator
                         ref scalarConditionCode,
                         out error))
                 {
+                    if (path.Supplemental)
+                    {
+                        // Speculative resource-discovery paths may run with
+                        // register state that never occurs on real execution;
+                        // abandon the path instead of failing the translation.
+                        supplementalPathFailed = true;
+                        break;
+                    }
+
                     return false;
                 }
 
@@ -310,6 +373,15 @@ internal static class Gen5ShaderScalarEvaluator
                     !HasGlobalMemoryBindingForPc(globalMemoryBindings, instruction.Pc);
                 if (!TryExecuteScalarLoad(ctx, state, instruction, scalarMemory, scalarRegisters, globalMemoryBindings, globalMemoryByAddress, runtimeScalarRegisters, recordBinding, out error))
                 {
+                    if (path.Supplemental)
+                    {
+                        // Speculative resource-discovery paths may run with
+                        // register state that never occurs on real execution;
+                        // abandon the path instead of failing the translation.
+                        supplementalPathFailed = true;
+                        break;
+                    }
+
                     return false;
                 }
                 continue;
@@ -328,6 +400,15 @@ internal static class Gen5ShaderScalarEvaluator
                     error =
                         $"global-address-register-range pc=0x{instruction.Pc:X} " +
                         $"s{globalMemory.ScalarAddress}";
+                    if (path.Supplemental)
+                    {
+                        // Speculative resource-discovery paths may run with
+                        // register state that never occurs on real execution;
+                        // abandon the path instead of failing the translation.
+                        supplementalPathFailed = true;
+                        break;
+                    }
+
                     return false;
                 }
 
@@ -337,6 +418,15 @@ internal static class Gen5ShaderScalarEvaluator
                 if (baseAddress == 0)
                 {
                     error = $"global-address-null pc=0x{instruction.Pc:X}";
+                    if (path.Supplemental)
+                    {
+                        // Speculative resource-discovery paths may run with
+                        // register state that never occurs on real execution;
+                        // abandon the path instead of failing the translation.
+                        supplementalPathFailed = true;
+                        break;
+                    }
+
                     return false;
                 }
 
@@ -363,6 +453,15 @@ internal static class Gen5ShaderScalarEvaluator
                         error =
                             $"global-memory-read-failed pc=0x{instruction.Pc:X} " +
                             $"address=0x{baseAddress:X16}";
+                        if (path.Supplemental)
+                        {
+                            // Speculative resource-discovery paths may run with
+                            // register state that never occurs on real execution;
+                            // abandon the path instead of failing the translation.
+                            supplementalPathFailed = true;
+                            break;
+                        }
+
                         return false;
                     }
 
@@ -395,6 +494,15 @@ internal static class Gen5ShaderScalarEvaluator
                     error =
                         $"buffer-resource-register-range pc=0x{instruction.Pc:X} " +
                         $"s{bufferMemory.ScalarResource}";
+                    if (path.Supplemental)
+                    {
+                        // Speculative resource-discovery paths may run with
+                        // register state that never occurs on real execution;
+                        // abandon the path instead of failing the translation.
+                        supplementalPathFailed = true;
+                        break;
+                    }
+
                     return false;
                 }
 
@@ -404,20 +512,35 @@ internal static class Gen5ShaderScalarEvaluator
                         strictType: true,
                         out var bufferDescriptor))
                 {
+                    var resourceBase = bufferMemory.ScalarResource;
                     error =
                         $"buffer-descriptor-invalid pc=0x{instruction.Pc:X} " +
-                        $"s{bufferMemory.ScalarResource}";
+                        $"s{resourceBase} words=0x{scalarRegisters[resourceBase]:X8}," +
+                        $"0x{scalarRegisters[resourceBase + 1]:X8}," +
+                        $"0x{scalarRegisters[resourceBase + 2]:X8}," +
+                        $"0x{scalarRegisters[resourceBase + 3]:X8}";
+                    if (path.Supplemental)
+                    {
+                        // Speculative resource-discovery paths may run with
+                        // register state that never occurs on real execution;
+                        // abandon the path instead of failing the translation.
+                        supplementalPathFailed = true;
+                        break;
+                    }
+
                     return false;
                 }
 
-                if (bufferDescriptor.BaseAddress == 0)
+                if (bufferDescriptor.BaseAddress == 0 || bufferDescriptor.SizeBytes == 0)
                 {
                     // A descriptor in a sibling block can be null for this
                     // invocation even though the GPU branch never executes the
-                    // memory instruction. Vulkan still requires a descriptor
-                    // for the statically present block, so bind a bounded zero
-                    // buffer to this exact PC. It is never reused for another
-                    // resource register or instruction.
+                    // memory instruction, and NumRecords==0 descriptors make
+                    // every RDNA buffer access out-of-bounds (reads return 0).
+                    // Vulkan still requires a descriptor for the statically
+                    // present block, so bind a bounded zero buffer to this
+                    // exact PC. It is never reused for another resource
+                    // register or instruction.
                     var nullKey = (bufferMemory.ScalarResource, 0UL);
                     if (globalMemoryByAddress.TryGetValue(nullKey, out var nullBinding))
                     {
@@ -450,10 +573,52 @@ internal static class Gen5ShaderScalarEvaluator
                 if (resolveVertexInputs &&
                     IsVertexFetchCandidate(instruction, bufferMemory, bufferDescriptor))
                 {
+                    if (instruction.Sources.Count <= 2 ||
+                        !TryEvaluateScalarOperand(
+                            instruction.Sources[2],
+                            scalarRegisters,
+                            out var scalarOffset))
+                    {
+                        error =
+                            $"vertex-input-offset-unresolved pc=0x{instruction.Pc:X} " +
+                            $"s{bufferMemory.ScalarResource}";
+                        if (path.Supplemental)
+                        {
+                            // Speculative resource-discovery paths may run with
+                            // register state that never occurs on real execution;
+                            // abandon the path instead of failing the translation.
+                            supplementalPathFailed = true;
+                            break;
+                        }
+
+                        return false;
+                    }
+
+                    var vertexReadBytes = bufferDescriptor.SizeBytes;
+                    if (requiredVertexRecordCount is > 0)
+                    {
+                        // Indexed draws describe their reachable vertex range
+                        // through the index buffer. Limit the snapshot to that
+                        // range instead of trying to copy an entire UE vertex
+                        // arena for each attribute.
+                        var bindingOffset = unchecked(
+                            (uint)bufferMemory.OffsetBytes + scalarOffset);
+                        var lastRecordOffset =
+                            (ulong)(requiredVertexRecordCount.Value - 1) *
+                            bufferDescriptor.Stride;
+                        var elementBytes =
+                            (ulong)Math.Max(bufferMemory.DwordCount, 1u) * sizeof(uint);
+                        var recordSpan = Math.Max(
+                            (ulong)bufferDescriptor.Stride,
+                            SaturatingAdd(bindingOffset, elementBytes));
+                        var requiredBytes = SaturatingAdd(lastRecordOffset, recordSpan);
+                        vertexReadBytes = Math.Min(vertexReadBytes, requiredBytes);
+                    }
+
                     if (!TryReadGlobalMemory(
                             ctx,
                             bufferDescriptor.BaseAddress,
-                            bufferDescriptor.SizeBytes,
+                            vertexReadBytes,
                             out var vertexData,
                             out var vertexDataLength))
                     {
@@ -462,6 +627,15 @@ internal static class Gen5ShaderScalarEvaluator
                             $"address=0x{bufferDescriptor.BaseAddress:X16} " +
                             $"bytes={bufferDescriptor.SizeBytes} " +
                             $"stride={bufferDescriptor.Stride} records={bufferDescriptor.NumRecords}";
+                        if (path.Supplemental)
+                        {
+                            // Speculative resource-discovery paths may run with
+                            // register state that never occurs on real execution;
+                            // abandon the path instead of failing the translation.
+                            supplementalPathFailed = true;
+                            break;
+                        }
+
                         return false;
                     }
 
@@ -478,6 +652,15 @@ internal static class Gen5ShaderScalarEvaluator
                         error =
                             $"vertex-input-binding-failed pc=0x{instruction.Pc:X} " +
                             $"s{bufferMemory.ScalarResource}";
+                        if (path.Supplemental)
+                        {
+                            // Speculative resource-discovery paths may run with
+                            // register state that never occurs on real execution;
+                            // abandon the path instead of failing the translation.
+                            supplementalPathFailed = true;
+                            break;
+                        }
+
                         return false;
                     }
 
@@ -517,6 +700,15 @@ internal static class Gen5ShaderScalarEvaluator
                                 $"bytes={bufferDescriptor.SizeBytes} " +
                                 $"stride={bufferDescriptor.Stride} records={bufferDescriptor.NumRecords} " +
                                 $"s{bufferMemory.ScalarResource}=[{descriptorWords}]";
+                            if (path.Supplemental)
+                            {
+                                // Speculative resource-discovery paths may run with
+                                // register state that never occurs on real execution;
+                                // abandon the path instead of failing the translation.
+                                supplementalPathFailed = true;
+                                break;
+                            }
+
                             return false;
                         }
 
@@ -568,6 +760,15 @@ internal static class Gen5ShaderScalarEvaluator
                     out var resourceDescriptor))
             {
                 error = $"resource-register-range pc=0x{instruction.Pc:X} s{image.ScalarResource}";
+                if (path.Supplemental)
+                {
+                    // Speculative resource-discovery paths may run with
+                    // register state that never occurs on real execution;
+                    // abandon the path instead of failing the translation.
+                    supplementalPathFailed = true;
+                    break;
+                }
+
                 return false;
             }
 
@@ -580,6 +781,15 @@ internal static class Gen5ShaderScalarEvaluator
                     out samplerDescriptor))
             {
                 error = $"sampler-register-range pc=0x{instruction.Pc:X} s{image.ScalarSampler}";
+                if (path.Supplemental)
+                {
+                    // Speculative resource-discovery paths may run with
+                    // register state that never occurs on real execution;
+                    // abandon the path instead of failing the translation.
+                    supplementalPathFailed = true;
+                    break;
+                }
+
                 return false;
             }
 
@@ -613,6 +823,15 @@ internal static class Gen5ShaderScalarEvaluator
                         error =
                             $"dynamic-image-descriptor pc=0x{instruction.Pc:X} " +
                             $"s{image.ScalarResource}/s{image.ScalarSampler}";
+                        if (path.Supplemental)
+                        {
+                            // Speculative resource-discovery paths may run with
+                            // register state that never occurs on real execution;
+                            // abandon the path instead of failing the translation.
+                            supplementalPathFailed = true;
+                            break;
+                        }
+
                         return false;
                     }
                 }
@@ -621,6 +840,12 @@ internal static class Gen5ShaderScalarEvaluator
                     resolvedImageByPc.Add(instruction.Pc, resolved.Count);
                     resolved.Add(imageBinding);
                 }
+            }
+
+            if (supplementalPathFailed)
+            {
+                error = string.Empty;
+                continue;
             }
 
             if (!path.Supplemental)
@@ -885,6 +1110,9 @@ internal static class Gen5ShaderScalarEvaluator
         return false;
     }
 
+    private static ulong SaturatingAdd(ulong left, ulong right) =>
+        ulong.MaxValue - left < right ? ulong.MaxValue : left + right;
+
     private static bool TryExecuteScalarAlu(
         Gen5ShaderInstruction instruction,
         ulong programAddress,
@@ -944,6 +1172,7 @@ internal static class Gen5ShaderScalarEvaluator
                     instruction.Sources[0],
                     registers,
                     execMask,
+                    scalarConditionCode,
                     out var value))
             {
                 error = $"scalar-source64 pc=0x{instruction.Pc:X} op={instruction.Opcode}";
@@ -975,10 +1204,13 @@ internal static class Gen5ShaderScalarEvaluator
                     instruction.Sources[0],
                     registers,
                     execMask,
+                    scalarConditionCode,
                     out var value) ||
                 !TryEvaluateScalarOperand(
                     instruction.Sources[1],
                     registers,
+                    execMask,
+                    scalarConditionCode,
                     out var shift))
             {
                 error = $"scalar-source64 pc=0x{instruction.Pc:X} op={instruction.Opcode}";
@@ -1001,10 +1233,13 @@ internal static class Gen5ShaderScalarEvaluator
                     instruction.Sources[0],
                     registers,
                     execMask,
+                    scalarConditionCode,
                     out var source) ||
                 !TryEvaluateScalarOperand(
                     instruction.Sources[1],
                     registers,
+                    execMask,
+                    scalarConditionCode,
                     out var control))
             {
                 error = $"scalar-source64 pc=0x{instruction.Pc:X} op={instruction.Opcode}";
@@ -1040,8 +1275,18 @@ internal static class Gen5ShaderScalarEvaluator
         {
             if (instruction.Sources.Count < 2 ||
                 destination.Value >= ScalarRegisterCount - 1 ||
-                !TryEvaluateScalarOperand(instruction.Sources[0], registers, out var widthSource) ||
-                !TryEvaluateScalarOperand(instruction.Sources[1], registers, out var offsetSource))
+                !TryEvaluateScalarOperand(
+                    instruction.Sources[0],
+                    registers,
+                    execMask,
+                    scalarConditionCode,
+                    out var widthSource) ||
+                !TryEvaluateScalarOperand(
+                    instruction.Sources[1],
+                    registers,
+                    execMask,
+                    scalarConditionCode,
+                    out var offsetSource))
             {
                 error = $"scalar-source64 pc=0x{instruction.Pc:X} op={instruction.Opcode}";
                 return false;
@@ -1073,11 +1318,13 @@ internal static class Gen5ShaderScalarEvaluator
                     instruction.Sources[0],
                     registers,
                     execMask,
+                    scalarConditionCode,
                     out var maskLeft) ||
                 !TryEvaluateScalarOperand64(
                     instruction.Sources[1],
                     registers,
                     execMask,
+                    scalarConditionCode,
                     out var maskRight))
             {
                 error = $"scalar-source64 pc=0x{instruction.Pc:X} op={instruction.Opcode}";
@@ -1102,7 +1349,12 @@ internal static class Gen5ShaderScalarEvaluator
         }
 
         if (instruction.Sources.Count == 0 ||
-            !TryEvaluateScalarOperand(instruction.Sources[0], registers, out var left))
+            !TryEvaluateScalarOperand(
+                instruction.Sources[0],
+                registers,
+                execMask,
+                scalarConditionCode,
+                out var left))
         {
             var source = instruction.Sources.Count == 0
                 ? "<missing>"
@@ -1141,7 +1393,12 @@ internal static class Gen5ShaderScalarEvaluator
         }
 
         if (instruction.Sources.Count < 2 ||
-            !TryEvaluateScalarOperand(instruction.Sources[1], registers, out var right))
+            !TryEvaluateScalarOperand(
+                instruction.Sources[1],
+                registers,
+                execMask,
+                scalarConditionCode,
+                out var right))
         {
             var source = instruction.Sources.Count < 2
                 ? "<missing>"
@@ -1351,7 +1608,12 @@ internal static class Gen5ShaderScalarEvaluator
                     Value: < ScalarRegisterCount,
                 } destination32 ||
                 instruction.Sources.Count == 0 ||
-                !TryEvaluateScalarOperand(instruction.Sources[0], registers, out var source32))
+                !TryEvaluateScalarOperand(
+                    instruction.Sources[0],
+                    registers,
+                    execMask,
+                    scalarConditionCode,
+                    out var source32))
             {
                 error = $"scalar-source32 pc=0x{instruction.Pc:X} op={instruction.Opcode}";
                 return false;
@@ -1406,6 +1668,7 @@ internal static class Gen5ShaderScalarEvaluator
                 instruction.Sources[0],
                 registers,
                 execMask,
+                scalarConditionCode,
                 out var source))
         {
             error = $"scalar-source64 pc=0x{instruction.Pc:X} op={instruction.Opcode}";
@@ -1438,6 +1701,7 @@ internal static class Gen5ShaderScalarEvaluator
         Gen5Operand operand,
         uint[] registers,
         ulong execMask,
+        bool scalarConditionCode,
         out ulong value)
     {
         if (operand.Kind == Gen5OperandKind.ScalarRegister &&
@@ -1454,7 +1718,12 @@ internal static class Gen5ShaderScalarEvaluator
             return true;
         }
 
-        if (TryEvaluateScalarOperand(operand, registers, out var low))
+        if (TryEvaluateScalarOperand(
+                operand,
+                registers,
+                execMask,
+                scalarConditionCode,
+                out var low))
         {
             value = operand.Kind == Gen5OperandKind.EncodedConstant &&
                     operand.Value is >= 193 and <= 208
@@ -1466,6 +1735,18 @@ internal static class Gen5ShaderScalarEvaluator
         value = 0;
         return false;
     }
+
+    private static bool TryEvaluateScalarOperand64(
+        Gen5Operand operand,
+        uint[] registers,
+        ulong execMask,
+        out ulong value) =>
+        TryEvaluateScalarOperand64(
+            operand,
+            registers,
+            execMask,
+            scalarConditionCode: false,
+            out value);
 
     private static void WriteScalarPair(
         uint[] registers,
@@ -1642,10 +1923,13 @@ internal static class Gen5ShaderScalarEvaluator
                 scalarBase.Value,
                 strictType: false,
                 out bufferDescriptor);
+        var scalarBaseAddress = scalarRegisters[scalarBase.Value] |
+            ((ulong)scalarRegisters[scalarBase.Value + 1] << 32);
         var baseAddress = hasBufferDescriptor
             ? bufferDescriptor.BaseAddress
-            : scalarRegisters[scalarBase.Value] |
-              ((ulong)scalarRegisters[scalarBase.Value + 1] << 32);
+            : _maskScalarGpuVirtualAddresses
+                ? scalarBaseAddress & GpuVirtualAddressMask
+                : scalarBaseAddress;
         var dynamicOffset = control.DynamicOffsetRegister is { } offsetRegister &&
                             offsetRegister < ScalarRegisterCount
             ? scalarRegisters[offsetRegister]
@@ -1655,15 +1939,24 @@ internal static class Gen5ShaderScalarEvaluator
         var address = unchecked(
             baseAddress +
             byteOffset) & ~3UL;
-        var bufferUnbound =
-            isBufferLoad &&
-            (!hasBufferDescriptor ||
-             bufferDescriptor.SizeBytes == 0 ||
-             (scalarRegisters[scalarBase.Value] == 0 &&
-              scalarRegisters[scalarBase.Value + 1] == 0 &&
-              scalarBase.Value + 3 < ScalarRegisterCount &&
-              scalarRegisters[scalarBase.Value + 2] == 0 &&
-              scalarRegisters[scalarBase.Value + 3] == 0));
+        var bufferUnbound = ShouldTreatBufferAsUnbound(
+            isBufferLoad,
+            hasBufferDescriptor,
+            bufferDescriptor);
+        if (bufferUnbound && _strictBufferLoad)
+        {
+            error = FormatScalarLoadError(
+                "unbound-buffer-descriptor",
+                instruction,
+                scalarBase.Value,
+                scalarRegisters,
+                control,
+                baseAddress,
+                dynamicOffset,
+                address);
+            return false;
+        }
+
         var scalarPointerUnbound = ShouldTreatScalarPointerAsUnbound(
             isBufferLoad,
             address,
@@ -1680,7 +1973,7 @@ internal static class Gen5ShaderScalarEvaluator
                 dynamicOffset);
         }
         var bufferSize = ulong.MaxValue;
-        if (recordBinding && isBufferLoad)
+        if (recordBinding && isBufferLoad && !bufferUnbound)
         {
             bufferSize = hasBufferDescriptor ? bufferDescriptor.SizeBytes : ulong.MaxValue;
 
@@ -1836,6 +2129,15 @@ internal static class Gen5ShaderScalarEvaluator
         bool strictScalarLoad) =>
         !isBufferLoad && address == 0 && !strictScalarLoad;
 
+    private static bool ShouldTreatBufferAsUnbound(
+        bool isBufferLoad,
+        bool hasBufferDescriptor,
+        BufferDescriptor descriptor) =>
+        isBufferLoad &&
+        (!hasBufferDescriptor ||
+         descriptor.BaseAddress == 0 ||
+         descriptor.SizeBytes == 0);
+
     private static void TraceScalarPointerFallback(
         Gen5ShaderState state,
         Gen5ShaderInstruction instruction,
@@ -1909,6 +2211,30 @@ internal static class Gen5ShaderScalarEvaluator
                 address: 0x1000,
                 strictScalarLoad: false),
             "A valid scalar pointer must not be treated as an unbound resource.");
+        Debug.Assert(
+            ShouldTreatBufferAsUnbound(
+                isBufferLoad: true,
+                hasBufferDescriptor: true,
+                new BufferDescriptor(
+                    BaseAddress: 0,
+                    Stride: 112,
+                    NumRecords: 0x006B0000,
+                    SizeBytes: 112UL * 0x006B0000,
+                    NumberFormat: 0,
+                    DataFormat: 0)),
+            "Stale descriptor metadata must not make a zero GPU address look bound.");
+        Debug.Assert(
+            !ShouldTreatBufferAsUnbound(
+                isBufferLoad: true,
+                hasBufferDescriptor: true,
+                new BufferDescriptor(
+                    BaseAddress: 0x1000,
+                    Stride: 4,
+                    NumRecords: 1,
+                    SizeBytes: 4,
+                    NumberFormat: 0,
+                    DataFormat: 0)),
+            "A non-empty buffer at a valid GPU address must remain bound.");
     }
 
     private static bool TryDecodeBufferDescriptor(
@@ -2022,6 +2348,34 @@ internal static class Gen5ShaderScalarEvaluator
 
         value = 0;
         return false;
+    }
+
+    private static bool TryEvaluateScalarOperand(
+        Gen5Operand operand,
+        uint[] scalarRegisters,
+        ulong execMask,
+        bool scalarConditionCode,
+        out uint value)
+    {
+        if (operand.Kind == Gen5OperandKind.EncodedConstant)
+        {
+            // RDNA2 scalar source encodings are live condition inputs, not
+            // inline constants: 252 is EXECZ and 253 is SCC. Treating SCC as
+            // an unsupported constant drops otherwise valid shader paths.
+            if (operand.Value == 252)
+            {
+                value = execMask == 0 ? 1u : 0u;
+                return true;
+            }
+
+            if (operand.Value == 253)
+            {
+                value = scalarConditionCode ? 1u : 0u;
+                return true;
+            }
+        }
+
+        return TryEvaluateScalarOperand(operand, scalarRegisters, out value);
     }
 
     private static bool TryDecodeInlineConstant(uint encoded, out uint value)

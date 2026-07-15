@@ -63,6 +63,14 @@ public static class ShareExports
         return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
     }
 
+    [SysAbiExport(
+        Nid = "YBiIdcDPrxs",
+        ExportName = "sceShareFeaturePermit",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceShareUtility")]
+    public static int ShareFeaturePermit(CpuContext ctx) =>
+        SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
+
     private static int SetReturn(CpuContext ctx, OrbisGen2Result result)
     {
         ctx[CpuRegister.Rax] = unchecked((ulong)(int)result);

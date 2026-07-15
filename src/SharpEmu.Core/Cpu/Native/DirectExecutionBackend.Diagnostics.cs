@@ -107,6 +107,111 @@ public sealed partial class DirectExecutionBackend
 		}
 	}
 
+	private void RecordRootImportTransition(
+		long dispatchIndex,
+		string nid,
+		ulong returnRip,
+		ulong arg0,
+		ulong arg1,
+		ulong arg2)
+	{
+		// The root thread spends most of its lifetime inside Unreal's scheduler.
+		// Retaining every mutex/time call site evicts the service calls that led
+		// into that scheduler, which are the useful part of this diagnostic.
+		if (IsRootImportSchedulerPrimitive(nid))
+		{
+			return;
+		}
+
+		var entry = new RecentImportTraceEntry(
+			dispatchIndex,
+			nid,
+			returnRip,
+			arg0,
+			arg1,
+			arg2);
+		var key = (nid, returnRip);
+		if (_recentRootImportTransitionSlots.TryGetValue(key, out var existingSlot))
+		{
+			_recentRootImportTransitions[existingSlot] = entry;
+			return;
+		}
+
+		if (_recentRootImportTransitionCount == _recentRootImportTransitions.Length)
+		{
+			var replaced = _recentRootImportTransitions[_recentRootImportTransitionWriteIndex];
+			_recentRootImportTransitionSlots.Remove((replaced.Nid, replaced.ReturnRip));
+		}
+		_recentRootImportTransitions[_recentRootImportTransitionWriteIndex] = entry;
+		_recentRootImportTransitionSlots[key] = _recentRootImportTransitionWriteIndex;
+		_recentRootImportTransitionWriteIndex =
+			(_recentRootImportTransitionWriteIndex + 1) % _recentRootImportTransitions.Length;
+		if (_recentRootImportTransitionCount < _recentRootImportTransitions.Length)
+		{
+			_recentRootImportTransitionCount++;
+		}
+	}
+
+	private static bool IsRootImportSchedulerPrimitive(string nid) => nid switch
+	{
+		"aI+OeCz8xrQ" or // scePthreadSelf
+		"EotR8a3ASf4" or // pthread_self
+		"EI-5-jlq2dE" or // scePthreadGetthreadid
+		"3eqs37G74-s" or // pthread_getthreadid_np
+		"9UK1vLZQft4" or // scePthreadMutexLock
+		"7H0iTOciTLo" or // pthread_mutex_lock
+		"tn3VlD0hG60" or // scePthreadMutexUnlock
+		"2Z+PpY6CaJg" or // pthread_mutex_unlock
+		"WKAXJ4XBPQ4" or // scePthreadCondWait
+		"BmMjYxmew1w" or // scePthreadCondTimedwait
+		"Op8TBGY5KHg" or // pthread_cond_wait
+		"27bAgiJmOh0" or // pthread_cond_timedwait
+		"kDh-NfxgMtE" or // scePthreadCondSignal
+		"JGgj7Uvrl+A" or // scePthreadCondBroadcast
+		"2MOy+rUfuhQ" or // pthread_cond_signal
+		"mkx2fVhNMsg" or // pthread_cond_broadcast
+		"Ox9i0c7L5w0" or // scePthreadRwlockRdlock
+		"iGjsr1WAtI0" or // pthread_rwlock_rdlock
+		"mqdNorrB+gI" or // scePthreadRwlockWrlock
+		"sIlRvQqsN2Y" or // pthread_rwlock_wrlock
+		"+L98PIbGttk" or // scePthreadRwlockUnlock
+		"EgmLo6EWgso" or // pthread_rwlock_unlock
+		"n88vx3C5nW8" or // gettimeofday
+		"lLMT9vJAck0" or // clock_gettime
+		"1jfXLRVzisc" or // sceKernelUsleep
+		"QcteRwbsnV0" => true, // usleep
+		_ => false,
+	};
+
+	private void DumpRootImportTransitions()
+	{
+		if (_recentRootImportTransitionCount == 0)
+		{
+			return;
+		}
+
+		Console.Error.WriteLine(
+			$"[LOADER][DIAG] Root import transitions ({_recentRootImportTransitionCount}):");
+		var entries = new List<RecentImportTraceEntry>(_recentRootImportTransitionCount);
+		for (var index = 0; index < _recentRootImportTransitions.Length; index++)
+		{
+			var entry = _recentRootImportTransitions[index];
+			if (string.IsNullOrEmpty(entry.Nid))
+			{
+				continue;
+			}
+			entries.Add(entry);
+		}
+
+		entries.Sort(static (left, right) => left.DispatchIndex.CompareTo(right.DispatchIndex));
+		foreach (var entry in entries)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][DIAG]   #{entry.DispatchIndex} nid={entry.Nid} ret=0x{entry.ReturnRip:X16} " +
+				$"rdi=0x{entry.Arg0:X16} rsi=0x{entry.Arg1:X16} rdx=0x{entry.Arg2:X16}");
+		}
+	}
+
 	private unsafe static List<ulong> ScanSuspiciousResolverPointers(ulong scanStart, ulong scanEnd)
 	{
 		if (scanEnd <= scanStart)

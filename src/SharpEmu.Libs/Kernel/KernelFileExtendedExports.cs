@@ -91,6 +91,11 @@ public static partial class KernelMemoryCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
+        LogIoTrace(
+            "pread",
+            stream.Name,
+            $"fd={fd} req={requested} read={read} offset={offset} preview='{PreviewIoBytes(buffer, read, 64)}' hex={PreviewIoHex(buffer, read, 32)} guest_tail={PreviewGuestHex(ctx, bufferAddress + (ulong)Math.Max(read, 0), 32)}");
+
         ctx[CpuRegister.Rax] = unchecked((ulong)read);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
@@ -627,6 +632,32 @@ public static partial class KernelMemoryCompatExports
             {
                 _ = ctx.Memory.TryWrite(statesAddress + (ulong)(i * sizeof(uint)), state);
             }
+        }
+
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(Nid = "2pOuoWoCxdk", ExportName = "sceKernelAioPollRequest",
+        Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libKernel")]
+    public static int KernelAioPollRequest(CpuContext ctx) => KernelAioCompleteSingle(ctx);
+
+    [SysAbiExport(Nid = "KOF-oJbQVvc", ExportName = "sceKernelAioWaitRequest",
+        Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libKernel")]
+    public static int KernelAioWaitRequest(CpuContext ctx) => KernelAioCompleteSingle(ctx);
+
+    private static int KernelAioCompleteSingle(CpuContext ctx)
+    {
+        // Single-request form: rdi = submit id, rsi = int* state out. The I/O
+        // already completed synchronously at submission, so the request always
+        // reports completed; leaving the state unwritten makes guests poll it
+        // forever (Silent Hill's savedata flow waits on this exact call).
+        var stateAddress = ctx[CpuRegister.Rsi];
+        if (stateAddress != 0)
+        {
+            Span<byte> state = stackalloc byte[sizeof(uint)];
+            BinaryPrimitives.WriteUInt32LittleEndian(state, AioStateCompleted);
+            _ = ctx.Memory.TryWrite(stateAddress, state);
         }
 
         ctx[CpuRegister.Rax] = 0;

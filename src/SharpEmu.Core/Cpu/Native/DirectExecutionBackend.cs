@@ -141,6 +141,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private const ulong GuestThreadRegionStride = 0x0100_0000UL;
 
+	private const int GuestThreadRegionSlotCount = 256;
+
 	private const uint PAGE_EXECUTE_READWRITE = 64u;
 
 	private const uint PAGE_READWRITE = 4u;
@@ -264,6 +266,14 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private int _recentImportTraceWriteIndex;
 
+	private readonly RecentImportTraceEntry[] _recentRootImportTransitions = new RecentImportTraceEntry[128];
+
+	private readonly Dictionary<(string Nid, ulong ReturnRip), int> _recentRootImportTransitionSlots = new();
+
+	private int _recentRootImportTransitionCount;
+
+	private int _recentRootImportTransitionWriteIndex;
+
 	private readonly string[] _distinctImportNidHistory = new string[128];
 
 	private int _distinctImportNidHistoryCount;
@@ -294,11 +304,15 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private bool _logImportRecent;
 
+	private bool _logRootImportTransitions;
+
 	private bool _logStackCheck;
 
 	private string? _probeImportReturn;
 
 	private string? _importFilter;
+
+	private string? _guestThreadImportFilter;
 
 	private ulong _guestPointerSearchTarget;
 
@@ -971,6 +985,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		InitializeRuntimeSymbolIndex(runtimeSymbols);
 		_recentImportTraceCount = 0;
 		_recentImportTraceWriteIndex = 0;
+		_recentRootImportTransitionCount = 0;
+		_recentRootImportTransitionWriteIndex = 0;
+		_recentRootImportTransitionSlots.Clear();
 		_distinctImportNidHistoryCount = 0;
 		_distinctImportNidHistoryWriteIndex = 0;
 		_lastDistinctImportNid = string.Empty;
@@ -986,9 +1003,11 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		_logAllImports = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_ALL_IMPORTS"), "1", StringComparison.Ordinal);
 		_logImportFrames = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_IMPORT_FRAMES"), "1", StringComparison.Ordinal);
 		_logImportRecent = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_IMPORT_RECENT"), "1", StringComparison.Ordinal);
+		_logRootImportTransitions = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_ROOT_IMPORT_TRANSITIONS"), "1", StringComparison.Ordinal);
 		_logStackCheck = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_STACK_CHK"), "1", StringComparison.Ordinal);
 		_probeImportReturn = Environment.GetEnvironmentVariable("SHARPEMU_PROBE_IMPORT_RET");
 		_importFilter = Environment.GetEnvironmentVariable("SHARPEMU_LOG_IMPORT_FILTER");
+		_guestThreadImportFilter = Environment.GetEnvironmentVariable("SHARPEMU_LOG_GUEST_THREAD_IMPORT_FILTER");
 		_guestPointerSearchTarget = ParseOptionalHexAddress(
 			Environment.GetEnvironmentVariable("SHARPEMU_FIND_GUEST_POINTER"));
 		_guestPointerSearchDone = 0;
@@ -3008,7 +3027,15 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			thread.BlockWakeKey = wakeKey;
 				thread.BlockResumeHandler = resumeHandler;
 				thread.BlockWakeHandler = wakeHandler;
-				thread.BlockDeadlineTimestamp = blockDeadlineTimestamp;
+			thread.BlockDeadlineTimestamp = blockDeadlineTimestamp;
+			if (_logGuestThreads)
+			{
+				Console.Error.WriteLine(
+					$"[LOADER][INFO] Captured blocked continuation for '{thread.Name}' " +
+					$"rip=0x{continuation.Rip:X16} rsp=0x{continuation.Rsp:X16} " +
+					$"r12=0x{continuation.R12:X16} r13=0x{continuation.R13:X16} " +
+					$"r14=0x{continuation.R14:X16} r15=0x{continuation.R15:X16} wake={wakeKey}");
+			}
 
 				// The producer can signal after the HLE call requests a block but
 				// before this continuation is registered. Recheck the predicate while
@@ -3147,6 +3174,32 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		string reason,
 		out string? error)
 	{
+		return TryCallGuestFunction(
+			callerContext,
+			entryPoint,
+			arg0,
+			arg1,
+			0,
+			stackAddress,
+			stackSize,
+			reason,
+			out _,
+			out error);
+	}
+
+	public bool TryCallGuestFunction(
+		CpuContext callerContext,
+		ulong entryPoint,
+		ulong arg0,
+		ulong arg1,
+		ulong arg2,
+		ulong stackAddress,
+		ulong stackSize,
+		string reason,
+		out ulong returnValue,
+		out string? error)
+	{
+		returnValue = 0;
 		error = null;
 		if (entryPoint < 65536)
 		{
@@ -3187,7 +3240,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		context[CpuRegister.Rsp] = AlignDown(callbackStackBase + callbackStackSize, 16) - sizeof(ulong);
 		context[CpuRegister.Rdi] = arg0;
 		context[CpuRegister.Rsi] = arg1;
-		context[CpuRegister.Rdx] = 0;
+		context[CpuRegister.Rdx] = arg2;
 		context[CpuRegister.Rcx] = 0;
 		context[CpuRegister.R8] = 0;
 		context[CpuRegister.R9] = 0;
@@ -3214,6 +3267,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				return false;
 			}
 
+			returnValue = context[CpuRegister.Rax];
 			return true;
 		}
 		finally
@@ -3648,7 +3702,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		out ulong mappedBase,
 		out string? error)
 	{
-		for (int i = 0; i < 64; i++)
+		for (int i = 0; i < GuestThreadRegionSlotCount; i++)
 		{
 			var candidateBase = baseAddress - ((ulong)i * GuestThreadRegionStride);
 			if (!IsGuestThreadRegionFree(virtualMemory, candidateBase, size))
@@ -3682,7 +3736,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		out ulong tlsBase,
 		out string? error)
 	{
-		for (int i = 0; i < 64; i++)
+		for (int i = 0; i < GuestThreadRegionSlotCount; i++)
 		{
 			var candidateBase = GuestThreadTlsBaseAddress - ((ulong)i * GuestThreadRegionStride);
 			var mappedBase = candidateBase - GuestThreadTlsPrefixSize;
@@ -3893,6 +3947,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		ApplyGuestThreadAffinity(thread.AffinityMask);
 		Volatile.Write(ref thread.HostThreadId, unchecked((int)GetCurrentThreadId()));
 		_activeGuestThreadState = thread;
+		var traceGuestThread =
+			_logGuestThreads ||
+			(!string.IsNullOrWhiteSpace(_guestThreadImportFilter) &&
+			 thread.Name.Contains(_guestThreadImportFilter, StringComparison.OrdinalIgnoreCase));
 		try
 		{
 			LastError = null;
@@ -3920,11 +3978,14 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				continuation = continuation with { Rax = unchecked((ulong)(long)resumeHandler()) };
 			}
 
-			if (_logGuestThreads)
+			if (traceGuestThread)
 			{
 				Console.Error.WriteLine(
 					resumeContinuation
-						? $"[LOADER][INFO] Pumping guest thread '{thread.Name}' reason={reason} resume=0x{continuation.Rip:X16}"
+						? $"[LOADER][INFO] Pumping guest thread '{thread.Name}' reason={reason} " +
+							$"resume=0x{continuation.Rip:X16} rsp=0x{continuation.Rsp:X16} " +
+							$"r12=0x{continuation.R12:X16} r13=0x{continuation.R13:X16} " +
+							$"r14=0x{continuation.R14:X16} r15=0x{continuation.R15:X16}"
 						: $"[LOADER][INFO] Pumping guest thread '{thread.Name}' reason={reason} entry=0x{thread.EntryPoint:X16}");
 			}
 			var exitReason = resumeContinuation
@@ -3937,12 +3998,14 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					case GuestNativeCallExitReason.Returned:
 						thread.ExitValue = thread.Context[CpuRegister.Rax];
 						thread.State = GuestThreadRunState.Exited;
-						if (_logGuestThreads)
-						Console.Error.WriteLine(
-							$"[LOADER][INFO] Guest thread exited: name='{thread.Name}' " +
-							$"exitValue=0x{thread.ExitValue:X16} imports={Interlocked.Read(ref thread.ImportCount)} " +
-							$"lastNid={Volatile.Read(ref thread.LastImportNid) ?? "none"} " +
-							$"entry=0x{thread.EntryPoint:X16} ret=0x{Volatile.Read(ref thread.LastReturnRip):X16}");
+						if (traceGuestThread)
+						{
+							Console.Error.WriteLine(
+								$"[LOADER][INFO] Guest thread exited: name='{thread.Name}' " +
+								$"exitValue=0x{thread.ExitValue:X16} imports={Interlocked.Read(ref thread.ImportCount)} " +
+								$"lastNid={Volatile.Read(ref thread.LastImportNid) ?? "none"} " +
+								$"entry=0x{thread.EntryPoint:X16} ret=0x{Volatile.Read(ref thread.LastReturnRip):X16}");
+						}
 						break;
 					case GuestNativeCallExitReason.Blocked:
 						thread.State = GuestThreadRunState.Blocked;
@@ -3965,7 +4028,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 						break;
 				}
 			}
-			if (_logGuestThreads)
+			if (traceGuestThread)
 			{
 				Console.Error.WriteLine(
 					$"[LOADER][INFO] Guest thread '{thread.Name}' state={thread.State} reason={blockReason ?? "none"}");
@@ -4204,7 +4267,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			ActiveGuestThreadYieldReason = null;
 			try
 			{
-				var nativeReturn = CallNativeEntry(ptr);
+				var nativeReturn = RunGuestEntryStub(ptr, hostRspSlot);
 				if (ActiveGuestThreadYieldRequested)
 				{
 					reason = ActiveGuestThreadYieldReason ?? "guest thread blocked";
@@ -4372,7 +4435,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			ActiveGuestThreadYieldReason = null;
 			try
 			{
-				var nativeReturn = CallNativeEntry(ptr);
+				var nativeReturn = RunGuestEntryStub(ptr, hostRspSlot);
 				if (ActiveGuestThreadYieldRequested)
 				{
 					reason = ActiveGuestThreadYieldReason ?? "guest thread blocked";
@@ -4660,10 +4723,11 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			Console.Error.WriteLine("[LOADER][INFO] Calling guest entry...");
 			StartStallWatchdog();
 			StartReadyThreadDispatcher();
+			StartPosixRegisterSampler();
 			int num6 = -1;
 			try
 			{
-				num6 = CallNativeEntry(ptr);
+				num6 = RunGuestEntryStub(ptr, num2);
 				Console.Error.WriteLine($"[LOADER][INFO] Guest returned: {num6}");
 				PumpUntilGuestThreadsIdle(context, "entry_return");
 			}
@@ -4708,6 +4772,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 		finally
 		{
+			StopPosixRegisterSampler();
 			StopReadyThreadDispatcher();
 			StopStallWatchdog();
 			ActiveEntryReturnSentinelRip = 0uL;
@@ -4753,25 +4818,6 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			return;
 		}
 		_stallWatchdogStop = false;
-
-		// Drives woken threads when every guest thread is parked (nothing dispatches then).
-		var dispatcherThread = new Thread(new ThreadStart(delegate
-		{
-			while (!_stallWatchdogStop)
-			{
-				Thread.Sleep(1);
-				WakeExpiredBlockedGuestThreads();
-				if (Volatile.Read(ref _readyGuestThreadCount) > 0 && _cpuContext is { } dispatchContext)
-				{
-					Pump(dispatchContext, "dispatcher");
-				}
-			}
-		}))
-		{
-			IsBackground = true,
-			Name = "SharpEmu-GuestThreadDispatcher"
-		};
-		dispatcherThread.Start();
 
 		long num = (long)((double)stallWatchdogSeconds * Stopwatch.Frequency);
 		int periodicSnapshotSeconds =
@@ -5121,6 +5167,20 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			if (rsp != 0 && cpuContext.TryReadUInt64(rsp, out var value) && cpuContext.TryReadUInt64(rsp + 8, out var value2))
 			{
 				Console.Error.WriteLine($"[LOADER][ERROR] Stall stack: [rsp]=0x{value:X16} [rsp+8]=0x{value2:X16}");
+				if (string.Equals(
+					Environment.GetEnvironmentVariable("SHARPEMU_LOG_STALL_DISASM"),
+					"1",
+					StringComparison.Ordinal))
+				{
+					DumpGuestDisasmDiagnostics(
+						cpuContext.Rip,
+						cpuContext[CpuRegister.Rbp],
+						rsp);
+				}
+			}
+			if (_logRootImportTransitions)
+			{
+				DumpRootImportTransitions();
 			}
 
 			var threads = SnapshotGuestThreads();
@@ -5130,6 +5190,17 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				foreach (var thread in threads)
 				{
 					var hostThreadId = Volatile.Read(ref thread.HostThreadId);
+					var guestContext = thread.Context;
+					var guestContextText =
+						$" guest_rip=0x{guestContext.Rip:X16} guest_rsp=0x{guestContext[CpuRegister.Rsp]:X16} " +
+						$"guest_rbp=0x{guestContext[CpuRegister.Rbp]:X16}";
+					if (thread.HasBlockedContinuation)
+					{
+						guestContextText +=
+							$" resume_rip=0x{thread.BlockedContinuation.Rip:X16} " +
+							$"resume_rsp=0x{thread.BlockedContinuation.Rsp:X16} " +
+							$"resume_rbp=0x{thread.BlockedContinuation.Rbp:X16}";
+					}
 					var hostContextText = string.Empty;
 					if (TryCaptureHostThreadContext(hostThreadId, out var hostContext))
 					{
@@ -5147,7 +5218,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 						$"[LOADER][ERROR] Stall guest-thread: handle=0x{thread.ThreadHandle:X16} name='{thread.Name}' " +
 						$"state={thread.State} imports={Interlocked.Read(ref thread.ImportCount)} " +
 						$"nid={Volatile.Read(ref thread.LastImportNid) ?? "none"} ret=0x{Volatile.Read(ref thread.LastReturnRip):X16} " +
-						$"block={thread.BlockReason ?? "none"}{hostContextText}");
+						$"block={thread.BlockReason ?? "none"}{guestContextText}{hostContextText}");
 					logged++;
 					if (logged >= 96 && threads.Length > logged)
 					{
@@ -5319,6 +5390,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	public unsafe void Dispose()
 	{
+		DisposeNativeGuestExecutors();
 		if (ReferenceEquals(_posixSignalBackend, this))
 		{
 			// The signal handlers stay installed (they chain to the previous

@@ -199,6 +199,17 @@ public static partial class KernelMemoryCompatExports
         }
     }
 
+    /// <summary>
+    /// Allocates a zero-filled, host-backed guest buffer that an HLE library can
+    /// hand back to the guest as a real guest-addressable pointer (for example a
+    /// decoded AvPlayer NV12 video frame or PCM audio chunk), without invoking a
+    /// guest allocator callback. Reuses the same reserve-and-zero machinery as
+    /// <see cref="TryAllocateHleData"/>; the buffer stays reserved for the life of
+    /// the process, so callers should allocate once and reuse across frames.
+    /// </summary>
+    public static bool TryAllocateHleGuestBuffer(CpuContext ctx, ulong length, out ulong address) =>
+        TryAllocateHleData(ctx, length, 0x1000, out address);
+
     internal static bool TryAllocateHleData(
         CpuContext ctx,
         ulong length,
@@ -1574,21 +1585,21 @@ public static partial class KernelMemoryCompatExports
         var count = ctx[CpuRegister.Rsi];
         var idsAddress = ctx[CpuRegister.Rdx];
         var sizesAddress = ctx[CpuRegister.Rcx];
+        var errorIndexAddress = ctx[CpuRegister.R8];
         if (pathListAddress == 0 || count == 0 || sizesAddress == 0 || count > 1024)
         {
             KernelRuntimeCompatExports.TrySetErrno(ctx, Einval);
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
+        var entryCount = (int)count;
+        Span<uint> localIds = count <= 256 ? stackalloc uint[entryCount] : new uint[entryCount];
+        Span<ulong> localSizes = count <= 128 ? stackalloc ulong[entryCount] : new ulong[entryCount];
+        var resolvedGuestPaths = new string[entryCount];
+        var resolvedHostPaths = new string[entryCount];
+
         for (ulong i = 0; i < count; i++)
         {
-            if (idsAddress != 0 &&
-                !TryWriteUInt32Compat(ctx, idsAddress + (i * sizeof(uint)), uint.MaxValue))
-            {
-                KernelRuntimeCompatExports.TrySetErrno(ctx, Efault);
-                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
-            }
-
             if (!TryResolveAprFilepath(ctx, pathListAddress, i, out var guestPath))
             {
                 KernelRuntimeCompatExports.TrySetErrno(ctx, Efault);
@@ -1598,38 +1609,46 @@ public static partial class KernelMemoryCompatExports
             var hostPath = ResolveGuestPath(guestPath);
             if (!TryGetAprFileSize(hostPath, out var fileSize))
             {
-                // Per-file resolve: a missing entry gets an invalid id
-                // (0xFFFFFFFF, already written above) and size 0, and the batch
-                // CONTINUES. Aborting the whole batch on the first miss left the
-                // remaining paths unresolved and could stall the guest's asset
-                // streaming when a batch happens to include an absent (e.g.
-                // patch/DLC) file; the caller checks per-file id/size.
                 LogIoTrace("apr_resolve", guestPath, $"host='{hostPath}' index={i} count={count} result=not_found");
-                if (sizesAddress != 0 &&
-                    !TryWriteUInt64Compat(ctx, sizesAddress + (i * sizeof(ulong)), 0))
+                if (errorIndexAddress != 0 &&
+                    !TryWriteUInt32Compat(ctx, errorIndexAddress, (uint)i))
                 {
                     KernelRuntimeCompatExports.TrySetErrno(ctx, Efault);
                     return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
                 }
 
-                continue;
+                KernelRuntimeCompatExports.TrySetErrno(ctx, 2);
+                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
             }
 
-            var fileId = AmprFileRegistry.Register(guestPath, hostPath);
-            LogIoTrace("apr_resolve", guestPath, $"host='{hostPath}' index={i} count={count} id=0x{fileId:X8} size={fileSize}");
+            var index = (int)i;
+            localSizes[index] = fileSize;
+            resolvedGuestPaths[index] = guestPath;
+            resolvedHostPaths[index] = hostPath;
+        }
 
-            if (idsAddress != 0 &&
-                !TryWriteUInt32Compat(ctx, idsAddress + (i * sizeof(uint)), fileId))
+        for (var i = 0; i < entryCount; i++)
+        {
+            localIds[i] = AmprFileRegistry.Register(resolvedGuestPaths[i], resolvedHostPaths[i]);
+            LogIoTrace(
+                "apr_resolve",
+                resolvedGuestPaths[i],
+                $"host='{resolvedHostPaths[i]}' index={i} count={count} id=0x{localIds[i]:X8} size={localSizes[i]}");
+        }
+
+        if (idsAddress != 0)
+        {
+            if (!TryWriteCompat(ctx, idsAddress, MemoryMarshal.AsBytes(localIds)))
             {
                 KernelRuntimeCompatExports.TrySetErrno(ctx, Efault);
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
             }
+        }
 
-            if (!TryWriteUInt64Compat(ctx, sizesAddress + (i * sizeof(ulong)), fileSize))
-            {
-                KernelRuntimeCompatExports.TrySetErrno(ctx, Efault);
-                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
-            }
+        if (!TryWriteCompat(ctx, sizesAddress, MemoryMarshal.AsBytes(localSizes)))
+        {
+            KernelRuntimeCompatExports.TrySetErrno(ctx, Efault);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
         ctx[CpuRegister.Rax] = 0;
@@ -3228,7 +3247,7 @@ public static partial class KernelMemoryCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
-        if (!TryProtectHostRange(alignedAddress, alignedLength, protection))
+        if (!TryProtectHostRange(ctx, alignedAddress, alignedLength, protection))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
         }
@@ -3262,7 +3281,7 @@ public static partial class KernelMemoryCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
-        if (!TryProtectHostRange(alignedAddress, alignedLength, protection))
+        if (!TryProtectHostRange(ctx, alignedAddress, alignedLength, protection))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
         }
@@ -5519,7 +5538,11 @@ public static partial class KernelMemoryCompatExports
         return alignedLength != 0;
     }
 
-    private static bool TryProtectHostRange(ulong address, ulong length, int orbisProtection)
+    private static bool TryProtectHostRange(
+        CpuContext ctx,
+        ulong address,
+        ulong length,
+        int orbisProtection)
     {
         if (length == 0 || length > nuint.MaxValue)
         {
@@ -5530,6 +5553,16 @@ public static partial class KernelMemoryCompatExports
         if (!VirtualProtect((nint)address, (nuint)length, hostProtection, out _))
         {
             return false;
+        }
+
+        if (ctx.Memory is IGuestMemoryProtectionTracker protectionTracker)
+        {
+            protectionTracker.UpdateHostProtection(
+                address,
+                length,
+                readable: (orbisProtection & (OrbisProtCpuRead | OrbisProtGpuRead)) != 0,
+                writable: (orbisProtection & (OrbisProtCpuWrite | OrbisProtGpuWrite)) != 0,
+                executable: (orbisProtection & OrbisProtCpuExec) != 0);
         }
 
         return true;

@@ -240,9 +240,19 @@ internal static partial class Program
                 // waiter. Recheck the condition after a short bounded delay so
                 // that lost startup notification cannot park Unreal forever.
                 SetEnvironmentDefault("SHARPEMU_PTHREAD_COND_RECHECK_MS", "10");
+                SetEnvironmentDefault(
+                    "SHARPEMU_PTHREAD_COND_RECHECK_FILTER",
+                    "0x0000007040E0B818,0x0000007040E0B4B8,0x0000007040E0B488," +
+                    "0x0000007040E0B458");
+                SetEnvironmentDefault("SHARPEMU_MUTEX_LOCK_BLOCKING", "1");
                 SetEnvironmentDefault("SHARPEMU_AGC_SUBMIT_COMPLETION_EVENT", "1");
+                SetEnvironmentDefault("SHARPEMU_AGC_SUBMIT_COMPLETION_EVENT_DELAY_MS", "1");
+                // Unreal builds its cooked-config manifest on first boot. Keep
+                // the installed app immutable while allowing those generated
+                // files to persist in SharpEmu's temp0-backed app0 overlay.
+                SetEnvironmentDefault("SHARPEMU_WRITABLE_APP0_COMPAT", "1");
                 Console.Error.WriteLine(
-                    "[LOADER][INFO] SILENT HILL compatibility: enabling startup condition recheck.");
+                    "[LOADER][INFO] SILENT HILL compatibility: enabling startup synchronization and writable app0 overlay.");
             }
         }
         catch (IOException exception)

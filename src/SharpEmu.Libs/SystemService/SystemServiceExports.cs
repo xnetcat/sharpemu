@@ -126,6 +126,20 @@ public static class SystemServiceExports
         return SetReturn(ctx, 0);
     }
 
+    [SysAbiExport(
+        Nid = "mPpPxv5CZt4",
+        ExportName = "sceSystemServiceGetHdrToneMapLuminance",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceSystemService")]
+    public static int SystemServiceGetHdrToneMapLuminance(CpuContext ctx) => SetReturn(ctx, 0);
+
+    [SysAbiExport(
+        Nid = "3RQ5aQfnstU",
+        ExportName = "sceSystemServiceGetNoticeScreenSkipFlag",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceSystemService")]
+    public static int SystemServiceGetNoticeScreenSkipFlag(CpuContext ctx) => SetReturn(ctx, 0);
+
     private static int SetReturn(CpuContext ctx, int result)
     {
         ctx[CpuRegister.Rax] = unchecked((ulong)result);

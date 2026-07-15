@@ -11,9 +11,13 @@ namespace SharpEmu.Libs.Audio;
 
 public static class AudioOut2Exports
 {
-    private const int AudioOut2ContextParamSize = 0x80;
+    // Report the guest-observed structure size, but only write the four fields
+    // whose layout is known. Callers use smaller stack-side wrappers around the
+    // parameter prefix; clearing the entire guessed structure clobbers their
+    // stack canaries (Silent Hill places one inside the old 0x30-byte write).
+    private const int AudioOut2ContextParamSize = 0x30;
+    private const int AudioOut2ContextParamPrefixSize = 0x10;
     private const int AudioOut2ContextMemorySize = 0x10000;
-    private const int AudioOut2ContextMemoryAlignment = 0x10000;
     private static long _nextContextHandle = 1;
     private static long _nextUserHandle = 1;
     private static int _nextPortId;
@@ -76,6 +80,20 @@ public static class AudioOut2Exports
     }
 
     [SysAbiExport(
+        Nid = "XHl38ZNknbs",
+        ExportName = "sceAudioOut2MasteringInit",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAudioOut2")]
+    public static int AudioOut2MasteringInit(CpuContext ctx) => SetReturn(ctx, 0);
+
+    [SysAbiExport(
+        Nid = "v8iOE+j8a5o",
+        ExportName = "sceAudioOut2MasteringSetParam",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAudioOut2")]
+    public static int AudioOut2MasteringSetParam(CpuContext ctx) => SetReturn(ctx, 0);
+
+    [SysAbiExport(
         Nid = "t5YrizufpQc",
         ExportName = "sceAudioOut2ContextResetParam",
         Target = Generation.Gen5,
@@ -88,7 +106,7 @@ public static class AudioOut2Exports
             return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        Span<byte> param = stackalloc byte[AudioOut2ContextParamSize];
+        Span<byte> param = stackalloc byte[AudioOut2ContextParamPrefixSize];
         param.Clear();
         BinaryPrimitives.WriteUInt32LittleEndian(param[0x00..], AudioOut2ContextParamSize);
         BinaryPrimitives.WriteUInt32LittleEndian(param[0x04..], 2);
@@ -108,20 +126,13 @@ public static class AudioOut2Exports
     public static int AudioOut2ContextQueryMemory(CpuContext ctx)
     {
         var paramAddress = ctx[CpuRegister.Rdi];
-        var memoryInfoAddress = ctx[CpuRegister.Rsi];
-        if (paramAddress == 0 || memoryInfoAddress == 0)
+        var outMemorySizeAddress = ctx[CpuRegister.Rsi];
+        if (paramAddress == 0 || outMemorySizeAddress == 0)
         {
             return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        Span<byte> memoryInfo = stackalloc byte[0x20];
-        memoryInfo.Clear();
-        BinaryPrimitives.WriteUInt64LittleEndian(memoryInfo[0x00..], AudioOut2ContextMemorySize);
-        BinaryPrimitives.WriteUInt64LittleEndian(memoryInfo[0x08..], AudioOut2ContextMemoryAlignment);
-        BinaryPrimitives.WriteUInt64LittleEndian(memoryInfo[0x10..], AudioOut2ContextMemorySize);
-        BinaryPrimitives.WriteUInt64LittleEndian(memoryInfo[0x18..], AudioOut2ContextMemoryAlignment);
-
-        return ctx.Memory.TryWrite(memoryInfoAddress, memoryInfo)
+        return TryWriteUInt64(ctx, outMemorySizeAddress, AudioOut2ContextMemorySize)
             ? SetReturn(ctx, 0)
             : SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
     }
@@ -214,11 +225,15 @@ public static class AudioOut2Exports
         LibraryName = "libSceAudioOut2")]
     public static int AudioOut2ContextGetQueueLevel(CpuContext ctx)
     {
-        // The advance path paces synchronously, so the queue is always drained.
-        var levelAddress = ctx[CpuRegister.Rsi];
-        if (levelAddress != 0)
+        // The guest ABI exposes two adjacent 32-bit output levels. Silent Hill
+        // passes them four bytes apart; the old single 64-bit write corrupted
+        // the following stack local.
+        var queuedAddress = ctx[CpuRegister.Rsi];
+        var availableAddress = ctx[CpuRegister.Rdx];
+        if ((queuedAddress != 0 && !TryWriteUInt32(ctx, queuedAddress, 0)) ||
+            (availableAddress != 0 && !TryWriteUInt32(ctx, availableAddress, 0)))
         {
-            _ = TryWriteUInt64(ctx, levelAddress, 0);
+            return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
 
         return SetReturn(ctx, 0);
@@ -231,21 +246,30 @@ public static class AudioOut2Exports
         LibraryName = "libSceAudioOut2")]
     public static int AudioOut2PortCreate(CpuContext ctx)
     {
-        var type = unchecked((int)ctx[CpuRegister.Rdi]);
+        // Observed PS5 ABI: (context, portParam, outPort, flags). The previous
+        // stub treated RDI as a port type and RCX as a required context pointer,
+        // so it rejected Silent Hill's valid flags=0 calls indefinitely.
+        var contextHandle = ctx[CpuRegister.Rdi];
         var paramAddress = ctx[CpuRegister.Rsi];
         var outPortAddress = ctx[CpuRegister.Rdx];
-        var contextAddress = ctx[CpuRegister.Rcx];
-        if (type < 0 || type > 255 || paramAddress == 0 || outPortAddress == 0 || contextAddress == 0)
+        if (!Contexts.ContainsKey(contextHandle) || paramAddress == 0 || outPortAddress == 0)
         {
             return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
         var portId = unchecked((uint)Interlocked.Increment(ref _nextPortId)) & 0xFF;
-        var handle = 0x2000_0000UL | ((ulong)(uint)type << 16) | portId;
+        var handle = 0x2000_0000UL | ((contextHandle & 0xFF) << 16) | portId;
         return TryWriteUInt64(ctx, outPortAddress, handle)
             ? SetReturn(ctx, 0)
             : SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
     }
+
+    [SysAbiExport(
+        Nid = "8XTArSPyWHk",
+        ExportName = "sceAudioOut2PortSetAttributes",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAudioOut2")]
+    public static int AudioOut2PortSetAttributes(CpuContext ctx) => SetReturn(ctx, 0);
 
     [SysAbiExport(
         Nid = "gatEUKG+Ea4",
@@ -337,6 +361,13 @@ public static class AudioOut2Exports
     {
         Span<byte> buffer = stackalloc byte[sizeof(ulong)];
         BinaryPrimitives.WriteUInt64LittleEndian(buffer, value);
+        return ctx.Memory.TryWrite(address, buffer);
+    }
+
+    private static bool TryWriteUInt32(CpuContext ctx, ulong address, uint value)
+    {
+        Span<byte> buffer = stackalloc byte[sizeof(uint)];
+        BinaryPrimitives.WriteUInt32LittleEndian(buffer, value);
         return ctx.Memory.TryWrite(address, buffer);
     }
 

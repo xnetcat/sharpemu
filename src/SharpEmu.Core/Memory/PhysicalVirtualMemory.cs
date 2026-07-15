@@ -7,7 +7,11 @@ using SharpEmu.HLE;
 
 namespace SharpEmu.Core.Memory;
 
-public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryAllocator, IDisposable
+public sealed unsafe class PhysicalVirtualMemory :
+    IVirtualMemory,
+    IGuestMemoryAllocator,
+    IGuestMemoryProtectionTracker,
+    IDisposable
 {
     private readonly ReaderWriterLockSlim _gate = new(LockRecursionPolicy.SupportsRecursion);
     private readonly object _guestAllocationGate = new();
@@ -24,6 +28,8 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
     private const ulong FullCommitRegionLimit = 4UL << 30;
     private const ulong DefaultLazyReservePrimeBytes = 0x0400_0000UL; // 64 MiB
     private const ulong LazyReservePrimeChunkBytes = 0x0200_0000UL; // 32 MiB
+    private const ulong Ps5UserVaStart = 0x0000_0010_0000_0000UL;
+    private const ulong Ps5SecondaryBootstrapOffset = 0x0000_0010_0000_0000UL;
 
     private const uint MEM_COMMIT = 0x1000;
     private const uint MEM_RESERVE = 0x2000;
@@ -242,6 +248,35 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
             {
                 lazyPrimeState = "skip:0";
             }
+
+            // PS5 titles can place their earliest boot allocator in the next
+            // 64-GiB VA band even though the process owns one large arena that
+            // begins at 0x1000000000. On Windows, letting the first AVX store
+            // fault into the managed VEH path can terminate the process after
+            // VirtualAlloc reports a successful lazy commit. Prime the same
+            // small window at 0x2000000000 so startup reaches the kernel mapping
+            // calls that manage subsequent ranges normally.
+            if (OperatingSystem.IsWindows() &&
+                actualAddress == Ps5UserVaStart &&
+                alignedSize > Ps5SecondaryBootstrapOffset)
+            {
+                var secondaryBase = actualAddress + Ps5SecondaryBootstrapOffset;
+                var secondaryAvailable = alignedSize - Ps5SecondaryBootstrapOffset;
+                var secondaryPrimeBytes = Math.Min(secondaryAvailable, LazyReservePrimeBytes);
+                var secondaryCommittedBytes = CommitLazyPrime(secondaryBase, secondaryPrimeBytes);
+                if (secondaryCommittedBytes != 0)
+                {
+                    TraceVmem(
+                        $"Primed PS5 secondary lazy region: 0x{secondaryBase:X16} - " +
+                        $"0x{secondaryBase + secondaryCommittedBytes:X16} ({secondaryCommittedBytes} bytes)");
+                }
+                else
+                {
+                    TraceVmem(
+                        $"Failed to prime PS5 secondary lazy region at 0x{secondaryBase:X16} " +
+                        $"({secondaryPrimeBytes} bytes), continuing with on-demand commit");
+                }
+            }
         }
 
         _gate.EnterWriteLock();
@@ -267,6 +302,29 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         TraceVmem($"Allocated {allocationKind}: 0x{actualAddress:X16} - 0x{actualAddress + alignedSize:X16} ({alignedSize} bytes) lazy_prime={lazyPrimeState}");
 
         return actualAddress;
+    }
+
+    private static ulong CommitLazyPrime(ulong baseAddress, ulong size)
+    {
+        ulong committedBytes = 0;
+        while (committedBytes < size)
+        {
+            var remaining = size - committedBytes;
+            var chunkBytes = Math.Min(remaining, LazyReservePrimeChunkBytes);
+            var committed = VirtualAlloc(
+                (void*)(baseAddress + committedBytes),
+                (nuint)chunkBytes,
+                MEM_COMMIT,
+                PAGE_READWRITE);
+            if (committed == null)
+            {
+                break;
+            }
+
+            committedBytes += chunkBytes;
+        }
+
+        return committedBytes;
     }
 
     public bool TryAllocateAtOrAbove(
@@ -667,9 +725,20 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                 }
                 else
                 {
-                    fixed (byte* srcPtr = source)
+                    if (!GuestImageWriteTracker.TryBeginManagedWrite(
+                            virtualAddress,
+                            (ulong)source.Length,
+                            out var writeScope))
                     {
-                        Buffer.MemoryCopy(srcPtr, destPtr, (nuint)source.Length, (nuint)source.Length);
+                        return false;
+                    }
+
+                    using (writeScope)
+                    {
+                        fixed (byte* srcPtr = source)
+                        {
+                            Buffer.MemoryCopy(srcPtr, destPtr, (nuint)source.Length, (nuint)source.Length);
+                        }
                     }
 
                     return true;
@@ -764,9 +833,20 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
 
             if (CanWriteWithoutProtectionChange((ulong)destPtr, (ulong)source.Length, region))
             {
-                fixed (byte* srcPtr = source)
+                if (!GuestImageWriteTracker.TryBeginManagedWrite(
+                        virtualAddress,
+                        (ulong)source.Length,
+                        out var writeScope))
                 {
-                    Buffer.MemoryCopy(srcPtr, destPtr, (nuint)source.Length, (nuint)source.Length);
+                    return false;
+                }
+
+                using (writeScope)
+                {
+                    fixed (byte* srcPtr = source)
+                    {
+                        Buffer.MemoryCopy(srcPtr, destPtr, (nuint)source.Length, (nuint)source.Length);
+                    }
                 }
 
                 return true;
@@ -779,9 +859,20 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
 
             try
             {
-                fixed (byte* srcPtr = source)
+                if (!GuestImageWriteTracker.TryBeginManagedWrite(
+                        virtualAddress,
+                        (ulong)source.Length,
+                        out var writeScope))
                 {
-                    Buffer.MemoryCopy(srcPtr, destPtr, (nuint)source.Length, (nuint)source.Length);
+                    return false;
+                }
+
+                using (writeScope)
+                {
+                    fixed (byte* srcPtr = source)
+                    {
+                        Buffer.MemoryCopy(srcPtr, destPtr, (nuint)source.Length, (nuint)source.Length);
+                    }
                 }
             }
             finally
@@ -804,6 +895,50 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         Span<byte> buffer = stackalloc byte[sizeof(ulong)];
         BitConverter.TryWriteBytes(buffer, value);
         return TryWrite(virtualAddress, buffer);
+    }
+
+    public void UpdateHostProtection(
+        ulong address,
+        ulong length,
+        bool readable,
+        bool writable,
+        bool executable)
+    {
+        if (length == 0 || ulong.MaxValue - address < length)
+        {
+            return;
+        }
+
+        var flags = ProgramHeaderFlags.None;
+        if (readable)
+        {
+            flags |= ProgramHeaderFlags.Read;
+        }
+        if (writable)
+        {
+            flags |= ProgramHeaderFlags.Write;
+        }
+        if (executable)
+        {
+            flags |= ProgramHeaderFlags.Execute;
+        }
+
+        var startPage = AlignDown(address, PageSize);
+        var endPage = AlignUp(address + length, PageSize);
+        _gate.EnterWriteLock();
+        try
+        {
+            for (var pageAddress = startPage;
+                 pageAddress < endPage;
+                 pageAddress += PageSize)
+            {
+                _pageProtections[pageAddress] = flags;
+            }
+        }
+        finally
+        {
+            _gate.ExitWriteLock();
+        }
     }
 
     public void* GetPointer(ulong virtualAddress)
