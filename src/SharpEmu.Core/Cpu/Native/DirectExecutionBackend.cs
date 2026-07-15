@@ -305,6 +305,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	private bool _logImportRecent;
 
 	private bool _logRootImportTransitions;
+	private static readonly bool _dumpImportTraceRing = string.Equals(
+		Environment.GetEnvironmentVariable("SHARPEMU_IMPORT_TRACE_RING"), "1", StringComparison.Ordinal);
 
 	private bool _logStackCheck;
 
@@ -437,6 +439,29 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		public ulong LastImportStack5;
 		public ulong LastImportRax;
 		public int LastImportResultValid;
+
+		// Per-thread ring buffer of the most recent HLE-call return sites. This
+		// is the "instruction tracer" for the render-fence stall investigation:
+		// the render thread runs native engine code between HLE calls, but the
+		// return RIP of each call pins the loop location, so the last N sites
+		// reconstruct what a thread's task loop did right before it parked.
+		// Always-on and lock-free (single writer per thread); enabled cheaply.
+		public const int ImportTraceRingSize = 96;
+		public readonly ulong[] ImportTraceRetRip = new ulong[ImportTraceRingSize];
+		public readonly string?[] ImportTraceNid = new string?[ImportTraceRingSize];
+		public readonly ulong[] ImportTraceRdi = new ulong[ImportTraceRingSize];
+		public readonly ulong[] ImportTraceRsi = new ulong[ImportTraceRingSize];
+		public int ImportTraceHead;
+
+		public void RecordImportTrace(string? nid, ulong retRip, ulong rdi, ulong rsi)
+		{
+			var slot = ImportTraceHead;
+			ImportTraceRetRip[slot] = retRip;
+			ImportTraceNid[slot] = nid;
+			ImportTraceRdi[slot] = rdi;
+			ImportTraceRsi[slot] = rsi;
+			ImportTraceHead = (slot + 1) % ImportTraceRingSize;
+		}
 
 		public Thread? HostThread { get; set; }
 
@@ -5254,6 +5279,35 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 						$"state={thread.State} imports={Interlocked.Read(ref thread.ImportCount)} " +
 						$"nid={Volatile.Read(ref thread.LastImportNid) ?? "none"} ret=0x{Volatile.Read(ref thread.LastReturnRip):X16} " +
 						$"block={thread.BlockReason ?? "none"}{guestContextText}{hostContextText}");
+
+					// Dump the per-thread HLE-call ring for the render-fence
+					// chain: the ordered list of recent return sites is a coarse
+					// instruction trace of each thread's last task-loop activity
+					// before the stall. Filter keeps the log focused.
+					if (_dumpImportTraceRing &&
+						thread.Name is "RenderThread 0" or "RenderThread 1" or "RHIThread"
+							or "Thread-2" or "AgcSubmissionThread"
+							or "TaskGraphThreadHP 8" or "TaskGraphThreadNP 0")
+					{
+						var ring = new System.Text.StringBuilder();
+						var head = thread.ImportTraceHead;
+						for (var i = 0; i < GuestThreadState.ImportTraceRingSize; i++)
+						{
+							var slot = (head + i) % GuestThreadState.ImportTraceRingSize;
+							var ret = thread.ImportTraceRetRip[slot];
+							if (ret == 0)
+							{
+								continue;
+							}
+
+							ring.Append(
+								$" [{thread.ImportTraceNid[slot]}@0x{ret:X}" +
+								$" a0=0x{thread.ImportTraceRdi[slot]:X} a1=0x{thread.ImportTraceRsi[slot]:X}]");
+						}
+
+						Console.Error.WriteLine(
+							$"[LOADER][DIAG] import_trace_ring name='{thread.Name}':{ring}");
+					}
 					logged++;
 					if (logged >= 96 && threads.Length > logged)
 					{

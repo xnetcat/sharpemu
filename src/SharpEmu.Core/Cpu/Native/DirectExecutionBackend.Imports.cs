@@ -200,6 +200,7 @@ public sealed partial class DirectExecutionBackend
 			// Publish the NID last so readers cannot pair a new import name with
 			// the preceding import's argument snapshot.
 			Volatile.Write(ref activeGuestThreadState.LastImportNid, importStubEntry.Nid);
+			activeGuestThreadState.RecordImportTrace(importStubEntry.Nid, num7, value, value2);
 		}
 		var traceGuestThreadImportFast =
 			_activeGuestThreadState is { } tracedFastGuestThreadState &&
@@ -680,6 +681,8 @@ public sealed partial class DirectExecutionBackend
 			Volatile.Write(ref activeGuestThreadState.LastImportResultValid, 0);
 			Volatile.Write(ref activeGuestThreadState.LastReturnRip, returnRip);
 			Volatile.Write(ref activeGuestThreadState.LastImportNid, importStubEntry.Nid);
+			activeGuestThreadState.RecordImportTrace(
+				importStubEntry.Nid, returnRip, arg0, *(ulong*)(argPackPtr + 8));
 		}
 		var traceGuestThreadImport =
 			_activeGuestThreadState is { } tracedGuestThreadState &&
