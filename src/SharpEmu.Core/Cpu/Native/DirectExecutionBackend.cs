@@ -5287,7 +5287,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					if (_dumpImportTraceRing &&
 						thread.Name is "RenderThread 0" or "RenderThread 1" or "RHIThread"
 							or "Thread-2" or "AgcSubmissionThread"
-							or "TaskGraphThreadHP 8" or "TaskGraphThreadNP 0")
+							or "TaskGraphThreadHP 8" or "TaskGraphThreadNP 0"
+							or "FAsyncLoadingThread" or "IoDispatcher" or "IoService"
+							or "FAsyncPurge" or "FMediaTicker")
 					{
 						var ring = new System.Text.StringBuilder();
 						var head = thread.ImportTraceHead;
