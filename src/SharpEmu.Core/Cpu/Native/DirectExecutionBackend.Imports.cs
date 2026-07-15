@@ -1261,6 +1261,7 @@ public sealed partial class DirectExecutionBackend
 
 	private static bool IsImportLoopGuardBoundary(string nid) =>
 		nid is
+			"T72hz6ffq08" or // scePthreadYield
 			"1jfXLRVzisc" or // sceKernelUsleep
 			"QcteRwbsnV0" or // usleep
 			"n88vx3C5nW8" or // gettimeofday (legitimate time polling)

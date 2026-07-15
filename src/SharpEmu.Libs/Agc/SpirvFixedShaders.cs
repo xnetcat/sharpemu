@@ -165,6 +165,169 @@ internal static class SpirvFixedShaders
         return module.Build();
     }
 
+    public static byte[] CreateTonemappedCopyFragment(float exposure)
+    {
+        var module = new SpirvModuleBuilder();
+        module.AddCapability(SpirvCapability.Shader);
+
+        var glsl = module.ImportExtInst("GLSL.std.450");
+        var voidType = module.TypeVoid();
+        var floatType = module.TypeFloat(32);
+        var vec2Type = module.TypeVector(floatType, 2);
+        var vec4Type = module.TypeVector(floatType, 4);
+        var inputVec4Pointer = module.TypePointer(SpirvStorageClass.Input, vec4Type);
+        var outputVec4Pointer = module.TypePointer(SpirvStorageClass.Output, vec4Type);
+        var imageType = module.TypeImage(
+            floatType,
+            SpirvImageDim.Dim2D,
+            depth: false,
+            arrayed: false,
+            multisampled: false,
+            sampled: 1,
+            SpirvImageFormat.Unknown);
+        var sampledImageType = module.TypeSampledImage(imageType);
+        var sampledImagePointer =
+            module.TypePointer(SpirvStorageClass.UniformConstant, sampledImageType);
+
+        var attribute = module.AddGlobalVariable(inputVec4Pointer, SpirvStorageClass.Input);
+        module.AddName(attribute, "attr0");
+        module.AddDecoration(attribute, SpirvDecoration.Location, 0);
+
+        var texture = module.AddGlobalVariable(
+            sampledImagePointer,
+            SpirvStorageClass.UniformConstant);
+        module.AddName(texture, "tex0");
+        module.AddDecoration(texture, SpirvDecoration.DescriptorSet, 0);
+        module.AddDecoration(texture, SpirvDecoration.Binding, 1);
+
+        var output = module.AddGlobalVariable(outputVec4Pointer, SpirvStorageClass.Output);
+        module.AddName(output, "outColor");
+        module.AddDecoration(output, SpirvDecoration.Location, 0);
+
+        var functionType = module.TypeFunction(voidType);
+        var main = module.BeginFunction(voidType, functionType);
+        module.AddName(main, "main");
+        module.AddLabel();
+
+        var attributeValue = module.AddInstruction(SpirvOp.Load, vec4Type, attribute);
+        var coordinates = module.AddInstruction(
+            SpirvOp.VectorShuffle,
+            vec2Type,
+            attributeValue,
+            attributeValue,
+            0,
+            1);
+        var sampledImage = module.AddInstruction(SpirvOp.Load, sampledImageType, texture);
+        var lod = module.ConstantFloat(floatType, 0f);
+        var color = module.AddInstruction(
+            SpirvOp.ImageSampleExplicitLod,
+            vec4Type,
+            sampledImage,
+            coordinates,
+            2,
+            lod);
+
+        var zero = module.ConstantFloat(floatType, 0f);
+        var one = module.ConstantFloat(floatType, 1f);
+        var exposureValue = module.ConstantFloat(floatType, exposure);
+        var gammaValue = module.ConstantFloat(floatType, 1f / 2.2f);
+        var zeroVector = module.ConstantComposite(vec4Type, zero, zero, zero, zero);
+        var oneVector = module.ConstantComposite(vec4Type, one, one, one, one);
+        var exposureVector = module.ConstantComposite(
+            vec4Type,
+            exposureValue,
+            exposureValue,
+            exposureValue,
+            one);
+        var gammaVector = module.ConstantComposite(
+            vec4Type,
+            gammaValue,
+            gammaValue,
+            gammaValue,
+            one);
+        var nonNegative = module.AddInstruction(
+            SpirvOp.ExtInst,
+            vec4Type,
+            glsl,
+            40,
+            color,
+            zeroVector);
+        var exposed = module.AddInstruction(
+            SpirvOp.FMul,
+            vec4Type,
+            nonNegative,
+            exposureVector);
+        var denominator = module.AddInstruction(
+            SpirvOp.FAdd,
+            vec4Type,
+            exposed,
+            oneVector);
+        var mapped = module.AddInstruction(
+            SpirvOp.FDiv,
+            vec4Type,
+            exposed,
+            denominator);
+        var gammaEncoded = module.AddInstruction(
+            SpirvOp.ExtInst,
+            vec4Type,
+            glsl,
+            26,
+            mapped,
+            gammaVector);
+        var outputColor = module.AddInstruction(
+            SpirvOp.VectorShuffle,
+            vec4Type,
+            gammaEncoded,
+            color,
+            0,
+            1,
+            2,
+            7);
+        module.AddStatement(SpirvOp.Store, output, outputColor);
+        module.AddStatement(SpirvOp.Return);
+        module.EndFunction();
+
+        module.AddEntryPoint(
+            SpirvExecutionModel.Fragment,
+            main,
+            "main",
+            [attribute, texture, output]);
+        module.AddExecutionMode(main, SpirvExecutionMode.OriginUpperLeft);
+        return module.Build();
+    }
+
+    public static byte[] CreateSolidFragment(float red, float green, float blue, float alpha)
+    {
+        var module = new SpirvModuleBuilder();
+        module.AddCapability(SpirvCapability.Shader);
+
+        var voidType = module.TypeVoid();
+        var floatType = module.TypeFloat(32);
+        var vec4Type = module.TypeVector(floatType, 4);
+        var outputVec4Pointer = module.TypePointer(SpirvStorageClass.Output, vec4Type);
+        var output = module.AddGlobalVariable(outputVec4Pointer, SpirvStorageClass.Output);
+        module.AddName(output, "outColor");
+        module.AddDecoration(output, SpirvDecoration.Location, 0);
+
+        var functionType = module.TypeFunction(voidType);
+        var main = module.BeginFunction(voidType, functionType);
+        module.AddName(main, "main");
+        module.AddLabel();
+        var color = module.ConstantComposite(
+            vec4Type,
+            module.ConstantFloat(floatType, red),
+            module.ConstantFloat(floatType, green),
+            module.ConstantFloat(floatType, blue),
+            module.ConstantFloat(floatType, alpha));
+        module.AddStatement(SpirvOp.Store, output, color);
+        module.AddStatement(SpirvOp.Return);
+        module.EndFunction();
+
+        module.AddEntryPoint(SpirvExecutionModel.Fragment, main, "main", [output]);
+        module.AddExecutionMode(main, SpirvExecutionMode.OriginUpperLeft);
+        return module.Build();
+    }
+
     /// <summary>
     /// Minimal fragment stage for fixed-function depth-only passes.  The
     /// guest has no pixel shader and therefore cannot export colour; keeping

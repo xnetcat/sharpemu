@@ -6,6 +6,7 @@ using SharpEmu.Libs.Kernel;
 using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Numerics;
+using System.Runtime.CompilerServices;
 
 namespace SharpEmu.Libs.Agc;
 
@@ -118,6 +119,11 @@ internal static class Gen5ShaderScalarEvaluator
         return false;
     }
 
+    // Rosetta's x64 .NET optimizing JIT can miscompile this large evaluator
+    // after tier promotion and turn an ordinary managed helper call into an
+    // UnmanagedCallersOnly transition. Keep this hot compatibility path on
+    // its stable first-tier body.
+    [MethodImpl(MethodImplOptions.NoInlining | MethodImplOptions.NoOptimization)]
     public static bool TryEvaluate(
         CpuContext ctx,
         Gen5ShaderState state,

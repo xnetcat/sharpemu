@@ -243,6 +243,21 @@ internal static unsafe class VulkanVideoPresenter
                 "SHARPEMU_SHARED_READONLY_BUFFERS"),
             "1",
             StringComparison.Ordinal);
+    // silent-hill-dev removed the guest-queue-identity tracking that this scope
+    // used to drive. aa7b519's ParseSubmittedDcbSnapshot still brackets its
+    // captured-command replay with EnterGuestQueue, so keep a no-op scope that
+    // satisfies that contract without reintroducing the removed per-queue state.
+    internal static IDisposable EnterGuestQueue(string queueName, ulong submissionId)
+        => GuestQueueScope.Instance;
+
+    private sealed class GuestQueueScope : IDisposable
+    {
+        public static readonly GuestQueueScope Instance = new();
+
+        public void Dispose()
+        {
+        }
+    }
     // The pending queue and per-render drain budget bound how much guest GPU
     // work can be buffered ahead of the presenter. Draws are batched into
     // shared command buffers, so draining a large batch per render tick is
@@ -5983,6 +5998,14 @@ internal static unsafe class VulkanVideoPresenter
             return expanded;
         }
 
+        // Constant-buffer-sized read-only bindings bind their parse-time
+        // snapshot rather than live guest memory. Unity recycles its transient
+        // constant ring long before a translated draw reaches the GPU, so a
+        // live alias hands later draws' constants to earlier draws (fullscreen
+        // blits then rasterize with the wrong ortho matrix), and refreshing
+        // the shared alias shadow stalls the whole guest queue on every reuse.
+        private const int SnapshotGlobalBufferLimit = 64 * 1024;
+
         private GlobalBufferResource CreateGlobalBufferResource(
             VulkanGuestMemoryBuffer guestBuffer)
         {
@@ -5995,6 +6018,12 @@ internal static unsafe class VulkanVideoPresenter
                 (UseTransientReadOnlyGuestBuffers && !guestBuffer.Writable))
             {
                 return CreateTransientGlobalBufferResource(guestBuffer);
+            }
+
+            if (!guestBuffer.Writable &&
+                guestBuffer.Length <= SnapshotGlobalBufferLimit)
+            {
+                return CreateSnapshotGlobalBufferResource(guestBuffer);
             }
 
             var size = (ulong)Math.Max(guestBuffer.Length, sizeof(uint));
@@ -6081,6 +6110,46 @@ internal static unsafe class VulkanVideoPresenter
             };
         }
 
+        private GlobalBufferResource CreateSnapshotGlobalBufferResource(
+            VulkanGuestMemoryBuffer guestBuffer)
+        {
+            // The translated shader adds the address's sub-alignment bias to
+            // every access (packed at parse time), so the snapshot must sit
+            // at that same bias inside its host buffer.
+            var byteBias = checked((int)(
+                guestBuffer.BaseAddress &
+                (GuestStorageBufferOffsetAlignment - 1)));
+            var length = checked(byteBias + Math.Max(guestBuffer.Length, sizeof(uint)));
+            var staging = System.Buffers.ArrayPool<byte>.Shared.Rent(length);
+            staging.AsSpan(0, byteBias).Clear();
+            guestBuffer.Data.AsSpan(0, guestBuffer.Length)
+                .CopyTo(staging.AsSpan(byteBias));
+            var buffer = CreateHostBuffer(
+                staging.AsSpan(0, length),
+                BufferUsageFlags.StorageBufferBit,
+                out var memory);
+            System.Buffers.ArrayPool<byte>.Shared.Return(staging);
+            var allocation = _hostBufferAllocations[buffer.Handle];
+            if (guestBuffer.Pooled)
+            {
+                System.Buffers.ArrayPool<byte>.Shared.Return(guestBuffer.Data);
+            }
+
+            return new GlobalBufferResource
+            {
+                BaseAddress = 0,
+                Writable = false,
+                WriteBackToGuest = false,
+                Buffer = buffer,
+                Memory = memory,
+                Mapped = allocation.Mapped,
+                Offset = 0,
+                Size = checked(((ulong)length + 3) & ~3UL),
+                GuestOffset = 0,
+                GuestSize = (ulong)length,
+            };
+        }
+
         private GlobalBufferResource CreateTransientGlobalBufferResource(
             VulkanGuestMemoryBuffer guestBuffer)
         {
@@ -6121,8 +6190,11 @@ internal static unsafe class VulkanVideoPresenter
             foreach (var buffer in buffers)
             {
                 if (buffer.BaseAddress == 0 ||
-                    (UseTransientReadOnlyGuestBuffers && !buffer.Writable))
+                    (UseTransientReadOnlyGuestBuffers && !buffer.Writable) ||
+                    (!buffer.Writable &&
+                     buffer.Length <= SnapshotGlobalBufferLimit))
                 {
+                    // Snapshot-bound buffers never alias guest memory.
                     continue;
                 }
 

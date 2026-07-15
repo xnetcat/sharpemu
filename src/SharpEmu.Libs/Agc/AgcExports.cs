@@ -6,6 +6,7 @@ using SharpEmu.Libs.Kernel;
 using SharpEmu.Libs.VideoOut;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
+using System.Globalization;
 using System.Runtime.CompilerServices;
 
 namespace SharpEmu.Libs.Agc;
@@ -225,9 +226,17 @@ public static class AgcExports
     private static readonly bool _traceDraws = string.Equals(
         Environment.GetEnvironmentVariable("SHARPEMU_TRACE_DRAWS"),
         "1",
-        StringComparison.Ordinal);
+        StringComparison.Ordinal) ||
+        string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_TRACE_COMPACT_DRAWS"),
+            "1",
+            StringComparison.Ordinal);
     private static readonly bool _traceInterpolantMappings = string.Equals(
         Environment.GetEnvironmentVariable("SHARPEMU_TRACE_INTERPOLANTS"),
+        "1",
+        StringComparison.Ordinal);
+    private static readonly bool _traceFramePackets = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_TRACE_FRAME_PACKETS"),
         "1",
         StringComparison.Ordinal);
     private static readonly bool _traceAgcCompletion = string.Equals(
@@ -3722,7 +3731,7 @@ public static class AgcExports
         {
             action();
             CompleteLabelProducer(producer);
-            if (GpuWaitRegistry.Count == 0)
+            if (GpuWaitRegistry.Count == 0 || _disableCompletionGpuWaitResume)
             {
                 return;
             }
@@ -4391,6 +4400,10 @@ public static class AgcExports
         StringComparison.OrdinalIgnoreCase);
     private static readonly bool _gpuWaitSuspendEnabled =
         !_gpuWaitForceEnabled && !_gpuWaitIgnoreEnabled && !_gpuWaitDeferEffectsEnabled;
+    private static readonly bool _disableCompletionGpuWaitResume = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_COMPLETION_GPU_WAIT_RESUME"),
+        "1",
+        StringComparison.Ordinal);
 
     // Optional age for one-shot missing-producer diagnostics. Stale waits are
     // never removed or force-satisfied in the normal defer/suspend modes: doing so
@@ -4539,12 +4552,36 @@ public static class AgcExports
             is64Bit ? 64 : 32, tracePacket);
 
         var memoryStateKey = GetCpuMemoryStateKey(ctx.Memory);
+        var resumeAddress = packetAddress + ((ulong)length * sizeof(uint));
+        var remainingDwords = dwordCount - (offset + length);
+        byte[]? remainingCommands = null;
+        if (remainingDwords != 0)
+        {
+            var remainingByteCount = checked((int)(remainingDwords * sizeof(uint)));
+            remainingCommands = new byte[remainingByteCount];
+            if (_dcbWindowBuffer is { } window &&
+                resumeAddress >= _dcbWindowStart &&
+                resumeAddress - _dcbWindowStart + (ulong)remainingByteCount <=
+                    (ulong)_dcbWindowByteLength)
+            {
+                window.AsSpan(
+                        checked((int)(resumeAddress - _dcbWindowStart)),
+                        remainingByteCount)
+                    .CopyTo(remainingCommands);
+            }
+            else if (!ctx.Memory.TryRead(resumeAddress, remainingCommands))
+            {
+                remainingCommands = null;
+            }
+        }
+
         var waiter = new GpuWaitRegistry.WaitingDcb
         {
             CommandBufferAddress = commandAddress,
-            ResumeAddress = packetAddress + ((ulong)length * sizeof(uint)),
+            ResumeAddress = resumeAddress,
             TotalDwords = dwordCount,
             ResumeOffset = offset + length,
+            RemainingCommands = remainingCommands,
             ReferenceValue = reference,
             Mask = mask,
             CompareFunction = compareFunction,
@@ -4897,13 +4934,23 @@ public static class AgcExports
         state.QueueName = waiter.QueueName ?? state.QueueName;
         state.ActiveSubmissionId = waiter.SubmissionId;
         state.IsSuspended = false;
-        if (ParseSubmittedDcb(
+        var suspended = waiter.RemainingCommands is { } remainingCommands
+            ? ParseSubmittedDcbSnapshot(
                 ctx,
                 gpuState,
                 state,
                 waiter.ResumeAddress,
                 remainingDwords,
-                tracePackets))
+                remainingCommands,
+                tracePackets)
+            : ParseSubmittedDcb(
+                ctx,
+                gpuState,
+                state,
+                waiter.ResumeAddress,
+                remainingDwords,
+                tracePackets);
+        if (suspended)
         {
             state.IsSuspended = true;
             return;
@@ -4912,6 +4959,38 @@ public static class AgcExports
         state.HasActiveSubmission = false;
         NotifySubmittedDcbCompleted(gpuState, state, waiter.SubmissionId);
         PumpSubmittedQueue(ctx, gpuState, state);
+    }
+
+    private static bool ParseSubmittedDcbSnapshot(
+        CpuContext ctx,
+        SubmittedGpuState gpuState,
+        SubmittedDcbState state,
+        ulong commandAddress,
+        uint dwordCount,
+        byte[] commands,
+        bool tracePackets)
+    {
+        using var guestQueueScope = VulkanVideoPresenter.EnterGuestQueue(
+            state.QueueName,
+            state.ActiveSubmissionId);
+        _dcbWindowBuffer = commands;
+        _dcbWindowStart = commandAddress;
+        _dcbWindowByteLength = commands.Length;
+        try
+        {
+            return ParseSubmittedDcbCore(
+                ctx,
+                gpuState,
+                state,
+                commandAddress,
+                dwordCount,
+                tracePackets);
+        }
+        finally
+        {
+            _dcbWindowBuffer = null;
+            _dcbWindowByteLength = 0;
+        }
     }
 
     private static void TraceSubmittedWait(
@@ -5379,17 +5458,19 @@ public static class AgcExports
             case ItDrawIndexAuto when packetLength >= 3:
                 return TryReadUInt32(ctx, packetAddress + 4, out drawCount);
             case ItDrawIndex2 when packetLength >= 6:
-                // The standard DRAW_INDEX_2 packet embeds its index-buffer
-                // address after MAX_SIZE.  Reusing a previously programmed
-                // INDEX_BASE here can silently fetch plausible indices from
-                // the wrong allocation, producing valid geometry with
-                // unrelated vertex attributes.
-                if (!TryReadUInt32(ctx, packetAddress + 8, out var indexBaseLo) ||
+                // DRAW_INDEX_2 embeds its own index base. Reusing the most
+                // recent INDEX_BASE packet here makes unrelated transient
+                // index data drive the draw (Unity's fullscreen six-index
+                // post-process quads then reference garbage vertices and
+                // leave their render targets black).
+                if (!TryReadUInt32(ctx, packetAddress + 4, out var indexBufferCount) ||
+                    !TryReadUInt32(ctx, packetAddress + 8, out var indexBaseLo) ||
                     !TryReadUInt32(ctx, packetAddress + 12, out var indexBaseHi))
                 {
                     return false;
                 }
 
+                state.IndexBufferCount = indexBufferCount;
                 state.IndexBufferAddress =
                     indexBaseLo | ((ulong)indexBaseHi << 32);
                 state.DrawIndexOffset = 0;
@@ -6181,6 +6262,7 @@ public static class AgcExports
         }
 
         var outputKind = GetPixelOutputKind(renderTargets.FirstOrDefault().NumberType);
+        DumpVsScalarsIfRequested(exportShaderAddress, exportEvaluation);
         var exportStateFingerprint = _bakeScalars
             ? ComputeShaderStateFingerprint(exportEvaluation)
             : ComputeShaderStructuralFingerprint(exportEvaluation);
@@ -6369,6 +6451,12 @@ public static class AgcExports
                     binding.MipLevel ?? 0,
                     binding.SamplerDescriptor));
         }
+
+        DumpNv12ShaderIfRequested(
+            pixelShaderAddress,
+            compiled.Pixel,
+            pixelState.Program,
+            textures);
 
         var globalMemoryBindings = pixelEvaluation.GlobalMemoryBindings
             .Concat(exportEvaluation.GlobalMemoryBindings)
@@ -7281,6 +7369,7 @@ public static class AgcExports
             $"buffers=[{buffers}] vertex=[{vertexInputs}] indices=[{indices}]");
     }
 
+    [MethodImpl(MethodImplOptions.NoInlining)]
     private static IReadOnlyList<VulkanGuestDrawTexture> CreateVulkanGuestDrawTextures(
         CpuContext ctx,
         IReadOnlyList<TranslatedImageBinding> bindings,
@@ -7288,8 +7377,14 @@ public static class AgcExports
     {
         var textures = new List<VulkanGuestDrawTexture>(bindings.Count);
         fallbackTextureCount = 0;
-        foreach (var binding in bindings)
+        // This is reachable both directly from the native import gateway and
+        // from GPU-wait continuations resumed on a managed worker. Rosetta's
+        // .NET JIT has incorrectly folded the generic interface enumerator
+        // through the UnmanagedCallersOnly import thunk in that mixed path.
+        // Keep the worker boundary explicit and use indexed dispatch only.
+        for (var index = 0; index < bindings.Count; index++)
         {
+            var binding = bindings[index];
             if (TryCreateVulkanGuestDrawTexture(
                     ctx,
                     binding.Descriptor,
@@ -7965,6 +8060,16 @@ public static class AgcExports
         var viewport = draw.RenderState.Viewport is { } vp
             ? $"{vp.X:0.#},{vp.Y:0.#},{vp.Width:0.#}x{vp.Height:0.#}"
             : "none";
+        var scissor = draw.RenderState.Scissor is { } sc
+            ? $"{sc.X},{sc.Y},{sc.Width}x{sc.Height}"
+            : "none";
+        var depthState = draw.RenderState.Depth;
+        var depthInfo = draw.DepthTarget is { } depthTarget
+            ? $"0x{depthTarget.WriteAddress:X}/r0x{depthTarget.ReadAddress:X}" +
+              $":{depthTarget.Width}x{depthTarget.Height}" +
+              $":t{(depthState.TestEnable ? 1 : 0)}w{(depthState.WriteEnable ? 1 : 0)}" +
+              $"c{depthState.CompareOp}"
+            : "none";
         var textureList = string.Join(
             '|',
             textures.Select(texture =>
@@ -8000,7 +8105,7 @@ public static class AgcExports
             $"prim=0x{draw.PrimitiveType:X} verts={draw.VertexCount} indexed={draw.IndexBuffer is not null} " +
             $"blend={(blend.Enable ? 1 : 0)}:{blend.ColorSrcFactor}/{blend.ColorDstFactor}/{blend.ColorFunc}" +
             $":a{blend.AlphaSrcFactor}/{blend.AlphaDstFactor}/{blend.AlphaFunc}/s{(blend.SeparateAlphaBlend ? 1 : 0)} " +
-            $"mask=0x{blend.WriteMask:X} viewport={viewport} textures={textureList} pos={positions} " +
+            $"mask=0x{blend.WriteMask:X} viewport={viewport} scissor={scissor} depth={depthInfo} textures={textureList} pos={positions} " +
             $"ps_s0..3={string.Join(',', draw.PixelUserData.Take(4).Select(value => BitConverter.UInt32BitsToSingle(value).ToString("0.###")))} " +
             $"rawblend=0x{draw.RawBlendControl:X8} info=0x{draw.RawColorInfo:X8}");
     }
@@ -8139,7 +8244,21 @@ public static class AgcExports
             return;
         }
 
-        var key = $"0x{descriptor.Address:X}-{descriptor.Width}x{descriptor.Height}";
+        // Video playback can begin after thousands of unrelated texture
+        // uploads have exhausted the general dump limit. This opt-in filter
+        // keeps the capture focused on the two linear NV12 planes produced by
+        // AvPlayer (full-height R8 luma and half-height RG8 chroma).
+        if (string.Equals(
+                Environment.GetEnvironmentVariable("SHARPEMU_TEXTURE_DUMP_NV12"),
+                "1",
+                StringComparison.Ordinal) &&
+            !((descriptor.Format == 1 && descriptor.Height == 1080) ||
+              (descriptor.Format == 3 && descriptor.Height == 540)))
+        {
+            return;
+        }
+
+        var key = $"0x{descriptor.Address:X}-{descriptor.Width}x{descriptor.Height}-f{descriptor.Format}";
         var occurrence = _textureDumpKeys.AddOrUpdate(key, 1, static (_, count) => count + 1);
         // First uses plus periodic later snapshots (the game reuses the same
         // allocation for successive full-screen images).
@@ -10843,6 +10962,111 @@ public static class AgcExports
         }
 
         File.WriteAllLines(Path.Combine(directory, $"{name}.ir.txt"), lines);
+    }
+
+    private static readonly ConcurrentDictionary<ulong, int> _vsScalarDumpCounts = new();
+
+    private static void DumpVsScalarsIfRequested(
+        ulong exportShaderAddress,
+        Gen5ShaderEvaluation evaluation)
+    {
+        var filter = Environment.GetEnvironmentVariable("SHARPEMU_DUMP_VS_SCALARS");
+        if (string.IsNullOrWhiteSpace(filter) ||
+            (filter != "*" &&
+             !filter.Split(',').Any(entry =>
+                ulong.TryParse(
+                    entry.Trim().Replace("0x", string.Empty),
+                    NumberStyles.HexNumber,
+                    CultureInfo.InvariantCulture,
+                    out var address) &&
+                address == exportShaderAddress)))
+        {
+            return;
+        }
+
+        var occurrence = _vsScalarDumpCounts.AddOrUpdate(
+            exportShaderAddress,
+            1,
+            static (_, count) => count + 1);
+        if (occurrence > 4)
+        {
+            return;
+        }
+
+        var registers = evaluation.ScalarRegisters;
+        var lines = new List<string>(8);
+        for (var row = 0; row < 96 && row < registers.Count; row += 16)
+        {
+            var values = string.Join(
+                ' ',
+                Enumerable.Range(row, Math.Min(16, registers.Count - row))
+                    .Select(index =>
+                        $"s{index}={BitConverter.UInt32BitsToSingle(registers[index]):0.####}"));
+            lines.Add(values);
+        }
+
+        var bindings = string.Join(
+            '|',
+            evaluation.GlobalMemoryBindings.Select(binding =>
+                $"s{binding.ScalarAddress}:0x{binding.BaseAddress:X}:{binding.DataLength}"));
+        Console.Error.WriteLine(
+            $"[VS-SCALARS] es=0x{exportShaderAddress:X} occurrence={occurrence} " +
+            $"bindings=[{bindings}]\n" +
+            string.Join('\n', lines));
+    }
+
+    private static int _nv12ShaderDumpCount;
+
+    private static void DumpNv12ShaderIfRequested(
+        ulong shaderAddress,
+        byte[] spirv,
+        Gen5ShaderProgram program,
+        IReadOnlyList<TranslatedImageBinding> textures)
+    {
+        var directory = Environment.GetEnvironmentVariable("SHARPEMU_DUMP_NV12_SHADER_DIR");
+        if (string.IsNullOrWhiteSpace(directory) ||
+            !textures.Any(binding =>
+                binding.Descriptor.Format == 1 && binding.Descriptor.Height == 1080) ||
+            !textures.Any(binding =>
+                binding.Descriptor.Format == 3 && binding.Descriptor.Height == 540) ||
+            Interlocked.CompareExchange(ref _nv12ShaderDumpCount, 1, 0) != 0)
+        {
+            return;
+        }
+
+        try
+        {
+            Directory.CreateDirectory(directory);
+            File.WriteAllBytes(
+                Path.Combine(directory, $"0x{shaderAddress:X16}.ps.spv"),
+                spirv);
+            var lines = new List<string>(program.Instructions.Count + textures.Count + 4)
+            {
+                $"address=0x{program.Address:X16}",
+                $"spirv_bytes={spirv.Length}",
+                "textures:",
+            };
+            lines.AddRange(textures.Select(binding =>
+                $"  {FormatTextureDescriptor(binding.Descriptor)} storage={binding.IsStorage}"));
+            lines.Add("pc words opcode destinations <- sources control");
+            foreach (var instruction in program.Instructions)
+            {
+                lines.Add(
+                    $"0x{instruction.Pc:X4} " +
+                    $"{string.Join('_', instruction.Words.Select(static word => $"{word:X8}"))} " +
+                    $"{instruction.Opcode} " +
+                    $"{string.Join(',', instruction.Destinations)} <- " +
+                    $"{string.Join(',', instruction.Sources)} " +
+                    $"{instruction.Control}");
+            }
+
+            File.WriteAllLines(
+                Path.Combine(directory, $"0x{shaderAddress:X16}.ps.ir.txt"),
+                lines);
+        }
+        catch (IOException)
+        {
+        }
     }
 
     private static void TraceCreateShader(ulong destinationAddress, ulong headerAddress, ulong codeAddress, string detail)

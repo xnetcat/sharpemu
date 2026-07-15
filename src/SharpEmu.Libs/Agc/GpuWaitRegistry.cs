@@ -22,6 +22,7 @@ internal static class GpuWaitRegistry
         public ulong ResumeAddress;
         public uint TotalDwords;
         public uint ResumeOffset;
+        public byte[]? RemainingCommands;
         public ulong WaitAddress;
         public ulong ReferenceValue;
         public ulong Mask;
