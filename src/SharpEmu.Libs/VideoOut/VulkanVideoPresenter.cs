@@ -44,7 +44,8 @@ internal sealed record VulkanGuestDrawTexture(
     uint Pitch = 0,
     uint TileMode = 0,
     uint DstSelect = 0xFAC,
-    VulkanGuestSampler Sampler = default);
+    VulkanGuestSampler Sampler = default,
+    ulong DeferredDescriptorAddress = 0);
 
 internal readonly record struct VulkanGuestSampler(
     uint Word0,
@@ -610,6 +611,20 @@ internal static unsafe class VulkanVideoPresenter
             StartPresenterLocked();
         }
     }
+
+    /// <summary>
+    /// Marks a guest range as GPU-written (CP DMA destinations, shader UAVs).
+    /// Read-only bindings intersecting such ranges must stay live-aliased:
+    /// their contents are produced on the GPU timeline, so a parse-time CPU
+    /// snapshot would bake stale data (Unity's autoexposure constant, written
+    /// by DMA from a compute result, otherwise reads zero and the frame goes
+    /// black).
+    /// </summary>
+    public static void NotifyGpuWritesGuestRange(ulong start, ulong end) =>
+        Presenter.RecordGpuWrittenGuestRange(start, end);
+
+    public static bool GpuWritesIntersectGuestRange(ulong start, ulong end) =>
+        Presenter.IntersectsGpuWrittenGuestRange(start, end);
 
     public static void SubmitOffscreenTranslatedDraw(
         byte[] pixelSpirv,
@@ -1832,6 +1847,18 @@ internal static unsafe class VulkanVideoPresenter
         private int _tracedLargeGlobalWritebackEvents;
         private readonly HashSet<ulong> _tracedGuestImageContents = new();
         private readonly Dictionary<ulong, int> _tracedGuestWriteCounts = new();
+        private static readonly long _traceCopyExecutionPeriod = long.TryParse(
+            Environment.GetEnvironmentVariable("SHARPEMU_TRACE_COPY_EXEC_EVERY"),
+            out var parsedCopyExecutionPeriod) && parsedCopyExecutionPeriod > 0
+            ? parsedCopyExecutionPeriod
+            : 0;
+        private long _traceCopyExecutionCount;
+        private long _traceExposureExecutionCount;
+        private readonly Dictionary<ulong, Queue<string>> _recentGuestDrawsByTarget = new();
+        private readonly Dictionary<ulong, HashSet<ulong>> _recentGuestDrawSourcesByTarget = new();
+        private readonly HashSet<ulong> _guestDisplayBufferAddresses = [];
+        private ulong _latestFullscreenSceneCandidateAddress;
+        private bool _loggedFullscreenSceneRedirect;
         private int _tracedVertexBufferCount;
         // Compute translation can produce an equivalent new byte array on a
         // later submit. Reference identity turns that into an expensive new
@@ -6069,7 +6096,10 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             if (!guestBuffer.Writable &&
-                guestBuffer.Length <= SnapshotGlobalBufferLimit)
+                guestBuffer.Length <= SnapshotGlobalBufferLimit &&
+                !IntersectsGpuWrittenGuestRange(
+                    guestBuffer.BaseAddress,
+                    checked(guestBuffer.BaseAddress + (ulong)guestBuffer.Length)))
             {
                 return CreateSnapshotGlobalBufferResource(guestBuffer);
             }
@@ -6172,6 +6202,21 @@ internal static unsafe class VulkanVideoPresenter
             staging.AsSpan(0, byteBias).Clear();
             guestBuffer.Data.AsSpan(0, guestBuffer.Length)
                 .CopyTo(staging.AsSpan(byteBias));
+            if (staging.AsSpan(byteBias, guestBuffer.Length)
+                    .IndexOfAnyExcept((byte)0) < 0)
+            {
+                // An all-zero parse-time snapshot means the guest had not yet
+                // written this constant buffer when the command list was
+                // parsed (queues are parsed ahead of the CPU's late writes).
+                // By execution time — now — the live contents are the values
+                // a real GPU would fetch. A recycled transient ring entry is
+                // never all-zero at parse, so this cannot reintroduce the
+                // stale-ring corruption.
+                _guestMemory?.TryRead(
+                    guestBuffer.BaseAddress,
+                    staging.AsSpan(byteBias, guestBuffer.Length));
+            }
+
             var buffer = CreateHostBuffer(
                 staging.AsSpan(0, length),
                 BufferUsageFlags.StorageBufferBit,
@@ -6185,7 +6230,10 @@ internal static unsafe class VulkanVideoPresenter
 
             return new GlobalBufferResource
             {
-                BaseAddress = 0,
+                // Keep the guest address for diagnostics; Writable=false and
+                // Allocation=null keep this resource out of the writeback and
+                // dirty-tracking paths.
+                BaseAddress = guestBuffer.BaseAddress,
                 Writable = false,
                 WriteBackToGuest = false,
                 Buffer = buffer,
@@ -6240,7 +6288,10 @@ internal static unsafe class VulkanVideoPresenter
                 if (buffer.BaseAddress == 0 ||
                     (UseTransientReadOnlyGuestBuffers && !buffer.Writable) ||
                     (!buffer.Writable &&
-                     buffer.Length <= SnapshotGlobalBufferLimit))
+                     buffer.Length <= SnapshotGlobalBufferLimit &&
+                     !IntersectsGpuWrittenGuestRange(
+                         buffer.BaseAddress,
+                         checked(buffer.BaseAddress + (ulong)buffer.Length))))
                 {
                     // Snapshot-bound buffers never alias guest memory.
                     continue;
@@ -6838,11 +6889,11 @@ internal static unsafe class VulkanVideoPresenter
 
         private static byte[] CreateFallbackTexturePixels(uint format, uint width, uint height, ulong expectedSize)
         {
-            if (format is 9 or 10)
-            {
-                return CreateBlackFrame(width, height);
-            }
-
+            // Unresolved textures degrade to ZERO: RDNA2 samples of a null T#
+            // return 0, and shaders ship dead feature blocks that sample with
+            // clobbered descriptor registers relying on exactly that (their
+            // results are zero-weighted). A white fallback turns those benign
+            // samples into screen-filling contributions.
             return new byte[checked((int)expectedSize)];
         }
 
@@ -7509,6 +7560,55 @@ internal static unsafe class VulkanVideoPresenter
                 null);
         }
 
+        // Guest address ranges the GPU has written (shader-writable bindings).
+        // Constant data inside these ranges is produced by earlier GPU work
+        // (e.g. Unity's autoexposure result), so a parse-time CPU snapshot
+        // would bake stale zeros; such bindings must stay live-aliased.
+        private static readonly object _gpuWrittenRangeGate = new();
+        private static readonly List<(ulong Start, ulong End)> _gpuWrittenGuestRanges = new();
+
+        internal static void RecordGpuWrittenGuestRange(ulong start, ulong end)
+        {
+            if (end <= start)
+            {
+                return;
+            }
+
+            lock (_gpuWrittenRangeGate)
+            {
+                for (var index = _gpuWrittenGuestRanges.Count - 1; index >= 0; index--)
+                {
+                    var existing = _gpuWrittenGuestRanges[index];
+                    if (end < existing.Start || existing.End < start)
+                    {
+                        continue;
+                    }
+
+                    start = Math.Min(start, existing.Start);
+                    end = Math.Max(end, existing.End);
+                    _gpuWrittenGuestRanges.RemoveAt(index);
+                }
+
+                _gpuWrittenGuestRanges.Add((start, end));
+            }
+        }
+
+        internal static bool IntersectsGpuWrittenGuestRange(ulong start, ulong end)
+        {
+            lock (_gpuWrittenRangeGate)
+            {
+                foreach (var range in _gpuWrittenGuestRanges)
+                {
+                    if (start < range.End && range.Start < end)
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
         private static void MarkGuestBufferDirty(
             GuestBufferAllocation allocation,
             ulong offset,
@@ -7518,6 +7618,10 @@ internal static unsafe class VulkanVideoPresenter
             {
                 return;
             }
+
+            RecordGpuWrittenGuestRange(
+                checked(allocation.BaseAddress + offset),
+                checked(allocation.BaseAddress + offset + length));
 
             var start = offset;
             var end = checked(offset + length);
@@ -7894,6 +7998,84 @@ internal static unsafe class VulkanVideoPresenter
             }
         }
 
+        private long _deferredDescriptorResolveCount;
+        private long _deferredDescriptorFailCount;
+
+        // Textures whose T# descriptor read zero at parse carry the guest
+        // address the descriptor was loaded from. By execution time the
+        // per-frame descriptor table has been written (CPU late-write or
+        // ordered GPU work), so re-read it and swap the fallback for the
+        // real render-target alias.
+        private VulkanOffscreenGuestDraw ResolveDeferredTextureDescriptors(
+            VulkanOffscreenGuestDraw work)
+        {
+            var textures = work.Draw.Textures;
+            VulkanGuestDrawTexture[]? replaced = null;
+            for (var index = 0; index < textures.Count; index++)
+            {
+                var texture = textures[index];
+                if (!texture.IsFallback || texture.DeferredDescriptorAddress == 0)
+                {
+                    continue;
+                }
+
+                var descriptorBytes = new byte[32];
+                if (_guestMemory?.TryRead(
+                        texture.DeferredDescriptorAddress,
+                        descriptorBytes) != true)
+                {
+                    if (Interlocked.Increment(ref _deferredDescriptorFailCount) <= 32)
+                    {
+                        Console.Error.WriteLine(
+                            $"[LOADER][TRACE] vk.deferred_texture_unreadable " +
+                            $"table=0x{texture.DeferredDescriptorAddress:X16}");
+                    }
+
+                    continue;
+                }
+
+                var descriptorWords = new uint[8];
+                for (var word = 0; word < 8; word++)
+                {
+                    descriptorWords[word] = System.Buffers.Binary.BinaryPrimitives
+                        .ReadUInt32LittleEndian(descriptorBytes.AsSpan(word * 4, 4));
+                }
+
+                if (!AgcExports.TryResolveDeferredDrawTexture(
+                        descriptorWords,
+                        texture.IsStorage,
+                        texture.MipLevel,
+                        out var resolvedTexture))
+                {
+                    if (Interlocked.Increment(ref _deferredDescriptorFailCount) <= 32)
+                    {
+                        Console.Error.WriteLine(
+                            $"[LOADER][TRACE] vk.deferred_texture_unresolved " +
+                            $"table=0x{texture.DeferredDescriptorAddress:X16} " +
+                            $"words=[{string.Join(',', descriptorWords.Select(word => $"{word:X8}"))}]");
+                    }
+
+                    continue;
+                }
+
+                replaced ??= textures.ToArray();
+                replaced[index] = resolvedTexture with { Sampler = texture.Sampler };
+                if (Interlocked.Increment(ref _deferredDescriptorResolveCount) <= 64)
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] vk.deferred_texture_resolved " +
+                        $"table=0x{texture.DeferredDescriptorAddress:X16} " +
+                        $"tex=0x{resolvedTexture.Address:X16}:" +
+                        $"{resolvedTexture.Width}x{resolvedTexture.Height}:" +
+                        $"f{resolvedTexture.Format}/n{resolvedTexture.NumberType}");
+                }
+            }
+
+            return replaced is null
+                ? work
+                : work with { Draw = work.Draw with { Textures = replaced } };
+        }
+
         private void ExecuteOffscreenDrawCore(VulkanOffscreenGuestDraw work)
         {
             var format = GetRenderTargetFormat(work.Target.Format, work.Target.NumberType);
@@ -7927,6 +8109,7 @@ internal static unsafe class VulkanVideoPresenter
                 return;
             }
 
+            work = ResolveDeferredTextureDescriptors(work);
             var effectiveTarget = work.Target.Address == 0 && work.DepthTarget is { } depthOnlyTarget
                 ? GetDepthOnlyColorTarget(depthOnlyTarget)
                 : work.Target;
@@ -8202,6 +8385,99 @@ internal static unsafe class VulkanVideoPresenter
                         TraceGuestImageContents(target);
                     }
                 }
+                TraceVulkanShader(
+                    $"vk.offscreen_draw addr=0x{target.Address:X16} " +
+                    $"size={target.Width}x{target.Height} format={target.Format} " +
+                    $"textures={work.Draw.Textures.Count}");
+                if (_traceCopyExecutionPeriod > 0 &&
+                    (resources is { Scissor: { X: 0, Y: 0, Width: 1, Height: 1 } } ||
+                     (work.Draw.Textures.Count >= 5 && target.Width >= 1280)) &&
+                    ++_traceExposureExecutionCount % 40 == 0)
+                {
+                    _commandBuffer = _presentationCommandBuffer;
+                    FlushBatchedGuestCommands();
+                    Check(
+                        _vk.QueueWaitIdle(_queue),
+                        "vkQueueWaitIdle(exposure exec trace)");
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] vk.exposure_exec dst=0x{target.Address:X16} " +
+                        $"ps={work.Draw.PixelSpirv.Length} " +
+                        $"buffers={resources.GlobalMemoryBuffers.Length} " +
+                        $"textures=[{string.Join('|', work.Draw.Textures.Select(entry => $"0x{entry.Address:X}:{entry.Width}x{entry.Height}"))}]");
+                    for (var bufferIndex = 0;
+                         bufferIndex < resources.GlobalMemoryBuffers.Length;
+                         bufferIndex++)
+                    {
+                        var globalBuffer = resources.GlobalMemoryBuffers[bufferIndex];
+                        if (globalBuffer is null ||
+                            globalBuffer.Mapped == 0 ||
+                            globalBuffer.GuestSize > 4096)
+                        {
+                            continue;
+                        }
+
+                        var wordCount = (int)Math.Min(globalBuffer.GuestSize / 4, 16);
+                        var words = new uint[wordCount];
+                        System.Runtime.InteropServices.Marshal.Copy(
+                            globalBuffer.Mapped,
+                            (int[])(object)words,
+                            0,
+                            wordCount);
+                        var liveWords = new byte[Math.Min((int)globalBuffer.GuestSize, 16)];
+                        var liveOk = globalBuffer.BaseAddress != 0 &&
+                            _guestMemory?.TryRead(globalBuffer.BaseAddress, liveWords) == true;
+                        var live = liveOk
+                            ? string.Join(
+                                ',',
+                                Enumerable.Range(0, liveWords.Length / 4).Select(index =>
+                                    BitConverter.ToSingle(liveWords, index * 4)
+                                        .ToString("0.####e0")))
+                            : "unreadable";
+                        Console.Error.WriteLine(
+                            $"[LOADER][TRACE] vk.exposure_buffer[{bufferIndex}] " +
+                            $"base=0x{globalBuffer.BaseAddress:X} size={globalBuffer.GuestSize} " +
+                            $"alias={(globalBuffer.Allocation is not null ? 1 : 0)} " +
+                            $"gpuwr={(IntersectsGpuWrittenGuestRange(globalBuffer.BaseAddress, globalBuffer.BaseAddress + globalBuffer.GuestSize) ? 1 : 0)} " +
+                            $"f32=[{string.Join(',', words.Select(word => BitConverter.UInt32BitsToSingle(word).ToString("0.####e0")))}] " +
+                            $"live=[{live}]");
+                    }
+                    TraceGuestImageContents(target);
+                }
+                if (_traceCopyExecutionPeriod > 0 &&
+                    work.Draw.Textures.Count >= 1 &&
+                    work.Draw.VertexCount <= 6 &&
+                    target.Width >= 1280 &&
+                    ++_traceCopyExecutionCount % _traceCopyExecutionPeriod == 0)
+                {
+                    _commandBuffer = _presentationCommandBuffer;
+                    FlushBatchedGuestCommands();
+                    Check(
+                        _vk.QueueWaitIdle(_queue),
+                        "vkQueueWaitIdle(copy exec trace)");
+                    var copySourceAddress = work.Draw.Textures[0].Address;
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] vk.copy_exec ps={work.Draw.PixelSpirv.Length} " +
+                        $"vs={work.Draw.VertexSpirv.Length} verts={work.Draw.VertexCount} " +
+                        $"src=0x{copySourceAddress:X16} dst=0x{target.Address:X16} " +
+                        $"textures=[{string.Join('|', work.Draw.Textures.Select(texture => $"0x{texture.Address:X}:{texture.Width}x{texture.Height}"))}]");
+                    foreach (var tinyTexture in work.Draw.Textures)
+                    {
+                        if (tinyTexture.Width <= 2 &&
+                            tinyTexture.Height <= 2 &&
+                            tinyTexture.Address != 0 &&
+                            _guestImages.TryGetValue(tinyTexture.Address, out var tinyImage) &&
+                            tinyImage.Initialized)
+                        {
+                            TraceGuestImageContents(tinyImage);
+                        }
+                    }
+                    if (_guestImages.TryGetValue(copySourceAddress, out var copySource) &&
+                        copySource.Initialized)
+                    {
+                        TraceGuestImageContents(copySource);
+                    }
+                    TraceGuestImageContents(target);
+                }
                 if (traceSelectedDrawTarget)
                 {
                     _commandBuffer = _presentationCommandBuffer;
@@ -8214,10 +8490,6 @@ internal static unsafe class VulkanVideoPresenter
                         $"addr=0x{target.Address:X16} size={target.Width}x{target.Height}");
                     TraceGuestImageContents(target);
                 }
-                TraceVulkanShader(
-                    $"vk.offscreen_draw addr=0x{target.Address:X16} " +
-                    $"size={target.Width}x{target.Height} format={target.Format} " +
-                    $"textures={work.Draw.Textures.Count}");
             }
             catch (Exception exception)
             {

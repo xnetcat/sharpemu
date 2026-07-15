@@ -162,6 +162,7 @@ internal static class Gen5ShaderScalarEvaluator
         // set already includes every instruction's destination registers, so
         // the per-load additions the loop used to make are redundant.
         var runtimeScalarRegisters = state.Program.RuntimeScalarRegisters;
+        var scalarLoadSources = new Dictionary<uint, ulong>();
         var resolvedImageByPc = new Dictionary<uint, int>();
         var finalScalarRegisters = (uint[])scalarRegisters.Clone();
         var pendingPaths = new Stack<ScalarPathState>();
@@ -272,15 +273,19 @@ internal static class Gen5ShaderScalarEvaluator
                 }
 
                 if (_cfgResourceDiscovery &&
-                    instruction.Opcode != "SBranch" &&
-                    instruction.Opcode.StartsWith("SCbranch", StringComparison.Ordinal) &&
+                    !path.Supplemental &&
+                    instruction.Opcode is "SCbranchVccz" or "SCbranchVccnz"
+                        or "SCbranchExecz" or "SCbranchExecnz"
+                        or "SCbranchScc0" or "SCbranchScc1" &&
                     TryGetSoppBranchTargetPc(instruction, out var conditionalTargetPc) &&
                     conditionalTargetPc > instruction.Pc)
                 {
-                    // Keep evaluating the fall-through path, but also discover
-                    // the target using the SGPR/EXEC state at the actual branch.
-                    // This matters when the fall-through overwrites a descriptor
-                    // register before jumping around the target block.
+                    // Forward conditional branches gate feature blocks that
+                    // clobber descriptor registers with unrelated constants
+                    // (e.g. a skipped env-reflection block reloading s16..s23
+                    // before Unity's uber pass samples with them). Discover
+                    // resources along the taken edge too; the image-descriptor
+                    // arbitration keeps whichever path carries a decodable T#.
                     QueuePath(
                         conditionalTargetPc,
                         (uint[])scalarRegisters.Clone(),
@@ -377,7 +382,7 @@ internal static class Gen5ShaderScalarEvaluator
                 var recordBinding =
                     !path.Supplemental ||
                     !HasGlobalMemoryBindingForPc(globalMemoryBindings, instruction.Pc);
-                if (!TryExecuteScalarLoad(ctx, state, instruction, scalarMemory, scalarRegisters, globalMemoryBindings, globalMemoryByAddress, runtimeScalarRegisters, recordBinding, out error))
+                if (!TryExecuteScalarLoad(ctx, state, instruction, scalarMemory, scalarRegisters, globalMemoryBindings, globalMemoryByAddress, runtimeScalarRegisters, recordBinding, out error, scalarLoadSources))
                 {
                     if (path.Supplemental)
                     {
@@ -754,8 +759,14 @@ internal static class Gen5ShaderScalarEvaluator
                 continue;
             }
 
-            if (path.Supplemental && resolvedImageByPc.ContainsKey(instruction.Pc))
+            if (path.Supplemental &&
+                resolvedImageByPc.TryGetValue(instruction.Pc, out var seenImageIndex) &&
+                AgcExports.IsPlausibleTextureDescriptor(
+                    resolved[seenImageIndex].ResourceDescriptor))
             {
+                // Already have a decodable T# for this sample; supplemental
+                // paths only get to replace garbage left by skipped feature
+                // blocks (see the arbitration below).
                 continue;
             }
 
@@ -812,17 +823,31 @@ internal static class Gen5ShaderScalarEvaluator
                         image,
                         out var mipLevel)
                         ? mipLevel
-                        : null);
+                        : null)
+                {
+                    DescriptorSourceAddress = scalarLoadSources.TryGetValue(
+                        image.ScalarResource,
+                        out var descriptorSource)
+                        ? descriptorSource
+                        : 0,
+                };
                 if (resolvedImageByPc.TryGetValue(instruction.Pc, out var existingIndex))
                 {
                     var existing = resolved[existingIndex];
-                    var existingNull = existing.ResourceDescriptor.All(static word => word == 0);
-                    var candidateNull = resourceDescriptor.All(static word => word == 0);
-                    if (existingNull && !candidateNull)
+                    var existingPlausible =
+                        AgcExports.IsPlausibleTextureDescriptor(existing.ResourceDescriptor);
+                    var candidatePlausible =
+                        AgcExports.IsPlausibleTextureDescriptor(resourceDescriptor);
+                    if (!existingPlausible && candidatePlausible)
                     {
+                        // Another explored control-flow path left non-descriptor
+                        // data (skipped feature block constants) in these
+                        // registers; the path carrying a decodable T# is the one
+                        // a real wave samples with.
                         resolved[existingIndex] = imageBinding;
                     }
-                    else if (!candidateNull &&
+                    else if (existingPlausible &&
+                             candidatePlausible &&
                              (!existing.ResourceDescriptor.SequenceEqual(resourceDescriptor) ||
                               !existing.SamplerDescriptor.SequenceEqual(samplerDescriptor)))
                     {
@@ -1905,7 +1930,8 @@ internal static class Gen5ShaderScalarEvaluator
         Dictionary<(uint ScalarAddress, ulong BaseAddress), Gen5GlobalMemoryBinding> globalMemoryByAddress,
         IReadOnlySet<uint> runtimeScalarRegisters,
         bool recordBinding,
-        out string error)
+        out string error,
+        Dictionary<uint, ulong>? scalarLoadSources = null)
     {
         error = string.Empty;
         if (instruction.Sources.Count == 0 ||
@@ -2090,6 +2116,16 @@ internal static class Gen5ShaderScalarEvaluator
             }
 
             var componentOffset = unchecked(byteOffset + (ulong)(index * sizeof(uint)));
+            if (scalarLoadSources is not null && baseAddress != 0)
+            {
+                // Provenance for late-bound descriptors: remember where each
+                // register's value comes from even when the read fails or
+                // zeroes — per-frame descriptor tables are often written only
+                // after the command list is parsed.
+                scalarLoadSources[destination.Value] =
+                    address + (ulong)(index * sizeof(uint));
+            }
+
             if (bufferUnbound ||
                 scalarPointerUnbound ||
                 isBufferLoad &&

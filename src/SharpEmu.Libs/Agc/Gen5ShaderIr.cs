@@ -282,7 +282,17 @@ internal sealed record Gen5ImageBinding(
     Gen5ImageControl Control,
     IReadOnlyList<uint> ResourceDescriptor,
     IReadOnlyList<uint> SamplerDescriptor,
-    uint? MipLevel);
+    uint? MipLevel)
+{
+    /// <summary>
+    /// Guest address the T# descriptor registers were scalar-loaded from, or
+    /// zero when unknown. Per-frame descriptor tables (render-target inputs,
+    /// autoexposure results) are often not yet written when the command list
+    /// is parsed; a zero descriptor with a known source address is re-read at
+    /// execution time on the ordered GPU timeline.
+    /// </summary>
+    public ulong DescriptorSourceAddress { get; init; }
+}
 
 // Data arrays may be rented from ArrayPool (oversized): always slice with
 // DataLength, never Data.Length. Ownership transfers to the presenter, which

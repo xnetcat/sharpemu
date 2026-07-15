@@ -496,7 +496,8 @@ public static class AgcExports
         TextureDescriptor Descriptor,
         bool IsStorage,
         uint MipLevel,
-        IReadOnlyList<uint> SamplerDescriptor);
+        IReadOnlyList<uint> SamplerDescriptor,
+        ulong DeferredDescriptorAddress = 0);
 
     private readonly record struct RenderTargetWriter(
         ulong Sequence,
@@ -3611,6 +3612,22 @@ public static class AgcExports
                   TryCopyGuestMemory(ctx, sourceAddress, destinationAddress, byteCount);
         }
 
+        if (destinationAddress != 0 && byteCount is > 0 and <= 256u * 1024u * 1024u)
+        {
+            // Constant data at the DMA destination is produced on the GPU
+            // timeline; parse-time snapshots of it would be stale.
+            VulkanVideoPresenter.NotifyGpuWritesGuestRange(
+                destinationAddress,
+                destinationAddress + byteCount);
+            var dmaTraceOrdinal = Interlocked.Increment(ref _dmaDataTraceCount);
+            if (dmaTraceOrdinal <= 200 || dmaTraceOrdinal % 500 == 0)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][TRACE] agc.dma_range dst=0x{destinationAddress:X16} " +
+                    $"src=0x{sourceAddress:X16} bytes={byteCount}");
+            }
+        }
+
         SubmitOrderedGpuSideEffect(
             ctx,
             gpuState,
@@ -4237,6 +4254,21 @@ public static class AgcExports
             ? DecodeStandardWriteDataControl(control)
             : DecodeAgcWriteDataControl(control);
         var dwordCount = packetLength - 4;
+        if (destinationAddress != 0 && dwordCount > 0)
+        {
+            // WRITE_DATA lands on the GPU timeline; parse-time snapshots of
+            // its destination (descriptor tables, constants) are stale.
+            VulkanVideoPresenter.NotifyGpuWritesGuestRange(
+                destinationAddress,
+                destinationAddress + (ulong)dwordCount * sizeof(uint));
+            var writeDataOrdinal = Interlocked.Increment(ref _writeDataRangeTraceCount);
+            if (writeDataOrdinal <= 200 || writeDataOrdinal % 997 == 0)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][TRACE] agc.write_data_range dst=0x{destinationAddress:X16} " +
+                    $"dwords={dwordCount} standard={standardPacket}");
+            }
+        }
         var values = new uint[dwordCount];
         for (uint index = 0; index < dwordCount; index++)
         {
@@ -6328,6 +6360,17 @@ public static class AgcExports
             }
         }
 
+        if (_dumpTinyPsState &&
+            pixelState.Program.Instructions.Count <= 10 &&
+            _tinyPsStateDumpCounts.AddOrUpdate(
+                pixelShaderAddress,
+                1,
+                static (_, count) => count + 1) <= 3)
+        {
+            Console.Error.WriteLine(
+                $"[TINY-PS] {Gen5ShaderTranslator.DescribeState(pixelState)}");
+        }
+
         // Every bound color target the shader exports to. Deferred renderers
         // draw a multi-render-target G-buffer (up to eight slots) in one pass;
         // we render one bound target per pass, so keep them all here and give
@@ -6534,12 +6577,31 @@ public static class AgcExports
                     $"decoded={FormatTextureDescriptor(texture)} " +
                     $"raw={FormatShaderDwords(binding.ResourceDescriptor)} sampler={FormatShaderDwords(binding.SamplerDescriptor)}");
             }
+            if (texture.Address == 0 &&
+                _zeroDescriptorTracedShaders.TryAdd(
+                    (pixelShaderAddress << 16) ^ binding.Pc,
+                    0) &&
+                Interlocked.Increment(ref _zeroDescriptorTraceCount) <= 256)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][TRACE] agc.zero_texture_descriptor ps=0x{pixelShaderAddress:X} " +
+                    $"pc=0x{binding.Pc:X} op={binding.Opcode} " +
+                    $"source=0x{binding.DescriptorSourceAddress:X16} " +
+                    $"raw=[{string.Join(',', binding.ResourceDescriptor.Select(word => $"{word:X8}"))}]");
+            }
+
             textures.Add(
                 new TranslatedImageBinding(
                     texture,
                     Gen5ShaderTranslator.IsStorageImageOperation(binding.Opcode),
                     binding.MipLevel ?? 0,
-                    binding.SamplerDescriptor));
+                    binding.SamplerDescriptor,
+                    // Descriptors that decode to no texture resolve late at
+                    // execution (per-frame RT/exposure tables are not yet
+                    // written when the command list is parsed).
+                    texture.Address == 0
+                        ? binding.DescriptorSourceAddress
+                        : 0));
         }
 
         DumpNv12ShaderIfRequested(
@@ -7483,6 +7545,14 @@ public static class AgcExports
                     binding.SamplerDescriptor,
                     out var texture))
             {
+                if (texture.IsFallback && binding.DeferredDescriptorAddress != 0)
+                {
+                    texture = texture with
+                    {
+                        DeferredDescriptorAddress = binding.DeferredDescriptorAddress,
+                    };
+                }
+
                 textures.Add(texture);
                 if (texture.IsFallback)
                 {
@@ -7544,9 +7614,27 @@ public static class AgcExports
         foreach (var binding in bindings)
         {
             var data = new byte[Math.Max(binding.DataLength, sizeof(uint))];
-            var guestMemoryBacked = binding.BaseAddress != 0 &&
-                (ctx.Memory.TryRead(binding.BaseAddress, data) ||
-                 KernelMemoryCompatExports.TryReadTrackedLibcHeap(binding.BaseAddress, data));
+            // Prefer the parse-time snapshot: the guest recycles its transient
+            // constant ring long before the flip, so a present-time re-read
+            // hands this draw a later draw's constants (Unity's final display
+            // blit then multiplies by garbage and presents black). GPU-written
+            // ranges (DMA/UAV results) are the exception: their parse-time
+            // contents are stale by construction, so keep the live read there.
+            var guestMemoryBacked = binding.DataLength > 0 &&
+                binding.Data.Length >= binding.DataLength &&
+                !VulkanVideoPresenter.GpuWritesIntersectGuestRange(
+                    binding.BaseAddress,
+                    binding.BaseAddress + (ulong)binding.DataLength);
+            if (guestMemoryBacked)
+            {
+                binding.Data.AsSpan(0, binding.DataLength).CopyTo(data);
+            }
+            else
+            {
+                guestMemoryBacked = binding.BaseAddress != 0 &&
+                    (ctx.Memory.TryRead(binding.BaseAddress, data) ||
+                     KernelMemoryCompatExports.TryReadTrackedLibcHeap(binding.BaseAddress, data));
+            }
             if (!guestMemoryBacked)
             {
                 // Keep the zero-filled buffer; layout must match the shader.
@@ -7962,6 +8050,73 @@ public static class AgcExports
             : null;
     }
 
+    /// <summary>
+    /// Whether the eight descriptor words decode to a usable 2D texture.
+    /// The scalar evaluator uses this to arbitrate when different control-flow
+    /// paths leave different values in the descriptor registers at a sample:
+    /// the path a real wave takes keeps the T#, while a skipped feature block
+    /// leaves unrelated constants behind.
+    /// </summary>
+    internal static bool IsPlausibleTextureDescriptor(IReadOnlyList<uint> words) =>
+        TryDecodeTextureDescriptor(words, out var descriptor) &&
+        descriptor.Type == Gen5TextureType2D &&
+        descriptor.Address != 0 &&
+        descriptor.Width != 0 &&
+        descriptor.Height != 0;
+
+    /// <summary>
+    /// Execution-time resolution for a texture whose T# read zero at parse
+    /// (late-written per-frame descriptor tables: RT inputs, autoexposure).
+    /// The presenter re-reads the descriptor words on the ordered GPU
+    /// timeline and swaps the fallback for the real render-target alias.
+    /// </summary>
+    internal static bool TryResolveDeferredDrawTexture(
+        uint[] descriptorWords,
+        bool isStorage,
+        uint mipLevel,
+        out VulkanGuestDrawTexture texture)
+    {
+        texture = default!;
+        if (!TryDecodeTextureDescriptor(descriptorWords, out var descriptor) ||
+            descriptor.Type != Gen5TextureType2D ||
+            descriptor.Address == 0 ||
+            descriptor.Width == 0 ||
+            descriptor.Height == 0 ||
+            descriptor.Width > 8192 ||
+            descriptor.Height > 8192 ||
+            isStorage ||
+            !VulkanVideoPresenter.IsGuestImageAvailable(
+                descriptor.Address,
+                descriptor.Format,
+                descriptor.NumberType))
+        {
+            return false;
+        }
+
+        texture = new VulkanGuestDrawTexture(
+            descriptor.Address,
+            descriptor.Width,
+            descriptor.Height,
+            descriptor.Format,
+            descriptor.NumberType,
+            [],
+            IsFallback: false,
+            IsStorage: false,
+            MipLevels: descriptor.MipLevels,
+            MipLevel: mipLevel,
+            BaseMipLevel: descriptor.ViewBaseLevel,
+            ResourceMipLevels: descriptor.ResourceMipLevels,
+            Pitch: descriptor.TileMode == 0
+                ? GetLinearTexturePitch(
+                    Math.Max(descriptor.Width, descriptor.Pitch),
+                    descriptor.Height,
+                    descriptor.Format)
+                : descriptor.Width,
+            TileMode: descriptor.TileMode,
+            DstSelect: descriptor.DstSelect);
+        return true;
+    }
+
     private static bool TryCreateVulkanGuestDrawTexture(
         CpuContext ctx,
         TextureDescriptor descriptor,
@@ -7977,6 +8132,16 @@ public static class AgcExports
             descriptor.Width > 8192 ||
             descriptor.Height > 8192)
         {
+            if (descriptor.Address != 0 &&
+                Interlocked.Increment(ref _unsupportedTextureTraceCount) <= 512)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][TRACE] agc.unsupported_texture addr=0x{descriptor.Address:X16} " +
+                    $"type={descriptor.Type} size={descriptor.Width}x{descriptor.Height} " +
+                    $"fmt={descriptor.Format}/n{descriptor.NumberType} tile={descriptor.TileMode} " +
+                    $"mips={descriptor.ResourceMipLevels} pitch={descriptor.Pitch}");
+            }
+
             texture = CreateFallbackGuestDrawTexture(isStorage, descriptor.Format, descriptor.NumberType);
             return true;
         }
@@ -11166,6 +11331,11 @@ public static class AgcExports
     }
 
     private static readonly ConcurrentDictionary<ulong, int> _vsScalarDumpCounts = new();
+    private static readonly bool _dumpTinyPsState = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_DUMP_TINY_PS_STATE"),
+        "1",
+        StringComparison.Ordinal);
+    private static readonly ConcurrentDictionary<ulong, int> _tinyPsStateDumpCounts = new();
 
     private static void DumpVsScalarsIfRequested(
         ulong exportShaderAddress,
@@ -11217,6 +11387,11 @@ public static class AgcExports
     }
 
     private static int _nv12ShaderDumpCount;
+    private static long _dmaDataTraceCount;
+    private static long _zeroDescriptorTraceCount;
+    private static long _writeDataRangeTraceCount;
+    private static long _unsupportedTextureTraceCount;
+    private static readonly ConcurrentDictionary<ulong, byte> _zeroDescriptorTracedShaders = new();
 
     private static void DumpNv12ShaderIfRequested(
         ulong shaderAddress,

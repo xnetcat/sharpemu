@@ -1408,24 +1408,6 @@ public static class KernelPthreadCompatExports
             }
         }
 
-        var consumedPendingSignal = false;
-        lock (state.SyncRoot)
-        {
-            consumedPendingSignal = state.TryConsumePendingSignal();
-        }
-
-        if (consumedPendingSignal)
-        {
-            TracePthreadCond("wait-wake-pending", condAddress, mutexAddress, state, timed, (int)OrbisGen2Result.ORBIS_GEN2_OK);
-            var unlockResult = PthreadMutexUnlockCore(ctx, mutexAddress, requireOwner: true);
-            if (unlockResult != (int)OrbisGen2Result.ORBIS_GEN2_OK)
-            {
-                return unlockResult;
-            }
-
-            return PthreadMutexLockCore(ctx, mutexAddress, tryOnly: false);
-        }
-
         var cooperative = GuestThreadExecution.IsGuestThread &&
             GuestThreadExecution.TryGetCurrentImportCallFrame(out _);
         var compatibilityRecheck = !timed &&
