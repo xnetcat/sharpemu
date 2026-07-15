@@ -26,10 +26,11 @@ public static class AudioOut2Exports
     // can pace to the real playback cadence (grain samples at the sample rate).
     private static readonly ConcurrentDictionary<ulong, ContextState> Contexts = new();
 
-    private sealed class ContextState
+    private sealed class ContextState : IDisposable
     {
         private readonly object _paceGate = new();
         private long _nextAdvanceTimestamp;
+        private Timer? _grainTimer;
 
         public ContextState(uint frequency, uint channels, uint grainSamples)
         {
@@ -41,6 +42,35 @@ public static class AudioOut2Exports
         public uint Frequency { get; }
         public uint Channels { get; }
         public uint GrainSamples { get; }
+
+        /// <summary>
+        /// Hardware signals the context's event flag every audio grain so the
+        /// title's audio thread wakes to mix/push the next block. The guest
+        /// audio thread blocks on this flag before it ever calls
+        /// ContextAdvance, so the signal must come from a host-side timer
+        /// rather than from the advance path (Silent Hill's Wwise
+        /// 'AudioThread' flag waits with pattern 0x1).
+        /// </summary>
+        public void StartGrainSignal(ulong eventFlagHandle)
+        {
+            var period = TimeSpan.FromSeconds((double)GrainSamples / Frequency);
+            if (period < TimeSpan.FromMilliseconds(4))
+            {
+                period = TimeSpan.FromMilliseconds(4);
+            }
+
+            _grainTimer = new Timer(
+                static state =>
+                {
+                    var handle = (ulong)state!;
+                    _ = Kernel.KernelEventFlagCompatExports.TrySignalEventFlag(handle, 0x1);
+                },
+                eventFlagHandle,
+                period,
+                period);
+        }
+
+        public void Dispose() => _grainTimer?.Dispose();
 
         // Blocks the advancing thread until one grain worth of wall-clock time
         // has elapsed since the previous advance, matching hardware timing so
@@ -153,24 +183,39 @@ public static class AudioOut2Exports
             return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        // Read channels/frequency/grain from the reset-param blob so the
-        // context can pace advances to the real audio cadence.
+        // Observed Silent Hill context param layout (0x60 bytes read):
+        //   +0x00 u32 size/version (0x10)
+        //   +0x04 u32 queue depth / max ports (0x80)
+        //   +0x0C u32 kernel event flag handle signalled every audio grain
+        //   +0x10 u32 grain in samples (0x200)
+        //   +0x40 u64 0xC0DEC0DECAFEBABE marker, then guest pointers.
         uint channels = 2;
         uint frequency = 48000;
         uint grain = 256;
-        Span<byte> param = stackalloc byte[0x10];
+        ulong eventFlagHandle = 0;
+        Span<byte> param = stackalloc byte[0x18];
         if (ctx.Memory.TryRead(paramAddress, param))
         {
-            var pc = BinaryPrimitives.ReadUInt32LittleEndian(param[0x04..]);
-            var pf = BinaryPrimitives.ReadUInt32LittleEndian(param[0x08..]);
-            var pg = BinaryPrimitives.ReadUInt32LittleEndian(param[0x0C..]);
-            if (pc is > 0 and <= 8) channels = pc;
-            if (pf is >= 8000 and <= 192000) frequency = pf;
+            var flagCandidate = BinaryPrimitives.ReadUInt32LittleEndian(param[0x0C..]);
+            var pg = BinaryPrimitives.ReadUInt32LittleEndian(param[0x10..]);
             if (pg is > 0 and <= 0x4000) grain = pg;
+            eventFlagHandle = flagCandidate;
         }
 
         var handle = (ulong)Interlocked.Increment(ref _nextContextHandle);
-        Contexts[handle] = new ContextState(frequency, channels, grain);
+        var contextState = new ContextState(frequency, channels, grain);
+        Contexts[handle] = contextState;
+        if (eventFlagHandle != 0 &&
+            Kernel.KernelEventFlagCompatExports.TrySignalEventFlag(eventFlagHandle, 0))
+        {
+            // Handle refers to a live kernel event flag: treat it as the
+            // context's grain notification target (signalling pattern 0 above
+            // was a validity probe with no observable effect).
+            contextState.StartGrainSignal(eventFlagHandle);
+            Console.Error.WriteLine(
+                $"[LOADER][INFO] audio2.context_create handle={handle} grain={grain} " +
+                $"event_flag=0x{eventFlagHandle:X} grain_signal=on");
+        }
         return TryWriteUInt64(ctx, outContextAddress, handle)
             ? SetReturn(ctx, 0)
             : SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
@@ -183,7 +228,11 @@ public static class AudioOut2Exports
         LibraryName = "libSceAudioOut2")]
     public static int AudioOut2ContextDestroy(CpuContext ctx)
     {
-        Contexts.TryRemove(ctx[CpuRegister.Rdi], out _);
+        if (Contexts.TryRemove(ctx[CpuRegister.Rdi], out var removed))
+        {
+            removed.Dispose();
+        }
+
         return SetReturn(ctx, 0);
     }
 

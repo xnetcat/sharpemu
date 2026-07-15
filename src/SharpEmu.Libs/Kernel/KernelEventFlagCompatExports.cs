@@ -131,6 +131,43 @@ public static class KernelEventFlagCompatExports
         return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
     }
 
+    /// <summary>
+    /// HLE-internal set: lets host-side subsystems (e.g. AudioOut2's grain
+    /// pacing) signal a guest event flag exactly like sceKernelSetEventFlag.
+    /// </summary>
+    public static bool TrySignalEventFlag(ulong handle, ulong pattern)
+    {
+        if (!_eventFlags.TryGetValue(handle, out var state))
+        {
+            return false;
+        }
+
+        lock (state.Gate)
+        {
+            state.Bits |= pattern;
+            Monitor.PulseAll(state.Gate);
+        }
+
+        _ = GuestThreadExecution.Scheduler?.WakeBlockedThreads(GetEventFlagWakeKey(handle));
+        return true;
+    }
+
+    /// <summary>Looks up a flag handle by its creation name (first match).</summary>
+    public static bool TryFindEventFlagByName(string name, out ulong handle)
+    {
+        foreach (var pair in _eventFlags)
+        {
+            if (string.Equals(pair.Value.Name, name, StringComparison.Ordinal))
+            {
+                handle = pair.Key;
+                return true;
+            }
+        }
+
+        handle = 0;
+        return false;
+    }
+
     [SysAbiExport(
         Nid = "7uhBFWRAS60",
         ExportName = "sceKernelClearEventFlag",

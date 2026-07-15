@@ -23,6 +23,21 @@ public static class PadExports
 
     private static bool _initialized;
 
+    private static readonly bool _tracePad = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_LOG_PAD"),
+        "1",
+        StringComparison.Ordinal);
+    private static int _padTraceCount;
+    private static int _readStateTraceCount;
+
+    private static void TracePad(string message)
+    {
+        if (_tracePad && Interlocked.Increment(ref _padTraceCount) <= 200)
+        {
+            Console.Error.WriteLine($"[LOADER][TRACE] pad.{message}");
+        }
+    }
+
     [SysAbiExport(
         Nid = "hv1luiJrqQM",
         ExportName = "scePadInit",
@@ -45,6 +60,7 @@ public static class PadExports
         var type = unchecked((int)ctx[CpuRegister.Rsi]);
         var index = unchecked((int)ctx[CpuRegister.Rdx]);
         var parameterAddress = ctx[CpuRegister.Rcx];
+        TracePad($"open user=0x{userId:X} type={type} index={index} param=0x{parameterAddress:X}");
         if (!_initialized)
         {
             return SetReturn(ctx, OrbisPadErrorNotInitialized);
@@ -77,6 +93,7 @@ public static class PadExports
         var userId = unchecked((int)ctx[CpuRegister.Rdi]);
         var type = unchecked((int)ctx[CpuRegister.Rsi]);
         var index = unchecked((int)ctx[CpuRegister.Rdx]);
+        TracePad($"get_handle user=0x{userId:X} type={type} index={index}");
         if (!_initialized)
         {
             return SetReturn(ctx, OrbisPadErrorNotInitialized);
@@ -149,6 +166,17 @@ public static class PadExports
     {
         var handle = unchecked((int)ctx[CpuRegister.Rdi]);
         var dataAddress = ctx[CpuRegister.Rsi];
+        if (_tracePad)
+        {
+            var count = Interlocked.Increment(ref _readStateTraceCount);
+            if (count <= 50 || count % 1000 == 0)
+            {
+                var elapsed = (Stopwatch.GetTimestamp() - PadStartTimestamp) /
+                    (double)Stopwatch.Frequency;
+                Console.Error.WriteLine(
+                    $"[LOADER][TRACE] pad.read_state#{count} handle={handle} t={elapsed:F1}s");
+            }
+        }
         if (handle != PrimaryPadHandle)
         {
             return SetReturn(ctx, OrbisPadErrorInvalidHandle);

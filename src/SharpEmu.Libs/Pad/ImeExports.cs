@@ -12,6 +12,7 @@ public static class ImeExports
     private const int ImeErrorInvalidAddress = unchecked((int)0x80BC0001);
     private const int ImeErrorInvalidUserId = unchecked((int)0x80BC0010);
     private const int ImeErrorNotOpened = unchecked((int)0x80BC0005);
+    private const int ImeErrorConnectionFailed = unchecked((int)0x80BC0007);
 
     private static bool _keyboardOpen;
 
@@ -34,8 +35,12 @@ public static class ImeExports
             return SetReturn(ctx, ImeErrorInvalidUserId);
         }
 
-        _keyboardOpen = true;
-        return SetReturn(ctx, 0);
+        // No physical USB keyboard is connected on a stock console, and no
+        // host keyboard-event bridge exists here. Reporting success makes
+        // titles (Silent Hill TSM's pre-title screen) wait forever for key
+        // events that never arrive; the authentic no-keyboard behavior is a
+        // connection failure, after which titles fall back to pad input.
+        return SetReturn(ctx, ImeErrorConnectionFailed);
     }
 
     [SysAbiExport(
