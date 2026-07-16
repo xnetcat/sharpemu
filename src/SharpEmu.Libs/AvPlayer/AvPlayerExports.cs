@@ -1305,10 +1305,18 @@ public static class AvPlayerExports
         }
 
         var normalized = guestPath.Replace('\\', '/');
-        if (Uri.TryCreate(normalized, UriKind.Absolute, out var uri) && uri.IsFile)
+        // Strip a file:// scheme by hand: UE hands the player RELATIVE file
+        // URIs ("file://../../../shpc/Content/Movies/x.mp4") whose first
+        // "path" segment System.Uri treats as a HOST, mangling LocalPath.
+        if (normalized.StartsWith("file://", StringComparison.OrdinalIgnoreCase))
         {
-            normalized = uri.LocalPath;
+            normalized = normalized["file://".Length..];
         }
+        else if (normalized.StartsWith("file:", StringComparison.OrdinalIgnoreCase))
+        {
+            normalized = normalized["file:".Length..];
+        }
+
         if (File.Exists(normalized))
         {
             return Path.GetFullPath(normalized);
@@ -1327,11 +1335,47 @@ public static class AvPlayerExports
                 break;
             }
         }
-        var candidate = Path.GetFullPath(Path.Combine(app0, normalized.TrimStart('/')));
+
+        // Leading parent-directory hops are relative to some sandbox
+        // subdirectory the game believes it runs in; app0 is the deepest
+        // root we expose, so resolve what remains against it.
+        normalized = normalized.TrimStart('/');
+        while (normalized.StartsWith("../", StringComparison.Ordinal))
+        {
+            normalized = normalized["../".Length..];
+        }
+
         var root = Path.GetFullPath(app0).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
-        return candidate.StartsWith(root, StringComparison.OrdinalIgnoreCase) && File.Exists(candidate)
-            ? candidate
-            : null;
+        var candidate = Path.GetFullPath(Path.Combine(app0, normalized));
+        if (candidate.StartsWith(root, StringComparison.OrdinalIgnoreCase) && File.Exists(candidate))
+        {
+            return candidate;
+        }
+
+        // Last resort: match by trailing path segments under app0 (the URI's
+        // directory prefix may not exist in the extracted layout).
+        var fileName = Path.GetFileName(normalized);
+        if (!string.IsNullOrEmpty(fileName))
+        {
+            try
+            {
+                var match = Directory
+                    .EnumerateFiles(root, fileName, SearchOption.AllDirectories)
+                    .FirstOrDefault();
+                if (match is not null)
+                {
+                    return match;
+                }
+            }
+            catch (IOException)
+            {
+            }
+            catch (UnauthorizedAccessException)
+            {
+            }
+        }
+
+        return null;
     }
 
     private static bool TryReadNullTerminatedUtf8(CpuContext ctx, ulong address, int maxLength, out string value)

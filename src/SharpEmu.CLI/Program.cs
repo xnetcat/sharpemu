@@ -177,6 +177,17 @@ internal static partial class Program
 
         ConfigureKnownTitleArguments(ebootPath);
 
+        // The directory holding eboot.bin IS the app0 mount. Every consumer
+        // of SHARPEMU_APP0_DIR (AvPlayer movie paths, temp0, writable-app0
+        // compatibility) silently fails without it — Silent Hill TSM's title
+        // movie then never opens and the game waits on player-ready forever.
+        if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("SHARPEMU_APP0_DIR")) &&
+            Path.GetDirectoryName(ebootPath) is { Length: > 0 } ebootDirectory)
+        {
+            Environment.SetEnvironmentVariable("SHARPEMU_APP0_DIR", ebootDirectory);
+            Console.Error.WriteLine($"[DEBUG] SHARPEMU_APP0_DIR defaulted to {ebootDirectory}");
+        }
+
         Console.Error.WriteLine("[DEBUG] Creating runtime...");
 
         using var runtime = SharpEmuRuntime.CreateDefault(runtimeOptions);
