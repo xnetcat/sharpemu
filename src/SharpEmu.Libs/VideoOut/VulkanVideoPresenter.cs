@@ -7370,6 +7370,7 @@ internal static unsafe class VulkanVideoPresenter
             var address = 0UL;
             if (!matchAnyLut &&
                 !matchRgba8Lut &&
+                !spec.StartsWith("cs:", StringComparison.OrdinalIgnoreCase) &&
                 !ulong.TryParse(
                     spec.Replace("0x", string.Empty),
                     System.Globalization.NumberStyles.HexNumber,
@@ -7379,17 +7380,35 @@ internal static unsafe class VulkanVideoPresenter
                 return;
             }
 
+            // "cs:<hex shader addr>": read back EVERY texture (sampled and
+            // storage) of that compute shader's dispatches — pins whether a
+            // reduction (histogram/eye-adaptation) sees garbage input.
+            var matchShader = 0UL;
+            if (spec.StartsWith("cs:", StringComparison.OrdinalIgnoreCase))
+            {
+                _ = ulong.TryParse(
+                    spec[3..].Replace("0x", string.Empty),
+                    System.Globalization.NumberStyles.HexNumber,
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    out matchShader);
+                if (work.ShaderAddress != matchShader)
+                {
+                    return;
+                }
+            }
+
             List<GuestImageResource>? images = null;
             foreach (var texture in work.Textures)
             {
-                if (texture.IsStorage &&
+                if ((matchShader != 0 || texture.IsStorage) &&
                     texture.Address != 0 &&
-                    (matchAnyLut
+                    (matchShader != 0 ||
+                     (matchAnyLut
                         ? texture.Width == 1 && texture.Height == 1
                         : matchRgba8Lut
                             ? texture.Width == 1 && texture.Height == 1 &&
                               texture.Format == 10
-                            : texture.Address == address) &&
+                            : texture.Address == address)) &&
                     _guestImages.TryGetValue(texture.Address, out var image))
                 {
                     images ??= [];
@@ -9746,8 +9765,11 @@ internal static unsafe class VulkanVideoPresenter
                 Format.R16G16Sint or
                 Format.R16G16Sfloat or
                 Format.R8G8B8A8Unorm or
+                Format.R8G8B8A8Srgb or
                 Format.R8G8B8A8Uint or
                 Format.R8G8B8A8Sint or
+                Format.B8G8R8A8Unorm or
+                Format.B8G8R8A8Srgb or
                 Format.A2R10G10B10UnormPack32 or
                 Format.A2B10G10R10UnormPack32 or
                 Format.B10G11R11UfloatPack32 => 32,
