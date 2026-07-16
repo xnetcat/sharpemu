@@ -3423,6 +3423,19 @@ internal static unsafe class VulkanVideoPresenter
         private bool _batchOpen;
         private int _batchDrawCount;
         private readonly List<TranslatedDrawResources> _batchResources = new();
+        // Refresh EVERY read-only constant-buffer snapshot from live guest
+        // memory at batch-flush time, not only all-zero ones. Per-frame post
+        // constants written after the command list is parsed hold garbage
+        // (not zeros) at parse; execution-time re-read is what a real GPU
+        // fetches. Env-gated because the same snapshot path also holds
+        // Unity's transient fullscreen-blit ortho ring, which the guest can
+        // recycle before execution — refreshing that hands a later draw's
+        // matrix to an earlier blit (SHARPEMU_REFRESH_ALL_CB_SNAPSHOTS=0 to
+        // isolate that regression).
+        private static readonly bool _refreshAllSnapshotBuffers = !string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_REFRESH_ALL_CB_SNAPSHOTS"),
+            "0",
+            StringComparison.Ordinal);
         private readonly List<GuestImageResource> _batchTraceImages = new();
         private bool _tracedScanoutSources;
         private bool _tracedFirst4kUfloatSources;
@@ -3577,7 +3590,8 @@ internal static unsafe class VulkanVideoPresenter
                     var mapped = new Span<byte>(
                         (void*)(buffer.Mapped + bias),
                         contentLength);
-                    if (mapped.IndexOfAnyExcept((byte)0) >= 0)
+                    var mappedAllZero = mapped.IndexOfAnyExcept((byte)0) < 0;
+                    if (!mappedAllZero && !_refreshAllSnapshotBuffers)
                     {
                         continue;
                     }
