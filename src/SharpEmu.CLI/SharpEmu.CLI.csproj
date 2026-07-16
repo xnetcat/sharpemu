@@ -36,6 +36,14 @@ SPDX-License-Identifier: GPL-2.0-or-later
     <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
 
+  <!-- Rosetta 2 intermittently wedges the whole process inside background
+       GC's FlushProcessWriteBuffers (every thread stalls, memory stops
+       growing, the window goes unresponsive). Non-concurrent GC trades
+       slightly longer pauses for never hitting that stall. -->
+  <PropertyGroup Condition="$(RuntimeIdentifier.StartsWith('osx'))">
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+  </PropertyGroup>
+
   <PropertyGroup Condition="'$(Configuration)' == 'Release'">
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
     <DebugType>none</DebugType>

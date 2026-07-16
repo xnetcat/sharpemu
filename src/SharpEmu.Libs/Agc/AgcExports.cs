@@ -6651,7 +6651,13 @@ public static class AgcExports
                     Gen5ShaderTranslator.IsStorageImageOperation(binding.Opcode),
                     binding.MipLevel ?? 0,
                     binding.SamplerDescriptor,
-                    descriptorUnusable ? binding.DescriptorSourceAddress : 0,
+                    // Provenance travels with USABLE descriptors too: a valid
+                    // parse-time T# can still be one generation stale (UE5
+                    // writes the lighting pass's table late; the old entry
+                    // points at a long-dead texture and the G-buffer samples
+                    // black). Execution re-reads the entry and re-resolves
+                    // when its address changed.
+                    binding.DescriptorSourceAddress,
                     descriptorUnusable ? binding.DeferredChain : null));
         }
 

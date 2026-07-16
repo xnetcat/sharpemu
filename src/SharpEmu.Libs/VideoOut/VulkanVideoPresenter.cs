@@ -8600,7 +8600,7 @@ internal static unsafe class VulkanVideoPresenter
                     descriptorAddress = address0;
                 }
 
-                if (!texture.IsFallback || descriptorAddress == 0)
+                if (descriptorAddress == 0)
                 {
                     if (texture.IsFallback &&
                         work.Target.Width >= 1280 &&
@@ -8616,6 +8616,33 @@ internal static unsafe class VulkanVideoPresenter
                     }
 
                     continue;
+                }
+
+                if (!texture.IsFallback)
+                {
+                    // A usable parse-time T# can still be one generation
+                    // stale: UE5 writes the lighting pass's descriptor table
+                    // after the command list is parsed, and the old entry
+                    // points at a long-dead texture (the sampled G-buffer
+                    // then reads black). Peek the entry's current address;
+                    // only a CHANGED address re-resolves, so transient-ring
+                    // recycling of unchanged entries cannot regress.
+                    var peek = new byte[8];
+                    if (_guestMemory?.TryRead(descriptorAddress, peek) != true)
+                    {
+                        continue;
+                    }
+
+                    var word0 = System.Buffers.Binary.BinaryPrimitives
+                        .ReadUInt32LittleEndian(peek);
+                    var word1 = System.Buffers.Binary.BinaryPrimitives
+                        .ReadUInt32LittleEndian(peek.AsSpan(4));
+                    var liveAddress =
+                        (((ulong)(word1 & 0xFFu) << 32) | word0) << 8;
+                    if (liveAddress == 0 || liveAddress == texture.Address)
+                    {
+                        continue;
+                    }
                 }
 
                 var descriptorBytes = new byte[32];
