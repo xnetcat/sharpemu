@@ -324,8 +324,11 @@ public static class KernelEventFlagCompatExports
                     return true;
                 },
                 deadline);
-            TraceEventFlag($"wait-unsatisfied handle=0x{handle:X16} pattern=0x{pattern:X16} bits=0x{state.Bits:X16} guest_thread=0x{currentGuestThread:X16} fiber=0x{currentFiber:X16} managed={managedThread} block={requestedBlock} ret=0x{returnRip:X16} frames={FormatFrameChain(ctx)}");
-            TraceEventFlag($"wait-object handle=0x{handle:X16} name='{state.Name}' {FormatGuestWaitObject(ctx)}");
+            if (TraceEventFlagEnabled)
+            {
+                TraceEventFlag($"wait-unsatisfied handle=0x{handle:X16} pattern=0x{pattern:X16} bits=0x{state.Bits:X16} guest_thread=0x{currentGuestThread:X16} fiber=0x{currentFiber:X16} managed={managedThread} block={requestedBlock} ret=0x{returnRip:X16} frames={FormatFrameChain(ctx)}");
+                TraceEventFlag($"wait-object handle=0x{handle:X16} name='{state.Name}' {FormatGuestWaitObject(ctx)}");
+            }
             if (!requestedBlock)
             {
                 var scheduler = GuestThreadExecution.Scheduler;
@@ -601,9 +604,20 @@ public static class KernelEventFlagCompatExports
         return value;
     }
 
+    // Cached once: the guest wait path is extremely hot, and building the
+    // trace strings (FormatGuestWaitObject / FormatFrameChain walk guest
+    // memory and format on the guest render/worker threads) on every wait is
+    // both wasteful and, under Rosetta, a JIT-through-import-thunk fatal-trap
+    // hazard when those helpers first compile on a worker. Skip the message
+    // construction entirely unless tracing is enabled.
+    internal static readonly bool TraceEventFlagEnabled = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_LOG_EVENT_FLAG"),
+        "1",
+        StringComparison.Ordinal);
+
     private static void TraceEventFlag(string message)
     {
-        if (string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_EVENT_FLAG"), "1", StringComparison.Ordinal))
+        if (TraceEventFlagEnabled)
         {
             Console.Error.WriteLine($"[LOADER][TRACE] event_flag.{message}");
         }
