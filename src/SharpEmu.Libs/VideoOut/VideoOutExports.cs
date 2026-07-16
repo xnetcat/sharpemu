@@ -504,11 +504,6 @@ public static class VideoOutExports
         var bufferIndex = unchecked((int)ctx[CpuRegister.Rsi]);
         var flipMode = unchecked((int)ctx[CpuRegister.Rdx]);
         var flipArg = unchecked((long)ctx[CpuRegister.Rcx]);
-        // Real avplayer posts state events from its own worker thread; pump
-        // queued events once per presented frame so a guest that waits for
-        // the READY callback before calling back into avplayer (UE5's title
-        // movie) is not starved.
-        AvPlayer.AvPlayerExports.PumpPendingEvents(ctx);
         return SubmitFlip(ctx, handle, bufferIndex, flipMode, flipArg, submitGpuImage: true);
     }
 
@@ -924,6 +919,12 @@ public static class VideoOutExports
         long flipArg,
         bool submitGpuImage)
     {
+        // Real avplayer posts state events from its own worker thread; pump
+        // queued events once per presented frame (this core also serves the
+        // AGC flip packets games actually use) so a guest that waits for the
+        // READY callback before calling back into avplayer (UE5's title
+        // movie) is not starved.
+        AvPlayer.AvPlayerExports.PumpPendingEvents(ctx);
         if (!TryGetPort(handle, out var port))
         {
             return OrbisVideoOutErrorInvalidHandle;
