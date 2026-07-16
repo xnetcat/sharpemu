@@ -3504,6 +3504,7 @@ internal static unsafe class VulkanVideoPresenter
 
             CloseOpenTranslatedRenderPass();
             _batchOpen = false;
+            RefreshZeroSnapshotBuffers(_batchResources);
             try
             {
                 Check(_vk.EndCommandBuffer(_batchCommandBuffer), "vkEndCommandBuffer(batch)");
@@ -3538,6 +3539,56 @@ internal static unsafe class VulkanVideoPresenter
                 _batchTraceImages.Clear();
                 _batchRetireBuffers.Clear();
                 _batchCommandBuffer = default;
+            }
+        }
+
+        // Last-moment refresh for parse-time constant-buffer snapshots that
+        // were still all-zero when their resources were built: per-frame CBs
+        // are written by the guest CPU after the command list is parsed, and
+        // resource creation can still run ahead of that write. The host
+        // buffers are host-visible, so rewriting them any time before the
+        // batch is submitted is safe and gives the guest the largest window.
+        private unsafe void RefreshZeroSnapshotBuffers(
+            List<TranslatedDrawResources> batchResources)
+        {
+            foreach (var resources in batchResources)
+            {
+                foreach (var buffer in resources.GlobalMemoryBuffers)
+                {
+                    if (buffer.Allocation is not null ||
+                        buffer.Writable ||
+                        buffer.BaseAddress == 0 ||
+                        buffer.Mapped == 0 ||
+                        buffer.GuestSize == 0 ||
+                        buffer.GuestSize > 65536)
+                    {
+                        continue;
+                    }
+
+                    var bias = checked((int)(
+                        buffer.BaseAddress &
+                        (GuestStorageBufferOffsetAlignment - 1)));
+                    var contentLength = checked((int)buffer.GuestSize) - bias;
+                    if (contentLength <= 0)
+                    {
+                        continue;
+                    }
+
+                    var mapped = new Span<byte>(
+                        (void*)(buffer.Mapped + bias),
+                        contentLength);
+                    if (mapped.IndexOfAnyExcept((byte)0) >= 0)
+                    {
+                        continue;
+                    }
+
+                    var live = new byte[contentLength];
+                    if (_guestMemory?.TryRead(buffer.BaseAddress, live) == true &&
+                        live.AsSpan().IndexOfAnyExcept((byte)0) >= 0)
+                    {
+                        live.CopyTo(mapped);
+                    }
+                }
             }
         }
 
