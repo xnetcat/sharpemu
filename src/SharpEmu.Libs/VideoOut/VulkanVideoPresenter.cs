@@ -11695,6 +11695,16 @@ internal static unsafe class VulkanVideoPresenter
             }
         }
 
+        // SHARPEMU_TRACE_LIGHTING_SOURCES=1: one-shot execution-time readback
+        // of every sampled source of the first texture-heavy 4K fmt12 draw
+        // (UE5's lighting-combine pass shape: full-res R16G16B16A16 target,
+        // 8+ sampled inputs — G-buffer, shadow masks, exposure).
+        private static readonly bool _traceLightingSourcesEnabled = string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_TRACE_LIGHTING_SOURCES"),
+            "1",
+            StringComparison.Ordinal);
+        private bool _tracedDrawSourcesPs;
+
         private bool TraceSelectedDrawSources(
             VulkanOffscreenGuestDraw work,
             TranslatedDrawResources resources)
@@ -11713,7 +11723,19 @@ internal static unsafe class VulkanVideoPresenter
             var isFirst4kUfloat =
                 is4kUfloat &&
                 ++_seen4kUfloatSources == _trace4kUfloatSourcesOrdinal;
-            if (!isScanout && !isFirst4kUfloat)
+            var isSelectedPs =
+                _traceLightingSourcesEnabled &&
+                !_tracedDrawSourcesPs &&
+                work.Target.Width == 3840 &&
+                work.Target.Height == 2160 &&
+                work.Target.Format == 12 &&
+                work.Draw.Textures.Count >= 8;
+            if (isSelectedPs)
+            {
+                _tracedDrawSourcesPs = true;
+            }
+
+            if (!isScanout && !isFirst4kUfloat && !isSelectedPs)
             {
                 return false;
             }
@@ -11738,7 +11760,7 @@ internal static unsafe class VulkanVideoPresenter
             WaitForAllGuestSubmissionsForCpuVisibility();
             Console.Error.WriteLine(
                 $"[LOADER][TRACE] vk.draw_source_readback " +
-                $"kind={(isScanout ? "scanout" : "first-4k-ufloat")} " +
+                $"kind={(isScanout ? "scanout" : isSelectedPs ? "lighting" : "first-4k-ufloat")} " +
                 $"target=0x{work.Target.Address:X16} sources={sourceImages.Length}");
             for (var index = 0; index < resources.Textures.Length; index++)
             {
