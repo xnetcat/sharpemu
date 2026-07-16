@@ -12,6 +12,14 @@ namespace SharpEmu.Libs.Agc;
 
 internal static class Gen5ShaderScalarEvaluator
 {
+    // Called from the host thread during startup. Touching any static member
+    // runs the static constructor (which pre-JITs the generic collections this
+    // evaluator uses) on a safe stack, so their first compilation never
+    // happens on a guest render worker inside the Rosetta import thunk.
+    internal static void EnsureJitWarm()
+    {
+    }
+
     // When a scalar POINTER load can't be resolved statically (its descriptor
     // register read back garbage — e.g. 0 or 0xFFFFFFFF, a per-draw descriptor
     // setup race), abort-and-drop-the-draw loses the whole pass. Demon's Souls'

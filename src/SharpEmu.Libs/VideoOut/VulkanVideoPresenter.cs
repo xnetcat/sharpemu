@@ -2161,6 +2161,21 @@ internal static unsafe class VulkanVideoPresenter
                 }
             }
 
+            // Force one-time enum-info initialization for Silk's Vulkan.Format
+            // on this (managed host) thread. Deferred until the first enum
+            // ToString on a guest render worker, .NET's lazy GetEnumInfo can
+            // fold through the UnmanagedCallersOnly import thunk under Rosetta
+            // and fatally trap ("attempted to call a UnmanagedCallersOnly
+            // method from managed code") in a diagnostic string interpolation.
+            _ = Format.Undefined.ToString();
+            _ = ImageLayout.Undefined.ToString();
+
+            // Same Rosetta hazard for the shader evaluator's generic
+            // collections (HashSet<ScalarPathKey>, Dictionary<uint,...>): their
+            // first JIT must happen here on the host thread, not on a guest
+            // worker whose stack sits inside the import thunk.
+            SharpEmu.Libs.Agc.Gen5ShaderScalarEvaluator.EnsureJitWarm();
+
             WaitForRenderDocAttachIfRequested();
             _vk = Vk.GetApi();
             CreateInstance();
