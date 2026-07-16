@@ -6722,7 +6722,12 @@ public static class AgcExports
         if (ctx.Memory.TryRead(address, span) ||
             KernelMemoryCompatExports.TryReadTrackedLibcHeap(address, span))
         {
-            return new VulkanGuestIndexBuffer(data, byteCount, is32Bit, Pooled: true);
+            return new VulkanGuestIndexBuffer(
+                data,
+                byteCount,
+                is32Bit,
+                Pooled: true,
+                GuestAddress: address);
         }
 
         System.Buffers.ArrayPool<byte>.Shared.Return(data);
@@ -6827,7 +6832,12 @@ public static class AgcExports
 
         var copy = new byte[source.Data.Length];
         Array.Copy(source.Data, copy, source.Data.Length);
-        return new VulkanGuestIndexBuffer(copy, source.Length, source.Is32Bit, Pooled: false);
+        return new VulkanGuestIndexBuffer(
+            copy,
+            source.Length,
+            source.Is32Bit,
+            Pooled: false,
+            GuestAddress: source.GuestAddress);
     }
 
     private static bool HasPixelColorExport(Gen5ShaderState state, uint target) =>

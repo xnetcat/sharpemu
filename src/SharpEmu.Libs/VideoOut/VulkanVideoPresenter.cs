@@ -87,7 +87,8 @@ internal sealed record VulkanGuestIndexBuffer(
     byte[] Data,
     int Length,
     bool Is32Bit,
-    bool Pooled);
+    bool Pooled,
+    ulong GuestAddress = 0);
 
 internal readonly record struct VulkanGuestRect(
     int X,
@@ -4182,8 +4183,31 @@ internal static unsafe class VulkanVideoPresenter
 
                 if (draw.IndexBuffer is { Length: > 0 } indexBuffer)
                 {
+                    var indexData = indexBuffer.Data.AsSpan(0, indexBuffer.Length);
+                    // The per-frame Slate/UMG index ring is written by the CPU
+                    // after the command list is parsed, exactly like the
+                    // vertex ring. When this draw carried a deferred vertex
+                    // V#, its parse-time index snapshot is equally stale
+                    // (quads then lose their second triangle to garbage
+                    // indices) — re-read the live indices on the ordered
+                    // timeline alongside the deferred vertex refresh.
+                    byte[]? refreshedIndices = null;
+                    if (indexBuffer.GuestAddress != 0 &&
+                        _guestMemory is not null &&
+                        draw.VertexBuffers.Any(static vertex =>
+                            vertex.DeferredDescriptorAddress != 0))
+                    {
+                        var live = new byte[indexBuffer.Length];
+                        if (_guestMemory.TryRead(indexBuffer.GuestAddress, live))
+                        {
+                            refreshedIndices = live;
+                        }
+                    }
+
                     resources.IndexBuffer = CreateHostBuffer(
-                        indexBuffer.Data.AsSpan(0, indexBuffer.Length),
+                        refreshedIndices is not null
+                            ? refreshedIndices.AsSpan()
+                            : indexData,
                         BufferUsageFlags.IndexBufferBit,
                         out resources.IndexMemory);
                     resources.Index32Bit = indexBuffer.Is32Bit;
@@ -6632,15 +6656,12 @@ internal static unsafe class VulkanVideoPresenter
                 return guestBuffer;
             }
 
-            var elementBytes =
-                (ulong)Math.Max(guestBuffer.ComponentCount, 1u) * sizeof(uint);
-            var recordSpan = Math.Max(stride, guestBuffer.OffsetBytes + elementBytes);
-            var requiredBytes = guestBuffer.RequiredRecords > 0
-                ? ((ulong)(guestBuffer.RequiredRecords - 1) * stride) + recordSpan
-                : sizeBytes;
-            var readBytes = (int)Math.Min(
-                Math.Min(requiredBytes, sizeBytes),
-                16UL * 1024 * 1024);
+            // RequiredRecords derives from the parse-time INDEX snapshot,
+            // which for a deferred draw came from the same late-written ring
+            // as the V# — trusting it undercuts the vertex range and drops
+            // the quad's second triangle. The refreshed descriptor's own
+            // size already bounds the read.
+            var readBytes = (int)Math.Min(sizeBytes, 16UL * 1024 * 1024);
             var vertexData = new byte[Math.Max(readBytes, sizeof(uint))];
             if (readBytes > 0 &&
                 !_guestMemory.TryRead(baseAddress, vertexData.AsSpan(0, readBytes)))
