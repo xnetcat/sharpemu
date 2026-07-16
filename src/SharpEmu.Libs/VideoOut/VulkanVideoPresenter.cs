@@ -7334,6 +7334,7 @@ internal static unsafe class VulkanVideoPresenter
             try
             {
                 ExecuteComputeDispatchCore(work);
+                ForceNeutralExposureAfterDispatch(work);
                 DebugReadbackAfterComputeStore(work);
             }
             finally
@@ -7352,6 +7353,145 @@ internal static unsafe class VulkanVideoPresenter
         private static readonly string? _debugReadbackImageSpec =
             Environment.GetEnvironmentVariable("SHARPEMU_READBACK_IMAGE");
         private static int _debugReadbackCount;
+
+        private static readonly bool _forceEyeAdaptation = string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_FORCE_EYE_ADAPTATION"),
+            "1",
+            StringComparison.Ordinal);
+        private static int _forcedExposureClears;
+
+        // SHARPEMU_FORCE_EYE_ADAPTATION=1: clear every 1x1 R32G32B32A32F
+        // compute-stored image (the UE5 eye-adaptation result structs) to
+        // neutral (1,1,1,1) right after the producing dispatch. Diagnostic:
+        // proves whether the auto-exposure crush (garbage average luminance
+        // driving the exposure scale to ~1e-5, which the float11 tonemap
+        // target then flushes to zero) is the only gate left between the
+        // scene chain and a visible frame.
+        private void ForceNeutralExposureAfterDispatch(VulkanComputeGuestDispatch work)
+        {
+            if (!_forceEyeAdaptation || _deviceLost)
+            {
+                return;
+            }
+
+            List<GuestImageResource>? images = null;
+            foreach (var texture in work.Textures)
+            {
+                if (texture.IsStorage &&
+                    texture.Width == 1 &&
+                    texture.Height == 1 &&
+                    texture.Address != 0 &&
+                    _guestImages.TryGetValue(texture.Address, out var image) &&
+                    image.Format == Format.R32G32B32A32Sfloat)
+                {
+                    images ??= [];
+                    if (!images.Contains(image))
+                    {
+                        images.Add(image);
+                    }
+                }
+            }
+
+            if (images is null)
+            {
+                return;
+            }
+
+            _commandBuffer = _presentationCommandBuffer;
+            FlushBatchedGuestCommands();
+            Check(_vk.QueueWaitIdle(_queue), "vkQueueWaitIdle(force exposure)");
+            foreach (var image in images)
+            {
+                Check(
+                    _vk.ResetCommandBuffer(_commandBuffer, 0),
+                    "vkResetCommandBuffer(force exposure)");
+                var beginInfo = new CommandBufferBeginInfo
+                {
+                    SType = StructureType.CommandBufferBeginInfo,
+                    Flags = CommandBufferUsageFlags.OneTimeSubmitBit,
+                };
+                Check(
+                    _vk.BeginCommandBuffer(_commandBuffer, &beginInfo),
+                    "vkBeginCommandBuffer(force exposure)");
+                var toTransfer = new ImageMemoryBarrier
+                {
+                    SType = StructureType.ImageMemoryBarrier,
+                    SrcAccessMask = AccessFlags.ShaderWriteBit,
+                    DstAccessMask = AccessFlags.TransferWriteBit,
+                    OldLayout = ImageLayout.Undefined,
+                    NewLayout = ImageLayout.TransferDstOptimal,
+                    SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    Image = image.Image,
+                    SubresourceRange = ColorSubresourceRange(),
+                };
+                _vk.CmdPipelineBarrier(
+                    _commandBuffer,
+                    PipelineStageFlags.ComputeShaderBit,
+                    PipelineStageFlags.TransferBit,
+                    0,
+                    0,
+                    null,
+                    0,
+                    null,
+                    1,
+                    &toTransfer);
+                var clearValue = new ClearColorValue(1f, 1f, 1f, 1f);
+                var range = ColorSubresourceRange();
+                _vk.CmdClearColorImage(
+                    _commandBuffer,
+                    image.Image,
+                    ImageLayout.TransferDstOptimal,
+                    &clearValue,
+                    1,
+                    &range);
+                var toShaderRead = new ImageMemoryBarrier
+                {
+                    SType = StructureType.ImageMemoryBarrier,
+                    SrcAccessMask = AccessFlags.TransferWriteBit,
+                    DstAccessMask = AccessFlags.ShaderReadBit,
+                    OldLayout = ImageLayout.TransferDstOptimal,
+                    NewLayout = ImageLayout.ShaderReadOnlyOptimal,
+                    SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    Image = image.Image,
+                    SubresourceRange = ColorSubresourceRange(),
+                };
+                _vk.CmdPipelineBarrier(
+                    _commandBuffer,
+                    PipelineStageFlags.TransferBit,
+                    PipelineStageFlags.FragmentShaderBit |
+                    PipelineStageFlags.ComputeShaderBit,
+                    0,
+                    0,
+                    null,
+                    0,
+                    null,
+                    1,
+                    &toShaderRead);
+                Check(
+                    _vk.EndCommandBuffer(_commandBuffer),
+                    "vkEndCommandBuffer(force exposure)");
+                var commandBuffer = _commandBuffer;
+                var submitInfo = new SubmitInfo
+                {
+                    SType = StructureType.SubmitInfo,
+                    CommandBufferCount = 1,
+                    PCommandBuffers = &commandBuffer,
+                };
+                Check(
+                    _vk.QueueSubmit(_queue, 1, &submitInfo, default),
+                    "vkQueueSubmit(force exposure)");
+                Check(
+                    _vk.QueueWaitIdle(_queue),
+                    "vkQueueWaitIdle(force exposure)");
+                if (Interlocked.Increment(ref _forcedExposureClears) <= 16)
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] dbg.forced_exposure addr=0x{image.Address:X16}");
+                }
+            }
+        }
 
         private void DebugReadbackAfterComputeStore(VulkanComputeGuestDispatch work)
         {
