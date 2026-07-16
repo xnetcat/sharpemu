@@ -397,7 +397,11 @@ internal static partial class Gen5SpirvTranslator
             uint ComponentType,
             uint VectorType,
             ImageComponentKind ComponentKind,
-            bool IsStorage);
+            bool IsStorage,
+            // True for a 3D (volume) image declared with SpirvImageDim.Dim3D.
+            // Drives 3-component coordinate/size building at every use site so
+            // the image type and the addressing agree.
+            bool Is3D = false);
 
         private readonly record struct SpirvVertexInput(
             uint Variable,
@@ -922,6 +926,10 @@ internal static partial class Gen5SpirvTranslator
                 _imageBindingByPc.TryAdd(binding.Pc, index);
                 var isStorage =
                     Gen5ShaderTranslator.IsStorageImageOperation(binding.Opcode);
+                // GFX10 MIMG DIM field: 0=1D, 1=2D, 2=3D, 3=Cube, 4/5/7=array
+                // variants. Only 3D changes the SPIR-V image dimensionality
+                // here; 2D-array (type 13) is bound as slice-0 2D upstream.
+                var is3D = binding.Control.Dimension == 2;
                 var (format, componentKind) =
                     DecodeImageFormat(binding.ResourceDescriptor);
                 var componentType = componentKind switch
@@ -945,7 +953,7 @@ internal static partial class Gen5SpirvTranslator
 
                 var imageType = _module.TypeImage(
                     componentType,
-                    SpirvImageDim.Dim2D,
+                    is3D ? SpirvImageDim.Dim3D : SpirvImageDim.Dim2D,
                     depth: false,
                     arrayed: false,
                     multisampled: false,
@@ -974,7 +982,8 @@ internal static partial class Gen5SpirvTranslator
                         componentType,
                         _module.TypeVector(componentType, 4),
                         componentKind,
-                        isStorage));
+                        isStorage,
+                        is3D));
                 _interfaces.Add(variable);
             }
         }
@@ -3035,11 +3044,15 @@ internal static partial class Gen5SpirvTranslator
                         SpirvOp.Image,
                         resource.ImageType,
                         imageObject);
+                // A 3D image's ImageQuerySize[Lod] yields a 3-component size
+                // (w,h,depth); reporting depth in component 2 keeps RESINFO
+                // honest for volumes while 2D still reports depth=1.
+                var sizeComponents = resource.Is3D ? 3u : 2u;
                 var size = _module.AddInstruction(
                     resource.IsStorage
                         ? SpirvOp.ImageQuerySize
                         : SpirvOp.ImageQuerySizeLod,
-                    _module.TypeVector(_intType, 2),
+                    _module.TypeVector(_intType, sizeComponents),
                     resource.IsStorage
                         ? [queryImage]
                         : [queryImage, UInt(0)]);
@@ -3052,7 +3065,7 @@ internal static partial class Gen5SpirvTranslator
                     }
 
                     uint value;
-                    if (component < 2)
+                    if (component < sizeComponents)
                     {
                         var signedValue = _module.AddInstruction(
                             SpirvOp.CompositeExtract,
@@ -3080,7 +3093,7 @@ internal static partial class Gen5SpirvTranslator
                     return false;
                 }
 
-                var coordinates = BuildIntegerCoordinates(image, 0);
+                var coordinates = BuildIntegerCoordinates(image, 0, resource.Is3D);
                 var components = new uint[4];
                 uint sourceIndex = 0;
                 for (var component = 0; component < components.Length; component++)
@@ -3116,13 +3129,14 @@ internal static partial class Gen5SpirvTranslator
                     components);
                 var imageSize = _module.AddInstruction(
                     SpirvOp.ImageQuerySize,
-                    _module.TypeVector(_intType, 2),
+                    _module.TypeVector(_intType, resource.Is3D ? 3u : 2u),
                     imageObject);
                 EmitBoundsCheckedImageWrite(
                     coordinates,
                     imageSize,
                     imageObject,
-                    texel);
+                    texel,
+                    resource.Is3D);
 
                 return true;
             }
@@ -3144,13 +3158,14 @@ internal static partial class Gen5SpirvTranslator
                     imageObject);
                 var imageSize = _module.AddInstruction(
                     SpirvOp.ImageQuerySizeLod,
-                    _module.TypeVector(_intType, 2),
+                    _module.TypeVector(_intType, resource.Is3D ? 3u : 2u),
                     fetchedImage,
                     UInt(mipLevel));
                 var coordinates = BuildClampedIntegerCoordinates(
                     image,
                     0,
-                    imageSize);
+                    imageSize,
+                    resource.Is3D);
                 sampled = _module.AddInstruction(
                     SpirvOp.ImageFetch,
                     resource.VectorType,
@@ -3226,28 +3241,44 @@ internal static partial class Gen5SpirvTranslator
                     addressCursor += 4;
                 }
 
-                var coordinates = BuildFloatCoordinates(image, addressCursor);
+                var coordinates =
+                    BuildFloatCoordinates(image, addressCursor, resource.Is3D);
                 if (traceThisSample && _tracePixelSampleFixedCenter)
                 {
-                    coordinates = _module.AddInstruction(
-                        SpirvOp.CompositeConstruct,
-                        _vec2Type,
-                        Float(0.5f),
-                        Float(0.5f));
+                    coordinates = resource.Is3D
+                        ? _module.AddInstruction(
+                            SpirvOp.CompositeConstruct,
+                            _vec3Type,
+                            Float(0.5f),
+                            Float(0.5f),
+                            Float(0.5f))
+                        : _module.AddInstruction(
+                            SpirvOp.CompositeConstruct,
+                            _vec2Type,
+                            Float(0.5f),
+                            Float(0.5f));
                 }
                 var explicitLod = hasGradients || hasZeroLod || hasLod;
+                // For an explicit-LOD sample the LOD follows the body: 2D packs
+                // it after x,y (cursor+2); a 3D volume packs it after x,y,z
+                // (cursor+3). SampleLz (the clustered-lighting case) uses a
+                // constant 0 and never reads a LOD register.
                 var lod = hasZeroLod
                     ? Float(0)
                     : hasLod
-                        ? LoadImageFloatAddress(image, addressCursor + 2)
+                        ? LoadImageFloatAddress(
+                            image,
+                            addressCursor + (resource.Is3D ? 3 : 2))
                         : lodOrBias;
-                if (hasOffset)
+                if (hasOffset && !resource.Is3D)
                 {
                     // Vulkan before maintenance8 forbids the dynamic Offset
                     // image operand on non-gather sampling operations. RDNA
                     // offsets are per-lane VGPR values, so ConstOffset is not
                     // equivalent. Fold the texel offset into normalized sample
-                    // coordinates using the queried mip extent instead.
+                    // coordinates using the queried mip extent instead. 3D
+                    // volume samples (clustered lighting) never carry a texel
+                    // offset, so this 2D-only fold is skipped for them.
                     var offsetLod = explicitLod && !hasGradients
                         ? lod
                         : Float(0);
@@ -3597,10 +3628,24 @@ internal static partial class Gen5SpirvTranslator
                 });
         }
 
-        private uint BuildFloatCoordinates(Gen5ImageControl image, int start)
+        private uint BuildFloatCoordinates(
+            Gen5ImageControl image,
+            int start,
+            bool is3D = false)
         {
             var x = LoadImageFloatAddress(image, start);
             var y = LoadImageFloatAddress(image, start + 1);
+            if (is3D)
+            {
+                var z = LoadImageFloatAddress(image, start + 2);
+                return _module.AddInstruction(
+                    SpirvOp.CompositeConstruct,
+                    _vec3Type,
+                    x,
+                    y,
+                    z);
+            }
+
             return _module.AddInstruction(
                 SpirvOp.CompositeConstruct,
                 _vec2Type,
@@ -3710,14 +3755,27 @@ internal static partial class Gen5SpirvTranslator
                 ShiftLeftLogical(BitwiseAnd(high, UInt(0xFFFF)), UInt(16)));
         }
 
-        private uint BuildIntegerCoordinates(Gen5ImageControl image, int start)
+        private uint BuildIntegerCoordinates(
+            Gen5ImageControl image,
+            int start,
+            bool is3D = false)
         {
-            var ivec2 = _module.TypeVector(_intType, 2);
             var x = Bitcast(_intType, LoadImageIntegerAddress(image, start));
             var y = Bitcast(_intType, LoadImageIntegerAddress(image, start + 1));
+            if (is3D)
+            {
+                var z = Bitcast(_intType, LoadImageIntegerAddress(image, start + 2));
+                return _module.AddInstruction(
+                    SpirvOp.CompositeConstruct,
+                    _module.TypeVector(_intType, 3),
+                    x,
+                    y,
+                    z);
+            }
+
             return _module.AddInstruction(
                 SpirvOp.CompositeConstruct,
-                ivec2,
+                _module.TypeVector(_intType, 2),
                 x,
                 y);
         }
@@ -3725,9 +3783,9 @@ internal static partial class Gen5SpirvTranslator
         private uint BuildClampedIntegerCoordinates(
             Gen5ImageControl image,
             int start,
-            uint imageSize)
+            uint imageSize,
+            bool is3D = false)
         {
-            var ivec2 = _module.TypeVector(_intType, 2);
             var x = ClampSignedCoordinate(
                 Bitcast(
                     _intType,
@@ -3746,9 +3804,28 @@ internal static partial class Gen5SpirvTranslator
                     _intType,
                     imageSize,
                     1));
+            if (is3D)
+            {
+                var z = ClampSignedCoordinate(
+                    Bitcast(
+                        _intType,
+                        LoadImageIntegerAddress(image, start + 2)),
+                    _module.AddInstruction(
+                        SpirvOp.CompositeExtract,
+                        _intType,
+                        imageSize,
+                        2));
+                return _module.AddInstruction(
+                    SpirvOp.CompositeConstruct,
+                    _module.TypeVector(_intType, 3),
+                    x,
+                    y,
+                    z);
+            }
+
             return _module.AddInstruction(
                 SpirvOp.CompositeConstruct,
-                ivec2,
+                _module.TypeVector(_intType, 2),
                 x,
                 y);
         }
@@ -3789,7 +3866,8 @@ internal static partial class Gen5SpirvTranslator
             uint coordinates,
             uint imageSize,
             uint imageObject,
-            uint texel)
+            uint texel,
+            bool is3D = false)
         {
             var x = _module.AddInstruction(
                 SpirvOp.CompositeExtract,
@@ -3847,6 +3925,42 @@ internal static partial class Gen5SpirvTranslator
                 _boolType,
                 lowerInRange,
                 upperInRange);
+            if (is3D)
+            {
+                // The z (slice) axis is bounds-checked against the volume's
+                // depth (imageSize component 2), same as x/y against w/h.
+                var z = _module.AddInstruction(
+                    SpirvOp.CompositeExtract,
+                    _intType,
+                    coordinates,
+                    2);
+                var imageDepth = _module.AddInstruction(
+                    SpirvOp.CompositeExtract,
+                    _intType,
+                    imageSize,
+                    2);
+                var zNonNegative = _module.AddInstruction(
+                    SpirvOp.SGreaterThanEqual,
+                    _boolType,
+                    z,
+                    zero);
+                var zInRange = _module.AddInstruction(
+                    SpirvOp.SLessThan,
+                    _boolType,
+                    z,
+                    imageDepth);
+                var zBothInRange = _module.AddInstruction(
+                    SpirvOp.LogicalAnd,
+                    _boolType,
+                    zNonNegative,
+                    zInRange);
+                inRange = _module.AddInstruction(
+                    SpirvOp.LogicalAnd,
+                    _boolType,
+                    inRange,
+                    zBothInRange);
+            }
+
             inRange = _module.AddInstruction(
                 SpirvOp.LogicalAnd,
                 _boolType,

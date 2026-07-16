@@ -136,7 +136,9 @@ public static class AgcExports
     private const uint Gen5TextureFormatR8G8B8A8Unorm = 10;
     private const uint Gen5TextureFormatR16G16B16A16Float = 12;
     private const uint Gen5TextureType2D = 9;
+    private const uint Gen5TextureType3D = 10;
     private const uint Gen5TextureType2DArray = 13;
+    private const uint MaxVolumeTextureDepth = 2048;
     private const ulong MaxPresentedTextureBytes = 128UL * 1024UL * 1024UL;
     private const ulong VideoOutPixelFormatA8R8G8B8Srgb = 0x80000000;
     private const ulong VideoOutPixelFormatA8B8G8R8Srgb = 0x80002200;
@@ -8062,7 +8064,7 @@ public static class AgcExports
     /// </summary>
     internal static bool IsPlausibleTextureDescriptor(IReadOnlyList<uint> words) =>
         TryDecodeTextureDescriptor(words, out var descriptor) &&
-        IsBindable2DTextureType(descriptor) &&
+        IsBindableTextureType(descriptor) &&
         descriptor.Address != 0 &&
         descriptor.Width != 0 &&
         descriptor.Height != 0;
@@ -8080,6 +8082,19 @@ public static class AgcExports
         (descriptor.Type == Gen5TextureType2DArray && descriptor.BaseArray == 0);
 
     /// <summary>
+    /// Descriptor types the presenter can bind, including true 3D (volume)
+    /// textures (SQ_RSRC_IMG_3D). A 3D descriptor carries a real slice count in
+    /// Depth (word4[12:0]+1); the presenter turns it into a Vulkan 3D image.
+    /// UE5 clustered lighting writes 32^3 light-cluster volumes and a 64^3
+    /// color LUT as 3D storage images with a compute ImageStore and samples
+    /// them in the lighting pass; the 2D-only gate bound those as zero
+    /// fallbacks, so the lit scene collapsed to black.
+    /// </summary>
+    private static bool IsBindableTextureType(in TextureDescriptor descriptor) =>
+        IsBindable2DTextureType(descriptor) ||
+        descriptor.Type == Gen5TextureType3D;
+
+    /// <summary>
     /// Execution-time resolution for a texture whose T# read zero at parse
     /// (late-written per-frame descriptor tables: RT inputs, autoexposure).
     /// The presenter re-reads the descriptor words on the ordered GPU
@@ -8093,12 +8108,13 @@ public static class AgcExports
     {
         texture = default!;
         if (!TryDecodeTextureDescriptor(descriptorWords, out var descriptor) ||
-            !IsBindable2DTextureType(descriptor) ||
+            !IsBindableTextureType(descriptor) ||
             descriptor.Address == 0 ||
             descriptor.Width == 0 ||
             descriptor.Height == 0 ||
             descriptor.Width > 8192 ||
             descriptor.Height > 8192 ||
+            descriptor.Depth > MaxVolumeTextureDepth ||
             isStorage ||
             !VulkanVideoPresenter.IsGuestImageAvailable(
                 descriptor.Address,
@@ -8128,7 +8144,8 @@ public static class AgcExports
                     descriptor.Format)
                 : descriptor.Width,
             TileMode: descriptor.TileMode,
-            DstSelect: descriptor.DstSelect);
+            DstSelect: descriptor.DstSelect,
+            Depth: descriptor.Depth);
         return true;
     }
 
@@ -8141,18 +8158,19 @@ public static class AgcExports
         out VulkanGuestDrawTexture texture)
     {
         texture = default!;
-        if (!IsBindable2DTextureType(descriptor) ||
+        if (!IsBindableTextureType(descriptor) ||
             descriptor.Width == 0 ||
             descriptor.Height == 0 ||
             descriptor.Width > 8192 ||
-            descriptor.Height > 8192)
+            descriptor.Height > 8192 ||
+            descriptor.Depth > MaxVolumeTextureDepth)
         {
             if (descriptor.Address != 0 &&
                 Interlocked.Increment(ref _unsupportedTextureTraceCount) <= 512)
             {
                 Console.Error.WriteLine(
                     $"[LOADER][TRACE] agc.unsupported_texture addr=0x{descriptor.Address:X16} " +
-                    $"type={descriptor.Type} size={descriptor.Width}x{descriptor.Height} " +
+                    $"type={descriptor.Type} size={descriptor.Width}x{descriptor.Height}x{descriptor.Depth} " +
                     $"fmt={descriptor.Format}/n{descriptor.NumberType} tile={descriptor.TileMode} " +
                     $"mips={descriptor.ResourceMipLevels} pitch={descriptor.Pitch}");
             }
@@ -8227,7 +8245,8 @@ public static class AgcExports
                 Pitch: sourceWidth,
                 TileMode: descriptor.TileMode,
                 DstSelect: descriptor.DstSelect,
-                Sampler: ToVulkanSampler(samplerDescriptor));
+                Sampler: ToVulkanSampler(samplerDescriptor),
+                Depth: descriptor.Depth);
             return true;
         }
 
@@ -8279,7 +8298,8 @@ public static class AgcExports
                 Pitch: sourceWidth,
                 TileMode: descriptor.TileMode,
                 DstSelect: descriptor.DstSelect,
-                Sampler: ToVulkanSampler(samplerDescriptor));
+                Sampler: ToVulkanSampler(samplerDescriptor),
+                Depth: descriptor.Depth);
             return true;
         }
 
@@ -8323,7 +8343,8 @@ public static class AgcExports
                 Pitch: sourceWidth,
                 TileMode: descriptor.TileMode,
                 DstSelect: descriptor.DstSelect,
-                Sampler: sampler);
+                Sampler: sampler,
+                Depth: descriptor.Depth);
             return true;
         }
 
@@ -8380,7 +8401,8 @@ public static class AgcExports
             Pitch: sourceWidth,
             TileMode: descriptor.TileMode,
             DstSelect: descriptor.DstSelect,
-            Sampler: ToVulkanSampler(samplerDescriptor));
+            Sampler: ToVulkanSampler(samplerDescriptor),
+            Depth: descriptor.Depth);
         return true;
     }
 

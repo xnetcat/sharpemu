@@ -45,7 +45,10 @@ internal sealed record VulkanGuestDrawTexture(
     uint TileMode = 0,
     uint DstSelect = 0xFAC,
     VulkanGuestSampler Sampler = default,
-    ulong DeferredDescriptorAddress = 0);
+    ulong DeferredDescriptorAddress = 0,
+    // Slice count for a volume (SQ_RSRC_IMG_3D) texture; 1 for ordinary 2D.
+    // Drives Type3D image/view creation in the presenter.
+    uint Depth = 1);
 
 internal readonly record struct VulkanGuestSampler(
     uint Word0,
@@ -164,7 +167,12 @@ internal sealed record VulkanGuestRenderTarget(
     uint Height,
     uint Format,
     uint NumberType,
-    uint MipLevels = 1);
+    uint MipLevels = 1,
+    // Slice count for a volume (SQ_RSRC_IMG_3D) resource; 1 for a plain 2D
+    // surface. When >1 the backing image is created as a Vulkan 3D image and
+    // never promoted to a color attachment (3D color attachments are invalid
+    // on MoltenVK).
+    uint Depth = 1);
 
 // Guest DB (depth-buffer) surface bound alongside a color render target.  The
 // read and write bases are retained separately because GFX10 can bind distinct
@@ -2060,6 +2068,11 @@ internal static unsafe class VulkanVideoPresenter
             public ulong Address;
             public uint Width;
             public uint Height;
+            // Volume-texture slice count. 1 for an ordinary 2D image; >1 marks a
+            // Vulkan 3D image whose views are Type3D and which is never used as a
+            // color attachment.
+            public uint Depth = 1;
+            public bool Is3D => Depth > 1;
             public uint MipLevels;
             public uint GuestFormat;
             public Format Format;
@@ -5300,6 +5313,16 @@ internal static unsafe class VulkanVideoPresenter
             VulkanGuestDrawTexture texture,
             GuestImageResource guestImage)
         {
+            // A 3D sampled binding must alias a 3D image and vice versa: the
+            // view type is derived from the image (Type3D vs Type2D) and must
+            // match the dimensionality the shader declared, or the descriptor
+            // is rejected by validation. Two resources that merely collided on
+            // an address with different dimensionality are not compatible.
+            if ((texture.Depth > 1) != guestImage.Is3D)
+            {
+                return false;
+            }
+
             if (guestImage.Width == texture.Width &&
                 guestImage.Height == texture.Height)
             {
@@ -5405,13 +5428,15 @@ internal static unsafe class VulkanVideoPresenter
         {
             var width = Math.Max(texture.Width, 1);
             var height = Math.Max(texture.Height, 1);
+            var depth = Math.Max(texture.Depth, 1u);
+            var is3D = depth > 1;
             var vkFormat = GetTextureFormat(texture.Format, texture.NumberType);
             var imageInfo = new ImageCreateInfo
             {
                 SType = StructureType.ImageCreateInfo,
-                ImageType = ImageType.Type2D,
+                ImageType = is3D ? ImageType.Type3D : ImageType.Type2D,
                 Format = vkFormat,
-                Extent = new Extent3D(width, height, 1),
+                Extent = new Extent3D(width, height, is3D ? depth : 1),
                 MipLevels = 1,
                 ArrayLayers = 1,
                 Samples = SampleCountFlags.Count1Bit,
@@ -5447,7 +5472,7 @@ internal static unsafe class VulkanVideoPresenter
             {
                 SType = StructureType.ImageViewCreateInfo,
                 Image = image,
-                ViewType = ImageViewType.Type2D,
+                ViewType = is3D ? ImageViewType.Type3D : ImageViewType.Type2D,
                 Format = vkFormat,
                 Components = new ComponentMapping(
                     ComponentSwizzle.Identity,
@@ -5467,6 +5492,7 @@ internal static unsafe class VulkanVideoPresenter
                 Address = 0,
                 Width = width,
                 Height = height,
+                Depth = depth,
                 MipLevels = 1,
                 GuestFormat = GetGuestTextureFormat(texture.Format, texture.NumberType),
                 Format = vkFormat,
@@ -5507,7 +5533,8 @@ internal static unsafe class VulkanVideoPresenter
                     texture.Height,
                     texture.Format,
                     texture.NumberType,
-                    texture.ResourceMipLevels),
+                    texture.ResourceMipLevels,
+                    texture.Depth),
                 format);
             var selectedMipLevel = GetStorageMipLevel(texture);
             if (selectedMipLevel >= guestImage.MipLevels)
@@ -5541,6 +5568,8 @@ internal static unsafe class VulkanVideoPresenter
         {
             var width = Math.Max(texture.Width, 1);
             var height = Math.Max(texture.Height, 1);
+            var depth = Math.Max(texture.Depth, 1u);
+            var is3D = depth > 1;
             var rowLength = texture.TileMode == 0
                 ? Math.Max(texture.Pitch, width)
                 : width;
@@ -5582,27 +5611,37 @@ internal static unsafe class VulkanVideoPresenter
             }
             _vk.UnmapMemory(_device, stagingMemory);
 
-            var supportsAttachmentUsage = !IsBlockCompressedFormat(vkFormat);
+            // A 3D image reached from guest memory (before the compute pass has
+            // populated the live volume) only needs sample/store usage; a 3D
+            // color attachment is invalid. Only slice 0 is staged here — the
+            // authoritative volume is the GPU-written live image this aliases
+            // once it exists.
+            var supportsAttachmentUsage = !is3D && !IsBlockCompressedFormat(vkFormat);
             var imageInfo = new ImageCreateInfo
             {
                 SType = StructureType.ImageCreateInfo,
-                Flags = supportsAttachmentUsage
+                Flags = (supportsAttachmentUsage || is3D)
                     ? ImageCreateFlags.CreateMutableFormatBit | ImageCreateFlags.CreateExtendedUsageBit
                     : 0,
-                ImageType = ImageType.Type2D,
+                ImageType = is3D ? ImageType.Type3D : ImageType.Type2D,
                 Format = vkFormat,
-                Extent = new Extent3D(width, height, 1),
+                Extent = new Extent3D(width, height, is3D ? depth : 1),
                 MipLevels = 1,
                 ArrayLayers = 1,
                 Samples = SampleCountFlags.Count1Bit,
                 Tiling = ImageTiling.Optimal,
-                Usage = supportsAttachmentUsage
+                Usage = is3D
                     ? ImageUsageFlags.TransferDstBit |
                       ImageUsageFlags.SampledBit |
-                      ImageUsageFlags.ColorAttachmentBit |
                       ImageUsageFlags.StorageBit |
                       ImageUsageFlags.TransferSrcBit
-                    : ImageUsageFlags.TransferDstBit | ImageUsageFlags.SampledBit,
+                    : supportsAttachmentUsage
+                        ? ImageUsageFlags.TransferDstBit |
+                          ImageUsageFlags.SampledBit |
+                          ImageUsageFlags.ColorAttachmentBit |
+                          ImageUsageFlags.StorageBit |
+                          ImageUsageFlags.TransferSrcBit
+                        : ImageUsageFlags.TransferDstBit | ImageUsageFlags.SampledBit,
                 SharingMode = SharingMode.Exclusive,
                 InitialLayout = ImageLayout.Undefined,
             };
@@ -5623,7 +5662,7 @@ internal static unsafe class VulkanVideoPresenter
             {
                 SType = StructureType.ImageViewCreateInfo,
                 Image = image,
-                ViewType = ImageViewType.Type2D,
+                ViewType = is3D ? ImageViewType.Type3D : ImageViewType.Type2D,
                 Format = vkFormat,
                 Components = ToVkComponentMapping(texture.DstSelect),
                 SubresourceRange = ColorSubresourceRange(),
@@ -5658,6 +5697,7 @@ internal static unsafe class VulkanVideoPresenter
                     Address = texture.Address,
                     Width = width,
                     Height = height,
+                    Depth = depth,
                     MipLevels = 1,
                     GuestFormat = GetGuestTextureFormat(texture.Format, texture.NumberType),
                     Format = vkFormat,
@@ -9134,16 +9174,21 @@ internal static unsafe class VulkanVideoPresenter
             Format format)
         {
             var mipLevels = ClampMipLevels(target.Width, target.Height, target.MipLevels);
+            var depth = Math.Max(target.Depth, 1u);
+            var is3D = depth > 1;
             var guestFormat = GetGuestTextureFormat(target.Format, target.NumberType);
             if (_guestImages.TryGetValue(target.Address, out var existing))
             {
                 if (existing.Width == target.Width &&
                     existing.Height == target.Height &&
+                    existing.Depth == depth &&
                     existing.MipLevels == mipLevels &&
                     existing.GuestFormat == guestFormat &&
                     existing.Format == format)
                 {
-                    if (existing.RenderPass.Handle == 0)
+                    // 3D images are never color attachments, so they have no
+                    // render pass to lazily promote (and must not acquire one).
+                    if (existing.RenderPass.Handle == 0 && !existing.Is3D)
                     {
                         var attachmentView = existing.MipViews.Length > 0
                             ? existing.MipViews[0]
@@ -9188,25 +9233,34 @@ internal static unsafe class VulkanVideoPresenter
                 SharpEmu.HLE.GuestImageWriteTracker.Untrack(target.Address);
             }
 
+            // 3D (volume) images cannot be bound as color attachments on
+            // MoltenVK, so they omit ColorAttachmentBit and are never given a
+            // render pass/framebuffer below. They keep Sampled|Storage so the
+            // clustered-lighting compute shader can ImageStore into them and the
+            // lighting pass can sample them.
             var imageInfo = new ImageCreateInfo
             {
                 SType = StructureType.ImageCreateInfo,
                 Flags =
                     ImageCreateFlags.CreateMutableFormatBit |
                     ImageCreateFlags.CreateExtendedUsageBit,
-                ImageType = ImageType.Type2D,
+                ImageType = is3D ? ImageType.Type3D : ImageType.Type2D,
                 Format = format,
-                Extent = new Extent3D(target.Width, target.Height, 1),
+                Extent = new Extent3D(target.Width, target.Height, is3D ? depth : 1),
                 MipLevels = mipLevels,
                 ArrayLayers = 1,
                 Samples = SampleCountFlags.Count1Bit,
                 Tiling = ImageTiling.Optimal,
-                Usage =
-                    ImageUsageFlags.ColorAttachmentBit |
-                    ImageUsageFlags.SampledBit |
-                    ImageUsageFlags.StorageBit |
-                    ImageUsageFlags.TransferSrcBit |
-                    ImageUsageFlags.TransferDstBit,
+                Usage = is3D
+                    ? ImageUsageFlags.SampledBit |
+                      ImageUsageFlags.StorageBit |
+                      ImageUsageFlags.TransferSrcBit |
+                      ImageUsageFlags.TransferDstBit
+                    : ImageUsageFlags.ColorAttachmentBit |
+                      ImageUsageFlags.SampledBit |
+                      ImageUsageFlags.StorageBit |
+                      ImageUsageFlags.TransferSrcBit |
+                      ImageUsageFlags.TransferDstBit,
                 SharingMode = SharingMode.Exclusive,
                 InitialLayout = ImageLayout.Undefined,
             };
@@ -9229,7 +9283,7 @@ internal static unsafe class VulkanVideoPresenter
             {
                 SType = StructureType.ImageViewCreateInfo,
                 Image = image,
-                ViewType = ImageViewType.Type2D,
+                ViewType = is3D ? ImageViewType.Type3D : ImageViewType.Type2D,
                 Format = format,
                 Components = new ComponentMapping(
                     ComponentSwizzle.Identity,
@@ -9257,18 +9311,27 @@ internal static unsafe class VulkanVideoPresenter
                 mipViews[mipLevel] = mipView;
             }
 
-            var (renderPass, initialRenderPass, framebuffer) =
-                CreateRenderPassAndFramebuffer(
-                    format,
-                    mipViews[0],
-                    target.Width,
-                    target.Height);
+            // 3D images are sampled/stored, never attached, so they carry no
+            // render pass or framebuffer.
+            var renderPass = default(RenderPass);
+            var initialRenderPass = default(RenderPass);
+            var framebuffer = default(Framebuffer);
+            if (!is3D)
+            {
+                (renderPass, initialRenderPass, framebuffer) =
+                    CreateRenderPassAndFramebuffer(
+                        format,
+                        mipViews[0],
+                        target.Width,
+                        target.Height);
+            }
 
             var resource = new GuestImageResource
             {
                 Address = target.Address,
                 Width = target.Width,
                 Height = target.Height,
+                Depth = depth,
                 MipLevels = mipLevels,
                 GuestFormat = guestFormat,
                 Format = format,
@@ -9290,9 +9353,12 @@ internal static unsafe class VulkanVideoPresenter
                     mipViews[mipLevel].Handle,
                     $"{debugName} mip{mipLevel}");
             }
-            SetDebugName(ObjectType.RenderPass, renderPass.Handle, $"{debugName} renderpass");
-            SetDebugName(ObjectType.RenderPass, initialRenderPass.Handle, $"{debugName} initial-renderpass");
-            SetDebugName(ObjectType.Framebuffer, framebuffer.Handle, $"{debugName} framebuffer");
+            if (!is3D)
+            {
+                SetDebugName(ObjectType.RenderPass, renderPass.Handle, $"{debugName} renderpass");
+                SetDebugName(ObjectType.RenderPass, initialRenderPass.Handle, $"{debugName} initial-renderpass");
+                SetDebugName(ObjectType.Framebuffer, framebuffer.Handle, $"{debugName} framebuffer");
+            }
             _guestImages.Add(target.Address, resource);
             lock (_gate)
             {
@@ -9302,7 +9368,10 @@ internal static unsafe class VulkanVideoPresenter
                     GetTextureByteCount(target.Format, target.Width, target.Height));
             }
 
-            if (target.Width <= 1920 && target.Height <= 1080)
+            // The CPU write tracker sizes its dirty range from width*height and
+            // cannot describe a volume's depth; skip it for 3D (these are
+            // GPU-written and aliased live, never restaged from guest memory).
+            if (!is3D && target.Width <= 1920 && target.Height <= 1080)
             {
                 SharpEmu.HLE.GuestImageWriteTracker.Track(
                     target.Address,
@@ -9313,7 +9382,7 @@ internal static unsafe class VulkanVideoPresenter
             {
                 Console.Error.WriteLine(
                     $"[GIMG] created-as-rt addr=0x{target.Address:X} " +
-                    $"{target.Width}x{target.Height} fmt={format}");
+                    $"{target.Width}x{target.Height}x{depth} fmt={format} is3d={is3D}");
             }
 
             return resource;
@@ -9858,7 +9927,7 @@ internal static unsafe class VulkanVideoPresenter
             {
                 SType = StructureType.ImageViewCreateInfo,
                 Image = resource.Image,
-                ViewType = ImageViewType.Type2D,
+                ViewType = resource.Is3D ? ImageViewType.Type3D : ImageViewType.Type2D,
                 Format = format,
                 Components = ToVkComponentMapping(dstSelect),
                 SubresourceRange = ColorSubresourceRange(mipLevel, levelCount),
