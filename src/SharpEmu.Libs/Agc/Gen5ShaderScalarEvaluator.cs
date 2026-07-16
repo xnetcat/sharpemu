@@ -68,6 +68,26 @@ internal static class Gen5ShaderScalarEvaluator
     static Gen5ShaderScalarEvaluator()
     {
         RunScalarLoadSelfChecks();
+
+        // Pre-JIT the generic collection methods this evaluator uses on guest
+        // render workers. Under Rosetta, first-time JIT of a generic method
+        // triggered from a worker whose stack sits inside the guest thunk can
+        // fold through the UnmanagedCallersOnly import boundary and fatally
+        // trap. Forcing the instantiations (HashSet<ScalarPathKey>.Resize,
+        // Dictionary lookups) to compile here on the host thread avoids that.
+        var pathSet = new HashSet<ScalarPathKey>();
+        var loadSources = new Dictionary<uint, ulong>();
+        var loadChains = new Dictionary<uint, Gen5DescriptorChain>();
+        for (var i = 0u; i < 64; i++)
+        {
+            pathSet.Add(new ScalarPathKey(i, i));
+            loadSources[i] = i;
+            loadChains[i] = new Gen5DescriptorChain(i, i, []);
+        }
+
+        _ = pathSet.Contains(new ScalarPathKey(0, 0));
+        _ = loadSources.TryGetValue(0, out _);
+        _ = loadChains.TryGetValue(0, out _);
     }
 
     private readonly record struct BufferDescriptor(
