@@ -7636,7 +7636,7 @@ internal static unsafe class VulkanVideoPresenter
                 Console.Error.WriteLine(
                     $"[LOADER][TRACE] dbg.post_dispatch_readback cs=0x{work.ShaderAddress:X16} " +
                     $"addr=0x{image.Address:X16} init={image.Initialized} " +
-                    $"pendingInit={image.InitialUploadPending}");
+                    $"pendingInit={image.InitialUploadPending} depth={image.Depth}");
                 TraceGuestImageContents(image);
             }
 
