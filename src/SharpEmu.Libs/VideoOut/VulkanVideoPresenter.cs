@@ -3776,14 +3776,20 @@ internal static unsafe class VulkanVideoPresenter
 
             if (anyRetired)
             {
-                // Publish retired GPU buffer stores to guest memory as they
-                // complete, not only at rare structural sync points. The
-                // guest CPU polls GPU results through ordinary memory (UE5
-                // reads the eye-adaptation exposure back and writes it into
-                // the next frame's view constants); values that only ever
-                // live in host allocations leave it reading zeros forever,
-                // and the whole scene chain multiplies to black.
-                WriteBackAllDirtyGuestBuffers();
+                // Publish retired GPU buffer stores to guest memory, not only
+                // at rare structural sync points: the guest CPU polls GPU
+                // results through ordinary memory (UE5 reads eye-adaptation
+                // exposure back and writes it into the next frame's view
+                // constants). Throttled — the page-diff write-back is too
+                // expensive to run per retirement on the main-thread render
+                // loop, and the CPU feedback only needs frame-scale latency.
+                var now = System.Diagnostics.Stopwatch.GetTimestamp();
+                if (now - _lastRetirementWriteBackTimestamp >
+                    System.Diagnostics.Stopwatch.Frequency / 20)
+                {
+                    _lastRetirementWriteBackTimestamp = now;
+                    WriteBackAllDirtyGuestBuffers();
+                }
             }
 
             ProcessDeferredTextureDestroys();
@@ -8528,6 +8534,7 @@ internal static unsafe class VulkanVideoPresenter
             }
         }
 
+        private long _lastRetirementWriteBackTimestamp;
         private long _deferredDescriptorResolveCount;
         private long _deferredDescriptorFailCount;
         private readonly System.Collections.Concurrent.ConcurrentDictionary<ulong, byte>
