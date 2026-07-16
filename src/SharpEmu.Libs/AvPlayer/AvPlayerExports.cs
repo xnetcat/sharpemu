@@ -1463,6 +1463,32 @@ public static class AvPlayerExports
         Trace($"event queued handle=0x{player.Handle:X16} id={eventId}");
     }
 
+    /// <summary>
+    /// Delivers queued state events for every live player. Real avplayer
+    /// posts events from its own worker thread; guests that wait for the
+    /// READY callback before touching the library again (UE5's title-movie
+    /// player) starve if delivery only happens inside avplayer entry points,
+    /// so the once-per-frame flip path pumps this with a valid guest context.
+    /// </summary>
+    public static void PumpPendingEvents(CpuContext ctx)
+    {
+        ulong[] handles;
+        lock (StateGate)
+        {
+            if (Players.Count == 0)
+            {
+                return;
+            }
+
+            handles = Players.Keys.ToArray();
+        }
+
+        foreach (var handle in handles)
+        {
+            DeliverPendingEvents(ctx, handle);
+        }
+    }
+
     private static void DeliverPendingEvents(CpuContext ctx, ulong handle)
     {
         PlayerState? player;
