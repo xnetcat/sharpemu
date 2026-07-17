@@ -45,6 +45,7 @@ public static partial class AgcExports
     private const uint ItWaitRegMem = 0x3C;
     private const uint ItIndirectBuffer = 0x3F;
     private const uint ItEventWrite = 0x46;
+    private const uint ItEventWriteEop = 0x47;
     private const uint ItReleaseMem = 0x49;
     private const uint ItDmaData = 0x50;
     private const uint ItSetContextReg = 0x69;
@@ -215,6 +216,12 @@ public static partial class AgcExports
         Environment.GetEnvironmentVariable("SHARPEMU_LOG_AGC"),
         "1",
         StringComparison.Ordinal);
+    private static readonly bool _traceAgcSync =
+        _traceAgc ||
+        string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_LOG_AGC_SYNC"),
+            "1",
+            StringComparison.Ordinal);
     // Drop a draw on an undecodable texture descriptor instead of substituting
     // a 1x1 fallback binding. Off by default so a garbage descriptor degrades
     // the pass rather than dropping it (Demon's Souls composite feeders).
@@ -1161,32 +1168,29 @@ public static partial class AgcExports
             return ReturnPointer(ctx, 0);
         }
 
-        var packetDwords = size == 0 ? 6u : 9u;
-        var packetRegister = size == 0 ? RWaitMem32 : RWaitMem64;
+        var packetDwords = size == 0 ? 7u : 9u;
         if (!TryAllocateCommandDwords(ctx, commandBufferAddress, packetDwords, out var commandAddress) ||
-            !TryWriteUInt32(ctx, commandAddress, Pm4(packetDwords, ItNop, packetRegister)) ||
-            !TryWriteUInt32(ctx, commandAddress + 4, (uint)address) ||
-            !TryWriteUInt32(ctx, commandAddress + 8, (uint)(address >> 32)) ||
-            !TryWriteUInt32(ctx, commandAddress + 12, (uint)mask))
+            !TryWriteAgcWaitRegMemPacket(
+                ctx,
+                commandAddress,
+                size,
+                compareFunction,
+                operation: 0,
+                cachePolicy,
+                address,
+                reference,
+                mask,
+                pollCycles))
         {
             return ReturnPointer(ctx, 0);
         }
 
-        if (size == 0)
+        if (_traceAgcSync)
         {
-            if (!TryWriteUInt32(ctx, commandAddress + 16, compareFunction) ||
-                !TryWriteUInt32(ctx, commandAddress + 20, (uint)reference))
-            {
-                return ReturnPointer(ctx, 0);
-            }
-        }
-        else if (!TryWriteUInt32(ctx, commandAddress + 16, (uint)(mask >> 32)) ||
-                 !TryWriteUInt32(ctx, commandAddress + 20, (uint)reference) ||
-                 !TryWriteUInt32(ctx, commandAddress + 24, (uint)(reference >> 32)) ||
-                 !TryWriteUInt32(ctx, commandAddress + 28, compareFunction) ||
-                 !TryWriteUInt32(ctx, commandAddress + 32, pollCycles / 40))
-        {
-            return ReturnPointer(ctx, 0);
+            TraceAgcSync(
+                $"agc.sync.wait_build queue=acb cmd=0x{commandAddress:X16} size={size} " +
+                $"compare={compareFunction} op=0 cache={cachePolicy} addr=0x{address:X16} " +
+                $"ref=0x{reference:X16} mask=0x{mask:X16} poll={pollCycles}");
         }
 
         return ReturnPointer(ctx, commandAddress);
@@ -1299,26 +1303,52 @@ public static partial class AgcExports
         var interruptContextId = (uint)interruptContextIdRaw;
         if (commandBufferAddress == 0 ||
             destination > 1 ||
-            dataSelection > 3 ||
-            gdsOffset != 0 ||
-            gdsSize > 2 ||
-            interrupt > 3)
+            dataSelection is not (0 or 1 or 2 or 3 or 5) ||
+            cachePolicy > 3 ||
+            interrupt > 4)
         {
             return ReturnPointer(ctx, 0);
         }
 
+        var packetGcrControl = gcrControl;
+        if ((packetGcrControl & 0x300u) == 0x100u)
+        {
+            packetGcrControl |= 0x200u;
+        }
+
+        var packetAddress = destinationAddress;
+        var packetData = data;
+        if (interrupt == 4)
+        {
+            packetAddress = 0;
+            packetData = 0;
+        }
+        else if (dataSelection == 5)
+        {
+            packetData = gdsOffset | ((ulong)gdsSize << 16);
+        }
+
+        var eventIndex = action >= 0x2Fu ? 6u : 5u;
         if (!TryAllocateCommandDwords(ctx, commandBufferAddress, 8, out var commandAddress) ||
             !TryWriteUInt32(ctx, commandAddress, Pm4(8, ItNop, RReleaseMem)) ||
-            !TryWriteUInt32(ctx, commandAddress + 4, action | (cachePolicy << 8)) ||
+            !TryWriteUInt32(
+                ctx,
+                commandAddress + 4,
+                (action & 0x3Fu) |
+                (eventIndex << 8) |
+                ((packetGcrControl & 0xFFFu) << 12) |
+                ((cachePolicy & 0x3u) << 25)) ||
             !TryWriteUInt32(
                 ctx,
                 commandAddress + 8,
-                gcrControl | (dataSelection << 16) | (interrupt << 24)) ||
-            !TryWriteUInt32(ctx, commandAddress + 12, (uint)destinationAddress) ||
-            !TryWriteUInt32(ctx, commandAddress + 16, (uint)(destinationAddress >> 32)) ||
-            !TryWriteUInt32(ctx, commandAddress + 20, (uint)data) ||
-            !TryWriteUInt32(ctx, commandAddress + 24, (uint)(data >> 32)) ||
-            !TryWriteUInt32(ctx, commandAddress + 28, interruptContextId))
+                ((destination & 0x3u) << 16) |
+                ((interrupt & 0x7u) << 24) |
+                ((dataSelection & 0x7u) << 29)) ||
+            !TryWriteUInt32(ctx, commandAddress + 12, (uint)packetAddress & 0xFFFF_FFFCu) ||
+            !TryWriteUInt32(ctx, commandAddress + 16, (uint)(packetAddress >> 32)) ||
+            !TryWriteUInt32(ctx, commandAddress + 20, (uint)packetData) ||
+            !TryWriteUInt32(ctx, commandAddress + 24, (uint)(packetData >> 32)) ||
+            !TryWriteUInt32(ctx, commandAddress + 28, interruptContextId & 0x07FF_FFFFu))
         {
             return ReturnPointer(ctx, 0);
         }
@@ -1326,6 +1356,15 @@ public static partial class AgcExports
         TraceAgc(
             $"agc.cb_release_mem buf=0x{commandBufferAddress:X16} cmd=0x{commandAddress:X16} " +
             $"action=0x{action:X2} gcr=0x{gcrControl:X4} dst=0x{destinationAddress:X16} data_sel={dataSelection} data=0x{data:X16}");
+        if (_traceAgcSync)
+        {
+            TraceAgcSync(
+                $"agc.sync.release_build cmd=0x{commandAddress:X16} action=0x{action:X2} " +
+                $"gcr=0x{packetGcrControl:X3} dst_sel={destination} cache={cachePolicy} " +
+                $"addr=0x{packetAddress:X16} data_sel={dataSelection} data=0x{packetData:X16} " +
+                $"interrupt={interrupt} context={interruptContextId}");
+        }
+
         return ReturnPointer(ctx, commandAddress);
     }
 
@@ -1804,47 +1843,19 @@ public static partial class AgcExports
             return ReturnPointer(ctx, 0);
         }
 
-        var standardWait = operation is 2 or 3;
-        var packetDwords = standardWait ? 7u : size == 0 ? 6u : 9u;
-        var packetRegister = size == 0 ? RWaitMem32 : RWaitMem64;
-        if (!TryAllocateCommandDwords(ctx, commandBufferAddress, packetDwords, out var commandAddress))
-        {
-            return ReturnPointer(ctx, 0);
-        }
-
-        if (standardWait)
-        {
-            if (!TryWriteUInt32(ctx, commandAddress, Pm4(packetDwords, ItWaitRegMem, 0)) ||
-                !TryWriteUInt32(ctx, commandAddress + 4, compareFunction | ((operation & 1) << 8)) ||
-                !TryWriteUInt32(ctx, commandAddress + 8, (uint)address) ||
-                !TryWriteUInt32(ctx, commandAddress + 12, (uint)(address >> 32)) ||
-                !TryWriteUInt32(ctx, commandAddress + 16, (uint)reference) ||
-                !TryWriteUInt32(ctx, commandAddress + 20, (uint)mask) ||
-                !TryWriteUInt32(ctx, commandAddress + 24, pollCycles / 40))
-            {
-                return ReturnPointer(ctx, 0);
-            }
-        }
-        else if (!TryWriteUInt32(ctx, commandAddress, Pm4(packetDwords, ItNop, packetRegister)) ||
-                 !TryWriteUInt32(ctx, commandAddress + 4, (uint)address) ||
-                 !TryWriteUInt32(ctx, commandAddress + 8, (uint)(address >> 32)) ||
-                 !TryWriteUInt32(ctx, commandAddress + 12, (uint)mask))
-        {
-            return ReturnPointer(ctx, 0);
-        }
-        else if (size == 0)
-        {
-            if (!TryWriteUInt32(ctx, commandAddress + 16, compareFunction | (operation << 8)) ||
-                !TryWriteUInt32(ctx, commandAddress + 20, (uint)reference))
-            {
-                return ReturnPointer(ctx, 0);
-            }
-        }
-        else if (!TryWriteUInt32(ctx, commandAddress + 16, (uint)(mask >> 32)) ||
-                 !TryWriteUInt32(ctx, commandAddress + 20, (uint)reference) ||
-                 !TryWriteUInt32(ctx, commandAddress + 24, (uint)(reference >> 32)) ||
-                 !TryWriteUInt32(ctx, commandAddress + 28, compareFunction | (operation << 8)) ||
-                 !TryWriteUInt32(ctx, commandAddress + 32, pollCycles / 40))
+        var packetDwords = size == 0 ? 7u : 9u;
+        if (!TryAllocateCommandDwords(ctx, commandBufferAddress, packetDwords, out var commandAddress) ||
+            !TryWriteAgcWaitRegMemPacket(
+                ctx,
+                commandAddress,
+                size,
+                compareFunction,
+                operation,
+                cachePolicy,
+                address,
+                reference,
+                mask,
+                pollCycles))
         {
             return ReturnPointer(ctx, 0);
         }
@@ -1854,6 +1865,14 @@ public static partial class AgcExports
             TraceAgc(
                 $"agc.dcb_wait_reg_mem buf=0x{commandBufferAddress:X16} cmd=0x{commandAddress:X16} " +
                 $"size={size} compare={compareFunction} op={operation} cache={cachePolicy} " +
+                $"addr=0x{address:X16} ref=0x{reference:X16} mask=0x{mask:X16} poll={pollCycles}");
+        }
+
+        if (_traceAgcSync)
+        {
+            TraceAgcSync(
+                $"agc.sync.wait_build queue=dcb cmd=0x{commandAddress:X16} size={size} " +
+                $"compare={compareFunction} op={operation} cache={cachePolicy} " +
                 $"addr=0x{address:X16} ref=0x{reference:X16} mask=0x{mask:X16} poll={pollCycles}");
         }
 
@@ -2270,6 +2289,13 @@ public static partial class AgcExports
         var address = ctx[CpuRegister.Rsi];
         if (!TryGetPacketIdentity(ctx, commandAddress, out var op, out var register))
         {
+            if (_traceAgcSync)
+            {
+                TraceAgcSync(
+                    $"agc.sync.wait_patch_address_reject cmd=0x{commandAddress:X16} " +
+                    $"addr=0x{address:X16} reason=unreadable");
+            }
+
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
@@ -2280,10 +2306,29 @@ public static partial class AgcExports
                 : 0;
         if (fieldOffset == 0)
         {
+            if (_traceAgcSync)
+            {
+                TraceAgcSync(
+                    $"agc.sync.wait_patch_address_reject cmd=0x{commandAddress:X16} " +
+                    $"op=0x{op:X2} reg=0x{register:X2} addr=0x{address:X16}");
+            }
+
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        return ctx.TryWriteUInt64(commandAddress + fieldOffset, address)
+        var wrote = op == ItNop && register == RWaitMem32
+            ? TryWriteWaitRegMemAddress(ctx, commandAddress + fieldOffset, address, is64Bit: false)
+            : op == ItNop && register == RWaitMem64
+                ? TryWriteWaitRegMemAddress(ctx, commandAddress + fieldOffset, address, is64Bit: true)
+                : ctx.TryWriteUInt64(commandAddress + fieldOffset, address);
+        if (_traceAgcSync)
+        {
+            TraceAgcSync(
+                $"agc.sync.wait_patch_address cmd=0x{commandAddress:X16} " +
+                $"op=0x{op:X2} reg=0x{register:X2} addr=0x{address:X16} wrote={wrote}");
+        }
+
+        return wrote
             ? SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK)
             : SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
     }
@@ -2306,12 +2351,20 @@ public static partial class AgcExports
         var fieldOffset = op == ItWaitRegMem
             ? 4UL
             : op == ItNop && register == RWaitMem32
-                ? 16UL
+                ? 20UL
                 : op == ItNop && register == RWaitMem64
                     ? 28UL
                     : 0;
-        return fieldOffset != 0 &&
-               TryPatchUInt32Bits(ctx, commandAddress + fieldOffset, 0x7u, compareFunction)
+        var wrote = fieldOffset != 0 &&
+                    TryPatchUInt32Bits(ctx, commandAddress + fieldOffset, 0x7u, compareFunction);
+        if (_traceAgcSync)
+        {
+            TraceAgcSync(
+                $"agc.sync.wait_patch_compare cmd=0x{commandAddress:X16} " +
+                $"op=0x{op:X2} reg=0x{register:X2} compare={compareFunction} wrote={wrote}");
+        }
+
+        return wrote
             ? SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK)
             : SetReturn(ctx, fieldOffset == 0
                 ? OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT
@@ -2335,9 +2388,16 @@ public static partial class AgcExports
         var wrote = op == ItWaitRegMem
             ? TryWriteUInt32(ctx, commandAddress + 16, (uint)reference)
             : op == ItNop && register == RWaitMem32
-                ? TryWriteUInt32(ctx, commandAddress + 20, (uint)reference)
+                ? TryWriteUInt32(ctx, commandAddress + 16, (uint)reference)
                 : op == ItNop && register == RWaitMem64 &&
                   ctx.TryWriteUInt64(commandAddress + 20, reference);
+        if (_traceAgcSync)
+        {
+            TraceAgcSync(
+                $"agc.sync.wait_patch_reference cmd=0x{commandAddress:X16} " +
+                $"op=0x{op:X2} reg=0x{register:X2} ref=0x{reference:X16} wrote={wrote}");
+        }
+
         return wrote
             ? SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK)
             : SetReturn(ctx, op == ItWaitRegMem ||
@@ -2366,6 +2426,13 @@ public static partial class AgcExports
                 ? TryWriteUInt32(ctx, commandAddress + 12, (uint)mask)
                 : op == ItNop && register == RWaitMem64 &&
                   ctx.TryWriteUInt64(commandAddress + 12, mask);
+        if (_traceAgcSync)
+        {
+            TraceAgcSync(
+                $"agc.sync.wait_patch_mask cmd=0x{commandAddress:X16} " +
+                $"op=0x{op:X2} reg=0x{register:X2} mask=0x{mask:X16} wrote={wrote}");
+        }
+
         return wrote
             ? SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK)
             : SetReturn(ctx, op == ItWaitRegMem ||
@@ -2383,14 +2450,52 @@ public static partial class AgcExports
     {
         var commandAddress = ctx[CpuRegister.Rdi];
         var address = ctx[CpuRegister.Rsi];
-        if (!TryGetPacketIdentity(ctx, commandAddress, out var op, out var register) ||
-            op != ItNop ||
-            register != RReleaseMem)
+        if (!TryGetPacketIdentity(ctx, commandAddress, out var op, out var register))
         {
+            if (_traceAgcSync)
+            {
+                TraceAgcSync(
+                    $"agc.sync.eop_patch_address_reject cmd=0x{commandAddress:X16} " +
+                    $"addr=0x{address:X16} reason=unreadable");
+            }
+
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        return ctx.TryWriteUInt64(commandAddress + 12, address)
+        bool wrote;
+        if ((op == ItNop && register == RReleaseMem) || op == ItReleaseMem)
+        {
+            wrote = ctx.TryWriteUInt64(commandAddress + 12, address);
+        }
+        else if (op == ItEventWriteEop)
+        {
+            wrote = TryReadUInt32(ctx, commandAddress + 12, out var currentHigh) &&
+                    TryWriteUInt32(ctx, commandAddress + 8, (uint)address) &&
+                    TryWriteUInt32(
+                        ctx,
+                        commandAddress + 12,
+                        (currentHigh & 0xFFFF_0000u) | ((uint)(address >> 32) & 0xFFFFu));
+        }
+        else
+        {
+            if (_traceAgcSync)
+            {
+                TraceAgcSync(
+                    $"agc.sync.eop_patch_address_reject cmd=0x{commandAddress:X16} " +
+                    $"op=0x{op:X2} reg=0x{register:X2} addr=0x{address:X16}");
+            }
+
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        if (_traceAgcSync)
+        {
+            TraceAgcSync(
+                $"agc.sync.eop_patch_address cmd=0x{commandAddress:X16} " +
+                $"op=0x{op:X2} reg=0x{register:X2} addr=0x{address:X16} wrote={wrote}");
+        }
+
+        return wrote
             ? SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK)
             : SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
     }
@@ -2408,11 +2513,25 @@ public static partial class AgcExports
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        return TryPatchUInt32Bits(
+        var gcrControl = (uint)ctx[CpuRegister.Rsi] & 0xFFFu;
+        if ((gcrControl & 0x300u) == 0x100u)
+        {
+            gcrControl |= 0x200u;
+        }
+
+        var wrote = TryPatchUInt32Bits(
                 ctx,
-                commandAddress + 8,
-                0x0000_FFFFu,
-                (uint)ctx[CpuRegister.Rsi] & 0xFFFFu)
+                commandAddress + 4,
+                0x00FF_F000u,
+                gcrControl << 12);
+        if (_traceAgcSync)
+        {
+            TraceAgcSync(
+                $"agc.sync.eop_patch_gcr cmd=0x{commandAddress:X16} " +
+                $"gcr=0x{gcrControl:X3} wrote={wrote}");
+        }
+
+        return wrote
             ? SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK)
             : SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
     }
@@ -2425,12 +2544,54 @@ public static partial class AgcExports
     public static int QueueEndOfPipeActionPatchData(CpuContext ctx)
     {
         var commandAddress = ctx[CpuRegister.Rdi];
-        if (!IsAgcReleaseMemPacket(ctx, commandAddress))
+        var contextId = (uint)ctx[CpuRegister.Rsi];
+        var dataSelection = (uint)ctx[CpuRegister.Rdx];
+        var data = ctx[CpuRegister.Rcx];
+        if (!TryGetPacketIdentity(ctx, commandAddress, out var op, out var register))
         {
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        return ctx.TryWriteUInt64(commandAddress + 20, ctx[CpuRegister.Rsi])
+        bool wrote;
+        if ((op == ItNop && register == RReleaseMem) || op == ItReleaseMem)
+        {
+            var packetData = data;
+            if (op == ItNop &&
+                register == RReleaseMem &&
+                contextId > 1 &&
+                dataSelection == 1)
+            {
+                packetData = ((ulong)(contextId - 2u) << 24) | (data & 0x00FF_FFFFUL);
+            }
+
+            wrote = ctx.TryWriteUInt64(commandAddress + 20, packetData);
+        }
+        else if (op == ItEventWriteEop)
+        {
+            wrote = ctx.TryWriteUInt64(commandAddress + 16, data);
+        }
+        else
+        {
+            if (_traceAgcSync)
+            {
+                TraceAgcSync(
+                    $"agc.sync.eop_patch_data_reject cmd=0x{commandAddress:X16} " +
+                    $"op=0x{op:X2} reg=0x{register:X2} context={contextId} " +
+                    $"data_sel={dataSelection} data=0x{data:X16}");
+            }
+
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        if (_traceAgcSync)
+        {
+            TraceAgcSync(
+                $"agc.sync.eop_patch_data cmd=0x{commandAddress:X16} " +
+                $"op=0x{op:X2} reg=0x{register:X2} context={contextId} " +
+                $"data_sel={dataSelection} data=0x{data:X16} wrote={wrote}");
+        }
+
+        return wrote
             ? SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK)
             : SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
     }
@@ -2446,16 +2607,25 @@ public static partial class AgcExports
         var dataSelection = (uint)ctx[CpuRegister.Rsi];
         TraceAgc(
             $"agc.eop_patch_type cmd=0x{commandAddress:X16} value=0x{dataSelection:X8}");
-        if (dataSelection > 3 || !IsAgcReleaseMemPacket(ctx, commandAddress))
+        if (dataSelection is not (0 or 1 or 2 or 3 or 5) ||
+            !IsAgcReleaseMemPacket(ctx, commandAddress))
         {
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        return TryPatchUInt32Bits(
+        var wrote = TryPatchUInt32Bits(
                 ctx,
                 commandAddress + 8,
-                0x00FF_0000u,
-                dataSelection << 16)
+                0xE000_0000u,
+                dataSelection << 29);
+        if (_traceAgcSync)
+        {
+            TraceAgcSync(
+                $"agc.sync.eop_patch_type cmd=0x{commandAddress:X16} " +
+                $"data_sel={dataSelection} wrote={wrote}");
+        }
+
+        return wrote
             ? SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK)
             : SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
     }
@@ -2643,6 +2813,22 @@ public static partial class AgcExports
         TraceAgc($"agc.driver_delete_eq_event eq=0x{equeue:X16} id=0x{eventId:X16}");
         return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
     }
+
+    [SysAbiExport(
+        Nid = "XlNp7jzGiPo",
+        ExportName = "sceAgcDriverSetTFRing",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgcDriver")]
+    public static int DriverSetTfRing(CpuContext ctx) =>
+        SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
+
+    [SysAbiExport(
+        Nid = "MM4IZSEYytQ",
+        ExportName = "sceAgcDriverSetHsOffchipParam",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgcDriver")]
+    public static int DriverSetHsOffchipParam(CpuContext ctx) =>
+        SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
 
     [SysAbiExport(
         Nid = "UglJIZjGssM",
@@ -3239,7 +3425,7 @@ public static partial class AgcExports
 
             if (op == ItNop &&
                 register is RWaitMem32 or RWaitMem64 &&
-                length >= (register == RWaitMem32 ? 6u : 9u))
+                length >= (register == RWaitMem32 ? 7u : 9u))
             {
                 if (HandleSubmittedWaitRegMem(
                         ctx, state, commandAddress, currentAddress, offset, length,
@@ -4575,7 +4761,7 @@ public static partial class AgcExports
         }
 
         if (!TryReadUInt64(ctx, packetAddress + 4, out waitAddress) ||
-            !TryReadUInt32(ctx, packetAddress + (is64Bit ? 28u : 16u), out var control))
+            !TryReadUInt32(ctx, packetAddress + (is64Bit ? 28u : 20u), out var control))
         {
             return false;
         }
@@ -4589,7 +4775,7 @@ public static partial class AgcExports
         }
 
         if (!TryReadUInt32(ctx, packetAddress + 12, out var mask32) ||
-            !TryReadUInt32(ctx, packetAddress + 20, out var reference32))
+            !TryReadUInt32(ctx, packetAddress + 16, out var reference32))
         {
             return false;
         }
@@ -5079,34 +5265,41 @@ public static partial class AgcExports
             return;
         }
 
-        var dataSelection = (control >> 16) & 0xFFu;
+        var (destination, dataSelection) = DecodeStandardReleaseMemControl(control);
         var destinationAddress = ((ulong)destinationHi << 32) | destinationLo;
         var data = ((ulong)dataHi << 32) | dataLo;
         var writeLength = dataSelection switch
         {
             1 => (ulong)sizeof(uint),
-            2 or 3 => (ulong)sizeof(ulong),
+            2 or 3 or 4 => (ulong)sizeof(ulong),
             _ => 0UL,
         };
+        var writesGuestMemory = destination is 0 or 1 &&
+                                destinationAddress != 0 &&
+                                writeLength != 0;
         SubmitOrderedGpuSideEffect(
             ctx,
             gpuState,
             state,
             () =>
             {
-                InvalidateDcbWindowIfOverlaps(destinationAddress, writeLength);
-                var wroteData = dataSelection switch
+                if (writesGuestMemory)
+                {
+                    InvalidateDcbWindowIfOverlaps(destinationAddress, writeLength);
+                }
+
+                var wroteData = writesGuestMemory && (dataSelection switch
                 {
                     1 => TryWriteUInt32(ctx, destinationAddress, dataLo),
                     2 => ctx.TryWriteUInt64(destinationAddress, data),
                     // Data selection 3 samples the GPU clock at the release
                     // point. The packet payload is ignored by hardware; Unity
                     // uses the nonzero timestamp as submit-completion state.
-                    3 => ctx.TryWriteUInt64(
+                    3 or 4 => ctx.TryWriteUInt64(
                         destinationAddress,
                         unchecked((ulong)System.Diagnostics.Stopwatch.GetTimestamp())),
                     _ => false,
-                };
+                });
 
                 if (tracePacket)
                 {
@@ -5117,8 +5310,8 @@ public static partial class AgcExports
             },
             $"release_mem dst=0x{destinationAddress:X16} data=0x{data:X16}",
             packetAddress,
-            dataSelection is 1 or 2 or 3 ? destinationAddress : 0,
-            writeLength);
+            writesGuestMemory ? destinationAddress : 0,
+            writesGuestMemory ? writeLength : 0);
     }
 
     private static void ApplySubmittedRegisters(
@@ -10649,6 +10842,61 @@ public static partial class AgcExports
     private static uint Pm4Length(uint header) =>
         ((header >> 16) & 0x3FFFu) + 2u;
 
+    private static bool TryWriteAgcWaitRegMemPacket(
+        CpuContext ctx,
+        ulong commandAddress,
+        uint size,
+        uint compareFunction,
+        uint operation,
+        uint cachePolicy,
+        ulong address,
+        ulong reference,
+        ulong mask,
+        uint pollCycles)
+    {
+        var is64Bit = size != 0;
+        var packetDwords = is64Bit ? 9u : 7u;
+        var packetRegister = is64Bit ? RWaitMem64 : RWaitMem32;
+        var control = 0x10u |
+                      (compareFunction & 0x7u) |
+                      (is64Bit
+                          ? ((operation & 0x1u) << 8) | ((operation & 0x6u) << 5)
+                          : ((operation & 0x3u) << 8) | ((operation & 0xCu) << 4)) |
+                      ((cachePolicy & 0x3u) << 25);
+        var poll = Math.Min(pollCycles >> 4, 0xFFFFu);
+
+        if (!TryWriteUInt32(ctx, commandAddress, Pm4(packetDwords, ItNop, packetRegister)) ||
+            !TryWriteWaitRegMemAddress(ctx, commandAddress + 4, address, is64Bit) ||
+            !TryWriteUInt32(ctx, commandAddress + 12, (uint)mask))
+        {
+            return false;
+        }
+
+        if (!is64Bit)
+        {
+            return TryWriteUInt32(ctx, commandAddress + 16, (uint)reference) &&
+                   TryWriteUInt32(ctx, commandAddress + 20, control) &&
+                   TryWriteUInt32(ctx, commandAddress + 24, poll);
+        }
+
+        return TryWriteUInt32(ctx, commandAddress + 16, (uint)(mask >> 32)) &&
+               TryWriteUInt32(ctx, commandAddress + 20, (uint)reference) &&
+               TryWriteUInt32(ctx, commandAddress + 24, (uint)(reference >> 32)) &&
+               TryWriteUInt32(ctx, commandAddress + 28, control) &&
+               TryWriteUInt32(ctx, commandAddress + 32, poll);
+    }
+
+    private static bool TryWriteWaitRegMemAddress(
+        CpuContext ctx,
+        ulong fieldAddress,
+        ulong address,
+        bool is64Bit) =>
+        TryWriteUInt32(
+            ctx,
+            fieldAddress,
+            (uint)address & (is64Bit ? 0xFFFF_FFF8u : 0xFFFF_FFFCu)) &&
+        TryWriteUInt32(ctx, fieldAddress + sizeof(uint), (uint)(address >> 32) & 0x3_FFFFu);
+
     private static bool TryReadByte(CpuContext ctx, ulong address, out byte value)
     {
         Span<byte> buffer = stackalloc byte[1];
@@ -10925,6 +11173,16 @@ public static partial class AgcExports
     private static void TraceAgc(string message)
     {
         if (!_traceAgc)
+        {
+            return;
+        }
+
+        Console.Error.WriteLine($"[LOADER][TRACE] {message}");
+    }
+
+    private static void TraceAgcSync(string message)
+    {
+        if (!_traceAgcSync)
         {
             return;
         }

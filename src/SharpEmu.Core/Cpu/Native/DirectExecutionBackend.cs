@@ -4313,15 +4313,25 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		GuestCpuContinuation continuation,
 		ulong size)
 	{
+		var bytes = BuildGuestExceptionContext(context, continuation, size);
+		return context.Memory.TryWrite(address, bytes);
+	}
+
+	internal static byte[] BuildGuestExceptionContext(
+		CpuContext context,
+		GuestCpuContinuation continuation,
+		ulong size)
+	{
 		var bytes = new byte[checked((int)size)];
 		void Write64(int offset, ulong value) =>
 			BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(offset, sizeof(ulong)), value);
 
 		var hasContinuation = continuation.Rip >= 65536 && continuation.Rsp != 0;
-		// Orbis ucontext_t has a 0x10-byte signal mask and 0x30 bytes of
-		// private fields before its amd64 mcontext. These offsets match the
-		// platform ABI used by libScePs5Util and Unity's Boehm GC. Supplying a
-		// bare mcontext here makes the collector miss live register roots.
+		// The kernel handler receives an Orbis ucontext_t: a 0x10-byte signal
+		// mask and 0x30 bytes of private fields precede amd64 mcontext_t.
+		// libScePs5Util reads RSP at ucontext+0xF8, while Unity copies
+		// ucontext[0..0xD8) and scans its GPR roots at +0x48..+0xB8. Keeping the
+		// prefix on both generations is therefore part of the observable ABI.
 		const int mcontext = 0x40;
 		Write64(mcontext + 0x08, hasContinuation ? continuation.Rdi : context[CpuRegister.Rdi]);
 		Write64(mcontext + 0x10, hasContinuation ? continuation.Rsi : context[CpuRegister.Rsi]);
@@ -4341,12 +4351,12 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		var rip = hasContinuation ? continuation.Rip : context.Rip;
 		var rsp = hasContinuation ? continuation.Rsp : context[CpuRegister.Rsp];
 		Write64(mcontext + 0xA0, rip);
-		Write64(mcontext + 0xB0, hasContinuation ? continuation.Rflags : 0);
+		Write64(mcontext + 0xB0, hasContinuation ? continuation.Rflags : context.Rflags);
 		Write64(mcontext + 0xB8, rsp);
 		Write64(mcontext + 0xC8, 0x480); // sizeof(Orbis mcontext_t)
 		Write64(mcontext + 0x440, hasContinuation ? continuation.FsBase : context.FsBase);
 		Write64(mcontext + 0x448, hasContinuation ? continuation.GsBase : context.GsBase);
-		return context.Memory.TryWrite(address, bytes);
+		return bytes;
 	}
 
 	private void TraceGuestContext(string message)
@@ -5076,7 +5086,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			ActiveGuestThreadYieldReason = null;
 			try
 			{
-				CallNativeEntry(ptr);
+				RunGuestEntryStub(ptr, hostRspSlot);
 				if (ActiveGuestThreadYieldRequested)
 				{
 					reason = ActiveGuestThreadYieldReason ?? "guest thread blocked";
@@ -5233,7 +5243,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			ActiveGuestThreadYieldReason = null;
 			try
 			{
-				CallNativeEntry(ptr);
+				RunGuestEntryStub(ptr, hostRspSlot);
 				if (ActiveGuestThreadYieldRequested)
 				{
 					reason = ActiveGuestThreadYieldReason ?? "guest thread blocked";
@@ -5565,7 +5575,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			int num6 = -1;
 			try
 			{
-				num6 = CallNativeEntry(ptr);
+				num6 = RunGuestEntryStub(ptr, num2);
 				Console.Error.WriteLine($"[LOADER][INFO] Guest returned: {num6}");
 				PumpUntilGuestThreadsIdle(context, "entry_return");
 			}

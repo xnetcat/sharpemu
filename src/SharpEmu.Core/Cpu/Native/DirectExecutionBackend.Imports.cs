@@ -30,10 +30,6 @@ public sealed partial class DirectExecutionBackend
 	private const int ImportSavedFpuControlOffset = -148;
 	private const int ImportSavedXmmOffset = -128;
 	private const int ImportVectorRegisterCount = 8;
-	private const ulong StackCheckGuardValue = 0xC0DEC0DECAFEBA00UL;
-	private static long _canaryReturnRecoveries;
-	private static long _shiftedReturnRecoveries;
-	private static long _misalignedRipRecoveries;
 
 	private readonly object _importResultLogSampleGate = new();
 	private readonly Dictionary<string, int> _importResultLogSamples = new(StringComparer.Ordinal);
@@ -88,19 +84,6 @@ public sealed partial class DirectExecutionBackend
 		void* contextRecord = ((EXCEPTION_POINTERS*)exceptionInfo)->ContextRecord;
 		ulong value = ReadCtxU64(contextRecord, 248);
 		ulong value2 = (ulong)exceptionRecord->ExceptionAddress;
-		if (value == StackCheckGuardValue && TryRecoverCanaryReturn(contextRecord))
-		{
-			return -1;
-		}
-		if (TryRecoverMisalignedRip(contextRecord))
-		{
-			return -1;
-		}
-		if (!IsCanonicalX64Address(value) &&
-			TryRecoverShiftedReturn(contextRecord))
-		{
-			return -1;
-		}
 		if (!IsUnresolvedSentinel(value) && !IsUnresolvedSentinel(value2))
 		{
 			return 0;
@@ -115,135 +98,6 @@ public sealed partial class DirectExecutionBackend
 			return -1;
 		}
 		return 0;
-	}
-
-	private unsafe static bool TryRecoverMisalignedRip(void* contextRecord)
-	{
-		var rip = ReadCtxU64(contextRecord, CTX_RIP);
-		if (rip < 6 ||
-			!TryReadStackU64(rip - 6, out var instructionWindow))
-		{
-			return false;
-		}
-
-		// A suspended guest can occasionally resume on the final displacement
-		// byte of a seven-byte RIP-relative MOV instead of the following
-		// instruction. Require the complete x86-64 instruction shape and a
-		// zero high displacement byte before advancing to the real boundary.
-		var rex = (byte)instructionWindow;
-		var opcode = (byte)(instructionWindow >> 8);
-		var modRm = (byte)(instructionWindow >> 16);
-		var displacementHigh = (byte)(instructionWindow >> 48);
-		if ((rex != 0x48 && rex != 0x4C) ||
-			opcode != 0x8B ||
-			(modRm & 0xC7) != 0x05 ||
-			displacementHigh != 0 ||
-			!IsLikelyReturnAddress(rip + 1))
-		{
-			return false;
-		}
-
-		WriteCtxU64(contextRecord, CTX_RIP, rip + 1);
-		var recoveryCount = Interlocked.Increment(ref _misalignedRipRecoveries);
-		Console.Error.WriteLine(
-			$"[LOADER][WARN] Recovered misaligned guest RIP #{recoveryCount}: " +
-			$"resume=0x{rip + 1:X16} previous=0x{rip:X16}");
-		Console.Error.Flush();
-		return true;
-	}
-
-	private unsafe static bool TryRecoverShiftedReturn(void* contextRecord)
-	{
-		var rsp = ReadCtxU64(contextRecord, CTX_RSP);
-		var interruptedReturn = ReadCtxU64(contextRecord, CTX_RBP);
-		if (rsp < sizeof(ulong) ||
-			!IsLikelyReturnAddress(interruptedReturn))
-		{
-			return false;
-		}
-
-		var callerRbp = 0UL;
-		var callerReturn = 0UL;
-		var frameOffset = 0UL;
-		for (var offset = 0x08UL; offset <= 0x400; offset += sizeof(ulong))
-		{
-			if (!TryReadStackU64(rsp + offset, out var candidateRbp) ||
-				!TryReadStackU64(rsp + offset + sizeof(ulong), out var candidateReturn) ||
-				candidateRbp <= rsp + offset ||
-				candidateRbp - rsp > 0x10000 ||
-				!IsLikelyReturnAddress(candidateReturn))
-			{
-				continue;
-			}
-
-			callerRbp = candidateRbp;
-			callerReturn = candidateReturn;
-			frameOffset = offset;
-			break;
-		}
-		if (frameOffset == 0)
-		{
-			return false;
-		}
-
-		// The return epilogue restored every nonvolatile register except rbp,
-		// then consumed the real continuation into rbp and a reused stack-local
-		// qword as RIP. Find the first intact frame-pointer/return pair above the
-		// damaged frame instead of assuming a title-specific frame size.
-		WriteCtxU64(contextRecord, CTX_RBP, callerRbp);
-		WriteCtxU64(contextRecord, CTX_RSP, rsp - sizeof(ulong));
-		WriteCtxU64(contextRecord, CTX_RIP, interruptedReturn);
-		var recoveryCount = Interlocked.Increment(ref _shiftedReturnRecoveries);
-		Console.Error.WriteLine(
-			$"[LOADER][WARN] Recovered shifted guest return #{recoveryCount}: " +
-			$"resume=0x{interruptedReturn:X16} rsp=0x{rsp - sizeof(ulong):X16} " +
-			$"rbp=0x{callerRbp:X16} caller=0x{callerReturn:X16} " +
-			$"frame_offset=0x{frameOffset:X}");
-		Console.Error.Flush();
-		return true;
-	}
-
-	private static bool IsCanonicalX64Address(ulong address)
-	{
-		var upper = address >> 48;
-		return ((address >> 47) & 1) == 0
-			? upper == 0
-			: upper == 0xFFFF;
-	}
-
-	private unsafe static bool TryRecoverCanaryReturn(void* contextRecord)
-	{
-		var rsp = ReadCtxU64(contextRecord, CTX_RSP);
-		var interruptedReturn = ReadCtxU64(contextRecord, CTX_RBP);
-		var interruptedFrame = rsp + 0x18;
-		if (!IsLikelyReturnAddress(interruptedReturn) ||
-			rsp < sizeof(ulong) ||
-			!TryReadStackU64(interruptedFrame, out var callerRbp) ||
-			!TryReadStackU64(rsp + 0x20, out var callerReturn) ||
-			callerRbp <= rsp || callerRbp - rsp > 0x10000 ||
-			!IsLikelyReturnAddress(callerReturn))
-		{
-			return false;
-		}
-
-		// The guest unwind reached this callback return one stack slot late: the
-		// final pop loaded the interrupted return into rbp and ret consumed the
-		// stack guard. Resume at that return with the outer frame pointer rebuilt
-		// from the still-intact caller frame on the stack.
-		WriteCtxU64(contextRecord, CTX_RBP, interruptedFrame);
-		WriteCtxU64(contextRecord, CTX_RSP, rsp - sizeof(ulong));
-		WriteCtxU64(contextRecord, CTX_RIP, interruptedReturn);
-		var recoveryCount = Interlocked.Increment(ref _canaryReturnRecoveries);
-		if (recoveryCount <= 4 || recoveryCount % 1000 == 0)
-		{
-			Console.Error.WriteLine(
-				$"[LOADER][WARN] Recovered malformed canary return #{recoveryCount}: " +
-				$"resume=0x{interruptedReturn:X16} rsp=0x{rsp - sizeof(ulong):X16} " +
-				$"rbp=0x{interruptedFrame:X16} caller_rbp=0x{callerRbp:X16} " +
-				$"caller=0x{callerReturn:X16}");
-			Console.Error.Flush();
-		}
-		return true;
 	}
 
 	private unsafe ulong DispatchImport(int importIndex, nint argPackPtr)
@@ -329,48 +183,6 @@ public sealed partial class DirectExecutionBackend
 				$"saved_rbp=0x{frameValue:X16} saved_ret=0x{frameReturn:X16}");
 		}
 		var isGuestWorker = GuestThreadExecution.IsGuestThread;
-		if (!IsLikelyReturnAddress(num7))
-		{
-			for (int i = 1; i <= 4; i++)
-			{
-				ulong num8 = *(ulong*)(argPackPtr + 96 + i * 8);
-				if (IsLikelyReturnAddress(num8))
-				{
-					*(ulong*)(argPackPtr + 96) = num8;
-					num7 = num8;
-					Console.Error.WriteLine($"[LOADER][WARNING] Import#{num}: corrected suspicious return RIP using stack slot +0x{i * 8:X} -> 0x{num7:X16}");
-					break;
-				}
-			}
-		}
-		// Diagnostic compatibility escape hatch for a guest stack-protector
-		// failure whose noreturn call is immediately followed by UD2.  Returning
-		// normally from the HLE export would execute that UD2; redirect this one
-		// well-known compiler epilogue back through its register/stack unwind.
-		// Keep the byte-pattern check strict so the opt-in cannot guess at an
-		// unrelated function layout.
-		if (string.Equals(importStubEntry.Nid, "Ou3iL1abvng", StringComparison.Ordinal) &&
-			string.Equals(
-				Environment.GetEnvironmentVariable("SHARPEMU_IGNORE_STACK_CHK"),
-				"1",
-				StringComparison.Ordinal) &&
-			num7 >= 0x20)
-		{
-			var returnCode = (byte*)num7;
-			if (returnCode[0] == 0x0F && returnCode[1] == 0x0B &&
-				returnCode[-22] == 0x75 && returnCode[-21] == 0x0F &&
-				returnCode[-20] == 0x48 && returnCode[-19] == 0x83 &&
-				returnCode[-18] == 0xC4)
-			{
-				var recoveredReturn = num7 - 20;
-				*(ulong*)(argPackPtr + 96) = recoveredReturn;
-				cpuContext[CpuRegister.Rax] = 0;
-				Console.Error.WriteLine(
-					$"[LOADER][WARN] Recovered guest stack-check epilogue " +
-					$"ret=0x{num7:X16} -> 0x{recoveredReturn:X16}");
-				return 0;
-			}
-		}
 		if (_activeGuestThreadState is { } activeGuestThreadState)
 		{
 			Interlocked.Increment(ref activeGuestThreadState.ImportCount);
@@ -1869,7 +1681,12 @@ public sealed partial class DirectExecutionBackend
 			"WKAXJ4XBPQ4" or // scePthreadCondWait
 			"BmMjYxmew1w" or // scePthreadCondTimedwait
 			"Op8TBGY5KHg" or // pthread_cond_wait
-			"27bAgiJmOh0";   // pthread_cond_timedwait
+			"27bAgiJmOh0" or // pthread_cond_timedwait
+			"9UK1vLZQft4" or // scePthreadMutexLock
+			"7H0iTOciTLo" or // pthread_mutex_lock
+			"tn3VlD0hG60" or // scePthreadMutexUnlock
+			"2Z+PpY6CaJg" or // pthread_mutex_unlock
+			"K-jXhbt2gn4";   // pthread_mutex_trylock
 
 	private void ResetImportLoopPattern()
 	{
