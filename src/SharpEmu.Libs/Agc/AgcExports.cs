@@ -5942,6 +5942,27 @@ public static partial class AgcExports
         var writesGuestMemory = destination is 0 or 1 &&
                                 destinationAddress != 0 &&
                                 writeLength != 0;
+        var eagerApplied = false;
+        bool ApplyGuestMemoryWrite()
+        {
+            if (!writesGuestMemory)
+            {
+                return false;
+            }
+
+            InvalidateDcbWindowIfOverlaps(destinationAddress, writeLength);
+            return dataSelection switch
+            {
+                1 => TryWriteUInt32(ctx, destinationAddress, dataLo),
+                2 => ctx.TryWriteUInt64(destinationAddress, data),
+                // Hardware counter writes are timing values sampled at the
+                // release point, not the immediate payload in ordinal 6/7.
+                3 or 4 => ctx.TryWriteUInt64(
+                    destinationAddress,
+                    unchecked((ulong)System.Diagnostics.Stopwatch.GetTimestamp())),
+                _ => false,
+            };
+        }
 
         SubmitOrderedGpuSideEffect(
             ctx,
@@ -5949,22 +5970,7 @@ public static partial class AgcExports
             state,
             () =>
             {
-                if (writesGuestMemory)
-                {
-                    InvalidateDcbWindowIfOverlaps(destinationAddress, writeLength);
-                }
-
-                var wroteData = writesGuestMemory && (dataSelection switch
-                {
-                    1 => TryWriteUInt32(ctx, destinationAddress, dataLo),
-                    2 => ctx.TryWriteUInt64(destinationAddress, data),
-                    // Hardware counter writes are timing values sampled at the
-                    // release point, not the immediate payload in ordinal 6/7.
-                    3 or 4 => ctx.TryWriteUInt64(
-                        destinationAddress,
-                        unchecked((ulong)System.Diagnostics.Stopwatch.GetTimestamp())),
-                    _ => false,
-                });
+                var wroteData = eagerApplied || ApplyGuestMemoryWrite();
 
                 // Record + latch the written value so a same-frame label reset
                 // cannot lose the wakeup, and so the deadlock breaker can release
@@ -5980,13 +5986,14 @@ public static partial class AgcExports
                     TraceAgc(
                         $"agc.dcb.release_mem_standard dst_sel={destination} " +
                         $"dst=0x{destinationAddress:X16} data_sel={dataSelection} " +
-                        $"data=0x{data:X16} wrote={wroteData}");
+                        $"data=0x{data:X16} wrote={wroteData} eager={eagerApplied}");
                 }
             },
             $"release_mem_standard dst=0x{destinationAddress:X16} data=0x{data:X16}",
             packetAddress,
             writesGuestMemory ? destinationAddress : 0,
-            writesGuestMemory ? writeLength : 0);
+            writesGuestMemory ? writeLength : 0,
+            eagerGuestMemoryApply: () => eagerApplied = ApplyGuestMemoryWrite());
     }
 
     private static (uint Destination, uint DataSelection)
@@ -6027,25 +6034,37 @@ public static partial class AgcExports
             2 or 3 => (ulong)sizeof(ulong),
             _ => 0UL,
         };
+        var writesGuestMemory = destinationAddress != 0 && writeLength != 0;
+        var eagerApplied = false;
+        bool ApplyGuestMemoryWrite()
+        {
+            if (!writesGuestMemory)
+            {
+                return false;
+            }
+
+            InvalidateDcbWindowIfOverlaps(destinationAddress, writeLength);
+            return dataSelection switch
+            {
+                1 => TryWriteUInt32(ctx, destinationAddress, dataLo),
+                2 => ctx.TryWriteUInt64(destinationAddress, data),
+                // Data selection 3 samples the GPU clock at the release
+                // point. The packet payload is ignored by hardware; Unity
+                // uses the nonzero timestamp as submit-completion state.
+                3 => ctx.TryWriteUInt64(
+                    destinationAddress,
+                    unchecked((ulong)System.Diagnostics.Stopwatch.GetTimestamp())),
+                _ => false,
+            };
+        }
+
         SubmitOrderedGpuSideEffect(
             ctx,
             gpuState,
             state,
             () =>
             {
-                InvalidateDcbWindowIfOverlaps(destinationAddress, writeLength);
-                var wroteData = dataSelection switch
-                {
-                    1 => TryWriteUInt32(ctx, destinationAddress, dataLo),
-                    2 => ctx.TryWriteUInt64(destinationAddress, data),
-                    // Data selection 3 samples the GPU clock at the release
-                    // point. The packet payload is ignored by hardware; Unity
-                    // uses the nonzero timestamp as submit-completion state.
-                    3 => ctx.TryWriteUInt64(
-                        destinationAddress,
-                        unchecked((ulong)System.Diagnostics.Stopwatch.GetTimestamp())),
-                    _ => false,
-                };
+                var wroteData = eagerApplied || ApplyGuestMemoryWrite();
 
                 // Latch waiters against the value we just wrote: the guest reuses
                 // these labels and can reset them to 0 before the wake pass reads
@@ -6062,7 +6081,8 @@ public static partial class AgcExports
                     TraceAgc(
                         $"agc.dcb.release_mem dst=0x{destinationAddress:X16} " +
                         $"data_sel={dataSelection} data=0x{data:X16} wrote={wroteData} " +
-                        $"interrupt={interrupt} interrupt_context=0x{interruptContextId:X8}");
+                        $"eager={eagerApplied} interrupt={interrupt} " +
+                        $"interrupt_context=0x{interruptContextId:X8}");
                 }
 
                 // The interrupt is the graphics-completion edge and must be
@@ -6074,8 +6094,9 @@ public static partial class AgcExports
             },
             $"release_mem dst=0x{destinationAddress:X16} data=0x{data:X16}",
             packetAddress,
-            dataSelection is 1 or 2 or 3 ? destinationAddress : 0,
-            writeLength);
+            writesGuestMemory ? destinationAddress : 0,
+            writesGuestMemory ? writeLength : 0,
+            eagerGuestMemoryApply: () => eagerApplied = ApplyGuestMemoryWrite());
     }
 
     private static void ApplySubmittedRegisters(
