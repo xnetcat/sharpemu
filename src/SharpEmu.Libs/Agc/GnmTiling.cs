@@ -90,6 +90,20 @@ internal static class GnmTiling
          Y(2), X(2), Y(3), X(3), Y(4), X(4), Y(5), X(5)],
     ];
 
+    // GFX10_SW_256_S_PATINFO selects nibble01 patterns 0-4 in AMD AddrLib.
+    // In particular, 16-byte elements (including BC2/3/5/6/7 blocks) are
+    // column-major inside each 4x4-element/256-byte swizzle block:
+    // address bits 4..7 = y0, y1, x0, x1. The generic standard fallback below
+    // interleaves x/y instead and visibly scrambles small BC7 UI atlases.
+    private static readonly AddressBit[][] Standard256 =
+    [
+        [X(0), X(1), X(2), X(3), Y(0), Y(1), Y(2), Y(3)],
+        [Zero, X(0), X(1), X(2), Y(0), Y(1), Y(2), X(3)],
+        [Zero, Zero, X(0), X(1), Y(0), Y(1), Y(2), X(2)],
+        [Zero, Zero, Zero, X(0), Y(0), Y(1), X(1), X(2)],
+        [Zero, Zero, Zero, Zero, Y(0), Y(1), X(0), X(1)],
+    ];
+
     // GFX10 4K_S has a separate 12-bit micro-tile equation. It is not the
     // generic x/y interleave used by the 64K standard block; using that larger
     // equation leaves a regular grid in linearized atlases.
@@ -326,6 +340,7 @@ internal static class GnmTiling
 
         pattern = swizzleMode switch
         {
+            1 => Standard256[bytesPerElementLog2],
             5 => Standard4K[bytesPerElementLog2],
             9 => RbPlus64KStandard[bytesPerElementLog2],
             24 => RbPlus64KDepthX[bytesPerElementLog2],

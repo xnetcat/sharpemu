@@ -9102,7 +9102,8 @@ public static partial class AgcExports
             '|',
             textures.Select(texture =>
                 $"0x{texture.Address:X}:{texture.Width}x{texture.Height}" +
-                $":f{texture.Format}/n{texture.NumberType}/d{texture.DstSelect:X3}" +
+                $":f{texture.Format}/n{texture.NumberType}/t{texture.TileMode}" +
+                $"/p{texture.Pitch}/d{texture.DstSelect:X3}" +
                 (texture.IsFallback ? ":FALLBACK" : string.Empty)));
         var positions = string.Empty;
         var positionBuffer = vertexBuffers.FirstOrDefault(buffer => buffer.Location == 0);
@@ -9245,6 +9246,11 @@ public static partial class AgcExports
             return;
         }
 
+        if (!MatchesTextureDumpFilter(descriptor))
+        {
+            return;
+        }
+
         var key = $"0x{descriptor.Address:X}-{descriptor.Width}x{descriptor.Height}";
         var occurrence = _textureDumpKeys.AddOrUpdate(key, 1, static (_, count) => count + 1);
         // First uses plus periodic later snapshots (the game reuses the same
@@ -9287,6 +9293,11 @@ public static partial class AgcExports
             return;
         }
 
+        if (!MatchesTextureDumpFilter(descriptor))
+        {
+            return;
+        }
+
         var key = $"linear-0x{descriptor.Address:X}-{descriptor.Width}x{descriptor.Height}";
         var occurrence = _textureDumpKeys.AddOrUpdate(key, 1, static (_, count) => count + 1);
         if ((occurrence > 3 && occurrence % 500 >= 3) ||
@@ -9308,6 +9319,23 @@ public static partial class AgcExports
         catch (IOException)
         {
         }
+    }
+
+    private static bool MatchesTextureDumpFilter(in TextureDescriptor descriptor)
+    {
+        var requestedSize = Environment.GetEnvironmentVariable("SHARPEMU_TEXTURE_DUMP_SIZE");
+        if (!string.IsNullOrWhiteSpace(requestedSize) &&
+            !string.Equals(
+                requestedSize.Trim(),
+                $"{descriptor.Width}x{descriptor.Height}",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var requestedAddress = ParseOptionalHexAddress(
+            Environment.GetEnvironmentVariable("SHARPEMU_TEXTURE_DUMP_ADDRESS"));
+        return requestedAddress == 0 || requestedAddress == descriptor.Address;
     }
 
     private static GuestDrawTexture CreateFallbackGuestDrawTexture(
