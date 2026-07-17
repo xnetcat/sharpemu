@@ -1299,6 +1299,56 @@ internal static unsafe class VulkanVideoPresenter
     internal static void AttachGuestMemory(SharpEmu.HLE.ICpuMemory memory) =>
         _guestMemory = memory;
 
+    internal static bool TryResolveDescriptorChainAddress(
+        ICpuMemory? memory,
+        Gen5DescriptorChain chain,
+        out ulong descriptorAddress)
+    {
+        descriptorAddress = 0;
+        if (memory is null)
+        {
+            return false;
+        }
+
+        Span<byte> wordBytes = stackalloc byte[sizeof(uint)];
+        var address0 = chain.Anchor0;
+        var address1 = chain.Anchor1;
+        foreach (var (stepOffset, viaBufferDescriptor) in chain.Steps)
+        {
+            if (!memory.TryRead(address0, wordBytes))
+            {
+                return false;
+            }
+
+            var pointerLow = System.Buffers.Binary.BinaryPrimitives
+                .ReadUInt32LittleEndian(wordBytes);
+            if (!memory.TryRead(address1, wordBytes))
+            {
+                return false;
+            }
+
+            var pointerHigh = System.Buffers.Binary.BinaryPrimitives
+                .ReadUInt32LittleEndian(wordBytes);
+            var pointer = pointerLow | ((ulong)pointerHigh << 32);
+            if (viaBufferDescriptor)
+            {
+                // V# word1 contains base-address high bits plus stride fields.
+                pointer &= 0x0000_FFFF_FFFF_FFFFUL;
+            }
+
+            if (pointer == 0)
+            {
+                return false;
+            }
+
+            address0 = unchecked(pointer + stepOffset) & ~3UL;
+            address1 = address0 + sizeof(uint);
+        }
+
+        descriptorAddress = address0;
+        return descriptorAddress != 0;
+    }
+
     internal static bool IsTextureContentCached(in TextureContentIdentity identity) =>
         _cachedTextureIdentities.ContainsKey(identity);
 
@@ -9374,6 +9424,104 @@ internal static unsafe class VulkanVideoPresenter
             }
         }
 
+        private long _deferredDescriptorResolveCount;
+        private long _deferredDescriptorFailCount;
+
+        private VulkanOffscreenGuestDraw ResolveDeferredTextureDescriptors(
+            VulkanOffscreenGuestDraw work)
+        {
+            var textures = work.Draw.Textures;
+            GuestDrawTexture[]? replaced = null;
+            var descriptorBytes = new byte[8 * sizeof(uint)];
+            for (var index = 0; index < textures.Count; index++)
+            {
+                var texture = textures[index];
+                if (!texture.IsFallback)
+                {
+                    continue;
+                }
+
+                var descriptorAddress = texture.DeferredDescriptorAddress;
+                if (descriptorAddress == 0 &&
+                    texture.DeferredChain is { } chain &&
+                    !VulkanVideoPresenter.TryResolveDescriptorChainAddress(
+                        _guestMemory,
+                        chain,
+                        out descriptorAddress))
+                {
+                    descriptorAddress = 0;
+                }
+
+                if (descriptorAddress == 0)
+                {
+                    continue;
+                }
+
+                if (_guestMemory?.TryRead(descriptorAddress, descriptorBytes) != true)
+                {
+                    if (Interlocked.Increment(ref _deferredDescriptorFailCount) <= 32)
+                    {
+                        Console.Error.WriteLine(
+                            $"[LOADER][TRACE] vk.deferred_texture_unreadable " +
+                            $"table=0x{descriptorAddress:X16}");
+                    }
+
+                    continue;
+                }
+
+                var descriptorWords = new uint[8];
+                for (var word = 0; word < descriptorWords.Length; word++)
+                {
+                    descriptorWords[word] =
+                        System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(
+                            descriptorBytes.AsSpan(
+                                word * sizeof(uint),
+                                sizeof(uint)));
+                }
+
+                if (!AgcExports.TryResolveDeferredDrawTexture(
+                        descriptorWords,
+                        texture.IsStorage,
+                        texture.MipLevel,
+                        texture.Sampler,
+                        _guestMemory,
+                        out var resolvedTexture))
+                {
+                    if (Interlocked.Increment(ref _deferredDescriptorFailCount) <= 32)
+                    {
+                        Console.Error.WriteLine(
+                            $"[LOADER][TRACE] vk.deferred_texture_unresolved " +
+                            $"table=0x{descriptorAddress:X16} " +
+                            $"words=[{string.Join(',', descriptorWords.Select(
+                                static word => $"{word:X8}"))}]");
+                    }
+
+                    continue;
+                }
+
+                replaced ??= textures.ToArray();
+                replaced[index] = resolvedTexture with
+                {
+                    Sampler = texture.Sampler,
+                    DeferredDescriptorAddress = 0,
+                    DeferredChain = null,
+                };
+                if (Interlocked.Increment(ref _deferredDescriptorResolveCount) <= 64)
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] vk.deferred_texture_resolved " +
+                        $"table=0x{descriptorAddress:X16} " +
+                        $"tex=0x{resolvedTexture.Address:X16}:" +
+                        $"{resolvedTexture.Width}x{resolvedTexture.Height}:" +
+                        $"f{resolvedTexture.Format}/n{resolvedTexture.NumberType}");
+                }
+            }
+
+            return replaced is null
+                ? work
+                : work with { Draw = work.Draw with { Textures = replaced } };
+        }
+
         private void ExecuteOffscreenDraw(VulkanOffscreenGuestDraw work)
         {
             if (_deviceLost || work.Targets.Count == 0)
@@ -9401,6 +9549,7 @@ internal static unsafe class VulkanVideoPresenter
 
         private void ExecuteOffscreenDrawCore(VulkanOffscreenGuestDraw work)
         {
+            work = ResolveDeferredTextureDescriptors(work);
             if (work.Targets.Count > _maxColorAttachments)
             {
                 Console.Error.WriteLine(

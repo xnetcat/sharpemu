@@ -168,6 +168,19 @@ public static class Gen5ShaderScalarEvaluator
         // set already includes every instruction's destination registers, so
         // the per-load additions the loop used to make are redundant.
         var runtimeScalarRegisters = state.Program.RuntimeScalarRegisters;
+        var scalarLoadSources = new Dictionary<uint, ulong>();
+        var scalarLoadChains = new Dictionary<uint, Gen5DescriptorChain>();
+        if (state.UserDataSources is { } userDataSources)
+        {
+            for (var index = 0; index < userDataSources.Count; index++)
+            {
+                if (userDataSources[index] != 0)
+                {
+                    scalarLoadSources[state.UserDataScalarRegisterBase + (uint)index] =
+                        userDataSources[index];
+                }
+            }
+        }
         var resolvedImageByPc = new Dictionary<uint, int>();
         var finalScalarRegisters = (uint[])scalarRegisters.Clone();
         var pendingPaths = new Stack<ScalarPathState>();
@@ -331,7 +344,19 @@ public static class Gen5ShaderScalarEvaluator
                 var recordBinding =
                     !path.Supplemental ||
                     !HasGlobalMemoryBindingForPc(globalMemoryBindings, instruction.Pc);
-                if (!TryExecuteScalarLoad(ctx, state, instruction, scalarMemory, scalarRegisters, globalMemoryBindings, globalMemoryByAddress, runtimeScalarRegisters, recordBinding, out error))
+                if (!TryExecuteScalarLoad(
+                        ctx,
+                        state,
+                        instruction,
+                        scalarMemory,
+                        scalarRegisters,
+                        globalMemoryBindings,
+                        globalMemoryByAddress,
+                        runtimeScalarRegisters,
+                        recordBinding,
+                        out error,
+                        scalarLoadSources,
+                        scalarLoadChains))
                 {
                     return false;
                 }
@@ -641,7 +666,19 @@ public static class Gen5ShaderScalarEvaluator
                         image,
                         out var mipLevel)
                         ? mipLevel
-                        : null);
+                        : null)
+                {
+                    DescriptorSourceAddress = scalarLoadSources.TryGetValue(
+                        image.ScalarResource,
+                        out var descriptorSource)
+                        ? descriptorSource
+                        : 0,
+                    DeferredChain = scalarLoadChains.TryGetValue(
+                        image.ScalarResource,
+                        out var descriptorChain)
+                        ? descriptorChain
+                        : null,
+                };
                 if (resolvedImageByPc.TryGetValue(instruction.Pc, out var existingIndex))
                 {
                     var existing = resolved[existingIndex];
@@ -1839,7 +1876,9 @@ public static class Gen5ShaderScalarEvaluator
         Dictionary<(uint ScalarAddress, ulong BaseAddress), Gen5GlobalMemoryBinding> globalMemoryByAddress,
         IReadOnlySet<uint> runtimeScalarRegisters,
         bool recordBinding,
-        out string error)
+        out string error,
+        Dictionary<uint, ulong>? scalarLoadSources = null,
+        Dictionary<uint, Gen5DescriptorChain>? scalarLoadChains = null)
     {
         error = string.Empty;
         if (instruction.Sources.Count == 0 ||
@@ -2012,6 +2051,49 @@ public static class Gen5ShaderScalarEvaluator
             }
 
             var componentOffset = unchecked(byteOffset + (ulong)(index * sizeof(uint)));
+            if (scalarLoadSources is not null && address != 0)
+            {
+                scalarLoadSources[destination.Value] =
+                    address + (ulong)(index * sizeof(uint));
+                scalarLoadChains?.Remove(destination.Value);
+            }
+            else if (scalarLoadChains is not null &&
+                     scalarLoadSources is not null &&
+                     baseAddress == 0)
+            {
+                Gen5DescriptorChain? parentChain = null;
+                if (scalarLoadSources.TryGetValue(
+                        scalarBase.Value,
+                        out var pointerSource) &&
+                    pointerSource != 0)
+                {
+                    parentChain = new Gen5DescriptorChain(
+                        pointerSource,
+                        scalarLoadSources.TryGetValue(
+                            scalarBase.Value + 1,
+                            out var pointerSourceHigh) &&
+                        pointerSourceHigh != 0
+                            ? pointerSourceHigh
+                            : pointerSource + sizeof(uint),
+                        []);
+                }
+                else
+                {
+                    scalarLoadChains.TryGetValue(scalarBase.Value, out parentChain);
+                }
+
+                if (parentChain is not null)
+                {
+                    var steps = new List<(ulong Offset, bool ViaBufferDescriptor)>(
+                        parentChain.Steps.Count + 1);
+                    steps.AddRange(parentChain.Steps);
+                    steps.Add((componentOffset, isBufferLoad));
+                    scalarLoadChains[destination.Value] =
+                        parentChain with { Steps = steps };
+                    scalarLoadSources.Remove(destination.Value);
+                }
+            }
+
             if (bufferUnbound ||
                 scalarPointerUnbound ||
                 isBufferLoad &&

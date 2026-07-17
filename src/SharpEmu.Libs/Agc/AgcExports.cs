@@ -433,7 +433,9 @@ public static partial class AgcExports
         TextureDescriptor Descriptor,
         bool IsStorage,
         uint MipLevel,
-        IReadOnlyList<uint> SamplerDescriptor);
+        IReadOnlyList<uint> SamplerDescriptor,
+        ulong DeferredDescriptorAddress = 0,
+        Gen5DescriptorChain? DeferredChain = null);
 
     private readonly record struct RenderTargetWriter(
         ulong Sequence,
@@ -518,6 +520,10 @@ public static partial class AgcExports
 
         public Dictionary<uint, uint> CxRegisters { get; } = new();
         public Dictionary<uint, uint> ShRegisters { get; } = new();
+        // Address of each SH register value read from an indirect patch table.
+        // The table can be written after command parsing, so shader descriptor
+        // evaluation retains this provenance for execution-time refresh.
+        public Dictionary<uint, ulong> ShRegisterSources { get; } = new();
         public Dictionary<uint, uint> UcRegisters { get; } = new();
         public TextureDescriptor? PresenterTexture { get; set; }
         public GuestDrawKind GuestDrawKind { get; set; }
@@ -3990,6 +3996,7 @@ public static partial class AgcExports
         // translated after RESET at this precise packet position.
         state.CxRegisters.Clear();
         state.ShRegisters.Clear();
+        state.ShRegisterSources.Clear();
         state.UcRegisters.Clear();
         state.PresenterTexture = null;
         state.GuestDrawKind = GuestDrawKind.None;
@@ -4462,11 +4469,13 @@ public static partial class AgcExports
         };
         queue.CxRegisters.Add(1, 2);
         queue.ShRegisters.Add(3, 4);
+        queue.ShRegisterSources.Add(3, 0x1000);
         queue.UcRegisters.Add(5, 6);
         queue.PendingSubmissions.Enqueue(new(0x3000, 2, 8, false));
         ResetSubmittedParserState(queue);
         System.Diagnostics.Debug.Assert(queue.CxRegisters.Count == 0);
         System.Diagnostics.Debug.Assert(queue.ShRegisters.Count == 0);
+        System.Diagnostics.Debug.Assert(queue.ShRegisterSources.Count == 0);
         System.Diagnostics.Debug.Assert(queue.UcRegisters.Count == 0);
         System.Diagnostics.Debug.Assert(queue.IndexBufferAddress == 0);
         System.Diagnostics.Debug.Assert(queue.IndexBufferCount == 0);
@@ -5145,6 +5154,10 @@ public static partial class AgcExports
                 }
 
                 directDestination[startRegister + index] = value;
+                if (op == ItSetShReg)
+                {
+                    state.ShRegisterSources.Remove(startRegister + index);
+                }
             }
 
             return;
@@ -5179,6 +5192,11 @@ public static partial class AgcExports
             // Dropping it leaves stale depth/render-control state active in
             // later passes.
             destination[registerOffset] = value;
+            if (register == RShRegsIndirect)
+            {
+                state.ShRegisterSources[registerOffset] =
+                    entryAddress + sizeof(uint);
+            }
         }
     }
 
@@ -5685,7 +5703,8 @@ public static partial class AgcExports
                 SelectExportUserDataRegister(state.ShRegisters),
                 out var exportState,
                 out error,
-                userDataScalarRegisterBase: NggUserDataScalarRegisterBase) ||
+                userDataScalarRegisterBase: NggUserDataScalarRegisterBase,
+                shaderRegisterSources: state.ShRegisterSources) ||
             !Gen5ShaderScalarEvaluator.TryEvaluate(
                 ctx,
                 exportState,
@@ -5755,7 +5774,9 @@ public static partial class AgcExports
             exportEvaluation.ImageBindings.Count);
         foreach (var binding in exportEvaluation.ImageBindings)
         {
-            if (!TryDecodeTextureDescriptor(binding.ResourceDescriptor, out var texture))
+            var descriptorValid =
+                TryDecodeTextureDescriptor(binding.ResourceDescriptor, out var texture);
+            if (!descriptorValid)
             {
                 if (_strictShaderDescriptors)
                 {
@@ -5778,11 +5799,19 @@ public static partial class AgcExports
                     0xFAC);
             }
 
+            var descriptorUnusable =
+                !descriptorValid ||
+                texture.Address == 0 ||
+                texture.Type is not (Gen5TextureType1D or Gen5TextureType2D) ||
+                texture.Width == 0 ||
+                texture.Height == 0;
             textures.Add(new TranslatedImageBinding(
                 texture,
                 Gen5ShaderTranslator.IsStorageImageOperation(binding.Opcode),
                 binding.MipLevel ?? 0,
-                binding.SamplerDescriptor));
+                binding.SamplerDescriptor,
+                descriptorUnusable ? binding.DescriptorSourceAddress : 0,
+                descriptorUnusable ? binding.DeferredChain : null));
         }
 
         IReadOnlyList<Gen5VertexInputBinding> vertexInputs =
@@ -5891,7 +5920,8 @@ public static partial class AgcExports
                 SelectExportUserDataRegister(state.ShRegisters),
                 out var exportState,
                 out error,
-                userDataScalarRegisterBase: NggUserDataScalarRegisterBase))
+                userDataScalarRegisterBase: NggUserDataScalarRegisterBase,
+                shaderRegisterSources: state.ShRegisterSources))
         {
             return false;
         }
@@ -5921,7 +5951,8 @@ public static partial class AgcExports
                 state.ShRegisters,
                 PsTextureUserDataRegister,
                 out var pixelState,
-                out error))
+                out error,
+                shaderRegisterSources: state.ShRegisterSources))
         {
             ReturnPooledEvaluationArrays(exportEvaluation);
             return false;
@@ -6199,7 +6230,9 @@ public static partial class AgcExports
     {
         foreach (var binding in bindings)
         {
-            if (!TryDecodeTextureDescriptor(binding.ResourceDescriptor, out var texture))
+            var descriptorValid =
+                TryDecodeTextureDescriptor(binding.ResourceDescriptor, out var texture);
+            if (!descriptorValid)
             {
                 // A garbage/zeroed texture descriptor (from a per-draw descriptor
                 // setup race — the same root as scalar-load-failed) would drop
@@ -6216,6 +6249,12 @@ public static partial class AgcExports
                     0, 1, 1, Gen5TextureFormatR8G8B8A8Unorm, 0, 0, 0, 0, 0, 1, 0xFAC);
             }
 
+            var descriptorUnusable =
+                !descriptorValid ||
+                texture.Address == 0 ||
+                texture.Type is not (Gen5TextureType1D or Gen5TextureType2D) ||
+                texture.Width == 0 ||
+                texture.Height == 0;
             var isStorage =
                 Gen5ShaderTranslator.IsStorageImageOperation(binding.Opcode);
             if (_traceAgcShader || _tracePixelShaderAddress == pixelShaderAddress)
@@ -6232,7 +6271,9 @@ public static partial class AgcExports
                     texture,
                     isStorage,
                     binding.MipLevel ?? 0,
-                    binding.SamplerDescriptor));
+                    binding.SamplerDescriptor,
+                    descriptorUnusable ? binding.DescriptorSourceAddress : 0,
+                    descriptorUnusable ? binding.DeferredChain : null));
         }
 
         error = string.Empty;
@@ -7180,13 +7221,24 @@ public static partial class AgcExports
         foreach (var binding in bindings)
         {
             if (TryCreateGuestDrawTexture(
-                    ctx,
+                    ctx.Memory,
                     binding.Descriptor,
                     binding.IsStorage,
                     binding.MipLevel,
                     binding.SamplerDescriptor,
                     out var texture))
             {
+                if (texture.IsFallback &&
+                    (binding.DeferredDescriptorAddress != 0 ||
+                     binding.DeferredChain is not null))
+                {
+                    texture = texture with
+                    {
+                        DeferredDescriptorAddress = binding.DeferredDescriptorAddress,
+                        DeferredChain = binding.DeferredChain,
+                    };
+                }
+
                 textures.Add(texture);
                 if (texture.IsFallback)
                 {
@@ -7649,7 +7701,7 @@ public static partial class AgcExports
     }
 
     private static bool TryCreateGuestDrawTexture(
-        CpuContext ctx,
+        ICpuMemory memory,
         TextureDescriptor descriptor,
         bool isStorage,
         uint mipLevel,
@@ -7787,7 +7839,7 @@ public static partial class AgcExports
                 // and run the same AddrLib-derived detile path used below for
                 // sampled textures before seeding the Vulkan image.
                 var storageSource = new byte[(int)physicalSourceByteCount];
-                if (ctx.Memory.TryRead(descriptor.Address, storageSource))
+                if (memory.TryRead(descriptor.Address, storageSource))
                 {
                     readSucceeded = true;
                     var linearStorage = TryDetileTextureSource(
@@ -7886,7 +7938,7 @@ public static partial class AgcExports
         }
 
         var source = new byte[(int)physicalSourceByteCount];
-        if (!ctx.Memory.TryRead(descriptor.Address, source))
+        if (!memory.TryRead(descriptor.Address, source))
         {
             TraceTextureFallback(
                 descriptor,
@@ -7945,7 +7997,39 @@ public static partial class AgcExports
         return true;
     }
 
+    /// <summary>
+    /// Rebuild a sampled texture from descriptor words re-read on the ordered
+    /// render timeline. This is used only when parse-time evaluation produced
+    /// a fallback from a late-written descriptor table.
+    /// </summary>
+    internal static bool TryResolveDeferredDrawTexture(
+        uint[] descriptorWords,
+        bool isStorage,
+        uint mipLevel,
+        GuestSampler sampler,
+        ICpuMemory? memory,
+        out GuestDrawTexture texture)
+    {
+        texture = default!;
+        if (memory is null ||
+            isStorage ||
+            !TryDecodeTextureDescriptor(descriptorWords, out var descriptor) ||
+            descriptor.Address == 0 ||
+            descriptor.Width is 0 or > 8192 ||
+            descriptor.Height is 0 or > 8192)
+        {
+            return false;
+        }
 
+        return TryCreateGuestDrawTexture(
+                memory,
+                descriptor,
+                isStorage: false,
+                mipLevel,
+                [sampler.Word0, sampler.Word1, sampler.Word2, sampler.Word3],
+                out texture) &&
+            !texture.IsFallback;
+    }
 
     /// <summary>
     /// On PS5 render targets alias guest memory, so pixels the game wrote with
@@ -8553,7 +8637,8 @@ public static partial class AgcExports
                 ComputeUserDataRegister,
                 out var shaderState,
                 out var error,
-                computeSystemRegisters) ||
+                computeSystemRegisters,
+                shaderRegisterSources: state.ShRegisterSources) ||
             !Gen5ShaderScalarEvaluator.TryEvaluate(
                 ctx,
                 shaderState,
@@ -8585,12 +8670,20 @@ public static partial class AgcExports
                 texture = CreateFallbackTextureDescriptor(binding.ResourceDescriptor);
             }
 
+            var descriptorUnusable =
+                !descriptorValid ||
+                texture.Address == 0 ||
+                texture.Type is not (Gen5TextureType1D or Gen5TextureType2D) ||
+                texture.Width == 0 ||
+                texture.Height == 0;
             translatedBindings.Add(
                 new TranslatedImageBinding(
                     texture,
                     isStorage,
                     binding.MipLevel ?? 0,
-                    binding.SamplerDescriptor));
+                    binding.SamplerDescriptor,
+                    descriptorUnusable ? binding.DescriptorSourceAddress : 0,
+                    descriptorUnusable ? binding.DeferredChain : null));
             hasStorageBinding |= isStorage;
 
             var descriptorState = descriptorValid ? string.Empty : "/invalid-desc";
@@ -9590,7 +9683,8 @@ public static partial class AgcExports
                         SelectExportUserDataRegister(state.ShRegisters),
                         out var exportState,
                         out _,
-                        userDataScalarRegisterBase: NggUserDataScalarRegisterBase) &&
+                        userDataScalarRegisterBase: NggUserDataScalarRegisterBase,
+                        shaderRegisterSources: state.ShRegisterSources) &&
                     Gen5ShaderTranslator.TryCreateState(
                         ctx,
                         pixelShaderAddress,
@@ -9598,7 +9692,8 @@ public static partial class AgcExports
                         state.ShRegisters,
                         PsTextureUserDataRegister,
                         out var pixelState,
-                        out _))
+                        out _,
+                        shaderRegisterSources: state.ShRegisterSources))
                 {
                     TraceAgcShader(
                         $"agc.shader_state es=0x{exportShaderAddress:X16} " +
