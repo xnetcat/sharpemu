@@ -1300,6 +1300,17 @@ public static class KernelRuntimeCompatExports
     }
 
     [SysAbiExport(
+        Nid = "4fU5yvOkVG4",
+        ExportName = "sceSysmoduleGetModuleInfoForUnwind",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceSysmodule")]
+    public static int SysmoduleGetModuleInfoForUnwind(CpuContext ctx) =>
+        // Same (VAddr, s32 flags, info*) ABI as sceKernelGetModuleInfoForUnwind.
+        // Delegate to the real implementation so C++ exception unwinding resolves
+        // the owning module instead of following an unresolved-import path.
+        KernelGetModuleInfoForUnwind(ctx);
+
+    [SysAbiExport(
         Nid = "g8cM39EUZ6o",
         ExportName = "sceSysmoduleLoadModule",
         Target = Generation.Gen4 | Generation.Gen5,
