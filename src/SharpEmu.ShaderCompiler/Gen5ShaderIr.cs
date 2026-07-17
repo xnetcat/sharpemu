@@ -124,7 +124,21 @@ public sealed record Gen5ShaderState(
     IReadOnlyList<uint> UserData,
     Gen5ShaderMetadata? Metadata,
     Gen5ComputeSystemRegisters? ComputeSystemRegisters = null,
-    uint UserDataScalarRegisterBase = 0);
+    uint UserDataScalarRegisterBase = 0,
+    // Guest addresses each user-data SGPR's value came from when the
+    // register was loaded through an indirect SH-register patch table.
+    // The patch table can be populated after command-list parsing.
+    IReadOnlyList<ulong>? UserDataSources = null);
+
+/// <summary>
+/// Provenance for a descriptor reached through one or more late-written
+/// pointer loads. Each step dereferences the prior low/high pointer pair and
+/// advances by the recorded byte offset.
+/// </summary>
+public sealed record Gen5DescriptorChain(
+    ulong Anchor0,
+    ulong Anchor1,
+    IReadOnlyList<(ulong Offset, bool ViaBufferDescriptor)> Steps);
 
 public readonly record struct Gen5Operand(Gen5OperandKind Kind, uint Value)
 {
@@ -284,7 +298,17 @@ public sealed record Gen5ImageBinding(
     Gen5ImageControl Control,
     IReadOnlyList<uint> ResourceDescriptor,
     IReadOnlyList<uint> SamplerDescriptor,
-    uint? MipLevel);
+    uint? MipLevel)
+{
+    /// <summary>The guest address this T# was scalar-loaded from, if known.</summary>
+    public ulong DescriptorSourceAddress { get; init; }
+
+    /// <summary>
+    /// Multi-hop source retained when an intermediate descriptor pointer was
+    /// still zero while the command list was parsed.
+    /// </summary>
+    public Gen5DescriptorChain? DeferredChain { get; init; }
+}
 
 // Data arrays may be rented from ArrayPool (oversized): always slice with
 // DataLength, never Data.Length. Ownership transfers to the presenter, which

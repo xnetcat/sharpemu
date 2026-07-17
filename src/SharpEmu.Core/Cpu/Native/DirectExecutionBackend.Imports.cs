@@ -1459,6 +1459,11 @@ public sealed partial class DirectExecutionBackend
 		var expectedPlayGoChunkTerminator =
 			string.Equals(nid, "uWIYLFkkwqk", StringComparison.Ordinal) &&
 			resultValue == unchecked((int)0x80B2000C);
+		var expectedImeNoKeyboard =
+			(string.Equals(nid, "eaFXjfJv3xs", StringComparison.Ordinal) &&
+			 resultValue == unchecked((int)0x80BC0007)) ||
+			(string.Equals(nid, "-4GCfYdNF1s", StringComparison.Ordinal) &&
+			 resultValue == unchecked((int)0x80BC0005));
 		if (!expectedFileProbeMiss &&
 			!expectedTimedWaitTimeout &&
 			!expectedEqueueTimeout &&
@@ -1467,7 +1472,8 @@ public sealed partial class DirectExecutionBackend
 			!expectedNetAcceptWouldBlock &&
 			!expectedUserServiceNoEvent &&
 			!expectedPrivacyInvalidParameter &&
-			!expectedPlayGoChunkTerminator)
+			!expectedPlayGoChunkTerminator &&
+			!expectedImeNoKeyboard)
 		{
 			return true;
 		}

@@ -1719,6 +1719,56 @@ internal static unsafe class VulkanVideoPresenter
     internal static void AttachGuestMemory(SharpEmu.HLE.ICpuMemory memory) =>
         _guestMemory = memory;
 
+    internal static bool TryResolveDescriptorChainAddress(
+        ICpuMemory? memory,
+        Gen5DescriptorChain chain,
+        out ulong descriptorAddress)
+    {
+        descriptorAddress = 0;
+        if (memory is null)
+        {
+            return false;
+        }
+
+        Span<byte> wordBytes = stackalloc byte[sizeof(uint)];
+        var address0 = chain.Anchor0;
+        var address1 = chain.Anchor1;
+        foreach (var (stepOffset, viaBufferDescriptor) in chain.Steps)
+        {
+            if (!memory.TryRead(address0, wordBytes))
+            {
+                return false;
+            }
+
+            var pointerLow = System.Buffers.Binary.BinaryPrimitives
+                .ReadUInt32LittleEndian(wordBytes);
+            if (!memory.TryRead(address1, wordBytes))
+            {
+                return false;
+            }
+
+            var pointerHigh = System.Buffers.Binary.BinaryPrimitives
+                .ReadUInt32LittleEndian(wordBytes);
+            var pointer = pointerLow | ((ulong)pointerHigh << 32);
+            if (viaBufferDescriptor)
+            {
+                // A V# uses the upper part of word1 for stride and flags.
+                pointer &= 0x0000_FFFF_FFFF_FFFFUL;
+            }
+
+            if (pointer == 0)
+            {
+                return false;
+            }
+
+            address0 = unchecked(pointer + stepOffset) & ~3UL;
+            address1 = address0 + sizeof(uint);
+        }
+
+        descriptorAddress = address0;
+        return descriptorAddress != 0;
+    }
+
     internal static bool IsTextureContentCached(in TextureContentIdentity identity) =>
         _cachedTextureIdentities.ContainsKey(identity);
 
@@ -9513,6 +9563,129 @@ internal static unsafe class VulkanVideoPresenter
         // producer can be fixed without changing the guest value.
         private const ulong MaxCredibleGuestWorkgroupsPerDispatch = 16UL * 1024 * 1024;
 
+        private long _deferredDescriptorResolveCount;
+        private long _deferredDescriptorFailCount;
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<ulong, byte>
+            _deferredUnresolvedTracedTables = new();
+
+        // UE5 recycles descriptor tables before the render thread reaches the
+        // associated draw/dispatch. Re-read a known T# source on the ordered
+        // timeline, replacing parse-time fallbacks and valid-but-stale image
+        // addresses with the live descriptor.
+        private IReadOnlyList<GuestDrawTexture> ResolveDeferredTextureDescriptors(
+            IReadOnlyList<GuestDrawTexture> textures,
+            ulong shaderAddress)
+        {
+            GuestDrawTexture[]? replaced = null;
+            var addressBytes = new byte[2 * sizeof(uint)];
+            for (var index = 0; index < textures.Count; index++)
+            {
+                var texture = textures[index];
+                var descriptorAddress = texture.DeferredDescriptorAddress;
+                if (descriptorAddress == 0 &&
+                    texture.DeferredChain is { } chain &&
+                    !VulkanVideoPresenter.TryResolveDescriptorChainAddress(
+                        _guestMemory,
+                        chain,
+                        out descriptorAddress))
+                {
+                    descriptorAddress = 0;
+                }
+
+                if (descriptorAddress == 0)
+                {
+                    continue;
+                }
+
+                if (!texture.IsFallback)
+                {
+                    if (_guestMemory?.TryRead(descriptorAddress, addressBytes) != true)
+                    {
+                        continue;
+                    }
+
+                    var word0 = System.Buffers.Binary.BinaryPrimitives
+                        .ReadUInt32LittleEndian(addressBytes);
+                    var word1 = System.Buffers.Binary.BinaryPrimitives
+                        .ReadUInt32LittleEndian(addressBytes.AsSpan(sizeof(uint)));
+                    var liveAddress =
+                        (((ulong)(word1 & 0xFFu) << 32) | word0) << 8;
+                    if (liveAddress == 0 || liveAddress == texture.Address)
+                    {
+                        continue;
+                    }
+                }
+
+                var descriptorBytes = new byte[8 * sizeof(uint)];
+                if (_guestMemory?.TryRead(descriptorAddress, descriptorBytes) != true)
+                {
+                    if (Interlocked.Increment(ref _deferredDescriptorFailCount) <= 32)
+                    {
+                        Console.Error.WriteLine(
+                            $"[LOADER][TRACE] vk.deferred_texture_unreadable " +
+                            $"shader=0x{shaderAddress:X16} " +
+                            $"table=0x{descriptorAddress:X16}");
+                    }
+
+                    continue;
+                }
+
+                var descriptorWords = new uint[8];
+                for (var word = 0; word < descriptorWords.Length; word++)
+                {
+                    descriptorWords[word] =
+                        System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(
+                            descriptorBytes.AsSpan(
+                                word * sizeof(uint),
+                                sizeof(uint)));
+                }
+
+                if (!AgcExports.TryResolveDeferredDrawTexture(
+                        descriptorWords,
+                        texture.IsStorage,
+                        texture.MipLevel,
+                        texture.Sampler,
+                        _guestMemory,
+                        out var resolvedTexture))
+                {
+                    var traceKey = descriptorAddress ^ descriptorWords[0];
+                    if (_deferredUnresolvedTracedTables.TryAdd(traceKey, 0) &&
+                        Interlocked.Increment(ref _deferredDescriptorFailCount) <= 128)
+                    {
+                        Console.Error.WriteLine(
+                            $"[LOADER][TRACE] vk.deferred_texture_unresolved " +
+                            $"shader=0x{shaderAddress:X16} " +
+                            $"table=0x{descriptorAddress:X16} " +
+                            $"words=[{string.Join(',', descriptorWords.Select(
+                                static word => $"{word:X8}"))}]");
+                    }
+
+                    continue;
+                }
+
+                replaced ??= textures.ToArray();
+                replaced[index] = resolvedTexture with
+                {
+                    Sampler = texture.Sampler,
+                    DeferredDescriptorAddress = 0,
+                    DeferredChain = null,
+                };
+                if (Interlocked.Increment(ref _deferredDescriptorResolveCount) <= 64)
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] vk.deferred_texture_resolved " +
+                        $"shader=0x{shaderAddress:X16} " +
+                        $"table=0x{descriptorAddress:X16} " +
+                        $"tex=0x{resolvedTexture.Address:X16}:" +
+                        $"{resolvedTexture.Width}x{resolvedTexture.Height}x" +
+                        $"{Math.Max(resolvedTexture.Depth, 1u)}:" +
+                        $"f{resolvedTexture.Format}/n{resolvedTexture.NumberType}");
+                }
+            }
+
+            return replaced ?? textures;
+        }
+
         private void ExecuteComputeDispatch(VulkanComputeGuestDispatch work)
         {
             var perfStart = Stopwatch.GetTimestamp();
@@ -9567,6 +9740,12 @@ internal static unsafe class VulkanVideoPresenter
             var chunksSubmitted = 0;
             try
             {
+                work = work with
+                {
+                    Textures = ResolveDeferredTextureDescriptors(
+                        work.Textures,
+                        work.ShaderAddress),
+                };
                 EnsureGuestSubmissionCapacity();
                 resources = CreateComputeDispatchResources(work);
 
@@ -10368,6 +10547,15 @@ internal static unsafe class VulkanVideoPresenter
 
         private void ExecuteOffscreenDrawCore(VulkanOffscreenGuestDraw work)
         {
+            work = work with
+            {
+                Draw = work.Draw with
+                {
+                    Textures = ResolveDeferredTextureDescriptors(
+                        work.Draw.Textures,
+                        work.ShaderAddress),
+                },
+            };
             if (work.Targets.Count > _maxColorAttachments)
             {
                 Console.Error.WriteLine(

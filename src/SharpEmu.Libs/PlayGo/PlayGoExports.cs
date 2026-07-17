@@ -680,6 +680,11 @@ public static class PlayGoExports
 
     private static PlayGoMetadata LoadPlayGoMetadata()
     {
+        var assumeInstalled =
+            string.Equals(
+                Environment.GetEnvironmentVariable("SHARPEMU_PLAYGO_ASSUME_INSTALLED"),
+                "1",
+                StringComparison.Ordinal);
         var app0Root = Environment.GetEnvironmentVariable("SHARPEMU_APP0_DIR");
         if (string.IsNullOrWhiteSpace(app0Root))
         {
@@ -688,7 +693,9 @@ public static class PlayGoExports
             return new PlayGoMetadata(
                 true,
                 [(ushort)0],
-                PlayGoChunkIdKnowledge.Authoritative);
+                assumeInstalled
+                    ? PlayGoChunkIdKnowledge.Unknown
+                    : PlayGoChunkIdKnowledge.Authoritative);
         }
 
         var playGoDat = Path.Combine(app0Root, "sce_sys", "playgo-chunk.dat");

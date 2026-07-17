@@ -59,6 +59,55 @@ public sealed class Gen5ShaderScalarEvaluatorTests
     }
 
     [Fact]
+    public void NonBufferDescriptor_InSiblingBufferBlock_UsesSyntheticStorage()
+    {
+        var memory = new FakeCpuMemory(ShaderAddress, 0x1000);
+        var ctx = new CpuContext(memory, Generation.Gen5);
+        Gen5ShaderAtomicDecodeTests.WriteProgram(
+            memory,
+            ShaderAddress,
+            [
+                // BUFFER_ATOMIC_UMAX v1, off, s[0:3], 128 offset:8 glc.
+                0xE0E04008,
+                0x80000100,
+            ]);
+
+        var shaderRegisters = new Dictionary<uint, uint>
+        {
+            [Gen5ShaderAtomicDecodeTests.ComputePgmRsrc2Register] = 4u << 1,
+            [Gen5ShaderAtomicDecodeTests.ComputeUserDataRegister] = 0x1234_0000,
+            [Gen5ShaderAtomicDecodeTests.ComputeUserDataRegister + 1] = 0,
+            [Gen5ShaderAtomicDecodeTests.ComputeUserDataRegister + 2] = 64,
+            // Resource type 1 is not a V# buffer descriptor.
+            [Gen5ShaderAtomicDecodeTests.ComputeUserDataRegister + 3] = 1u << 30,
+        };
+        Assert.True(
+            Gen5ShaderTranslator.TryCreateState(
+                ctx,
+                ShaderAddress,
+                0,
+                shaderRegisters,
+                Gen5ShaderAtomicDecodeTests.ComputeUserDataRegister,
+                out var state,
+                out var error),
+            error);
+
+        Assert.True(
+            Gen5ShaderScalarEvaluator.TryEvaluate(
+                ctx,
+                state,
+                out var evaluation,
+                out error),
+            error);
+        var binding = Assert.Single(evaluation.GlobalMemoryBindings);
+        Assert.Equal(0UL, binding.BaseAddress);
+        Assert.Equal(new uint[] { 0 }, binding.InstructionPcs);
+        Assert.True(binding.Writable);
+        Assert.False(binding.WriteBackToGuest);
+        Assert.Equal(sizeof(uint), binding.DataLength);
+    }
+
+    [Fact]
     public void DeferredVertexDescriptor_DecodesLiveLayout()
     {
         const ulong baseAddress = 0x1234_5678_9ABC;

@@ -28,6 +28,7 @@ public sealed class PlayGoExportsTests : IDisposable
     private const ulong LociAddress = MemoryBase + 0x400;
 
     private readonly string? _originalApp0Root;
+    private readonly string? _originalAssumeInstalled;
     private readonly string _app0Root;
     private readonly FakeCpuMemory _memory = new(MemoryBase, 0x10000);
     private readonly CpuContext _ctx;
@@ -35,9 +36,12 @@ public sealed class PlayGoExportsTests : IDisposable
     public PlayGoExportsTests()
     {
         _originalApp0Root = Environment.GetEnvironmentVariable("SHARPEMU_APP0_DIR");
+        _originalAssumeInstalled =
+            Environment.GetEnvironmentVariable("SHARPEMU_PLAYGO_ASSUME_INSTALLED");
         _app0Root = Path.Combine(Path.GetTempPath(), $"sharpemu-playgo-{Guid.NewGuid():N}");
         Directory.CreateDirectory(_app0Root);
         Environment.SetEnvironmentVariable("SHARPEMU_APP0_DIR", _app0Root);
+        Environment.SetEnvironmentVariable("SHARPEMU_PLAYGO_ASSUME_INSTALLED", null);
         PlayGoExports.ResetForTests();
         _ctx = new CpuContext(_memory, Generation.Gen5);
     }
@@ -52,6 +56,18 @@ public sealed class PlayGoExportsTests : IDisposable
 
         Assert.Equal(BadChunkId, GetLocus(handle, [1]));
         Assert.Equal(new byte[] { LocusNotDownloaded }, ReadLoci(1));
+    }
+
+    [Fact]
+    public void GetLocus_MetadataFreeInstalledDump_AcceptsQueriedChunks()
+    {
+        Environment.SetEnvironmentVariable("SHARPEMU_PLAYGO_ASSUME_INSTALLED", "1");
+        var handle = InitializeAndOpen();
+
+        Assert.Equal(
+            (int)OrbisGen2Result.ORBIS_GEN2_OK,
+            GetLocus(handle, [1, 8]));
+        Assert.Equal(new byte[] { LocusLocalFast, LocusLocalFast }, ReadLoci(2));
     }
 
     [Fact]
@@ -134,6 +150,9 @@ public sealed class PlayGoExportsTests : IDisposable
     {
         PlayGoExports.ResetForTests();
         Environment.SetEnvironmentVariable("SHARPEMU_APP0_DIR", _originalApp0Root);
+        Environment.SetEnvironmentVariable(
+            "SHARPEMU_PLAYGO_ASSUME_INSTALLED",
+            _originalAssumeInstalled);
         Directory.Delete(_app0Root, recursive: true);
     }
 
