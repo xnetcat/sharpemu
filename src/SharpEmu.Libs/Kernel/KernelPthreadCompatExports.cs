@@ -1943,8 +1943,18 @@ public static class KernelPthreadCompatExports
             return null;
         }
 
+        var normalizedFilter = filter.Trim();
+        if (normalizedFilter is "*" ||
+            normalizedFilter.Equals("all", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
         var addresses = new HashSet<ulong>();
-        foreach (var token in filter.Split(new[] { ',', ';', ' ' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        foreach (var token in normalizedFilter.Split(
+                     new[] { ',', ';', ' ' },
+                     StringSplitOptions.RemoveEmptyEntries |
+                     StringSplitOptions.TrimEntries))
         {
             var normalized = token.StartsWith("0x", StringComparison.OrdinalIgnoreCase)
                 ? token[2..]
