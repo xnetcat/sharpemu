@@ -10,6 +10,8 @@ namespace SharpEmu.Libs.Audio;
 
 public static class AjmExports
 {
+    private const int InvalidParameter = unchecked((int)0x806A0001);
+    private const uint MaximumGen5InitializeRevision = 3;
     private const int OrbisAjmErrorInvalidContext = unchecked((int)0x80930002);
     private const int OrbisAjmErrorInvalidInstance = unchecked((int)0x80930003);
     private const int OrbisAjmErrorInvalidParameter = unchecked((int)0x80930005);
@@ -35,11 +37,11 @@ public static class AjmExports
 
     public static int AjmInitialize(CpuContext ctx)
     {
-        var reserved = ctx[CpuRegister.Rdi];
+        var initializeFlags = ctx[CpuRegister.Rdi];
         var outputAddress = ctx[CpuRegister.Rsi];
-        if (reserved != 0 || outputAddress == 0)
+        if (!IsValidInitializeFlags(ctx.TargetGeneration, initializeFlags) || outputAddress == 0)
         {
-            return unchecked((int)0x806A0001);
+            return InvalidParameter;
         }
 
         var contextId = unchecked((uint)Interlocked.Increment(ref _nextContextId));
@@ -47,18 +49,36 @@ public static class AjmExports
         BinaryPrimitives.WriteUInt32LittleEndian(value, contextId);
         if (!ctx.Memory.TryWrite(outputAddress, value))
         {
-            return unchecked((int)0x806A0001);
+            return InvalidParameter;
         }
 
         Contexts[contextId] = new AjmContextState();
         if (string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_AJM"), "1", StringComparison.Ordinal))
         {
             Console.Error.WriteLine(
-                $"[LOADER][TRACE] ajm.initialize reserved={reserved} out=0x{outputAddress:X16} context={contextId}");
+                $"[LOADER][TRACE] ajm.initialize flags=0x{initializeFlags:X16} " +
+                $"revision={initializeFlags >> 32} out=0x{outputAddress:X16} context={contextId}");
         }
 
         ctx[CpuRegister.Rax] = 0;
         return 0;
+    }
+
+    internal static bool IsValidInitializeFlags(Generation generation, ulong initializeFlags)
+    {
+        // Gen4 defines this argument as an s64 reserved value and requires
+        // zero. Gen5 retained the same NID and output pointer but encodes the
+        // AJM ABI revision in the high dword. Current SDK middleware passes
+        // 0x00000003_00000000; the low reserved dword must remain zero.
+        if (initializeFlags == 0)
+        {
+            return true;
+        }
+
+        var revision = initializeFlags >> 32;
+        return generation == Generation.Gen5 &&
+               (initializeFlags & uint.MaxValue) == 0 &&
+               revision is >= 1 and <= MaximumGen5InitializeRevision;
     }
 
     [SysAbiExport(
