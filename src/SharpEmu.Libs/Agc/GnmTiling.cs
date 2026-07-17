@@ -107,6 +107,19 @@ internal static class GnmTiling
          Y(2), X(2), Y(3), X(3)],
     ];
 
+    // AMD AddrLib's GFX10_SW_256_S_PATINFO selects nibble01 patterns 0-4.
+    // For 16-byte elements (including BC2/3/5/6/7 blocks), address bits 4..7
+    // are y0, y1, x0, x1. Treating this as generic Morton order instead swaps
+    // BC7 blocks inside every 4x4-block tile, corrupting small UI glyphs.
+    private static readonly AddressBit[][] Standard256 =
+    [
+        [X(0), X(1), X(2), X(3), Y(0), Y(1), Y(2), Y(3)],
+        [Zero, X(0), X(1), X(2), Y(0), Y(1), Y(2), X(3)],
+        [Zero, Zero, X(0), X(1), Y(0), Y(1), Y(2), X(2)],
+        [Zero, Zero, Zero, X(0), Y(0), Y(1), X(1), X(2)],
+        [Zero, Zero, Zero, Zero, Y(0), Y(1), X(0), X(1)],
+    ];
+
     private static readonly bool _enabled = string.Equals(
         Environment.GetEnvironmentVariable("SHARPEMU_DETILE"),
         "1",
@@ -326,6 +339,7 @@ internal static class GnmTiling
 
         pattern = swizzleMode switch
         {
+            1 => Standard256[bytesPerElementLog2],
             5 => Standard4K[bytesPerElementLog2],
             9 => RbPlus64KStandard[bytesPerElementLog2],
             24 => RbPlus64KDepthX[bytesPerElementLog2],
