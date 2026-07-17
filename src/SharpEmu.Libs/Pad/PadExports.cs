@@ -23,6 +23,7 @@ public static class PadExports
     private const int PrimaryPadHandle = 1;
     private const int ControllerInformationSize = 0x1C;
     private const int PadDataSize = 0x78;
+    private const int TriggerEffectStateSize = 8;
 
     // Real firmware hands out small non-negative handles; 0 is valid. Some titles
     // (Monster Truck Championship) read pad state with handle 0, and rejecting it
@@ -113,7 +114,7 @@ public static class PadExports
         }
 
         var typeAccepted = extended ? type is 0 or 1 or 2 : type == StandardPortType;
-        if (userId != PrimaryUserId || !typeAccepted || index != 0 || (!extended && parameterAddress != 0))
+        if (userId != PrimaryUserId || !typeAccepted || index != 0)
         {
             return ctx.SetReturn(OrbisPadErrorDeviceNotConnected);
         }
@@ -128,6 +129,31 @@ public static class PadExports
         }
 
         return ctx.SetReturn(PrimaryPadHandle);
+    }
+
+    [SysAbiExport(
+        Nid = "u1GRHp+oWoY",
+        ExportName = "scePadGetHandle",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libScePad")]
+    public static int PadGetHandle(CpuContext ctx)
+    {
+        var userId = unchecked((int)ctx[CpuRegister.Rdi]);
+        var type = unchecked((int)ctx[CpuRegister.Rsi]);
+        var index = unchecked((int)ctx[CpuRegister.Rdx]);
+        if (!_initialized)
+        {
+            return ctx.SetReturn(OrbisPadErrorNotInitialized);
+        }
+
+        if (userId == -1)
+        {
+            return ctx.SetReturn(OrbisPadErrorDeviceNoHandle);
+        }
+
+        return userId == PrimaryUserId && type == StandardPortType && index == 0
+            ? ctx.SetReturn(PrimaryPadHandle)
+            : ctx.SetReturn(OrbisPadErrorDeviceNoHandle);
     }
 
     [SysAbiExport(
@@ -323,6 +349,32 @@ public static class PadExports
 
         return WriteNeutralPadData(ctx, dataAddress)
             ? ctx.SetReturn(1)
+            : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    [SysAbiExport(
+        Nid = "znaWI0gpuo8",
+        ExportName = "scePadGetTriggerEffectState",
+        Target = Generation.Gen5,
+        LibraryName = "libScePad")]
+    public static int PadGetTriggerEffectState(CpuContext ctx)
+    {
+        var handle = unchecked((int)ctx[CpuRegister.Rdi]);
+        var stateAddress = ctx[CpuRegister.Rsi];
+        if (!IsPrimaryPadHandle(handle))
+        {
+            return ctx.SetReturn(OrbisPadErrorInvalidHandle);
+        }
+
+        if (stateAddress == 0)
+        {
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        Span<byte> state = stackalloc byte[TriggerEffectStateSize];
+        state.Clear();
+        return ctx.Memory.TryWrite(stateAddress, state)
+            ? ctx.SetReturn(0)
             : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
     }
 
@@ -545,6 +597,20 @@ public static class PadExports
 
     private static readonly long PadStartTimestamp = Stopwatch.GetTimestamp();
     private static readonly double[] AutoCrossTimes = ParseAutoCrossTimes();
+    private static readonly double AutoCrossHoldSeconds = ParseAutoCrossHoldSeconds();
+    private static readonly bool AutoCrossCatchUp = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_AUTO_CROSS_CATCH_UP"),
+        "1",
+        StringComparison.Ordinal);
+    private static readonly bool TraceAutoCross = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_LOG_AUTO_CROSS"),
+        "1",
+        StringComparison.Ordinal);
+    private static readonly object AutoCrossGate = new();
+    private static long _autoCrossLoggedMask;
+    private static int _autoCrossNextIndex;
+    private static double _autoCrossActiveUntil;
+    private static double _autoCrossReleaseUntil;
 
     private static double[] ParseAutoCrossTimes()
     {
@@ -577,15 +643,71 @@ public static class PadExports
         }
 
         var elapsed = (Stopwatch.GetTimestamp() - PadStartTimestamp) / (double)Stopwatch.Frequency;
-        foreach (var time in times)
+        if (AutoCrossCatchUp)
         {
-            if (elapsed >= time && elapsed < time + 0.4)
+            lock (AutoCrossGate)
             {
+                if (elapsed < _autoCrossActiveUntil)
+                {
+                    return true;
+                }
+
+                if (elapsed < _autoCrossReleaseUntil ||
+                    _autoCrossNextIndex >= times.Length ||
+                    elapsed < times[_autoCrossNextIndex])
+                {
+                    return false;
+                }
+
+                var index = _autoCrossNextIndex++;
+                _autoCrossActiveUntil = elapsed + AutoCrossHoldSeconds;
+                _autoCrossReleaseUntil = _autoCrossActiveUntil + 0.5;
+                LogAutoCross(index, times[index], elapsed, catchUp: true);
+                return true;
+            }
+        }
+
+        for (var index = 0; index < times.Length; index++)
+        {
+            var time = times[index];
+            if (elapsed >= time && elapsed < time + AutoCrossHoldSeconds)
+            {
+                LogAutoCross(index, time, elapsed, catchUp: false);
                 return true;
             }
         }
 
         return false;
+    }
+
+    private static void LogAutoCross(int index, double scheduled, double elapsed, bool catchUp)
+    {
+        if (!TraceAutoCross || index >= 64)
+        {
+            return;
+        }
+
+        var bit = 1L << index;
+        var previous = Interlocked.Or(ref _autoCrossLoggedMask, bit);
+        if ((previous & bit) == 0)
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][DIAG] pad.auto_cross_consumed index={index} " +
+                $"scheduled={scheduled:F3}s elapsed={elapsed:F3}s catch_up={catchUp}");
+        }
+    }
+
+    private static double ParseAutoCrossHoldSeconds()
+    {
+        var raw = Environment.GetEnvironmentVariable("SHARPEMU_AUTO_CROSS_HOLD_MS");
+        return double.TryParse(
+                   raw,
+                   System.Globalization.NumberStyles.Float,
+                   System.Globalization.CultureInfo.InvariantCulture,
+                   out var milliseconds) &&
+               milliseconds is >= 1 and <= 10_000
+            ? milliseconds / 1000.0
+            : 0.4;
     }
 
     /// <summary>Maps the host seam's neutral button flags onto SCE_PAD_BUTTON bits.</summary>

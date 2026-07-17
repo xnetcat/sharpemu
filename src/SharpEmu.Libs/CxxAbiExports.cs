@@ -5,6 +5,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Threading;
 using SharpEmu.HLE;
+using SharpEmu.Libs.Kernel;
 
 namespace SharpEmu.Libs.CxxAbi;
 
@@ -16,7 +17,7 @@ public static class CxaGuardExports
 
     private sealed class GuardState
     {
-        public int OwnerThreadId { get; set; }
+        public ulong OwnerThreadId { get; set; }
         public int RecursionDepth { get; set; }
     }
 
@@ -36,7 +37,9 @@ public static class CxaGuardExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
-        var currentThreadId = Environment.CurrentManagedThreadId;
+        // Guest continuations can resume on a different managed/native worker.
+        // Guard ownership must follow the guest pthread, not the CLR worker.
+        var currentThreadId = KernelPthreadState.GetCurrentThreadUniqueId();
         var spinner = new SpinWait();
         while (true)
         {
@@ -107,7 +110,7 @@ public static class CxaGuardExports
         }
 
         if (_inProgress.TryGetValue(guardPtr, out var state) &&
-            state.OwnerThreadId != Environment.CurrentManagedThreadId)
+            state.OwnerThreadId != KernelPthreadState.GetCurrentThreadUniqueId())
         {
             ctx[CpuRegister.Rax] = 0;
             LogGuardResult("guard_release", guardPtr, result: 0, initialized: false, inProgress: true, ownerThreadId: state.OwnerThreadId);
@@ -156,7 +159,7 @@ public static class CxaGuardExports
         }
 
         if (_inProgress.TryGetValue(guardPtr, out var state) &&
-            state.OwnerThreadId != Environment.CurrentManagedThreadId)
+            state.OwnerThreadId != KernelPthreadState.GetCurrentThreadUniqueId())
         {
             ctx[CpuRegister.Rax] = 0;
             LogGuardResult("guard_abort", guardPtr, result: 0, initialized: false, inProgress: true, ownerThreadId: state.OwnerThreadId);
@@ -209,7 +212,7 @@ public static class CxaGuardExports
             $"[LOADER][TRACE] {op}: guard=0x{guardPtr:X16} init={initialized} in_progress={inProgress} word={(readable ? $"0x{word:X16}" : "<unreadable>")}");
     }
 
-    private static void LogGuardResult(string op, ulong guardPtr, int result, bool initialized, bool inProgress, int ownerThreadId)
+    private static void LogGuardResult(string op, ulong guardPtr, int result, bool initialized, bool inProgress, ulong ownerThreadId)
     {
         if (!string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_GUARDS"), "1", StringComparison.Ordinal))
         {

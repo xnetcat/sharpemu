@@ -31,6 +31,7 @@ public static partial class Gen5SpirvTranslator
         int pixelRenderTargetSlot = 0,
         uint pixelInputEnable = 0,
         uint pixelInputAddress = 0,
+        IReadOnlyDictionary<uint, uint>? pixelInputLocations = null,
         ulong storageBufferOffsetAlignment = 1) =>
         TryCompilePixelShader(
             state,
@@ -44,6 +45,7 @@ public static partial class Gen5SpirvTranslator
             initialScalarBufferIndex,
             pixelInputEnable,
             pixelInputAddress,
+            pixelInputLocations,
             storageBufferOffsetAlignment);
 
     public static bool TryCompilePixelShader(
@@ -58,6 +60,7 @@ public static partial class Gen5SpirvTranslator
         int initialScalarBufferIndex = -1,
         uint pixelInputEnable = 0,
         uint pixelInputAddress = 0,
+        IReadOnlyDictionary<uint, uint>? pixelInputLocations = null,
         ulong storageBufferOffsetAlignment = 1)
     {
         if (outputs.Count > 8 || outputs.Any(output => output.GuestSlot > 7))
@@ -99,6 +102,7 @@ public static partial class Gen5SpirvTranslator
             initialScalarBufferIndex,
             pixelInputEnable: pixelInputEnable,
             pixelInputAddress: pixelInputAddress,
+            pixelInputLocations: pixelInputLocations,
             storageBufferOffsetAlignment: storageBufferOffsetAlignment);
         return context.TryCompile(out shader, out error);
     }
@@ -231,6 +235,10 @@ public static partial class Gen5SpirvTranslator
         private readonly int _initialScalarBufferIndex;
         private readonly uint _pixelInputEnable;
         private readonly uint _pixelInputAddress;
+        // Pixel interpolation instructions address logical attributes. The
+        // SPI_PS_INPUT_CNTL registers remap each attribute to the vertex
+        // parameter location carrying that semantic.
+        private readonly IReadOnlyDictionary<uint, uint>? _pixelInputLocations;
         private readonly ulong _storageBufferOffsetAlignment;
         private readonly List<uint> _interfaces = [];
         private readonly Dictionary<uint, uint> _pixelInputs = [];
@@ -341,6 +349,7 @@ public static partial class Gen5SpirvTranslator
             int initialScalarBufferIndex,
             uint pixelInputEnable = 0,
             uint pixelInputAddress = 0,
+            IReadOnlyDictionary<uint, uint>? pixelInputLocations = null,
             int requiredVertexOutputCount = 0,
             uint waveLaneCount = 32,
             ulong storageBufferOffsetAlignment = 1)
@@ -366,6 +375,7 @@ public static partial class Gen5SpirvTranslator
             _initialScalarBufferIndex = initialScalarBufferIndex;
             _pixelInputEnable = pixelInputEnable;
             _pixelInputAddress = pixelInputAddress;
+            _pixelInputLocations = pixelInputLocations;
             if (storageBufferOffsetAlignment == 0 ||
                 (storageBufferOffsetAlignment & (storageBufferOffsetAlignment - 1)) != 0 ||
                 storageBufferOffsetAlignment > uint.MaxValue)
@@ -1220,6 +1230,7 @@ public static partial class Gen5SpirvTranslator
             {
                 var inputVec4Pointer =
                     _module.TypePointer(SpirvStorageClass.Input, _vec4Type);
+                var inputsByLocation = new Dictionary<uint, uint>();
                 var attributes = _state.Program.Instructions
                     .Select(instruction => instruction.Control)
                     .OfType<Gen5InterpolationControl>()
@@ -1229,10 +1240,25 @@ public static partial class Gen5SpirvTranslator
                     .ToArray();
                 foreach (var attribute in attributes)
                 {
+                    var location = _pixelInputLocations is not null &&
+                        _pixelInputLocations.TryGetValue(attribute, out var mappedLocation)
+                            ? mappedLocation
+                            : attribute;
+                    // Multiple logical interpolants may select the same vertex
+                    // parameter. Declare that SPIR-V input once and alias each
+                    // logical attribute to it; Metal rejects duplicate user
+                    // inputs at one location.
+                    if (inputsByLocation.TryGetValue(location, out var existing))
+                    {
+                        _pixelInputs.Add(attribute, existing);
+                        continue;
+                    }
+
                     var variable = _module.AddGlobalVariable(
                         inputVec4Pointer,
                         SpirvStorageClass.Input);
-                    _module.AddDecoration(variable, SpirvDecoration.Location, attribute);
+                    _module.AddDecoration(variable, SpirvDecoration.Location, location);
+                    inputsByLocation.Add(location, variable);
                     _pixelInputs.Add(attribute, variable);
                     _interfaces.Add(variable);
                 }

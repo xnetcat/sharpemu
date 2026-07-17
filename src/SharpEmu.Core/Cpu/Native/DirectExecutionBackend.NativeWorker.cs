@@ -30,8 +30,24 @@ public sealed partial class DirectExecutionBackend
 		string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_NATIVE_GUEST_WORKERS"), "1", StringComparison.Ordinal);
 
 	private readonly object _nativeWorkerGate = new();
-	private readonly List<NativeGuestExecutor> _allNativeWorkers = new();
-	private readonly Stack<NativeGuestExecutor> _idleNativeWorkers = new();
+	private interface INativeGuestExecutor : IDisposable
+	{
+		int Run(
+			CpuContext context,
+			GuestThreadState? state,
+			ulong guestThreadHandle,
+			ulong sentinelRip,
+			ulong returnSlotAddress,
+			nint hostRspSlot,
+			nint entryStub,
+			ulong affinityMask,
+			out bool yieldRequested,
+			out string? yieldReason,
+			out bool forcedExit);
+	}
+
+	private readonly List<INativeGuestExecutor> _allNativeWorkers = new();
+	private readonly Stack<INativeGuestExecutor> _idleNativeWorkers = new();
 	private bool _nativeWorkersDisposed;
 	private int _nativeWorkerCreationFailedLogged;
 
@@ -90,12 +106,9 @@ public sealed partial class DirectExecutionBackend
 		}
 	}
 
-	private NativeGuestExecutor? RentNativeGuestExecutor()
+	private INativeGuestExecutor? RentNativeGuestExecutor()
 	{
-		// NativeGuestExecutor emits a Win32 wait loop and creates it with
-		// kernel32!CreateThread. POSIX hosts use the established inline entry
-		// path until the worker loop has a pthread/eventfd implementation.
-		if (!OperatingSystem.IsWindows() || NativeGuestWorkersDisabled)
+		if (NativeGuestWorkersDisabled)
 		{
 			return null;
 		}
@@ -110,7 +123,9 @@ public sealed partial class DirectExecutionBackend
 				return _idleNativeWorkers.Pop();
 			}
 		}
-		var worker = NativeGuestExecutor.TryCreate(this);
+		INativeGuestExecutor? worker = OperatingSystem.IsWindows()
+			? WindowsNativeGuestExecutor.TryCreate(this)
+			: PosixNativeGuestExecutor.TryCreate(this);
 		if (worker is null)
 		{
 			if (Interlocked.Exchange(ref _nativeWorkerCreationFailedLogged, 1) == 0)
@@ -132,7 +147,7 @@ public sealed partial class DirectExecutionBackend
 		return worker;
 	}
 
-	private void ReturnNativeGuestExecutor(NativeGuestExecutor worker)
+	private void ReturnNativeGuestExecutor(INativeGuestExecutor worker)
 	{
 		lock (_nativeWorkerGate)
 		{
@@ -147,7 +162,7 @@ public sealed partial class DirectExecutionBackend
 
 	private void DisposeNativeGuestExecutors()
 	{
-		NativeGuestExecutor[] workers;
+		INativeGuestExecutor[] workers;
 		lock (_nativeWorkerGate)
 		{
 			if (_nativeWorkersDisposed)
@@ -178,7 +193,7 @@ public sealed partial class DirectExecutionBackend
 	// Workers carry no per-guest identity of their own: the prologue rebinds guest TLS,
 	// the host-RSP slot, the Active* thread-statics and the GuestThreadExecution ambient
 	// on every run, so a worker can be reused for any guest thread.
-	private sealed unsafe class NativeGuestExecutor : IDisposable
+	private sealed unsafe class WindowsNativeGuestExecutor : INativeGuestExecutor
 	{
 		private const uint LoopStubSize = 512u;
 		private const uint WorkerStackReservation = 4u * 1024u * 1024u;
@@ -237,7 +252,7 @@ public sealed partial class DirectExecutionBackend
 		private int _prevHostThreadId;
 		private bool _entered;
 
-		private NativeGuestExecutor(DirectExecutionBackend backend)
+		private WindowsNativeGuestExecutor(DirectExecutionBackend backend)
 		{
 			_backend = backend;
 			if (OperatingSystem.IsWindows())
@@ -247,13 +262,13 @@ public sealed partial class DirectExecutionBackend
 			}
 		}
 
-		public static NativeGuestExecutor? TryCreate(DirectExecutionBackend backend)
+		public static WindowsNativeGuestExecutor? TryCreate(DirectExecutionBackend backend)
 		{
 			if (!EnsureKernel32Exports())
 			{
 				return null;
 			}
-			var executor = new NativeGuestExecutor(backend);
+			var executor = new WindowsNativeGuestExecutor(backend);
 			if (!executor.Initialize())
 			{
 				executor.Dispose();
@@ -484,7 +499,7 @@ public sealed partial class DirectExecutionBackend
 		{
 			try
 			{
-				var executor = (NativeGuestExecutor)GCHandle.FromIntPtr(executorHandle).Target!;
+				var executor = (WindowsNativeGuestExecutor)GCHandle.FromIntPtr(executorHandle).Target!;
 				return executor.EnterRun();
 			}
 			catch (Exception ex)
@@ -506,7 +521,7 @@ public sealed partial class DirectExecutionBackend
 		{
 			try
 			{
-				var executor = (NativeGuestExecutor)GCHandle.FromIntPtr(executorHandle).Target!;
+				var executor = (WindowsNativeGuestExecutor)GCHandle.FromIntPtr(executorHandle).Target!;
 				executor.ExitRun(nativeResult);
 			}
 			catch (Exception ex)

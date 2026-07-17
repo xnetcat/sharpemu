@@ -64,6 +64,7 @@ internal sealed class VulkanGuestGpuBackend : IGuestGpuBackend
         int scalarRegisterBufferIndex = -1,
         uint pixelInputEnable = 0,
         uint pixelInputAddress = 0,
+        IReadOnlyDictionary<uint, uint>? pixelInputLocations = null,
         ulong storageBufferOffsetAlignment = 1)
     {
         shader = null;
@@ -79,6 +80,7 @@ internal sealed class VulkanGuestGpuBackend : IGuestGpuBackend
                 scalarRegisterBufferIndex,
                 pixelInputEnable,
                 pixelInputAddress,
+                pixelInputLocations,
                 storageBufferOffsetAlignment))
         {
             return false;

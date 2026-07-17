@@ -37,7 +37,9 @@ public static class SystemServiceExports
             return ctx.SetReturn(OrbisSystemServiceErrorParameter);
         }
 
-        // No system notice screen to skip in the emulator; report "do not skip".
+        // The PS5 ABI uses a one-byte boolean. Writing an int here overwrites
+        // adjacent caller locals (Silent Hill places its stack canary next to
+        // this flag).
         Span<byte> flagBytes = stackalloc byte[1];
         flagBytes[0] = 0;
         return ctx.Memory.TryWrite(flagAddress, flagBytes)

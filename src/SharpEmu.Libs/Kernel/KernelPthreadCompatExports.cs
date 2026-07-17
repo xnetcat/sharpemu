@@ -37,6 +37,10 @@ public static class KernelPthreadCompatExports
         string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_PTHREAD_CONDS"), "1", StringComparison.Ordinal);
     private static readonly HashSet<ulong>? _tracePthreadMutexFilter = ParseTraceAddressFilter(
         Environment.GetEnvironmentVariable("SHARPEMU_LOG_PTHREAD_MUTEX_FILTER"));
+    private static readonly TimeSpan? _condCompatibilityRecheck = ParsePositiveMilliseconds(
+        Environment.GetEnvironmentVariable("SHARPEMU_PTHREAD_COND_RECHECK_MS"));
+    private static readonly HashSet<ulong>? _condCompatibilityRecheckFilter = ParseTraceAddressFilter(
+        Environment.GetEnvironmentVariable("SHARPEMU_PTHREAD_COND_RECHECK_FILTER"));
     private static long _nextSynchronizationWaiterId;
 
     private sealed class PthreadMutexState
@@ -75,6 +79,7 @@ public static class KernelPthreadCompatExports
         public LinkedListNode<PthreadCondWaiter>? Node { get; set; }
         public PthreadMutexWaiter? MutexWaiter { get; set; }
         public Timer? TimeoutTimer { get; set; }
+        public bool CompatibilityRecheck { get; init; }
         // 0 = waiting, 1 = signaled, 2 = timed out.
         public int CompletionState { get; set; }
     }
@@ -675,10 +680,26 @@ public static class KernelPthreadCompatExports
                     return (int)OrbisGen2Result.ORBIS_GEN2_OK;
                 }
 
-                if (state.Type is MutexTypeNormal or MutexTypeAdaptiveNp)
-                {
-                    if (tryOnly)
-                    {
+				if (state.Type == MutexTypeAdaptiveNp)
+				{
+					if (tryOnly)
+					{
+						TracePthreadMutex(ctx, "trylock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY);
+						return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY;
+					}
+
+					// PS5 runtime wrappers can layer an adaptive lock call over
+					// scePthreadMutexLock for one logical acquisition, followed by
+					// only one unlock. Treat the duplicate as idempotent: recursive
+					// counting would retain ownership after that matching unlock.
+					TracePthreadMutex(ctx, "lock-idempotent", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_OK);
+					return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+				}
+
+				if (state.Type == MutexTypeNormal)
+				{
+					if (tryOnly)
+					{
                         TracePthreadMutex(ctx, "trylock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY);
                         return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY;
                     }
@@ -1247,7 +1268,7 @@ public static class KernelPthreadCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
-        if (!TryResolveCondState(ctx, condAddress, createIfZero: true, out _, out var state))
+        if (!TryResolveCondState(ctx, condAddress, createIfZero: true, out var resolvedCondAddress, out var state))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
         }
@@ -1284,12 +1305,15 @@ public static class KernelPthreadCompatExports
 
         var cooperative = GuestThreadExecution.IsGuestThread &&
             GuestThreadExecution.TryGetCurrentImportCallFrame(out _);
+        var compatibilityRecheck = !timed &&
+            ShouldCompatibilityRecheck(condAddress, resolvedCondAddress);
         var waiter = new PthreadCondWaiter
         {
             ThreadId = currentThreadId,
             MutexState = mutexState,
             Cooperative = cooperative,
             PosixErrors = posixErrors,
+            CompatibilityRecheck = compatibilityRecheck,
             WakeKey = cooperative
                 ? $"pthread_cond_waiter:{Interlocked.Increment(ref _nextSynchronizationWaiterId)}"
                 : string.Empty,
@@ -1309,16 +1333,17 @@ public static class KernelPthreadCompatExports
                 return unlockResult;
             }
 
-            if (cooperative && timed)
+            if (cooperative && (timed || compatibilityRecheck))
             {
                 waiter.TimeoutTimer = new Timer(
                     static callbackState =>
                     {
-                        var (condState, condWaiter) = ((PthreadCondState, PthreadCondWaiter))callbackState!;
-                        CompleteCondWaiter(condState, condWaiter, timedOut: true);
+                        var (condState, condWaiter, isTimed) =
+                            ((PthreadCondState, PthreadCondWaiter, bool))callbackState!;
+                        CompleteCondWaiter(condState, condWaiter, timedOut: isTimed);
                     },
-                    (state, waiter),
-                    GetCondWaitTimeout(timeoutUsec),
+                    (state, waiter, timed),
+                    timed ? GetCondWaitTimeout(timeoutUsec) : _condCompatibilityRecheck!.Value,
                     Timeout.InfiniteTimeSpan);
             }
         }
@@ -1347,12 +1372,21 @@ public static class KernelPthreadCompatExports
             {
                 if (!timed)
                 {
-                    Monitor.Wait(state.SyncRoot);
+                    if (!compatibilityRecheck)
+                    {
+                        Monitor.Wait(state.SyncRoot);
+                        continue;
+                    }
+
+                    if (!Monitor.Wait(state.SyncRoot, _condCompatibilityRecheck.GetValueOrDefault()))
+                    {
+                        CompleteCondWaiterLocked(state, waiter, timedOut: false);
+                    }
                     continue;
                 }
 
                 var remaining = GetRemainingTimeout(deadline);
-                if (remaining <= TimeSpan.Zero || !Monitor.Wait(state.SyncRoot, remaining))
+                if (remaining <= TimeSpan.Zero || !WaitForMonitorSignal(state.SyncRoot, remaining))
                 {
                     CompleteCondWaiterLocked(state, waiter, timedOut: true);
                     break;
@@ -1704,6 +1738,29 @@ public static class KernelPthreadCompatExports
 
         return TimeSpan.FromSeconds(remainingTicks / (double)Stopwatch.Frequency);
     }
+
+    private static bool WaitForMonitorSignal(object syncRoot, TimeSpan timeout)
+    {
+        // Monitor.Wait(TimeSpan) has millisecond host resolution. Positive
+        // sub-millisecond guest deadlines otherwise collapse into a zero-time
+        // poll and can execute millions of timed waits before the wall clock
+        // reaches the absolute deadline.
+        var timeoutMilliseconds = (int)Math.Min(
+            int.MaxValue,
+            Math.Max(1D, Math.Ceiling(timeout.TotalMilliseconds)));
+        return Monitor.Wait(syncRoot, timeoutMilliseconds);
+    }
+
+    private static TimeSpan? ParsePositiveMilliseconds(string? value) =>
+        int.TryParse(value, out var milliseconds) && milliseconds > 0
+            ? TimeSpan.FromMilliseconds(milliseconds)
+            : null;
+
+    private static bool ShouldCompatibilityRecheck(ulong condAddress, ulong resolvedCondAddress) =>
+        _condCompatibilityRecheck.HasValue &&
+        (_condCompatibilityRecheckFilter is null ||
+         _condCompatibilityRecheckFilter.Contains(condAddress) ||
+         _condCompatibilityRecheckFilter.Contains(resolvedCondAddress));
 
     private static int NormalizeMutexType(int type)
     {

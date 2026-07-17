@@ -257,6 +257,8 @@ internal static partial class Program
             return 2;
         }
 
+        ConfigureKnownTitleCompatibility(ebootPath);
+
         if (!TryGetDebugServerOptions(args, out var debugServerEnabled, out var debugServerOptions, out var debugServerError))
         {
             Log.Error($"Invalid --debug-server endpoint: {debugServerError}");
@@ -407,6 +409,50 @@ internal static partial class Program
 
         emulatorArgs = remaining.ToArray();
         return true;
+    }
+
+    private static void ConfigureKnownTitleCompatibility(string ebootPath)
+    {
+        var installRoot = Path.GetDirectoryName(ebootPath) ?? string.Empty;
+        var paramPath = Path.Combine(installRoot, "sce_sys", "param.json");
+        try
+        {
+            if (!File.Exists(paramPath) ||
+                !File.ReadAllText(paramPath).Contains("PPSA10112", StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            SetEnvironmentDefault("SHARPEMU_PTHREAD_COND_RECHECK_MS", "10");
+            SetEnvironmentDefault(
+                "SHARPEMU_PTHREAD_COND_RECHECK_FILTER",
+                "0x0000007040E0B818,0x0000007040E0B4B8,0x0000007040E0B488," +
+                "0x0000007040E0B458");
+            SetEnvironmentDefault("SHARPEMU_MUTEX_LOCK_BLOCKING", "1");
+            SetEnvironmentDefault("SHARPEMU_AGC_SUBMIT_COMPLETION_EVENT", "1");
+            SetEnvironmentDefault("SHARPEMU_AGC_SUBMIT_COMPLETION_EVENT_DELAY_MS", "1");
+            SetEnvironmentDefault("SHARPEMU_WRITABLE_APP0_COMPAT", "1");
+            SetEnvironmentDefault("SHARPEMU_APR_BATCH_FAIL_ON_MISSING", "1");
+            SetEnvironmentDefault("SHARPEMU_DISABLE_IMPORT_LOOP_GUARD", "1");
+            SetEnvironmentDefault("SHARPEMU_IME_NO_KEYBOARD", "1");
+            SetEnvironmentDefault("SHARPEMU_GUEST_ARGS", "-nothreadtimeout");
+            Console.Error.WriteLine(
+                "[LOADER][INFO] SILENT HILL compatibility: enabling startup synchronization, " +
+                "PS5 service ABI fixes, and writable app0 overlay.");
+        }
+        catch (IOException exception)
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][WARN] Could not inspect title metadata: {exception.Message}");
+        }
+    }
+
+    private static void SetEnvironmentDefault(string name, string value)
+    {
+        if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(name)))
+        {
+            Environment.SetEnvironmentVariable(name, value);
+        }
     }
 
     private static void EnsureCliConsole()
