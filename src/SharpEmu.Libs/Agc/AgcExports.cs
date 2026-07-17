@@ -273,6 +273,7 @@ public static partial class AgcExports
     private static long _standardDmaTraceCount;
     private static long _packetParseFailureTraceCount;
     private static int _textureFallbackTraceCount;
+    private static int _singleTexelCompatibilityTraceCount;
     private static readonly object _softwarePresenterGate = new();
     private static readonly Dictionary<(ulong Source, ulong Destination), ulong> _softwarePresenterFingerprints = new();
     private static readonly Dictionary<(ulong Shader, ulong Source, ulong Destination), ulong> _softwareComputeBlitFingerprints = new();
@@ -7618,6 +7619,35 @@ public static partial class AgcExports
             $"dst=0x{descriptor.DstSelect:X3}");
     }
 
+    internal static bool ShouldBindSingleTexelAs2D(
+        uint type,
+        bool isStorage,
+        ulong address,
+        uint width,
+        uint height) =>
+        type != Gen5TextureType1D &&
+        type != Gen5TextureType2D &&
+        !isStorage &&
+        address != 0 &&
+        width == 1 &&
+        height == 1;
+
+    private static void TraceSingleTexelCompatibility(TextureDescriptor descriptor)
+    {
+        var mode = Environment.GetEnvironmentVariable("SHARPEMU_TRACE_GUEST_IMAGES");
+        if ((!string.Equals(mode, "1", StringComparison.Ordinal) &&
+             !string.Equals(mode, "present", StringComparison.OrdinalIgnoreCase)) ||
+            Interlocked.Increment(ref _singleTexelCompatibilityTraceCount) > 64)
+        {
+            return;
+        }
+
+        Console.Error.WriteLine(
+            $"[LOADER][TRACE] agc.texture_single_texel_2d " +
+            $"addr=0x{descriptor.Address:X16} source_type={descriptor.Type} " +
+            $"format={descriptor.Format} num={descriptor.NumberType}");
+    }
+
     private static bool TryCreateGuestDrawTexture(
         CpuContext ctx,
         TextureDescriptor descriptor,
@@ -7627,6 +7657,32 @@ public static partial class AgcExports
         out GuestDrawTexture texture)
     {
         texture = default!;
+        // Neutral 1x1x1 grading LUTs, default reflection cubes, and exposure
+        // planes all sample their single texel for every coordinate. Bind
+        // unsupported non-storage variants as a 1x1 2D image instead of a
+        // zero fallback, which can black out an entire post-processing pass.
+        if (ShouldBindSingleTexelAs2D(
+                descriptor.Type,
+                isStorage,
+                descriptor.Address,
+                descriptor.Width,
+                descriptor.Height))
+        {
+            TraceSingleTexelCompatibility(descriptor);
+            descriptor = descriptor with
+            {
+                Type = Gen5TextureType2D,
+                Depth = 1,
+                BaseArray = 0,
+                ArrayPitch = 0,
+                BaseLevel = 0,
+                LastLevel = 0,
+                MaxMip = 0,
+                Pitch = 1,
+                TileMode = 0,
+            };
+        }
+
         if ((descriptor.Type != Gen5TextureType1D &&
              descriptor.Type != Gen5TextureType2D) ||
             descriptor.Width == 0 ||
