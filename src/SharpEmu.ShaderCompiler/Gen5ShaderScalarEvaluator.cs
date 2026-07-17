@@ -1879,12 +1879,8 @@ public static class Gen5ShaderScalarEvaluator
         var bufferUnbound =
             isBufferLoad &&
             (!hasBufferDescriptor ||
-             bufferDescriptor.SizeBytes == 0 ||
-             (scalarRegisters[scalarBase.Value] == 0 &&
-              scalarRegisters[scalarBase.Value + 1] == 0 &&
-              scalarBase.Value + 3 < ScalarRegisterCount &&
-              scalarRegisters[scalarBase.Value + 2] == 0 &&
-              scalarRegisters[scalarBase.Value + 3] == 0));
+             bufferDescriptor.BaseAddress == 0 ||
+             bufferDescriptor.SizeBytes == 0);
         var scalarPointerUnbound = ShouldTreatScalarPointerAsUnbound(
             isBufferLoad,
             address,

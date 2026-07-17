@@ -334,8 +334,7 @@ internal static partial class Program
             SetEnvironmentDefault("SHARPEMU_PTHREAD_COND_RECHECK_MS", "10");
             SetEnvironmentDefault(
                 "SHARPEMU_PTHREAD_COND_RECHECK_FILTER",
-                "0x0000007040E0B818,0x0000007040E0B4B8,0x0000007040E0B488," +
-                "0x0000007040E0B458");
+                "*");
             SetEnvironmentDefault("SHARPEMU_MUTEX_LOCK_BLOCKING", "1");
             SetEnvironmentDefault("SHARPEMU_AGC_SUBMIT_COMPLETION_EVENT", "1");
             SetEnvironmentDefault("SHARPEMU_AGC_SUBMIT_COMPLETION_EVENT_DELAY_MS", "1");
