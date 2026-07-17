@@ -11,12 +11,13 @@ namespace SharpEmu.Libs.Audio;
 
 public static class AudioOut2Exports
 {
-    // FMOD's PS5 backend allocates this ABI structure as four 16-byte lanes.
-    // Clearing 0x80 bytes here overwrote the caller's stack canary immediately
-    // following the 0x40-byte parameter block.
-    private const int AudioOut2ContextParamSize = 0x40;
+    // Report the guest-observed structure size, but only write the four fields
+    // whose layout is known. Callers use smaller stack-side wrappers around the
+    // parameter prefix; clearing the whole guessed structure clobbers their
+    // stack canaries.
+    private const int AudioOut2ContextParamSize = 0x30;
+    private const int AudioOut2ContextParamPrefixSize = 0x10;
     private const int AudioOut2ContextMemorySize = 0x10000;
-    private const int AudioOut2ContextMemoryAlignment = 0x10000;
     private static long _nextContextHandle = 1;
     private static long _nextUserHandle = 1;
     private static int _nextPortId;
@@ -26,10 +27,11 @@ public static class AudioOut2Exports
     // can pace to the real playback cadence (grain samples at the sample rate).
     private static readonly ConcurrentDictionary<ulong, ContextState> Contexts = new();
 
-    private sealed class ContextState
+    private sealed class ContextState : IDisposable
     {
         private readonly object _paceGate = new();
         private long _nextAdvanceTimestamp;
+        private Timer? _grainTimer;
 
         public ContextState(uint frequency, uint channels, uint grainSamples)
         {
@@ -41,6 +43,28 @@ public static class AudioOut2Exports
         public uint Frequency { get; }
         public uint Channels { get; }
         public uint GrainSamples { get; }
+        public bool HasGrainSignal => _grainTimer is not null;
+
+        public void StartGrainSignal(ulong eventFlagHandle)
+        {
+            var period = TimeSpan.FromSeconds((double)GrainSamples / Frequency);
+            if (period < TimeSpan.FromMilliseconds(4))
+            {
+                period = TimeSpan.FromMilliseconds(4);
+            }
+
+            _grainTimer = new Timer(
+                static state =>
+                {
+                    var handle = (ulong)state!;
+                    _ = Kernel.KernelEventFlagCompatExports.TrySignalEventFlag(handle, 0x1);
+                },
+                eventFlagHandle,
+                period,
+                period);
+        }
+
+        public void Dispose() => _grainTimer?.Dispose();
 
         // Blocks the advancing thread until one grain worth of wall-clock time
         // has elapsed since the previous advance, matching hardware timing so
@@ -80,6 +104,20 @@ public static class AudioOut2Exports
     }
 
     [SysAbiExport(
+        Nid = "XHl38ZNknbs",
+        ExportName = "sceAudioOut2MasteringInit",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAudioOut2")]
+    public static int AudioOut2MasteringInit(CpuContext ctx) => SetReturn(ctx, 0);
+
+    [SysAbiExport(
+        Nid = "v8iOE+j8a5o",
+        ExportName = "sceAudioOut2MasteringSetParam",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAudioOut2")]
+    public static int AudioOut2MasteringSetParam(CpuContext ctx) => SetReturn(ctx, 0);
+
+    [SysAbiExport(
         Nid = "t5YrizufpQc",
         ExportName = "sceAudioOut2ContextResetParam",
         Target = Generation.Gen5,
@@ -92,7 +130,7 @@ public static class AudioOut2Exports
             return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        Span<byte> param = stackalloc byte[AudioOut2ContextParamSize];
+        Span<byte> param = stackalloc byte[AudioOut2ContextParamPrefixSize];
         param.Clear();
         BinaryPrimitives.WriteUInt32LittleEndian(param[0x00..], AudioOut2ContextParamSize);
         BinaryPrimitives.WriteUInt32LittleEndian(param[0x04..], 2);
@@ -112,20 +150,13 @@ public static class AudioOut2Exports
     public static int AudioOut2ContextQueryMemory(CpuContext ctx)
     {
         var paramAddress = ctx[CpuRegister.Rdi];
-        var memoryInfoAddress = ctx[CpuRegister.Rsi];
-        if (paramAddress == 0 || memoryInfoAddress == 0)
+        var outMemorySizeAddress = ctx[CpuRegister.Rsi];
+        if (paramAddress == 0 || outMemorySizeAddress == 0)
         {
             return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        Span<byte> memoryInfo = stackalloc byte[0x20];
-        memoryInfo.Clear();
-        BinaryPrimitives.WriteUInt64LittleEndian(memoryInfo[0x00..], AudioOut2ContextMemorySize);
-        BinaryPrimitives.WriteUInt64LittleEndian(memoryInfo[0x08..], AudioOut2ContextMemoryAlignment);
-        BinaryPrimitives.WriteUInt64LittleEndian(memoryInfo[0x10..], AudioOut2ContextMemorySize);
-        BinaryPrimitives.WriteUInt64LittleEndian(memoryInfo[0x18..], AudioOut2ContextMemoryAlignment);
-
-        return ctx.Memory.TryWrite(memoryInfoAddress, memoryInfo)
+        return TryWriteUInt64(ctx, outMemorySizeAddress, AudioOut2ContextMemorySize)
             ? SetReturn(ctx, 0)
             : SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
     }
@@ -146,27 +177,32 @@ public static class AudioOut2Exports
             return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        // Read channels/frequency/grain from the reset-param blob so the
-        // context can pace advances to the real audio cadence.
+        // Observed PS5 layout: the kernel event-flag handle is at +0x0C and
+        // the audio grain in samples is at +0x10.
         uint channels = 2;
         uint frequency = 48000;
         uint grain = 256;
-        Span<byte> param = stackalloc byte[AudioOut2ContextParamSize];
+        ulong eventFlagHandle = 0;
+        Span<byte> param = stackalloc byte[0x18];
         if (ctx.Memory.TryRead(paramAddress, param))
         {
-            var pc = BinaryPrimitives.ReadUInt32LittleEndian(param[0x04..]);
-            var pf = BinaryPrimitives.ReadUInt32LittleEndian(param[0x08..]);
-            var pg = BinaryPrimitives.ReadUInt32LittleEndian(param[0x0C..]);
-            if (pc is > 0 and <= 8) channels = pc;
-            if (pf is >= 8000 and <= 192000) frequency = pf;
-            // Values below one cache line are flags/counts in observed PS5
-            // callers, not audio grains. Keep the hardware-sized default.
-            if (pg is >= 64 and <= 0x4000) grain = pg;
+            eventFlagHandle = BinaryPrimitives.ReadUInt32LittleEndian(param[0x0C..]);
+            var pg = BinaryPrimitives.ReadUInt32LittleEndian(param[0x10..]);
+            if (pg is > 0 and <= 0x4000) grain = pg;
             TraceAudioOut2($"context-param address=0x{paramAddress:X} bytes={Convert.ToHexString(param)}");
         }
 
         var handle = (ulong)Interlocked.Increment(ref _nextContextHandle);
-        Contexts[handle] = new ContextState(frequency, channels, grain);
+        var contextState = new ContextState(frequency, channels, grain);
+        Contexts[handle] = contextState;
+        if (eventFlagHandle != 0 &&
+            Kernel.KernelEventFlagCompatExports.TrySignalEventFlag(eventFlagHandle, 0))
+        {
+            contextState.StartGrainSignal(eventFlagHandle);
+            Console.Error.WriteLine(
+                $"[LOADER][INFO] audio2.context_create handle={handle} grain={grain} " +
+                $"event_flag=0x{eventFlagHandle:X} grain_signal=on");
+        }
         TraceAudioOut2($"context-create handle=0x{handle:X} frequency={frequency} channels={channels} grain={grain} memory=0x{memoryAddress:X} size=0x{memorySize:X}");
         return TryWriteUInt64(ctx, outContextAddress, handle)
             ? SetReturn(ctx, 0)
@@ -180,7 +216,11 @@ public static class AudioOut2Exports
         LibraryName = "libSceAudioOut2")]
     public static int AudioOut2ContextDestroy(CpuContext ctx)
     {
-        Contexts.TryRemove(ctx[CpuRegister.Rdi], out _);
+        if (Contexts.TryRemove(ctx[CpuRegister.Rdi], out var removed))
+        {
+            removed.Dispose();
+        }
+
         return SetReturn(ctx, 0);
     }
 
@@ -205,7 +245,7 @@ public static class AudioOut2Exports
             TraceAudioOut2($"context-push count={traceCount} rdi=0x{handle:X} rsi=0x{ctx[CpuRegister.Rsi]:X} rdx=0x{ctx[CpuRegister.Rdx]:X} rcx=0x{ctx[CpuRegister.Rcx]:X}");
         }
 
-        if (Contexts.TryGetValue(handle, out var context))
+        if (Contexts.TryGetValue(handle, out var context) && !context.HasGrainSignal)
         {
             // FMOD's PS5 output path uses ContextPush as the submission clock
             // and does not call ContextAdvance. Pace pushes to one hardware
@@ -240,11 +280,14 @@ public static class AudioOut2Exports
         LibraryName = "libSceAudioOut2")]
     public static int AudioOut2ContextGetQueueLevel(CpuContext ctx)
     {
-        // The advance path paces synchronously, so the queue is always drained.
-        var levelAddress = ctx[CpuRegister.Rsi];
-        if (levelAddress != 0)
+        // The ABI exposes two adjacent 32-bit levels. Writing one 64-bit value
+        // corrupts the next stack local when the outputs are four bytes apart.
+        var queuedAddress = ctx[CpuRegister.Rsi];
+        var availableAddress = ctx[CpuRegister.Rdx];
+        if ((queuedAddress != 0 && !TryWriteUInt32(ctx, queuedAddress, 0)) ||
+            (availableAddress != 0 && !TryWriteUInt32(ctx, availableAddress, 0)))
         {
-            _ = TryWriteUInt64(ctx, levelAddress, 0);
+            return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
 
         return SetReturn(ctx, 0);
@@ -257,17 +300,17 @@ public static class AudioOut2Exports
         LibraryName = "libSceAudioOut2")]
     public static int AudioOut2PortCreate(CpuContext ctx)
     {
-        var type = unchecked((int)ctx[CpuRegister.Rdi]);
+        // PS5 ABI: (context, portParam, outPort, flags).
+        var contextHandle = ctx[CpuRegister.Rdi];
         var paramAddress = ctx[CpuRegister.Rsi];
         var outPortAddress = ctx[CpuRegister.Rdx];
-        var contextAddress = ctx[CpuRegister.Rcx];
-        if (type < 0 || type > 255 || paramAddress == 0 || outPortAddress == 0 || contextAddress == 0)
+        if (!Contexts.ContainsKey(contextHandle) || paramAddress == 0 || outPortAddress == 0)
         {
             return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
         var portId = unchecked((uint)Interlocked.Increment(ref _nextPortId)) & 0xFF;
-        var handle = 0x2000_0000UL | ((ulong)(uint)type << 16) | portId;
+        var handle = 0x2000_0000UL | ((contextHandle & 0xFF) << 16) | portId;
         return TryWriteUInt64(ctx, outPortAddress, handle)
             ? SetReturn(ctx, 0)
             : SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
@@ -371,6 +414,13 @@ public static class AudioOut2Exports
     {
         Span<byte> buffer = stackalloc byte[sizeof(ulong)];
         BinaryPrimitives.WriteUInt64LittleEndian(buffer, value);
+        return ctx.Memory.TryWrite(address, buffer);
+    }
+
+    private static bool TryWriteUInt32(CpuContext ctx, ulong address, uint value)
+    {
+        Span<byte> buffer = stackalloc byte[sizeof(uint)];
+        BinaryPrimitives.WriteUInt32LittleEndian(buffer, value);
         return ctx.Memory.TryWrite(address, buffer);
     }
 

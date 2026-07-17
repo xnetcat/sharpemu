@@ -136,6 +136,26 @@ public static class KernelEventFlagCompatExports
         return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
     }
 
+    /// <summary>
+    /// Signals a guest event flag from a host-side HLE subsystem.
+    /// </summary>
+    public static bool TrySignalEventFlag(ulong handle, ulong pattern)
+    {
+        if (!_eventFlags.TryGetValue(handle, out var state))
+        {
+            return false;
+        }
+
+        lock (state.Gate)
+        {
+            state.Bits |= pattern;
+            Monitor.PulseAll(state.Gate);
+        }
+
+        _ = GuestThreadExecution.Scheduler?.WakeBlockedThreads(GetEventFlagWakeKey(handle));
+        return true;
+    }
+
     [SysAbiExport(
         Nid = "7uhBFWRAS60",
         ExportName = "sceKernelClearEventFlag",

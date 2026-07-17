@@ -905,9 +905,20 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                 }
                 else
                 {
-                    fixed (byte* srcPtr = source)
+                    if (!GuestImageWriteTracker.TryBeginManagedWrite(
+                            virtualAddress,
+                            (ulong)source.Length,
+                            out var writeScope))
                     {
-                        Buffer.MemoryCopy(srcPtr, destPtr, (nuint)source.Length, (nuint)source.Length);
+                        return false;
+                    }
+
+                    using (writeScope)
+                    {
+                        fixed (byte* srcPtr = source)
+                        {
+                            Buffer.MemoryCopy(srcPtr, destPtr, (nuint)source.Length, (nuint)source.Length);
+                        }
                     }
 
                     return true;
@@ -1002,9 +1013,20 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
 
             if (CanWriteWithoutProtectionChange((ulong)destPtr, (ulong)source.Length, region))
             {
-                fixed (byte* srcPtr = source)
+                if (!GuestImageWriteTracker.TryBeginManagedWrite(
+                        virtualAddress,
+                        (ulong)source.Length,
+                        out var writeScope))
                 {
-                    Buffer.MemoryCopy(srcPtr, destPtr, (nuint)source.Length, (nuint)source.Length);
+                    return false;
+                }
+
+                using (writeScope)
+                {
+                    fixed (byte* srcPtr = source)
+                    {
+                        Buffer.MemoryCopy(srcPtr, destPtr, (nuint)source.Length, (nuint)source.Length);
+                    }
                 }
 
                 return true;
@@ -1017,9 +1039,20 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
 
             try
             {
-                fixed (byte* srcPtr = source)
+                if (!GuestImageWriteTracker.TryBeginManagedWrite(
+                        virtualAddress,
+                        (ulong)source.Length,
+                        out var writeScope))
                 {
-                    Buffer.MemoryCopy(srcPtr, destPtr, (nuint)source.Length, (nuint)source.Length);
+                    return false;
+                }
+
+                using (writeScope)
+                {
+                    fixed (byte* srcPtr = source)
+                    {
+                        Buffer.MemoryCopy(srcPtr, destPtr, (nuint)source.Length, (nuint)source.Length);
+                    }
                 }
             }
             finally

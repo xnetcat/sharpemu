@@ -4,15 +4,15 @@
 namespace SharpEmu.Libs.Agc;
 
 /// <summary>
-/// Holds DCBs whose parsing was suspended on an unsatisfied WAIT_REG_MEM
-/// condition. AgcExports re-checks every waiter against guest memory on each
-/// submit and resumes the ones whose condition became true (labels are advanced
-/// by ReleaseMem / WriteData / DmaData packets, or by direct CPU writes).
+/// Tracks unsatisfied WAIT_REG_MEM conditions. In the default mode parsing
+/// continues so later producer submits can run, while guest-visible effects
+/// following the wait remain deferred. The strict diagnostic mode instead
+/// suspends and later resumes the rest of the DCB. AgcExports re-checks every
+/// waiter against guest memory on each submit (labels are advanced by
+/// ReleaseMem / WriteData / DmaData packets, or by direct CPU writes).
 ///
-/// This preserves cross-submit ordering: the work that follows a wait inside a
-/// DCB is only queued once the awaited completion label is genuinely written,
-/// instead of being force-satisfied at parse time and running ahead of the
-/// compute/graphics work it depends on (which produced a black composite).
+/// This preserves cross-submit ordering without requiring a strict graphics
+/// FIFO to stop before it reaches a producer submitted behind its consumer.
 /// </summary>
 internal static class GpuWaitRegistry
 {
@@ -29,6 +29,11 @@ internal static class GpuWaitRegistry
         public uint ControlValue;
         public bool Is64Bit;
         public bool IsStandard;
+        // The parser continued past this wait, but guest-visible memory effects
+        // after it remain queued until the condition becomes true. This lets a
+        // later producer submit run without exposing the consumer's completion
+        // labels early.
+        public bool DeferEffectsOnly;
         public object? Memory;
         public string? QueueName;
         public ulong SubmissionId;

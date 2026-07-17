@@ -51,6 +51,30 @@ public static unsafe class GuestImageWriteTracker
     private static readonly object _gate = new();
     private static readonly Dictionary<ulong, TrackedRange> _rangesByAddress = new();
 
+    /// <summary>
+    /// Keeps a managed guest-memory write disarmed until the caller finishes
+    /// copying. Without holding the tracker gate across the copy, the video
+    /// thread can re-arm the same image after it is prepared but before the
+    /// managed memcpy, causing a host access violation.
+    /// </summary>
+    public readonly ref struct ManagedWriteScope
+    {
+        private readonly bool _holdsGate;
+
+        internal ManagedWriteScope(bool holdsGate)
+        {
+            _holdsGate = holdsGate;
+        }
+
+        public void Dispose()
+        {
+            if (_holdsGate)
+            {
+                Monitor.Exit(_gate);
+            }
+        }
+    }
+
     // Snapshot array read lock-free from the signal handler; rebuilt on every
     // mutation under the gate. Signal handlers must not take managed locks.
     private static TrackedRange[] _rangeSnapshot = [];
@@ -248,34 +272,141 @@ public static unsafe class GuestImageWriteTracker
         }
     }
 
-    /// <summary>
-    /// Prepares pages touched by a managed HLE memory write. Native guest
-    /// stores fault and enter <see cref="TryHandleWriteFault"/> through the
-    /// POSIX signal bridge, but a managed Buffer.MemoryCopy into a protected
-    /// page is surfaced by the runtime as a fatal AccessViolation instead of
-    /// a resumable guest fault. Visit every page in the write span up front so
-    /// all overlapping texture owners are dirtied and made writable.
-    /// </summary>
-    public static void NotifyManagedWrite(ulong address, ulong byteCount)
+    public static bool PrepareWrite(ulong address, ulong byteCount)
     {
-        if (!_enabled || address == 0 || byteCount == 0)
+        if (!TryBeginManagedWrite(address, byteCount, out var scope))
         {
-            return;
+            return false;
         }
 
-        var end = address > ulong.MaxValue - byteCount
-            ? ulong.MaxValue
-            : address + byteCount;
-        var candidate = address;
-        while (candidate < end)
+        scope.Dispose();
+        return true;
+    }
+
+    /// <summary>
+    /// Disarms every tracked image touched by a managed HLE write and holds
+    /// the tracker gate until the returned scope is disposed. Native guest
+    /// stores use the POSIX signal bridge; managed memcpy cannot recover from
+    /// a protection fault, so no video thread may re-arm the pages mid-copy.
+    /// </summary>
+    public static bool TryBeginManagedWrite(
+        ulong address,
+        ulong byteCount,
+        out ManagedWriteScope scope)
+    {
+        scope = default;
+        if (!_enabled || address == 0 || byteCount == 0)
         {
-            _ = TryHandleWriteFault(candidate);
-            var nextPage = (candidate & ~0xFFFUL) + 0x1000UL;
-            if (nextPage <= candidate)
+            return true;
+        }
+
+        if (ulong.MaxValue - address < byteCount)
+        {
+            return false;
+        }
+
+        Monitor.Enter(_gate);
+        var success = false;
+        try
+        {
+            var end = address + byteCount;
+            var ranges = Volatile.Read(ref _rangeSnapshot);
+            var writableStart = ulong.MaxValue;
+            var writableEnd = 0UL;
+            for (var index = 0; index < ranges.Length; index++)
             {
-                break;
+                var range = ranges[index];
+                if (address >= range.End || end <= range.Start)
+                {
+                    continue;
+                }
+
+                writableStart = Math.Min(writableStart, range.Start);
+                writableEnd = Math.Max(writableEnd, range.End);
             }
-            candidate = nextPage;
+
+            if (writableStart != ulong.MaxValue)
+            {
+                var expanded = true;
+                while (expanded)
+                {
+                    expanded = false;
+                    for (var index = 0; index < ranges.Length; index++)
+                    {
+                        var range = ranges[index];
+                        if (range.Start >= writableEnd || range.End <= writableStart)
+                        {
+                            continue;
+                        }
+
+                        var start = Math.Min(writableStart, range.Start);
+                        var expandedEnd = Math.Max(writableEnd, range.End);
+                        if (start != writableStart || expandedEnd != writableEnd)
+                        {
+                            writableStart = start;
+                            writableEnd = expandedEnd;
+                            expanded = true;
+                        }
+                    }
+                }
+
+                var needsUnprotect = false;
+                for (var index = 0; index < ranges.Length; index++)
+                {
+                    var range = ranges[index];
+                    if (range.Start < writableEnd && range.End > writableStart &&
+                        Volatile.Read(ref range.Armed) != 0)
+                    {
+                        needsUnprotect = true;
+                        break;
+                    }
+                }
+
+                if (needsUnprotect &&
+                    Mprotect(
+                        (nint)writableStart,
+                        (nuint)(writableEnd - writableStart),
+                        ProtRead | ProtWrite) != 0)
+                {
+                    return false;
+                }
+
+                for (var index = 0; index < ranges.Length; index++)
+                {
+                    var range = ranges[index];
+                    if (range.Start >= writableEnd || range.End <= writableStart)
+                    {
+                        continue;
+                    }
+
+                    var wasArmed = Interlocked.Exchange(ref range.Armed, 0) != 0;
+                    if (wasArmed &&
+                        range.TraceLifetime &&
+                        Interlocked.CompareExchange(ref range.FirstCpuWriteSeen, 1, 0) == 0)
+                    {
+                        range.FirstCpuWriteTraceSequence =
+                            Interlocked.Increment(ref _lifetimeTraceSequence);
+                        range.FirstCpuWriteTimestampNanoseconds = GetMonotonicNanoseconds();
+                        range.FirstCpuWriteAddress = address;
+                        range.FirstCpuWritePage = address & ~0xFFFUL;
+                        Volatile.Write(ref range.PendingFirstCpuWrite, 1);
+                        Volatile.Write(ref range.FirstCpuWriteSeen, 2);
+                    }
+
+                    Volatile.Write(ref range.Dirty, 1);
+                }
+            }
+
+            scope = new ManagedWriteScope(holdsGate: true);
+            success = true;
+            return true;
+        }
+        finally
+        {
+            if (!success)
+            {
+                Monitor.Exit(_gate);
+            }
         }
     }
 
