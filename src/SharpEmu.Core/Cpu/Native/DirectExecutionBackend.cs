@@ -3852,6 +3852,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		bool savedHasBlockedContinuation;
 		GuestCpuContinuation savedBlockedContinuation;
 		string? savedBlockWakeKey;
+		IGuestThreadBlockWaiter? savedBlockWaiter;
 		Func<int>? savedBlockResumeHandler;
 		Func<bool>? savedBlockWakeHandler;
 		long savedBlockDeadlineTimestamp;
@@ -3989,6 +3990,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			savedHasBlockedContinuation = target.HasBlockedContinuation;
 			savedBlockedContinuation = target.BlockedContinuation;
 			savedBlockWakeKey = target.BlockWakeKey;
+			savedBlockWaiter = target.BlockWaiter;
 			savedBlockResumeHandler = target.BlockResumeHandler;
 			savedBlockWakeHandler = target.BlockWakeHandler;
 			savedBlockDeadlineTimestamp = target.BlockDeadlineTimestamp;
@@ -4000,6 +4002,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			target.HasBlockedContinuation = false;
 			target.BlockedContinuation = default;
 			target.BlockWakeKey = null;
+			target.BlockWaiter = null;
 			target.BlockResumeHandler = null;
 			target.BlockWakeHandler = null;
 			target.BlockDeadlineTimestamp = 0;
@@ -4049,6 +4052,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			target.HasBlockedContinuation = savedHasBlockedContinuation;
 			target.BlockedContinuation = savedBlockedContinuation;
 			target.BlockWakeKey = savedBlockWakeKey;
+			target.BlockWaiter = savedBlockWaiter;
 			target.BlockResumeHandler = savedBlockResumeHandler;
 			target.BlockWakeHandler = savedBlockWakeHandler;
 			target.BlockDeadlineTimestamp = savedBlockDeadlineTimestamp;
@@ -4060,8 +4064,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			// pthread wait remains parked forever after a GC suspension races it.
 			if (target.State == GuestThreadRunState.Blocked &&
 				target.HasBlockedContinuation &&
-				target.BlockWakeHandler is not null &&
-				target.BlockWakeHandler())
+				(target.BlockWaiter is not null
+					? target.BlockWaiter.TryWake()
+					: target.BlockWakeHandler is not null && target.BlockWakeHandler()))
 			{
 				target.State = GuestThreadRunState.Ready;
 				target.BlockReason = null;
@@ -4266,20 +4271,31 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					$"rip=0x{interruptedContinuation.Rip:X16}");
 			}
 
-			if (!TryCallGuestFunction(
-					currentContext,
-					pending.Handler,
-					unchecked((ulong)pending.ExceptionType),
-					exceptionContextAddress,
-					pending.ExceptionStackBase + callbackStackOffset,
-					callbackStackSize,
-					$"kernel exception 0x{pending.ExceptionType:X2} safe point",
-					out var callbackError))
+			// The outer HLE import may already have staged a thread block. Run the
+			// exception handler with clean staging slots so its nested imports
+			// cannot consume that block and bind it to a different return frame.
+			var interruptedStagedState = GuestThreadExecution.SaveAndResetStagedState();
+			try
 			{
-				Console.Error.WriteLine(
-					$"[LOADER][ERROR] Guest exception safe-point delivery failed: " +
-					$"target=0x{threadHandle:X16} type=0x{pending.ExceptionType:X2} " +
-					$"error={callbackError ?? "unknown"}");
+				if (!TryCallGuestFunction(
+						currentContext,
+						pending.Handler,
+						unchecked((ulong)pending.ExceptionType),
+						exceptionContextAddress,
+						pending.ExceptionStackBase + callbackStackOffset,
+						callbackStackSize,
+						$"kernel exception 0x{pending.ExceptionType:X2} safe point",
+						out var callbackError))
+				{
+					Console.Error.WriteLine(
+						$"[LOADER][ERROR] Guest exception safe-point delivery failed: " +
+						$"target=0x{threadHandle:X16} type=0x{pending.ExceptionType:X2} " +
+						$"error={callbackError ?? "unknown"}");
+				}
+			}
+			finally
+			{
+				GuestThreadExecution.RestoreStagedState(interruptedStagedState);
 			}
 		}
 		finally
