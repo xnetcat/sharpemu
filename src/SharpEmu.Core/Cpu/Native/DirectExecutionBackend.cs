@@ -3559,7 +3559,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 				owner.State = GuestThreadRunState.Blocked;
 				owner.BlockReason = callbackReason ?? reason;
-				if (owner.BlockWakeHandler is not null && owner.BlockWakeHandler())
+				var wakeReady = owner.BlockWaiter is not null
+					? owner.BlockWaiter.TryWake()
+					: owner.BlockWakeHandler is not null && owner.BlockWakeHandler();
+				if (wakeReady)
 				{
 					owner.State = GuestThreadRunState.Ready;
 					owner.BlockReason = null;
@@ -3575,6 +3578,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			}
 
 			GuestCpuContinuation continuation = default;
+			IGuestThreadBlockWaiter? blockWaiter = null;
 			Func<int>? resumeHandler = null;
 			while (!ActiveForcedGuestExit)
 			{
@@ -3596,6 +3600,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 						owner.BlockedContinuation = default;
 						owner.HasBlockedContinuation = false;
 						owner.BlockWakeKey = null;
+						blockWaiter = owner.BlockWaiter;
+						owner.BlockWaiter = null;
 						resumeHandler = owner.BlockResumeHandler;
 						owner.BlockResumeHandler = null;
 						owner.BlockWakeHandler = null;
@@ -3621,7 +3627,11 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				return false;
 			}
 
-			if (resumeHandler is not null)
+			if (blockWaiter is not null)
+			{
+				continuation = continuation with { Rax = unchecked((ulong)(long)blockWaiter.Resume()) };
+			}
+			else if (resumeHandler is not null)
 			{
 				continuation = continuation with { Rax = unchecked((ulong)(long)resumeHandler()) };
 			}
