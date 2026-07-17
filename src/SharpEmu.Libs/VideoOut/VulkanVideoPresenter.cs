@@ -2284,6 +2284,12 @@ internal static unsafe class VulkanVideoPresenter
         target is not null &&
         (state.TestEnable || state.WriteEnable || state.ClearEnable);
 
+    internal static bool GuestDepthCoversColorTarget(
+        GuestDepthTarget target,
+        uint colorWidth,
+        uint colorHeight) =>
+        target.Width >= colorWidth && target.Height >= colorHeight;
+
     private readonly record struct Presentation(
         byte[]? Pixels,
         uint Width,
@@ -9996,16 +10002,42 @@ internal static unsafe class VulkanVideoPresenter
                         }
                     }
 
-                    depth = GetOrCreateGuestDepth(effectiveDepthTarget);
-                    PrepareFirstUseDepth(depth, draw.RenderState.Depth);
-                    if (clearDepthForDraw)
+                    if (!GuestDepthCoversColorTarget(
+                            effectiveDepthTarget,
+                            firstTarget.Width,
+                            firstTarget.Height))
                     {
-                        depth.GuestClearDepth = effectiveDepthTarget.ClearDepth;
-                        depth.ClearDepth = effectiveDepthTarget.ClearDepth;
+                        // Vulkan framebuffers cannot use an attachment smaller
+                        // than the render area. A stale low-resolution DB
+                        // binding must not discard an otherwise valid
+                        // full-resolution color composite (UI/video passes in
+                        // particular inherit these registers on Gen5).
+                        if (_tracedDepthExtentFallbacks.Add(
+                                (effectiveDepthTarget.Address,
+                                 firstTarget.Width,
+                                 firstTarget.Height)))
+                        {
+                            Console.Error.WriteLine(
+                                $"[LOADER][WARN] Vulkan omitted stale guest depth attachment " +
+                                $"addr=0x{effectiveDepthTarget.Address:X16} " +
+                                $"depth={effectiveDepthTarget.Width}x{effectiveDepthTarget.Height} " +
+                                $"color=0x{firstTarget.Address:X16}:" +
+                                $"{firstTarget.Width}x{firstTarget.Height}");
+                        }
                     }
-                    if (targets.Length == 1)
+                    else
                     {
-                        depthFramebuffer = GetOrCreateDepthFramebuffer(firstTarget, depth);
+                        depth = GetOrCreateGuestDepth(effectiveDepthTarget);
+                        PrepareFirstUseDepth(depth, draw.RenderState.Depth);
+                        if (clearDepthForDraw)
+                        {
+                            depth.GuestClearDepth = effectiveDepthTarget.ClearDepth;
+                            depth.ClearDepth = effectiveDepthTarget.ClearDepth;
+                        }
+                        if (targets.Length == 1)
+                        {
+                            depthFramebuffer = GetOrCreateDepthFramebuffer(firstTarget, depth);
+                        }
                     }
                 }
 
@@ -10378,7 +10410,15 @@ internal static unsafe class VulkanVideoPresenter
 
                 Console.Error.WriteLine(
                     $"[LOADER][ERROR] Vulkan offscreen draw failed " +
-                    $"mrt={work.Targets.Count}: {exception.Message}");
+                    $"mrt={work.Targets.Count} " +
+                    $"targets=[{string.Join(',', work.Targets.Select((target, index) =>
+                        $"0x{target.Address:X16}:{target.Width}x{target.Height}:" +
+                        $"f{target.Format}/n{target.NumberType}:" +
+                        $"vk{formats[index]}:" +
+                        $"resource={(targets[index] is null ? "null" : targets[index].Format)}"))}] " +
+                    $"shader=0x{work.ShaderAddress:X16} " +
+                    $"vs_bytes={work.Draw.VertexSpirv.Length} " +
+                    $"ps_bytes={work.Draw.PixelSpirv.Length}: {exception.Message}");
             }
             finally
             {

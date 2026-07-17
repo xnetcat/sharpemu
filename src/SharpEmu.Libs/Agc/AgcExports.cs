@@ -3567,13 +3567,16 @@ public static partial class AgcExports
 
             if (op == ItIndirectBuffer && length >= 4)
             {
-                ExecuteSubmittedJump(
-                    ctx,
-                    gpuState,
-                    state,
-                    currentAddress,
-                    header,
-                    tracePackets);
+                if (ExecuteSubmittedJump(
+                        ctx,
+                        gpuState,
+                        state,
+                        currentAddress,
+                        header,
+                        tracePackets))
+                {
+                    return true;
+                }
             }
 
             if (op == ItSetBase &&
@@ -4572,7 +4575,10 @@ public static partial class AgcExports
             $"condition=0x{state.PredicationAddress:X16}");
     }
 
-    private static void ExecuteSubmittedJump(
+    // Returns true only when the called segment stopped on an unsatisfied
+    // WAIT_REG_MEM. A normally completed call returns false so the parent
+    // stream resumes immediately after its INDIRECT_BUFFER packet.
+    private static bool ExecuteSubmittedJump(
         CpuContext ctx,
         SubmittedGpuState gpuState,
         SubmittedDcbState state,
@@ -4584,7 +4590,7 @@ public static partial class AgcExports
             !TryReadUInt32(ctx, packetAddress + 8, out var targetHigh) ||
             !TryReadUInt32(ctx, packetAddress + 12, out var control))
         {
-            return;
+            return false;
         }
 
         var targetAddress =
@@ -4596,7 +4602,7 @@ public static partial class AgcExports
             targetDwordCount > 0x40000 ||
             state.JumpDepth >= 8)
         {
-            return;
+            return false;
         }
 
         ulong condition = 0;
@@ -4619,15 +4625,15 @@ public static partial class AgcExports
 
         if (skip)
         {
-            return;
+            return false;
         }
 
         state.JumpDepth++;
         try
         {
             // The AGC jump is a call-with-length: fold the side segment here,
-            // then resume parsing the parent immediately after this packet.
-            ParseSubmittedDcbCore(
+            // then resume the parent unless the side segment is waiting.
+            return ParseSubmittedDcbCore(
                 ctx,
                 gpuState,
                 state,
