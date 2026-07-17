@@ -561,12 +561,47 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
 
     public bool TryProtect(ulong address, ulong size, GuestPageProtection protection)
     {
-        if (size == 0)
+        if (size == 0 || address > ulong.MaxValue - size)
         {
             return false;
         }
 
-        return _hostMemory.Protect(address, size, ResolveProtection(protection), out _);
+        _gate.EnterWriteLock();
+        try
+        {
+            if (FindRegion(address, size) is null ||
+                !_hostMemory.Protect(address, size, ResolveProtection(protection), out _))
+            {
+                return false;
+            }
+
+            var flags = ProgramHeaderFlags.None;
+            if ((protection & GuestPageProtection.Read) != 0)
+            {
+                flags |= ProgramHeaderFlags.Read;
+            }
+            if ((protection & GuestPageProtection.Write) != 0)
+            {
+                flags |= ProgramHeaderFlags.Write;
+            }
+            if ((protection & GuestPageProtection.Execute) != 0)
+            {
+                flags |= ProgramHeaderFlags.Execute;
+            }
+
+            var startPage = AlignDown(address, PageSize);
+            var endPage = AlignUp(address + size, PageSize);
+            for (var pageAddress = startPage; pageAddress < endPage; pageAddress += PageSize)
+            {
+                _pageProtections[pageAddress] = flags;
+            }
+
+            return true;
+        }
+        finally
+        {
+            _gate.ExitWriteLock();
+        }
     }
 
     // Reproduces the decomposition KernelMemoryCompatExports.ResolveHostProtection
@@ -1285,6 +1320,15 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         var endPage = AlignUp(address + size, PageSize);
         for (var pageAddress = startPage; pageAddress < endPage; pageAddress += PageSize)
         {
+            if (!_hostMemory.Query(pageAddress, out var hostRegion) ||
+                hostRegion.State != HostRegionState.Committed ||
+                (write
+                    ? !IsWritableHostProtection(hostRegion.Protection)
+                    : !IsReadableHostProtection(hostRegion.Protection)))
+            {
+                return false;
+            }
+
             if (_pageProtections.TryGetValue(pageAddress, out var flags))
             {
                 if (write ? (flags & ProgramHeaderFlags.Write) == 0 : (flags & ProgramHeaderFlags.Read) == 0)
@@ -1300,6 +1344,21 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
 
         return true;
     }
+
+    private static bool IsReadableHostProtection(HostPageProtection protection) =>
+        protection is
+            HostPageProtection.ReadOnly or
+            HostPageProtection.ReadWrite or
+            HostPageProtection.Execute or
+            HostPageProtection.ReadExecute or
+            HostPageProtection.ReadWriteExecute or
+            HostPageProtection.ExecuteWriteCopy;
+
+    private static bool IsWritableHostProtection(HostPageProtection protection) =>
+        protection is
+            HostPageProtection.ReadWrite or
+            HostPageProtection.ReadWriteExecute or
+            HostPageProtection.ExecuteWriteCopy;
 
     private static bool IsReadableProtection(uint protection)
     {

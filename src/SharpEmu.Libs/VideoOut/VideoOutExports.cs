@@ -719,6 +719,10 @@ public static class VideoOutExports
         var bufferIndex = unchecked((int)ctx[CpuRegister.Rsi]);
         var flipMode = unchecked((int)ctx[CpuRegister.Rdx]);
         var flipArg = unchecked((long)ctx[CpuRegister.Rcx]);
+        // The native avplayer worker posts state events independently. A
+        // presented frame gives HLE a safe guest context in which to deliver
+        // queued events without re-entering sceAvPlayerAddSource.
+        AvPlayer.AvPlayerExports.PumpPendingEvents(ctx);
         return SubmitFlip(ctx, handle, bufferIndex, flipMode, flipArg, submitGpuImage: true);
     }
 

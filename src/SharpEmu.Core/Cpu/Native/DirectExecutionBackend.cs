@@ -2362,6 +2362,13 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 		byte* code = (byte*)ptr;
 		int offset = 0;
+		// TlsGetValue clobbers RAX, which still contains the guest callback's
+		// full-width return value here. Preserve it in a host callee-saved
+		// register and publish it beside the saved host stack pointer before
+		// restoring the host execution frame.
+		EmitByte(code, ref offset, 0x49); // mov r12, rax
+		EmitByte(code, ref offset, 0x89);
+		EmitByte(code, ref offset, 0xC4);
 		EmitByte(code, ref offset, 0x48); // sub rsp, 0x20
 		EmitByte(code, ref offset, 0x83);
 		EmitByte(code, ref offset, 0xEC);
@@ -2378,6 +2385,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		EmitByte(code, ref offset, 0x83);
 		EmitByte(code, ref offset, 0xC4);
 		EmitByte(code, ref offset, 0x20);
+		EmitByte(code, ref offset, 0x4C); // mov [rax+8], r12
+		EmitByte(code, ref offset, 0x89);
+		EmitByte(code, ref offset, 0x60);
+		EmitByte(code, ref offset, 0x08);
 		EmitByte(code, ref offset, 0x48); // mov rsp, [rax]
 		EmitByte(code, ref offset, 0x8B);
 		EmitByte(code, ref offset, 0x20);
@@ -4315,20 +4326,31 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					$"rip=0x{interruptedContinuation.Rip:X16}");
 			}
 
-			if (!TryCallGuestFunction(
-					currentContext,
-					pending.Handler,
-					unchecked((ulong)pending.ExceptionType),
-					exceptionContextAddress,
-					pending.ExceptionStackBase + callbackStackOffset,
-					callbackStackSize,
-					$"kernel exception 0x{pending.ExceptionType:X2} safe point",
-					out var callbackError))
+			// The outer HLE import may already have staged a thread block. Run the
+			// exception handler with clean staging slots so its nested imports
+			// cannot consume that block and bind it to a different return frame.
+			var interruptedStagedState = GuestThreadExecution.SaveAndResetStagedState();
+			try
 			{
-				Console.Error.WriteLine(
-					$"[LOADER][ERROR] Guest exception safe-point delivery failed: " +
-					$"target=0x{threadHandle:X16} type=0x{pending.ExceptionType:X2} " +
-					$"error={callbackError ?? "unknown"}");
+				if (!TryCallGuestFunction(
+						currentContext,
+						pending.Handler,
+						unchecked((ulong)pending.ExceptionType),
+						exceptionContextAddress,
+						pending.ExceptionStackBase + callbackStackOffset,
+						callbackStackSize,
+						$"kernel exception 0x{pending.ExceptionType:X2} safe point",
+						out var callbackError))
+				{
+					Console.Error.WriteLine(
+						$"[LOADER][ERROR] Guest exception safe-point delivery failed: " +
+						$"target=0x{threadHandle:X16} type=0x{pending.ExceptionType:X2} " +
+						$"error={callbackError ?? "unknown"}");
+				}
+			}
+			finally
+			{
+				GuestThreadExecution.RestoreStagedState(interruptedStagedState);
 			}
 		}
 		finally
@@ -4973,7 +4995,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			reason = "failed to allocate executable memory for guest thread stub";
 			return GuestNativeCallExitReason.Exception;
 		}
-		void* hostRspStorage = NativeMemory.Alloc((nuint)sizeof(ulong));
+		void* hostRspStorage = NativeMemory.AllocZeroed((nuint)(2 * sizeof(ulong)));
 		if (hostRspStorage == null)
 		{
 			VirtualFree(ptr, 0u, 32768u);
@@ -5124,7 +5146,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			ActiveGuestThreadYieldReason = null;
 			try
 			{
-				var nativeReturn = RunGuestEntryStub(ptr, hostRspSlot);
+				RunGuestEntryStub(ptr, hostRspSlot);
 				if (ActiveGuestThreadYieldRequested)
 				{
 					reason = ActiveGuestThreadYieldReason ?? "guest thread blocked";
@@ -5135,7 +5157,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					reason = LastError ?? "guest thread forced exit";
 					return GuestNativeCallExitReason.ForcedExit;
 				}
-				reason = $"returned 0x{nativeReturn:X8}";
+				var guestRax = *((ulong*)hostRspStorage + 1);
+				context[CpuRegister.Rax] = guestRax;
+				reason = $"returned 0x{guestRax:X8}";
 				return GuestNativeCallExitReason.Returned;
 			}
 			catch (AccessViolationException ex)
@@ -5185,7 +5209,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			reason = "failed to allocate executable memory for guest thread stub";
 			return GuestNativeCallExitReason.Exception;
 		}
-		void* hostRspStorage = NativeMemory.Alloc((nuint)sizeof(ulong));
+		void* hostRspStorage = NativeMemory.AllocZeroed((nuint)(2 * sizeof(ulong)));
 		if (hostRspStorage == null)
 		{
 			VirtualFree(ptr, 0u, 32768u);
@@ -5279,7 +5303,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			ActiveGuestThreadYieldReason = null;
 			try
 			{
-				var nativeReturn = RunGuestEntryStub(ptr, hostRspSlot);
+				RunGuestEntryStub(ptr, hostRspSlot);
 				if (ActiveGuestThreadYieldRequested)
 				{
 					reason = ActiveGuestThreadYieldReason ?? "guest thread blocked";
@@ -5290,7 +5314,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					reason = LastError ?? "guest thread forced exit";
 					return GuestNativeCallExitReason.ForcedExit;
 				}
-				reason = $"returned 0x{nativeReturn:X8}";
+				var guestRax = *((ulong*)hostRspStorage + 1);
+				context[CpuRegister.Rax] = guestRax;
+				reason = $"returned 0x{guestRax:X8}";
 				return GuestNativeCallExitReason.Returned;
 			}
 			catch (AccessViolationException ex)
@@ -5446,7 +5472,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			result = OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
 			return false;
 		}
-		void* hostRspStorage = NativeMemory.Alloc((nuint)sizeof(ulong));
+		void* hostRspStorage = NativeMemory.AllocZeroed((nuint)(2 * sizeof(ulong)));
 		if (hostRspStorage == null)
 		{
 			VirtualFree(ptr, 0u, 32768u);

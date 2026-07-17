@@ -60,6 +60,36 @@ public sealed class ImportTrampolineAbiTests
         }
     }
 
+    [Fact]
+    public unsafe void GuestReturnStub_PreservesFullWidthGuestRax()
+    {
+        if (RuntimeInformation.ProcessArchitecture != Architecture.X64)
+        {
+            return;
+        }
+
+        var backend = (DirectExecutionBackend)RuntimeHelpers.GetUninitializedObject(
+            typeof(DirectExecutionBackend));
+        var createReturnStub = typeof(DirectExecutionBackend).GetMethod(
+            "CreateGuestReturnStub",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(createReturnStub);
+        var returnStub = (nint)createReturnStub.Invoke(backend, null)!;
+        Assert.NotEqual(0, returnStub);
+
+        try
+        {
+            var code = new ReadOnlySpan<byte>((void*)returnStub, 256);
+            AssertContains(code, [0x49, 0x89, 0xC4]);       // mov r12,rax
+            AssertContains(code, [0x4C, 0x89, 0x60, 0x08]); // mov [rax+8],r12
+            AssertContains(code, [0x48, 0x8B, 0x20]);       // mov rsp,[rax]
+        }
+        finally
+        {
+            Assert.True(HostMemory.Free((void*)returnStub, 0, HostMemory.MEM_RELEASE));
+        }
+    }
+
     private static unsafe byte[] CreateTrampolineBytes()
     {
         var backend = (DirectExecutionBackend)RuntimeHelpers.GetUninitializedObject(
