@@ -4485,9 +4485,9 @@ internal static unsafe class VulkanVideoPresenter
         // Per-frame constants can be populated after command parsing and even
         // after draw resources are built. Refreshing at batch flush gives the
         // host shader the execution-time bytes a real GPU would fetch.
-        private static readonly bool _refreshAllSnapshotBuffers = string.Equals(
+        private static readonly bool _refreshAllSnapshotBuffers = !string.Equals(
             Environment.GetEnvironmentVariable("SHARPEMU_REFRESH_ALL_CB_SNAPSHOTS"),
-            "1",
+            "0",
             StringComparison.Ordinal);
         private long _runtimeScalarRefreshCount;
         private long _snapshotBufferRefreshCount;
