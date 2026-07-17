@@ -1456,6 +1456,9 @@ public sealed partial class DirectExecutionBackend
 		var expectedPrivacyInvalidParameter =
 			string.Equals(nid, "D-CzAxQL0XI", StringComparison.Ordinal) &&
 			resultValue == unchecked((int)0x80960009);
+		var expectedPlayGoChunkTerminator =
+			string.Equals(nid, "uWIYLFkkwqk", StringComparison.Ordinal) &&
+			resultValue == unchecked((int)0x80B2000C);
 		if (!expectedFileProbeMiss &&
 			!expectedTimedWaitTimeout &&
 			!expectedEqueueTimeout &&
@@ -1463,7 +1466,8 @@ public sealed partial class DirectExecutionBackend
 			!expectedSemaphoreTrywaitAgain &&
 			!expectedNetAcceptWouldBlock &&
 			!expectedUserServiceNoEvent &&
-			!expectedPrivacyInvalidParameter)
+			!expectedPrivacyInvalidParameter &&
+			!expectedPlayGoChunkTerminator)
 		{
 			return true;
 		}
