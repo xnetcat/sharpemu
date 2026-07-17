@@ -291,6 +291,7 @@ public static partial class AgcExports
     private static long _dcbWriteDataTraceCount;
     private static int _tracedVertexRangeCount;
     private static long _dcbWaitRegMemTraceCount;
+    private static long _recycledWaitLabelTraceCount;
     private static long _createShaderTraceCount;
     private static long _packetPayloadTraceCount;
     private static long _predicationTraceCount;
@@ -4049,6 +4050,7 @@ public static partial class AgcExports
             return;
         }
 
+        var eagerAttempted = false;
         var eagerApplied = false;
         bool ApplyDmaGuestMemory(out bool immediateFill)
         {
@@ -4082,7 +4084,11 @@ public static partial class AgcExports
                     destinationAddress >= 0x10000 &&
                     (destinationAddress & 3) == 0 &&
                     sourceAddress <= uint.MaxValue;
-                var copied = eagerApplied || ApplyDmaGuestMemory(out immediateFill);
+                var copied = eagerApplied;
+                if (ShouldRetryQueuedGuestWrite(eagerAttempted))
+                {
+                    copied = ApplyDmaGuestMemory(out immediateFill);
+                }
                 if (copied)
                 {
                     MirrorDmaWriteToGuestImage(
@@ -4104,7 +4110,11 @@ public static partial class AgcExports
             packetAddress,
             destinationAddress,
             byteCount,
-            eagerGuestMemoryApply: () => eagerApplied = ApplyDmaGuestMemory(out _));
+            eagerGuestMemoryApply: () =>
+            {
+                eagerAttempted = true;
+                eagerApplied = ApplyDmaGuestMemory(out _);
+            });
     }
 
     private static readonly bool _eagerGpuDataWritesEnabled = !string.Equals(
@@ -4122,7 +4132,8 @@ public static partial class AgcExports
         ulong packetAddress,
         ulong producerAddress = 0,
         ulong producerLength = 0,
-        Action? eagerGuestMemoryApply = null)
+        Action? eagerGuestMemoryApply = null,
+        bool eagerWatchedLabelWrite = false)
     {
         if (_gpuWaitDeferEffectsEnabled && state.DeferredWaitCount > 0)
         {
@@ -4164,13 +4175,16 @@ public static partial class AgcExports
             _eagerGpuDataWritesEnabled &&
             producerAddress != 0 &&
             producerLength != 0 &&
-            producerLength <= MaxEagerGpuDataWriteBytes &&
-            GpuWaitRegistry.SnapshotInRange(
+            producerLength <= MaxEagerGpuDataWriteBytes)
+        {
+            var hasActiveWait = GpuWaitRegistry.SnapshotInRange(
                 GetCpuMemoryStateKey(ctx.Memory),
                 producerAddress,
-                producerLength).Count == 0)
-        {
-            eagerGuestMemoryApply();
+                producerLength).Count != 0;
+            if (ShouldEagerlyApplyGuestWrite(hasActiveWait, eagerWatchedLabelWrite))
+            {
+                eagerGuestMemoryApply();
+            }
         }
 
         var producer = RegisterLabelProducer(
@@ -4232,6 +4246,14 @@ public static partial class AgcExports
             ApplyAndQueueCompletion();
         }
     }
+
+    internal static bool ShouldEagerlyApplyGuestWrite(
+        bool hasActiveWait,
+        bool eagerWatchedLabelWrite) =>
+        !hasActiveWait || eagerWatchedLabelWrite;
+
+    internal static bool ShouldRetryQueuedGuestWrite(bool eagerAttempted) =>
+        !eagerAttempted;
 
     private static LabelProducerTrace? RegisterLabelProducer(
         object memory,
@@ -4986,6 +5008,7 @@ public static partial class AgcExports
             return wroteData;
         }
 
+        var eagerAttempted = false;
         var eagerApplied = false;
         SubmitOrderedGpuSideEffect(
             ctx,
@@ -4993,7 +5016,11 @@ public static partial class AgcExports
             state,
             () =>
             {
-                var wroteData = eagerApplied || ApplyWriteDataGuestMemory();
+                var wroteData = eagerApplied;
+                if (ShouldRetryQueuedGuestWrite(eagerAttempted))
+                {
+                    wroteData = ApplyWriteDataGuestMemory();
+                }
 
                 if (tracePacket)
                 {
@@ -5011,7 +5038,11 @@ public static partial class AgcExports
             destination is 1 or 2 or 4 or 5
                 ? incrementAddress ? (ulong)dwordCount * sizeof(uint) : sizeof(uint)
                 : 0,
-            eagerGuestMemoryApply: () => eagerApplied = ApplyWriteDataGuestMemory());
+            eagerGuestMemoryApply: () =>
+            {
+                eagerAttempted = true;
+                eagerApplied = ApplyWriteDataGuestMemory();
+            });
     }
 
     private static (uint Destination, bool IncrementAddress, bool WriteConfirm, uint CachePolicy)
@@ -5378,6 +5409,29 @@ public static partial class AgcExports
             return false; // already satisfied — keep parsing
         }
 
+        if (!is64Bit &&
+            TryReadUInt64(ctx, waitAddress, out var currentQword) &&
+            IsRecycledGpuLabelPointer(
+                currentQword,
+                reference,
+                mask,
+                compareFunction))
+        {
+            // The command reached HLE after its 32-bit completion label had
+            // already been returned to Unreal's allocator. Its first eight
+            // bytes now contain an aligned guest pointer, so no real producer
+            // can safely write the old label without corrupting that object.
+            // Retire the obsolete wait without mutating recycled memory.
+            if (ShouldTraceHotPath(ref _recycledWaitLabelTraceCount))
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][WARN] agc.wait_retired_recycled label=0x{waitAddress:X16} " +
+                    $"value=0x{currentQword:X16} queue={state.QueueName} " +
+                    $"submission={state.ActiveSubmissionId}");
+            }
+            return false;
+        }
+
         if (_gpuWaitForceEnabled)
         {
             if (hasCurrent)
@@ -5427,6 +5481,26 @@ public static partial class AgcExports
         // provide this label. Guest-visible writes after the barrier are held
         // by SubmitOrderedGpuSideEffect until the condition becomes true.
         return !_gpuWaitDeferEffectsEnabled;
+    }
+
+    internal static bool IsRecycledGpuLabelPointer(
+        ulong currentQword,
+        ulong reference,
+        ulong mask,
+        uint compareFunction)
+    {
+        // This recovery is intentionally limited to the common 32-bit
+        // completion-label condition (label == 1). A canonical, aligned
+        // user-memory pointer in the same eight bytes proves that the 4-byte
+        // label storage has been repurposed.
+        const ulong guestUserAddressStart = 0x0000_0070_0000_0000UL;
+        const ulong guestUserAddressEnd = 0x0000_0080_0000_0000UL;
+        return compareFunction == 3 &&
+               reference == 1 &&
+               mask == uint.MaxValue &&
+               currentQword >= guestUserAddressStart &&
+               currentQword < guestUserAddressEnd &&
+               (currentQword & 0xFUL) == 0;
     }
 
     private static void ReleaseDeferredWaitProducers(
@@ -5792,6 +5866,7 @@ public static partial class AgcExports
         var writesGuestMemory = destination is 0 or 1 &&
                                 destinationAddress != 0 &&
                                 writeLength != 0;
+        var eagerAttempted = false;
         var eagerApplied = false;
         bool ApplyGuestMemoryWrite()
         {
@@ -5820,7 +5895,11 @@ public static partial class AgcExports
             state,
             () =>
             {
-                var wroteData = eagerApplied || ApplyGuestMemoryWrite();
+                var wroteData = eagerApplied;
+                if (ShouldRetryQueuedGuestWrite(eagerAttempted))
+                {
+                    wroteData = ApplyGuestMemoryWrite();
+                }
 
                 if (tracePacket)
                 {
@@ -5834,7 +5913,12 @@ public static partial class AgcExports
             packetAddress,
             writesGuestMemory ? destinationAddress : 0,
             writesGuestMemory ? writeLength : 0,
-            eagerGuestMemoryApply: () => eagerApplied = ApplyGuestMemoryWrite());
+            eagerGuestMemoryApply: () =>
+            {
+                eagerAttempted = true;
+                eagerApplied = ApplyGuestMemoryWrite();
+            },
+            eagerWatchedLabelWrite: true);
     }
 
     private static (uint Destination, uint DataSelection)
@@ -5876,6 +5960,7 @@ public static partial class AgcExports
             _ => 0UL,
         };
         var writesGuestMemory = destinationAddress != 0 && writeLength != 0;
+        var eagerAttempted = false;
         var eagerApplied = false;
         bool ApplyGuestMemoryWrite()
         {
@@ -5905,7 +5990,11 @@ public static partial class AgcExports
             state,
             () =>
             {
-                var wroteData = eagerApplied || ApplyGuestMemoryWrite();
+                var wroteData = eagerApplied;
+                if (ShouldRetryQueuedGuestWrite(eagerAttempted))
+                {
+                    wroteData = ApplyGuestMemoryWrite();
+                }
 
                 if (tracePacket)
                 {
@@ -5927,7 +6016,12 @@ public static partial class AgcExports
             packetAddress,
             writesGuestMemory ? destinationAddress : 0,
             writesGuestMemory ? writeLength : 0,
-            eagerGuestMemoryApply: () => eagerApplied = ApplyGuestMemoryWrite());
+            eagerGuestMemoryApply: () =>
+            {
+                eagerAttempted = true;
+                eagerApplied = ApplyGuestMemoryWrite();
+            },
+            eagerWatchedLabelWrite: true);
     }
 
     private static void ApplySubmittedRegisters(

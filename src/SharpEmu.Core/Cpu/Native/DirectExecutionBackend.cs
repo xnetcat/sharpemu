@@ -2252,6 +2252,13 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 		byte* code = (byte*)ptr;
 		int offset = 0;
+		// TlsGetValue clobbers RAX, which still contains the guest callback's
+		// full-width return value here. Preserve it in a host callee-saved
+		// register and publish it beside the saved host stack pointer before
+		// restoring the host execution frame.
+		EmitByte(code, ref offset, 0x49); // mov r12, rax
+		EmitByte(code, ref offset, 0x89);
+		EmitByte(code, ref offset, 0xC4);
 		EmitByte(code, ref offset, 0x48); // sub rsp, 0x20
 		EmitByte(code, ref offset, 0x83);
 		EmitByte(code, ref offset, 0xEC);
@@ -2268,6 +2275,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		EmitByte(code, ref offset, 0x83);
 		EmitByte(code, ref offset, 0xC4);
 		EmitByte(code, ref offset, 0x20);
+		EmitByte(code, ref offset, 0x4C); // mov [rax+8], r12
+		EmitByte(code, ref offset, 0x89);
+		EmitByte(code, ref offset, 0x60);
+		EmitByte(code, ref offset, 0x08);
 		EmitByte(code, ref offset, 0x48); // mov rsp, [rax]
 		EmitByte(code, ref offset, 0x8B);
 		EmitByte(code, ref offset, 0x20);
@@ -3559,7 +3570,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 				owner.State = GuestThreadRunState.Blocked;
 				owner.BlockReason = callbackReason ?? reason;
-				if (owner.BlockWakeHandler is not null && owner.BlockWakeHandler())
+				var wakeReady = owner.BlockWaiter is not null
+					? owner.BlockWaiter.TryWake()
+					: owner.BlockWakeHandler is not null && owner.BlockWakeHandler();
+				if (wakeReady)
 				{
 					owner.State = GuestThreadRunState.Ready;
 					owner.BlockReason = null;
@@ -3575,6 +3589,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			}
 
 			GuestCpuContinuation continuation = default;
+			IGuestThreadBlockWaiter? blockWaiter = null;
 			Func<int>? resumeHandler = null;
 			while (!ActiveForcedGuestExit)
 			{
@@ -3596,6 +3611,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 						owner.BlockedContinuation = default;
 						owner.HasBlockedContinuation = false;
 						owner.BlockWakeKey = null;
+						blockWaiter = owner.BlockWaiter;
+						owner.BlockWaiter = null;
 						resumeHandler = owner.BlockResumeHandler;
 						owner.BlockResumeHandler = null;
 						owner.BlockWakeHandler = null;
@@ -3621,7 +3638,11 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				return false;
 			}
 
-			if (resumeHandler is not null)
+			if (blockWaiter is not null)
+			{
+				continuation = continuation with { Rax = unchecked((ulong)(long)blockWaiter.Resume()) };
+			}
+			else if (resumeHandler is not null)
 			{
 				continuation = continuation with { Rax = unchecked((ulong)(long)resumeHandler()) };
 			}
@@ -3831,6 +3852,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		bool savedHasBlockedContinuation;
 		GuestCpuContinuation savedBlockedContinuation;
 		string? savedBlockWakeKey;
+		IGuestThreadBlockWaiter? savedBlockWaiter;
 		Func<int>? savedBlockResumeHandler;
 		Func<bool>? savedBlockWakeHandler;
 		long savedBlockDeadlineTimestamp;
@@ -3968,6 +3990,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			savedHasBlockedContinuation = target.HasBlockedContinuation;
 			savedBlockedContinuation = target.BlockedContinuation;
 			savedBlockWakeKey = target.BlockWakeKey;
+			savedBlockWaiter = target.BlockWaiter;
 			savedBlockResumeHandler = target.BlockResumeHandler;
 			savedBlockWakeHandler = target.BlockWakeHandler;
 			savedBlockDeadlineTimestamp = target.BlockDeadlineTimestamp;
@@ -3979,6 +4002,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			target.HasBlockedContinuation = false;
 			target.BlockedContinuation = default;
 			target.BlockWakeKey = null;
+			target.BlockWaiter = null;
 			target.BlockResumeHandler = null;
 			target.BlockWakeHandler = null;
 			target.BlockDeadlineTimestamp = 0;
@@ -4028,6 +4052,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			target.HasBlockedContinuation = savedHasBlockedContinuation;
 			target.BlockedContinuation = savedBlockedContinuation;
 			target.BlockWakeKey = savedBlockWakeKey;
+			target.BlockWaiter = savedBlockWaiter;
 			target.BlockResumeHandler = savedBlockResumeHandler;
 			target.BlockWakeHandler = savedBlockWakeHandler;
 			target.BlockDeadlineTimestamp = savedBlockDeadlineTimestamp;
@@ -4039,8 +4064,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			// pthread wait remains parked forever after a GC suspension races it.
 			if (target.State == GuestThreadRunState.Blocked &&
 				target.HasBlockedContinuation &&
-				target.BlockWakeHandler is not null &&
-				target.BlockWakeHandler())
+				(target.BlockWaiter is not null
+					? target.BlockWaiter.TryWake()
+					: target.BlockWakeHandler is not null && target.BlockWakeHandler()))
 			{
 				target.State = GuestThreadRunState.Ready;
 				target.BlockReason = null;
@@ -4245,20 +4271,31 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					$"rip=0x{interruptedContinuation.Rip:X16}");
 			}
 
-			if (!TryCallGuestFunction(
-					currentContext,
-					pending.Handler,
-					unchecked((ulong)pending.ExceptionType),
-					exceptionContextAddress,
-					pending.ExceptionStackBase + callbackStackOffset,
-					callbackStackSize,
-					$"kernel exception 0x{pending.ExceptionType:X2} safe point",
-					out var callbackError))
+			// The outer HLE import may already have staged a thread block. Run the
+			// exception handler with clean staging slots so its nested imports
+			// cannot consume that block and bind it to a different return frame.
+			var interruptedStagedState = GuestThreadExecution.SaveAndResetStagedState();
+			try
 			{
-				Console.Error.WriteLine(
-					$"[LOADER][ERROR] Guest exception safe-point delivery failed: " +
-					$"target=0x{threadHandle:X16} type=0x{pending.ExceptionType:X2} " +
-					$"error={callbackError ?? "unknown"}");
+				if (!TryCallGuestFunction(
+						currentContext,
+						pending.Handler,
+						unchecked((ulong)pending.ExceptionType),
+						exceptionContextAddress,
+						pending.ExceptionStackBase + callbackStackOffset,
+						callbackStackSize,
+						$"kernel exception 0x{pending.ExceptionType:X2} safe point",
+						out var callbackError))
+				{
+					Console.Error.WriteLine(
+						$"[LOADER][ERROR] Guest exception safe-point delivery failed: " +
+						$"target=0x{threadHandle:X16} type=0x{pending.ExceptionType:X2} " +
+						$"error={callbackError ?? "unknown"}");
+				}
+			}
+			finally
+			{
+				GuestThreadExecution.RestoreStagedState(interruptedStagedState);
 			}
 		}
 		finally
@@ -4888,7 +4925,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			reason = "failed to allocate executable memory for guest thread stub";
 			return GuestNativeCallExitReason.Exception;
 		}
-		void* hostRspStorage = NativeMemory.Alloc((nuint)sizeof(ulong));
+		void* hostRspStorage = NativeMemory.AllocZeroed((nuint)(2 * sizeof(ulong)));
 		if (hostRspStorage == null)
 		{
 			VirtualFree(ptr, 0u, 32768u);
@@ -5039,7 +5076,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			ActiveGuestThreadYieldReason = null;
 			try
 			{
-				var nativeReturn = RunGuestEntryStub(ptr, hostRspSlot);
+				RunGuestEntryStub(ptr, hostRspSlot);
 				if (ActiveGuestThreadYieldRequested)
 				{
 					reason = ActiveGuestThreadYieldReason ?? "guest thread blocked";
@@ -5050,7 +5087,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					reason = LastError ?? "guest thread forced exit";
 					return GuestNativeCallExitReason.ForcedExit;
 				}
-				reason = $"returned 0x{nativeReturn:X8}";
+				var guestRax = *((ulong*)hostRspStorage + 1);
+				context[CpuRegister.Rax] = guestRax;
+				reason = $"returned 0x{guestRax:X8}";
 				return GuestNativeCallExitReason.Returned;
 			}
 			catch (AccessViolationException ex)
@@ -5100,7 +5139,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			reason = "failed to allocate executable memory for guest thread stub";
 			return GuestNativeCallExitReason.Exception;
 		}
-		void* hostRspStorage = NativeMemory.Alloc((nuint)sizeof(ulong));
+		void* hostRspStorage = NativeMemory.AllocZeroed((nuint)(2 * sizeof(ulong)));
 		if (hostRspStorage == null)
 		{
 			VirtualFree(ptr, 0u, 32768u);
@@ -5194,7 +5233,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			ActiveGuestThreadYieldReason = null;
 			try
 			{
-				var nativeReturn = RunGuestEntryStub(ptr, hostRspSlot);
+				RunGuestEntryStub(ptr, hostRspSlot);
 				if (ActiveGuestThreadYieldRequested)
 				{
 					reason = ActiveGuestThreadYieldReason ?? "guest thread blocked";
@@ -5205,7 +5244,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					reason = LastError ?? "guest thread forced exit";
 					return GuestNativeCallExitReason.ForcedExit;
 				}
-				reason = $"returned 0x{nativeReturn:X8}";
+				var guestRax = *((ulong*)hostRspStorage + 1);
+				context[CpuRegister.Rax] = guestRax;
+				reason = $"returned 0x{guestRax:X8}";
 				return GuestNativeCallExitReason.Returned;
 			}
 			catch (AccessViolationException ex)
@@ -5361,7 +5402,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			result = OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
 			return false;
 		}
-		void* hostRspStorage = NativeMemory.Alloc((nuint)sizeof(ulong));
+		void* hostRspStorage = NativeMemory.AllocZeroed((nuint)(2 * sizeof(ulong)));
 		if (hostRspStorage == null)
 		{
 			VirtualFree(ptr, 0u, 32768u);

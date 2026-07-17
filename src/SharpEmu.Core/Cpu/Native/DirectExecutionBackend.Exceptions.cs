@@ -551,14 +551,38 @@ public sealed partial class DirectExecutionBackend
 		ulong faultAddress = exceptionRecord->ExceptionInformation[1];
 		ulong freeListHead = ReadCtxU64(contextRecord, CTX_RCX);
 		ulong freeListSlot = ReadCtxU64(contextRecord, CTX_RSI);
-		byte[] code = new byte[GuestAllocatorFreeListPopSignature.Length];
-		if (!TryReadHostBytes(rip, code) ||
-			!IsGuestAllocatorFreeListPop(
+		bool inlinedPop = false;
+		byte[] code = new byte[GuestAllocatorFreeListRecoveryPattern.LeafPopCodeLength];
+		bool recognized = TryReadHostBytes(rip, code) &&
+			GuestAllocatorFreeListRecoveryPattern.IsLeafPop(
 				code,
 				accessType,
 				faultAddress,
 				freeListHead,
-				freeListSlot))
+				freeListSlot);
+
+		if (!recognized && rip >= GuestAllocatorInlinedFreeListPopFaultOffset)
+		{
+			freeListHead = ReadCtxU64(contextRecord, CTX_RAX);
+			freeListSlot = ReadCtxU64(contextRecord, CTX_RCX);
+			ulong bucketBase = ReadCtxU64(contextRecord, CTX_R14);
+			ulong bucketOffset = ReadCtxU64(contextRecord, CTX_RDI);
+			byte[] inlinedCode = new byte[GuestAllocatorFreeListRecoveryPattern.InlinedPopCodeLength];
+			recognized = TryReadHostBytes(
+					rip - GuestAllocatorInlinedFreeListPopFaultOffset,
+					inlinedCode) &&
+				GuestAllocatorFreeListRecoveryPattern.IsInlinedPop(
+					inlinedCode,
+					accessType,
+					faultAddress,
+					freeListHead,
+					freeListSlot,
+					bucketBase,
+					bucketOffset);
+			inlinedPop = recognized;
+		}
+
+		if (!recognized)
 		{
 			return false;
 		}
@@ -580,47 +604,39 @@ public sealed partial class DirectExecutionBackend
 		// the corrupt head would spread the bad pointer into another object.
 		*(ulong*)freeListSlot = 0;
 		*(uint*)(freeListSlot + 8) = 0;
-		const ulong allocatorSlowPathDelta = 0x14;
-		WriteCtxU64(contextRecord, CTX_RIP, rip + allocatorSlowPathDelta);
+		ulong resumeRip;
+		if (inlinedPop)
+		{
+			// Re-run the allocator's own null check. RAX originally held the
+			// corrupt head, and the following conditional branch enters the
+			// slow path without dereferencing or returning that head.
+			WriteCtxU64(contextRecord, CTX_RAX, 0);
+			resumeRip = rip - GuestAllocatorInlinedFreeListPopNullTestOffset;
+		}
+		else
+		{
+			const ulong allocatorSlowPathDelta = 0x14;
+			resumeRip = rip + allocatorSlowPathDelta;
+		}
+
+		WriteCtxU64(contextRecord, CTX_RIP, resumeRip);
 
 		var recovery = Interlocked.Increment(ref _guestAllocatorFreeListRecoveries);
 		if (recovery <= 16 || (recovery & (recovery - 1)) == 0)
 		{
 			Console.Error.WriteLine(
 				$"[LOADER][WARN] Guest allocator free-list recovery #{recovery}: " +
+				$"form={(inlinedPop ? "inlined" : "leaf")} " +
 				$"head=0x{freeListHead:X16} slot=0x{freeListSlot:X16} " +
-				$"rip=0x{rip:X16} -> 0x{rip + allocatorSlowPathDelta:X16}");
+				$"rip=0x{rip:X16} -> 0x{resumeRip:X16}");
 			Console.Error.Flush();
 		}
 
 		return true;
 	}
 
-	private static readonly byte[] GuestAllocatorFreeListPopSignature =
-	[
-		0x48, 0x8B, 0x01,       // mov rax, [rcx]
-		0x48, 0x89, 0x06,       // mov [rsi], rax
-		0x48, 0x89, 0xC8,       // mov rax, rcx
-		0x48, 0x83, 0xC4, 0x08, // add rsp, 8
-		0x5B,                   // pop rbx
-		0x41, 0x5E,             // pop r14
-		0x41, 0x5F,             // pop r15
-		0x5D,                   // pop rbp
-		0xC3,                   // ret
-	];
-
-	internal static bool IsGuestAllocatorFreeListPop(
-		ReadOnlySpan<byte> code,
-		ulong accessType,
-		ulong faultAddress,
-		ulong freeListHead,
-		ulong freeListSlot) =>
-		accessType == 0 &&
-		faultAddress >= 0x10000 &&
-		faultAddress == freeListHead &&
-		freeListSlot >= 0x0000000800000000UL &&
-		(freeListSlot & 7) == 0 &&
-		code.SequenceEqual(GuestAllocatorFreeListPopSignature);
+	private const ulong GuestAllocatorInlinedFreeListPopFaultOffset = 17;
+	private const ulong GuestAllocatorInlinedFreeListPopNullTestOffset = 14;
 
 	private static bool IsWritableProtection(uint protect)
 	{
