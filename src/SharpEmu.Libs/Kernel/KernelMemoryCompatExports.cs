@@ -3159,7 +3159,9 @@ public static partial class KernelMemoryCompatExports
         var flags = unchecked((int)ctx[CpuRegister.Rsi]);
         var infoAddress = ctx[CpuRegister.Rdx];
         var infoSize = ctx[CpuRegister.Rcx];
-        if (infoAddress == 0 || infoSize < OrbisVirtualQueryInfoSize)
+        if (infoAddress == 0 ||
+            infoSize != OrbisVirtualQueryInfoSize ||
+            unchecked((uint)flags) > 1)
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
@@ -3170,7 +3172,7 @@ public static partial class KernelMemoryCompatExports
         {
             if (!TryFindVirtualQueryRegionLocked(queryAddress, findNext: (flags & 0x1) != 0, out region))
             {
-                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_ACCESS_DENIED;
             }
 
             if (region.IsDirect && TryFindDirectAllocationLocked(region.DirectStart, out var allocation))
@@ -3282,25 +3284,41 @@ public static partial class KernelMemoryCompatExports
     public static int KernelDirectMemoryQuery(CpuContext ctx)
     {
         var offset = ctx[CpuRegister.Rdi];
-        _ = ctx[CpuRegister.Rsi]; // flags
+        var flags = unchecked((uint)ctx[CpuRegister.Rsi]);
         var infoAddress = ctx[CpuRegister.Rdx];
         var infoSize = ctx[CpuRegister.Rcx];
-        if (infoAddress == 0 || infoSize < 24)
+        if (infoAddress == 0 || infoSize != 24 || flags > 1)
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
+        DirectAllocation? found = null;
         lock (_memoryGate)
         {
             foreach (var block in _directAllocations.Values)
             {
-                if (offset < block.Start || offset >= block.Start + block.Length)
+                if (offset >= block.Start &&
+                    TryAddU64(block.Start, block.Length, out var blockEnd) &&
+                    offset < blockEnd)
                 {
-                    continue;
+                    found = block;
+                    break;
                 }
 
-                if (!ctx.TryWriteUInt64(infoAddress, block.Start) ||
-                    !ctx.TryWriteUInt64(infoAddress + sizeof(ulong), block.Start + block.Length) ||
+                if (flags == 1 &&
+                    block.Start >= offset &&
+                    (!found.HasValue || block.Start < found.Value.Start))
+                {
+                    found = block;
+                }
+            }
+
+            if (found.HasValue)
+            {
+                var block = found.Value;
+                if (!TryAddU64(block.Start, block.Length, out var blockEnd) ||
+                    !ctx.TryWriteUInt64(infoAddress, block.Start) ||
+                    !ctx.TryWriteUInt64(infoAddress + sizeof(ulong), blockEnd) ||
                     !TryWriteInt32(ctx, infoAddress + (sizeof(ulong) * 2), block.MemoryType))
                 {
                     return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
@@ -3310,7 +3328,7 @@ public static partial class KernelMemoryCompatExports
             }
         }
 
-        return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+        return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_ACCESS_DENIED;
     }
 
     [SysAbiExport(

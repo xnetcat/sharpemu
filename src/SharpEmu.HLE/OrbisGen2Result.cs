@@ -48,6 +48,12 @@ public enum OrbisGen2Result : int
     ORBIS_GEN2_ERROR_DELETED = unchecked((int)0x8002000D),
 
     /// <summary>
+    /// Indicates that access to the requested resource or address was denied.
+    /// This shares FreeBSD's EACCES value with the deleted-wait-object result.
+    /// </summary>
+    ORBIS_GEN2_ERROR_ACCESS_DENIED = unchecked((int)0x8002000D),
+
+    /// <summary>
     /// Indicates that the target resource is busy.
     /// </summary>
     ORBIS_GEN2_ERROR_BUSY = unchecked((int)0x80020010),

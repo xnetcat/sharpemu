@@ -1,6 +1,7 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using SharpEmu.HLE;
 using SharpEmu.Libs.Kernel;
 using Xunit;
 
@@ -11,6 +12,19 @@ namespace SharpEmu.Libs.Tests.Kernel;
 // otherwise falls back to the QPC-based Stopwatch, so the frequency selection has to follow suit.
 public sealed class KernelRuntimeCompatExportsTests
 {
+    [Fact]
+    public void IsSignalReturn_ReportsNoSyntheticSignalFrame()
+    {
+        var memory = new FakeCpuMemory(0x1_0000_0000, 0x1000);
+        var context = new CpuContext(memory, Generation.Gen5);
+        context[CpuRegister.Rax] = ulong.MaxValue;
+
+        var result = KernelRuntimeCompatExports.IsSignalReturn(context);
+
+        Assert.Equal(0, result);
+        Assert.Equal(0UL, context[CpuRegister.Rax]);
+    }
+
     private static KernelRuntimeCompatExports.TryGetFrequency Yields(ulong hz) =>
         (out ulong frequencyHz) =>
         {

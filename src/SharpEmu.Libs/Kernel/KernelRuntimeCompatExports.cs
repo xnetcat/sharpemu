@@ -1016,6 +1016,19 @@ public static class KernelRuntimeCompatExports
     }
 
     [SysAbiExport(
+        Nid = "crb5j7mkk1c",
+        ExportName = "_is_signal_return",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int IsSignalReturn(CpuContext ctx)
+    {
+        // SharpEmu does not materialize the kernel signal-return trampoline
+        // frames that libunwind is probing for.
+        ctx[CpuRegister.Rax] = 0;
+        return 0;
+    }
+
+    [SysAbiExport(
         Nid = "kUpgrXIrz7Q",
         ExportName = "sceKernelGetModuleInfo",
         Target = Generation.Gen4 | Generation.Gen5,
