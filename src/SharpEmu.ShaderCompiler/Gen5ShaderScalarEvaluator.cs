@@ -168,6 +168,10 @@ public static class Gen5ShaderScalarEvaluator
         // set already includes every instruction's destination registers, so
         // the per-load additions the loop used to make are redundant.
         var runtimeScalarRegisters = state.Program.RuntimeScalarRegisters;
+        // Preserve where scalar-load results came from. Per-frame descriptor
+        // tables can be populated after command-list parsing, so execution can
+        // re-read a stale vertex V# instead of dropping the whole draw.
+        var scalarLoadSources = new Dictionary<uint, ulong>();
         var resolvedImageByPc = new Dictionary<uint, int>();
         var finalScalarRegisters = (uint[])scalarRegisters.Clone();
         var pendingPaths = new Stack<ScalarPathState>();
@@ -331,7 +335,18 @@ public static class Gen5ShaderScalarEvaluator
                 var recordBinding =
                     !path.Supplemental ||
                     !HasGlobalMemoryBindingForPc(globalMemoryBindings, instruction.Pc);
-                if (!TryExecuteScalarLoad(ctx, state, instruction, scalarMemory, scalarRegisters, globalMemoryBindings, globalMemoryByAddress, runtimeScalarRegisters, recordBinding, out error))
+                if (!TryExecuteScalarLoad(
+                        ctx,
+                        state,
+                        instruction,
+                        scalarMemory,
+                        scalarRegisters,
+                        globalMemoryBindings,
+                        globalMemoryByAddress,
+                        runtimeScalarRegisters,
+                        recordBinding,
+                        out error,
+                        scalarLoadSources))
                 {
                     return false;
                 }
@@ -518,6 +533,11 @@ public static class Gen5ShaderScalarEvaluator
                                 (ulong)MaxGlobalMemoryBindingBytes)),
                             (uint)vertexInputBindings.Count,
                             scalarOffset,
+                            scalarLoadSources.TryGetValue(
+                                bufferMemory.ScalarResource,
+                                out var descriptorSource)
+                                ? descriptorSource
+                                : 0,
                             out var vertexInputBinding))
                     {
                         error =
@@ -717,6 +737,7 @@ public static class Gen5ShaderScalarEvaluator
         int desiredDataLength,
         uint location,
         uint scalarOffset,
+        ulong deferredDescriptorAddress,
         out Gen5VertexInputBinding binding)
     {
         binding = default!;
@@ -740,7 +761,8 @@ public static class Gen5ShaderScalarEvaluator
             bindingOffset,
             Data: [],
             DataLength: desiredDataLength,
-            DataPooled: false);
+            DataPooled: false,
+            DeferredDescriptorAddress: deferredDescriptorAddress);
         return true;
     }
 
@@ -787,6 +809,28 @@ public static class Gen5ShaderScalarEvaluator
             if (byteCount == 0 ||
                 !TryReadGlobalMemory(ctx, start, byteCount, out var data, out var dataLength))
             {
+                var canDefer = true;
+                for (var index = first; index < last; index++)
+                {
+                    canDefer &= ordered[index].DeferredDescriptorAddress != 0;
+                }
+
+                if (canDefer)
+                {
+                    for (var index = first; index < last; index++)
+                    {
+                        captured.Add(ordered[index] with
+                        {
+                            Data = new byte[sizeof(uint)],
+                            DataLength = sizeof(uint),
+                            DataPooled = false,
+                        });
+                    }
+
+                    first = last;
+                    continue;
+                }
+
                 foreach (var binding in captured)
                 {
                     if (binding.DataPooled)
@@ -813,6 +857,7 @@ public static class Gen5ShaderScalarEvaluator
                     Data = data,
                     DataLength = dataLength,
                     DataPooled = index == first,
+                    DeferredDescriptorAddress = 0,
                 });
             }
 
@@ -1839,7 +1884,8 @@ public static class Gen5ShaderScalarEvaluator
         Dictionary<(uint ScalarAddress, ulong BaseAddress), Gen5GlobalMemoryBinding> globalMemoryByAddress,
         IReadOnlySet<uint> runtimeScalarRegisters,
         bool recordBinding,
-        out string error)
+        out string error,
+        Dictionary<uint, ulong>? scalarLoadSources = null)
     {
         error = string.Empty;
         if (instruction.Sources.Count == 0 ||
@@ -2008,6 +2054,15 @@ public static class Gen5ShaderScalarEvaluator
             }
 
             var componentOffset = unchecked(byteOffset + (ulong)(index * sizeof(uint)));
+            if (scalarLoadSources is not null && baseAddress != 0)
+            {
+                // Keep provenance even when this parse-time read fails or
+                // returns zero; the GPU-timeline consumer may observe the
+                // completed descriptor table later.
+                scalarLoadSources[destination.Value] =
+                    address + (ulong)(index * sizeof(uint));
+            }
+
             if (bufferUnbound ||
                 scalarPointerUnbound ||
                 isBufferLoad &&
@@ -2044,6 +2099,39 @@ public static class Gen5ShaderScalarEvaluator
             scalarRegisters[destination.Value] = value;
         }
 
+        return true;
+    }
+
+    /// <summary>
+    /// Decodes a V# descriptor re-read from guest memory when the draw reaches
+    /// the ordered GPU timeline.
+    /// </summary>
+    public static bool TryDecodeDeferredVertexDescriptor(
+        IReadOnlyList<uint> words,
+        out ulong baseAddress,
+        out uint stride,
+        out ulong sizeBytes,
+        out uint dataFormat,
+        out uint numberFormat)
+    {
+        baseAddress = 0;
+        stride = 0;
+        sizeBytes = 0;
+        dataFormat = 0;
+        numberFormat = 0;
+        if (!TryDecodeBufferDescriptor(words, 0, strictType: true, out var descriptor) ||
+            descriptor.BaseAddress == 0 ||
+            descriptor.Stride == 0 ||
+            descriptor.SizeBytes == 0)
+        {
+            return false;
+        }
+
+        baseAddress = descriptor.BaseAddress;
+        stride = descriptor.Stride;
+        sizeBytes = descriptor.SizeBytes;
+        dataFormat = descriptor.DataFormat;
+        numberFormat = descriptor.NumberFormat;
         return true;
     }
 

@@ -94,7 +94,9 @@ internal interface IGuestGpuBackend
         uint primitiveType = 4,
         GuestIndexBuffer? indexBuffer = null,
         IReadOnlyList<GuestVertexBuffer>? vertexBuffers = null,
-        GuestRenderState? renderState = null);
+        GuestRenderState? renderState = null,
+        Func<IReadOnlyList<GuestVertexBuffer>, IGuestCompiledShader?>?
+            deferredVertexCompiler = null);
 
     void SubmitDepthOnlyTranslatedDraw(
         IGuestCompiledShader pixelShader,
@@ -109,7 +111,9 @@ internal interface IGuestGpuBackend
         GuestIndexBuffer? indexBuffer = null,
         IReadOnlyList<GuestVertexBuffer>? vertexBuffers = null,
         GuestRenderState? renderState = null,
-        ulong shaderAddress = 0);
+        ulong shaderAddress = 0,
+        Func<IReadOnlyList<GuestVertexBuffer>, IGuestCompiledShader?>?
+            deferredVertexCompiler = null);
 
     void SubmitOffscreenTranslatedDraw(
         IGuestCompiledShader pixelShader,
@@ -125,7 +129,9 @@ internal interface IGuestGpuBackend
         IReadOnlyList<GuestVertexBuffer>? vertexBuffers = null,
         GuestRenderState? renderState = null,
         GuestDepthTarget? depthTarget = null,
-        ulong shaderAddress = 0);
+        ulong shaderAddress = 0,
+        Func<IReadOnlyList<GuestVertexBuffer>, IGuestCompiledShader?>?
+            deferredVertexCompiler = null);
 
     void SubmitStorageTranslatedDraw(
         IGuestCompiledShader pixelShader,

@@ -57,4 +57,55 @@ public sealed class Gen5ShaderScalarEvaluatorTests
         Assert.Equal(0u, evaluation.ScalarRegisters[18]);
         Assert.Equal(0u, evaluation.ScalarRegisters[19]);
     }
+
+    [Fact]
+    public void DeferredVertexDescriptor_DecodesLiveLayout()
+    {
+        const ulong baseAddress = 0x1234_5678_9ABC;
+        const uint stride = 16;
+        const uint records = 37;
+        // Unified FORMAT 5 is R8_UINT (data format 1, number format 4).
+        uint[] words =
+        [
+            unchecked((uint)baseAddress),
+            unchecked((uint)(baseAddress >> 32)) | stride << 16,
+            records,
+            5u << 12,
+        ];
+
+        Assert.True(
+            Gen5ShaderScalarEvaluator.TryDecodeDeferredVertexDescriptor(
+                words,
+                out var decodedAddress,
+                out var decodedStride,
+                out var decodedSize,
+                out var dataFormat,
+                out var numberFormat));
+        Assert.Equal(baseAddress, decodedAddress);
+        Assert.Equal(stride, decodedStride);
+        Assert.Equal((ulong)stride * records, decodedSize);
+        Assert.Equal(1u, dataFormat);
+        Assert.Equal(4u, numberFormat);
+    }
+
+    [Fact]
+    public void DeferredVertexDescriptor_RejectsNonBufferResource()
+    {
+        uint[] words =
+        [
+            0x1000,
+            16u << 16,
+            4,
+            (5u << 12) | (1u << 30),
+        ];
+
+        Assert.False(
+            Gen5ShaderScalarEvaluator.TryDecodeDeferredVertexDescriptor(
+                words,
+                out _,
+                out _,
+                out _,
+                out _,
+                out _));
+    }
 }

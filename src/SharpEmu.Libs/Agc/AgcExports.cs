@@ -147,6 +147,9 @@ public static partial class AgcExports
     private const uint Gen5TextureFormatR16G16B16A16Float = 12;
     private const uint Gen5TextureType1D = 8;
     private const uint Gen5TextureType2D = 9;
+    private const uint Gen5TextureType3D = 10;
+    private const uint Gen5TextureType2DArray = 13;
+    private const uint MaxVolumeTextureDepth = 2048;
     private const ulong MaxPresentedTextureBytes = 128UL * 1024UL * 1024UL;
     private const ulong VideoOutPixelFormatA8R8G8B8Srgb = 0x80000000;
     private const ulong VideoOutPixelFormatA8B8G8R8Srgb = 0x80002200;
@@ -227,6 +230,10 @@ public static partial class AgcExports
     private static readonly ConcurrentDictionary<
         (ulong Es, ulong State, ulong AliasAlignment),
         IGuestCompiledShader> _depthOnlyVertexShaderCache = new();
+    private static readonly ConcurrentDictionary<
+        (ulong Es, ulong State, ulong Layout, int GlobalBuffers, int ImageBase,
+         int ScalarBuffer, int Outputs, ulong AliasAlignment),
+        IGuestCompiledShader> _deferredVertexShaderCache = new();
     private static readonly Dictionary<ulong, ulong> _shaderHeadersByCode = new();
     private static readonly bool _traceAgc = string.Equals(
         Environment.GetEnvironmentVariable("SHARPEMU_LOG_AGC"),
@@ -447,7 +454,9 @@ public static partial class AgcExports
         uint RawBlendControl,
         uint RawColorInfo,
         IReadOnlyList<uint> PixelInitialScalars,
-        IReadOnlyList<uint> VertexInitialScalars);
+        IReadOnlyList<uint> VertexInitialScalars,
+        Func<IReadOnlyList<GuestVertexBuffer>, IGuestCompiledShader?>?
+            DeferredVertexCompiler = null);
 
     private sealed record TranslatedImageBinding(
         TextureDescriptor Descriptor,
@@ -3804,7 +3813,8 @@ public static partial class AgcExports
                         vertexBuffers,
                         pendingComposite.RenderState,
                         pendingComposite.DepthTarget,
-                        pendingComposite.PixelShaderAddress);
+                        pendingComposite.PixelShaderAddress,
+                        pendingComposite.DeferredVertexCompiler);
                     TraceAgcShader(
                         $"agc.deferred_composite ps=0x{pendingComposite.PixelShaderAddress:X16} " +
                         $"src=0x{pendingComposite.Textures.FirstOrDefault()?.Descriptor.Address ?? 0:X16} " +
@@ -6165,7 +6175,8 @@ public static partial class AgcExports
                 depthOnlyDraw.IndexBuffer,
                 vertexBuffers,
                 renderState,
-                depthOnlyDraw.PixelShaderAddress);
+                depthOnlyDraw.PixelShaderAddress,
+                depthOnlyDraw.DeferredVertexCompiler);
 
             if (_traceAgcShader)
             {
@@ -6310,7 +6321,8 @@ public static partial class AgcExports
                     sharedVertexBuffers,
                     translatedDraw.RenderState,
                     translatedDraw.DepthTarget,
-                    translatedDraw.PixelShaderAddress);
+                    translatedDraw.PixelShaderAddress,
+                    translatedDraw.DeferredVertexCompiler);
             }
             else
             {
@@ -6351,7 +6363,8 @@ public static partial class AgcExports
                         translatedDraw.IndexBuffer,
                         vertexBuffers,
                         renderState,
-                        translatedDraw.PixelShaderAddress);
+                        translatedDraw.PixelShaderAddress,
+                        translatedDraw.DeferredVertexCompiler);
                 }
                 else
                 {
@@ -6963,6 +6976,15 @@ public static partial class AgcExports
         }
         IReadOnlyList<Gen5VertexInputBinding> vertexInputs =
             exportEvaluation.VertexInputs ?? [];
+        var deferredVertexCompiler = CreateDeferredVertexCompiler(
+            exportShaderAddress,
+            exportStateFingerprint,
+            exportState,
+            exportEvaluation,
+            totalGlobalBuffers,
+            pixelEvaluation.ImageBindings.Count,
+            _bakeScalars ? -1 : guestGlobalBuffers + 1,
+            requiredVertexOutputCount);
         state.UcRegisters.TryGetValue(VgtPrimitiveType, out var primitiveType);
         var guestTargets = new GuestRenderTarget[renderTargets.Length];
         for (var index = 0; index < renderTargets.Length; index++)
@@ -7011,7 +7033,8 @@ public static partial class AgcExports
                 ? rawInfo
                 : 0,
             pixelEvaluation.InitialScalarRegisters,
-            exportEvaluation.InitialScalarRegisters);
+            exportEvaluation.InitialScalarRegisters,
+            deferredVertexCompiler);
         return true;
     }
 
@@ -7203,7 +7226,12 @@ public static partial class AgcExports
         if (ctx.Memory.TryRead(address, span) ||
             KernelMemoryCompatExports.TryReadTrackedLibcHeap(address, span))
         {
-            return new GuestIndexBuffer(data, byteCount, is32Bit, Pooled: true);
+            return new GuestIndexBuffer(
+                data,
+                byteCount,
+                is32Bit,
+                Pooled: true,
+                GuestAddress: address);
         }
 
         GuestDataPool.Shared.Return(data);
@@ -8392,10 +8420,104 @@ public static partial class AgcExports
                 binding.OffsetBytes,
                 binding.Data,
                 binding.DataLength,
-                binding.DataPooled);
+                binding.DataPooled,
+                binding.DeferredDescriptorAddress);
         }
 
         return buffers;
+    }
+
+    private static Func<IReadOnlyList<GuestVertexBuffer>, IGuestCompiledShader?>?
+        CreateDeferredVertexCompiler(
+            ulong shaderAddress,
+            ulong stateFingerprint,
+            Gen5ShaderState state,
+            Gen5ShaderEvaluation evaluation,
+            int totalGlobalBufferCount,
+            int imageBindingBase,
+            int scalarRegisterBufferIndex,
+            int requiredVertexOutputCount)
+    {
+        if (evaluation.VertexInputs is not { Count: > 0 } vertexInputs ||
+            !vertexInputs.Any(static input => input.DeferredDescriptorAddress != 0))
+        {
+            return null;
+        }
+
+        return resolvedBuffers =>
+        {
+            if (resolvedBuffers.Count != vertexInputs.Count)
+            {
+                return null;
+            }
+
+            const ulong offsetBasis = 14695981039346656037UL;
+            const ulong prime = 1099511628211UL;
+            var layout = offsetBasis;
+            var updatedInputs = new Gen5VertexInputBinding[vertexInputs.Count];
+            for (var index = 0; index < vertexInputs.Count; index++)
+            {
+                var input = vertexInputs[index];
+                var resolved = resolvedBuffers[index];
+                updatedInputs[index] = input with
+                {
+                    DataFormat = resolved.DataFormat,
+                    NumberFormat = resolved.NumberFormat,
+                    BaseAddress = resolved.BaseAddress,
+                    Stride = resolved.Stride,
+                    OffsetBytes = resolved.OffsetBytes,
+                    DeferredDescriptorAddress = 0,
+                };
+                layout = (layout ^ resolved.Location) * prime;
+                layout = (layout ^ resolved.ComponentCount) * prime;
+                layout = (layout ^ resolved.DataFormat) * prime;
+                layout = (layout ^ resolved.NumberFormat) * prime;
+            }
+
+            var cacheKey = (
+                shaderAddress,
+                stateFingerprint,
+                layout,
+                totalGlobalBufferCount,
+                imageBindingBase,
+                scalarRegisterBufferIndex,
+                requiredVertexOutputCount,
+                VulkanVideoPresenter.GuestStorageBufferOffsetAlignment);
+            if (_deferredVertexShaderCache.TryGetValue(cacheKey, out var cached))
+            {
+                return cached;
+            }
+
+            var refreshedEvaluation = evaluation with
+            {
+                VertexInputs = updatedInputs,
+            };
+            if (!GuestGpu.Current.TryCompileVertexShader(
+                    state,
+                    refreshedEvaluation,
+                    out var shader,
+                    out var error,
+                    globalBufferBase: 0,
+                    totalGlobalBufferCount: totalGlobalBufferCount,
+                    imageBindingBase: imageBindingBase,
+                    scalarRegisterBufferIndex: scalarRegisterBufferIndex,
+                    requiredVertexOutputCount: requiredVertexOutputCount,
+                    storageBufferOffsetAlignment:
+                        VulkanVideoPresenter.GuestStorageBufferOffsetAlignment))
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][WARN] agc.deferred_vertex_compile_failed " +
+                    $"es=0x{shaderAddress:X16} layout=0x{layout:X16} error={error}");
+                return null;
+            }
+
+            VulkanVideoPresenter.CountSpirvCompilation();
+            _deferredVertexShaderCache.TryAdd(cacheKey, shader!);
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] agc.deferred_vertex_compiled " +
+                $"es=0x{shaderAddress:X16} layout=0x{layout:X16}");
+            return shader;
+        };
     }
 
     private static IReadOnlyList<GuestVertexBuffer>
@@ -8485,15 +8607,38 @@ public static partial class AgcExports
         }
 
         var linear = new byte[logicalByteCount];
-        return GnmTiling.TryDetile(
-            source,
-            linear,
-            descriptor.TileMode,
-            elementsWide,
-            elementsHigh,
-            bytesPerElement)
-            ? linear
-            : null;
+        var depth = Math.Max(descriptor.Depth, 1u);
+        var logicalSliceBytes = checked(elementsWide * elementsHigh * bytesPerElement);
+        if (!GnmTiling.TryGetTiledByteCount(
+                descriptor.TileMode,
+                elementsWide,
+                elementsHigh,
+                bytesPerElement,
+                out var tiledSliceBytes) ||
+            tiledSliceBytes > int.MaxValue)
+        {
+            return null;
+        }
+
+        for (uint slice = 0; slice < depth; slice++)
+        {
+            var sourceOffset = checked((int)(slice * tiledSliceBytes));
+            var destinationOffset = checked((int)(slice * (ulong)logicalSliceBytes));
+            if (sourceOffset + (int)tiledSliceBytes > source.Length ||
+                destinationOffset + logicalSliceBytes > linear.Length ||
+                !GnmTiling.TryDetile(
+                    source.AsSpan(sourceOffset, (int)tiledSliceBytes),
+                    linear.AsSpan(destinationOffset, logicalSliceBytes),
+                    descriptor.TileMode,
+                    elementsWide,
+                    elementsHigh,
+                    bytesPerElement))
+            {
+                return null;
+            }
+        }
+
+        return linear;
     }
 
     private static void TraceTextureFallback(TextureDescriptor descriptor, string reason)
@@ -8515,6 +8660,10 @@ public static partial class AgcExports
             $"dst=0x{descriptor.DstSelect:X3}");
     }
 
+    private static bool IsBindableTextureType(in TextureDescriptor descriptor) =>
+        descriptor.Type is Gen5TextureType1D or Gen5TextureType2D or Gen5TextureType3D ||
+        descriptor.Type == Gen5TextureType2DArray && descriptor.BaseArray == 0;
+
     private static bool TryCreateGuestDrawTexture(
         CpuContext ctx,
         TextureDescriptor descriptor,
@@ -8524,12 +8673,12 @@ public static partial class AgcExports
         out GuestDrawTexture texture)
     {
         texture = default!;
-        if ((descriptor.Type != Gen5TextureType1D &&
-             descriptor.Type != Gen5TextureType2D) ||
+        if (!IsBindableTextureType(descriptor) ||
             descriptor.Width == 0 ||
             descriptor.Height == 0 ||
             descriptor.Width > 8192 ||
-            descriptor.Height > 8192)
+            descriptor.Height > 8192 ||
+            descriptor.Depth > MaxVolumeTextureDepth)
         {
             TraceTextureFallback(descriptor, "invalid-descriptor");
             texture = CreateFallbackGuestDrawTexture(isStorage, descriptor.Format, descriptor.NumberType);
@@ -8542,10 +8691,13 @@ public static partial class AgcExports
                 descriptor.Height,
                 descriptor.Format)
             : descriptor.Width;
-        var sourceByteCount = GetTextureByteCount(
-            descriptor.Format,
-            sourceWidth,
-            descriptor.Height);
+        var depth = Math.Max(descriptor.Depth, 1u);
+        var sourceByteCount = checked(
+            GetTextureByteCount(
+                descriptor.Format,
+                sourceWidth,
+                descriptor.Height) *
+            depth);
         if (sourceByteCount == 0 ||
             sourceByteCount > MaxPresentedTextureBytes ||
             sourceByteCount > int.MaxValue)
@@ -8572,7 +8724,7 @@ public static partial class AgcExports
                 bytesPerElement,
                 out var tiledByteCount))
         {
-            physicalSourceByteCount = tiledByteCount;
+            physicalSourceByteCount = checked(tiledByteCount * depth);
         }
 
         if (physicalSourceByteCount > MaxPresentedTextureBytes ||
@@ -8605,7 +8757,8 @@ public static partial class AgcExports
                 Pitch: sourceWidth,
                 TileMode: descriptor.TileMode,
                 DstSelect: descriptor.DstSelect,
-                Sampler: ToGuestSampler(samplerDescriptor));
+                Sampler: ToGuestSampler(samplerDescriptor),
+                Depth: descriptor.Depth);
             return true;
         }
 
@@ -8678,7 +8831,8 @@ public static partial class AgcExports
                 Pitch: sourceWidth,
                 TileMode: descriptor.TileMode,
                 DstSelect: descriptor.DstSelect,
-                Sampler: ToGuestSampler(samplerDescriptor));
+                Sampler: ToGuestSampler(samplerDescriptor),
+                Depth: descriptor.Depth);
             return true;
         }
 
@@ -8704,7 +8858,8 @@ public static partial class AgcExports
                     descriptor.DstSelect,
                     descriptor.TileMode,
                     sourceWidth,
-                    sampler)))
+                    sampler,
+                    descriptor.Depth)))
         {
             texture = new GuestDrawTexture(
                 descriptor.Address,
@@ -8722,7 +8877,8 @@ public static partial class AgcExports
                 Pitch: sourceWidth,
                 TileMode: descriptor.TileMode,
                 DstSelect: descriptor.DstSelect,
-                Sampler: sampler);
+                Sampler: sampler,
+                Depth: descriptor.Depth);
             return true;
         }
 
@@ -8782,7 +8938,8 @@ public static partial class AgcExports
             Pitch: sourceWidth,
             TileMode: descriptor.TileMode,
             DstSelect: descriptor.DstSelect,
-            Sampler: ToGuestSampler(samplerDescriptor));
+            Sampler: ToGuestSampler(samplerDescriptor),
+            Depth: descriptor.Depth);
         return true;
     }
 

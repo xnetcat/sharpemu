@@ -152,7 +152,9 @@ internal sealed class VulkanGuestGpuBackend : IGuestGpuBackend
         uint primitiveType = 4,
         GuestIndexBuffer? indexBuffer = null,
         IReadOnlyList<GuestVertexBuffer>? vertexBuffers = null,
-        GuestRenderState? renderState = null) =>
+        GuestRenderState? renderState = null,
+        Func<IReadOnlyList<GuestVertexBuffer>, IGuestCompiledShader?>?
+            deferredVertexCompiler = null) =>
         VulkanVideoPresenter.SubmitTranslatedDraw(
             Spirv(pixelShader),
             textures,
@@ -166,7 +168,8 @@ internal sealed class VulkanGuestGpuBackend : IGuestGpuBackend
             primitiveType,
             indexBuffer,
             vertexBuffers,
-            renderState);
+            renderState,
+            ToSpirvCompiler(deferredVertexCompiler));
 
     public void SubmitDepthOnlyTranslatedDraw(
         IGuestCompiledShader pixelShader,
@@ -181,7 +184,9 @@ internal sealed class VulkanGuestGpuBackend : IGuestGpuBackend
         GuestIndexBuffer? indexBuffer = null,
         IReadOnlyList<GuestVertexBuffer>? vertexBuffers = null,
         GuestRenderState? renderState = null,
-        ulong shaderAddress = 0) =>
+        ulong shaderAddress = 0,
+        Func<IReadOnlyList<GuestVertexBuffer>, IGuestCompiledShader?>?
+            deferredVertexCompiler = null) =>
         VulkanVideoPresenter.SubmitDepthOnlyTranslatedDraw(
             Spirv(pixelShader),
             textures,
@@ -195,7 +200,8 @@ internal sealed class VulkanGuestGpuBackend : IGuestGpuBackend
             indexBuffer,
             vertexBuffers,
             renderState,
-            shaderAddress);
+            shaderAddress,
+            ToSpirvCompiler(deferredVertexCompiler));
 
     public void SubmitOffscreenTranslatedDraw(
         IGuestCompiledShader pixelShader,
@@ -211,7 +217,9 @@ internal sealed class VulkanGuestGpuBackend : IGuestGpuBackend
         IReadOnlyList<GuestVertexBuffer>? vertexBuffers = null,
         GuestRenderState? renderState = null,
         GuestDepthTarget? depthTarget = null,
-        ulong shaderAddress = 0) =>
+        ulong shaderAddress = 0,
+        Func<IReadOnlyList<GuestVertexBuffer>, IGuestCompiledShader?>?
+            deferredVertexCompiler = null) =>
         VulkanVideoPresenter.SubmitOffscreenTranslatedDraw(
             Spirv(pixelShader),
             textures,
@@ -226,7 +234,8 @@ internal sealed class VulkanGuestGpuBackend : IGuestGpuBackend
             vertexBuffers,
             renderState,
             depthTarget,
-            shaderAddress);
+            shaderAddress,
+            ToSpirvCompiler(deferredVertexCompiler));
 
     public void SubmitStorageTranslatedDraw(
         IGuestCompiledShader pixelShader,
@@ -406,4 +415,14 @@ internal sealed class VulkanGuestGpuBackend : IGuestGpuBackend
             ? vulkanShader.Spirv
             : throw new InvalidOperationException(
                 $"shader handle of type {shader.GetType().Name} was not compiled by the Vulkan backend");
+
+    private static Func<IReadOnlyList<GuestVertexBuffer>, byte[]?>? ToSpirvCompiler(
+        Func<IReadOnlyList<GuestVertexBuffer>, IGuestCompiledShader?>? compiler) =>
+        compiler is null
+            ? null
+            : buffers =>
+            {
+                var shader = compiler(buffers);
+                return shader is null ? null : Spirv(shader);
+            };
 }
