@@ -10,6 +10,23 @@ namespace SharpEmu.Libs.Tests.VideoOut;
 
 public sealed class VulkanDescriptorChainTests
 {
+    [Theory]
+    [InlineData(true, false, true)]
+    [InlineData(false, false, false)]
+    [InlineData(true, true, true)]
+    [InlineData(false, true, true)]
+    public void SnapshotRefreshPolicy(
+        bool mappedAllZero,
+        bool refreshAll,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            VulkanVideoPresenter.ShouldRefreshSnapshotBuffer(
+                mappedAllZero,
+                refreshAll));
+    }
+
     [Fact]
     public void ResolvesMultiplePointerLoadsAndMasksBufferDescriptorStride()
     {
