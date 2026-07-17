@@ -3128,55 +3128,27 @@ public static partial class AgcExports
         SubmittedDcbState state,
         ulong submissionId)
     {
-        var isGraphics = ReferenceEquals(state, gpuState.Graphics);
-        if ((!isGraphics && !_compatibilitySubmitCompletionEvent) ||
+        if (!_compatibilitySubmitCompletionEvent ||
+            ReferenceEquals(state, gpuState.Graphics) ||
             state.CompletionEventNotifiedSubmissionId == submissionId)
         {
             return;
         }
 
         state.CompletionEventNotifiedSubmissionId = submissionId;
-        if (!isGraphics)
-        {
-            var completionEventId = state.CompletionEventId;
-            void QueueCompletionEvent() =>
-                EnqueueCompletionEvent(submissionId, completionEventId);
+        var completionEventId = state.CompletionEventId;
+        void QueueCompletionEvent() =>
+            EnqueueCompletionEvent(submissionId, completionEventId);
 
-            if (VulkanVideoPresenter.SubmitOrderedGuestAction(
-                    QueueCompletionEvent,
-                    $"agc completion event submission={submissionId} event=0x{completionEventId:X}") == 0)
-            {
-                QueueCompletionEvent();
-            }
-
-            return;
-        }
-
-        void TriggerCompletionEvents()
-        {
-            var triggered = KernelEventQueueCompatExports.TriggerRegisteredEvents(
-                ident: 0,
-                KernelEventQueueCompatExports.KernelEventFilterGraphics,
-                data: 0);
-            if (_compatibilitySubmitCompletionEvent)
-            {
-                triggered += KernelEventQueueCompatExports.TriggerRegisteredEventsDistinct(
-                    KernelEventQueueCompatExports.KernelEventFilterGraphics);
-            }
-            TraceAgc(
-                $"agc.driver_submit_dcb completion submission={submissionId} " +
-                $"queues={triggered}");
-        }
-
-        // A DCB is complete only after its translated Vulkan work and ordered
-        // guest-memory writes have finished. Put the notification on that same
-        // logical graphics queue instead of approximating completion with a
-        // timer, which can wake Unity while its upload data is still stale.
+        // Parsing a compute DCB only schedules its work and CPU-visible PM4
+        // writes. Deliver the compatibility interrupt on the same ordered
+        // stream so all label writebacks are visible first. Graphics DCBs use
+        // their real interrupt-bearing RELEASE_MEM packets instead.
         if (VulkanVideoPresenter.SubmitOrderedGuestAction(
-                TriggerCompletionEvents,
-                $"agc submit completion {submissionId}") == 0)
+                QueueCompletionEvent,
+                $"agc completion event submission={submissionId} event=0x{completionEventId:X}") == 0)
         {
-            TriggerCompletionEvents();
+            QueueCompletionEvent();
         }
     }
 
@@ -3396,22 +3368,13 @@ public static partial class AgcExports
                 TryReadUInt32(ctx, currentAddress + sizeof(uint), out var eventTypeRaw))
             {
                 var eventType = eventTypeRaw & 0x3Fu;
-                SubmitOrderedGpuSideEffect(
-                    ctx,
-                    gpuState,
-                    state,
-                    () =>
-                    {
-                        var triggered = KernelEventQueueCompatExports.TriggerRegisteredEventsByFilter(
-                            KernelEventQueueCompatExports.KernelEventFilterGraphics,
-                            eventType);
-                        if (tracePackets)
-                        {
-                            TraceAgc($"agc.dcb.event type=0x{eventType:X2} queues={triggered}");
-                        }
-                    },
-                    $"event_write type=0x{eventType:X2}",
-                    currentAddress);
+                // EVENT_WRITE carries a GPU pipeline/cache event, not a
+                // kernel event-queue identifier. Treating common cache events
+                // as CPU interrupts floods the guest RHI completion thread.
+                if (tracePackets)
+                {
+                    TraceAgc($"agc.dcb.event type=0x{eventType:X2}");
+                }
             }
 
             if (op == ItNop && register == RReleaseMem && length >= 7)
@@ -5554,14 +5517,21 @@ public static partial class AgcExports
             !TryReadUInt32(ctx, packetAddress + 12, out var destinationLo) ||
             !TryReadUInt32(ctx, packetAddress + 16, out var destinationHi) ||
             !TryReadUInt32(ctx, packetAddress + 20, out var dataLo) ||
-            !TryReadUInt32(ctx, packetAddress + 24, out var dataHi))
+            !TryReadUInt32(ctx, packetAddress + 24, out var dataHi) ||
+            !TryReadUInt32(ctx, packetAddress + 28, out var interruptContextId))
         {
             return;
         }
 
         var dataSelection = (control >> 16) & 0xFFu;
+        var interrupt = (control >> 24) & 0xFFu;
         var destinationAddress = ((ulong)destinationHi << 32) | destinationLo;
         var data = ((ulong)dataHi << 32) | dataLo;
+        var submissionId = state.ActiveSubmissionId;
+        if (interrupt != 0)
+        {
+            state.CompletionEventNotifiedSubmissionId = submissionId;
+        }
         var writeLength = dataSelection switch
         {
             1 => (ulong)sizeof(uint),
@@ -5592,7 +5562,15 @@ public static partial class AgcExports
                 {
                     TraceAgc(
                         $"agc.dcb.release_mem dst=0x{destinationAddress:X16} " +
-                        $"data_sel={dataSelection} data=0x{data:X16} wrote={wroteData}");
+                        $"data_sel={dataSelection} data=0x{data:X16} wrote={wroteData} " +
+                        $"interrupt={interrupt} interrupt_context=0x{interruptContextId:X8}");
+                }
+
+                // The interrupt is the graphics-completion edge and must be
+                // delivered after this packet's status-label write.
+                if (interrupt != 0)
+                {
+                    EnqueueCompletionEvent(submissionId, state.CompletionEventId);
                 }
             },
             $"release_mem dst=0x{destinationAddress:X16} data=0x{data:X16}",
