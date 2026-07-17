@@ -18,6 +18,7 @@ public sealed partial class DirectExecutionBackend
 	private const ulong LazyCommitWindowBytes = 0x0200_0000UL;
 	private static int _lazyCommitTraceCount;
 	private static int _guestAllocatorHoleRecoveries;
+	private static int _guestAllocatorFreeListRecoveries;
 	private static int _auxiliaryThreadExecuteFaultRecoveries;
 
 	private unsafe void SetupExceptionHandler()
@@ -125,6 +126,11 @@ public sealed partial class DirectExecutionBackend
 			}
 			if (exceptionCode == 3221225477u &&
 				TryRecoverGuestAllocatorHole(exceptionRecord, contextRecord, rip))
+			{
+				return -1;
+			}
+			if (exceptionCode == 3221225477u &&
+				TryRecoverGuestAllocatorFreeListCorruption(exceptionRecord, contextRecord, rip))
 			{
 				return -1;
 			}
@@ -525,6 +531,109 @@ public sealed partial class DirectExecutionBackend
 		}
 
 		return true;
+	}
+
+	private unsafe static bool TryRecoverGuestAllocatorFreeListCorruption(
+		EXCEPTION_RECORD* exceptionRecord,
+		void* contextRecord,
+		ulong rip)
+	{
+		if (string.Equals(
+				Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_GUEST_ALLOCATOR_FREELIST_RECOVERY"),
+				"1",
+				StringComparison.Ordinal) ||
+			exceptionRecord->NumberParameters < 2)
+		{
+			return false;
+		}
+
+		ulong accessType = exceptionRecord->ExceptionInformation[0];
+		ulong faultAddress = exceptionRecord->ExceptionInformation[1];
+		ulong freeListHead = ReadCtxU64(contextRecord, CTX_RCX);
+		ulong freeListSlot = ReadCtxU64(contextRecord, CTX_RSI);
+		byte[] code = new byte[GuestAllocatorFreeListPopSignature.Length];
+		if (!TryReadHostBytes(rip, code) ||
+			!IsGuestAllocatorFreeListPop(
+				code,
+				accessType,
+				faultAddress,
+				freeListHead,
+				freeListSlot))
+		{
+			return false;
+		}
+
+		if (VirtualQuery(
+				(void*)freeListSlot,
+				out var mbi,
+				(nuint)sizeof(MEMORY_BASIC_INFORMATION64)) == 0 ||
+			mbi.State != MEM_COMMIT ||
+			!IsWritableProtection(mbi.Protect) ||
+			freeListSlot > mbi.BaseAddress + mbi.RegionSize - 12)
+		{
+			return false;
+		}
+
+		// The allocator has already decremented this size class's count, but
+		// its head is no longer a mapped guest node. Discard the entire damaged
+		// chain and continue through the allocator's own slow path; returning
+		// the corrupt head would spread the bad pointer into another object.
+		*(ulong*)freeListSlot = 0;
+		*(uint*)(freeListSlot + 8) = 0;
+		const ulong allocatorSlowPathDelta = 0x14;
+		WriteCtxU64(contextRecord, CTX_RIP, rip + allocatorSlowPathDelta);
+
+		var recovery = Interlocked.Increment(ref _guestAllocatorFreeListRecoveries);
+		if (recovery <= 16 || (recovery & (recovery - 1)) == 0)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][WARN] Guest allocator free-list recovery #{recovery}: " +
+				$"head=0x{freeListHead:X16} slot=0x{freeListSlot:X16} " +
+				$"rip=0x{rip:X16} -> 0x{rip + allocatorSlowPathDelta:X16}");
+			Console.Error.Flush();
+		}
+
+		return true;
+	}
+
+	private static readonly byte[] GuestAllocatorFreeListPopSignature =
+	[
+		0x48, 0x8B, 0x01,       // mov rax, [rcx]
+		0x48, 0x89, 0x06,       // mov [rsi], rax
+		0x48, 0x89, 0xC8,       // mov rax, rcx
+		0x48, 0x83, 0xC4, 0x08, // add rsp, 8
+		0x5B,                   // pop rbx
+		0x41, 0x5E,             // pop r14
+		0x41, 0x5F,             // pop r15
+		0x5D,                   // pop rbp
+		0xC3,                   // ret
+	];
+
+	internal static bool IsGuestAllocatorFreeListPop(
+		ReadOnlySpan<byte> code,
+		ulong accessType,
+		ulong faultAddress,
+		ulong freeListHead,
+		ulong freeListSlot) =>
+		accessType == 0 &&
+		faultAddress >= 0x10000 &&
+		faultAddress == freeListHead &&
+		freeListSlot >= 0x0000000800000000UL &&
+		(freeListSlot & 7) == 0 &&
+		code.SequenceEqual(GuestAllocatorFreeListPopSignature);
+
+	private static bool IsWritableProtection(uint protect)
+	{
+		if ((protect & PAGE_GUARD) != 0)
+		{
+			return false;
+		}
+
+		return (protect & 0xFF) is
+			PAGE_READWRITE or
+			0x08 or // PAGE_WRITECOPY
+			PAGE_EXECUTE_READWRITE or
+			PAGE_EXECUTE_WRITECOPY;
 	}
 
 	private static bool IsBenignHostDebugException(uint exceptionCode)
