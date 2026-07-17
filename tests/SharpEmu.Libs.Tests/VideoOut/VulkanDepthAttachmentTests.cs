@@ -67,6 +67,24 @@ public sealed class VulkanDepthAttachmentTests
     }
 
     [Theory]
+    [InlineData(1920u, 1080u, true)]
+    [InlineData(1280u, 720u, true)]
+    [InlineData(3840u, 2160u, false)]
+    [InlineData(1920u, 2160u, false)]
+    public void GuestDepthTarget_MustCoverColorRenderArea(
+        uint colorWidth,
+        uint colorHeight,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            VulkanVideoPresenter.GuestDepthCoversColorTarget(
+                Target,
+                colorWidth,
+                colorHeight));
+    }
+
+    [Theory]
     [InlineData(0x41u, true)]
     [InlineData(0x40u, false)]
     public void DepthState_DecodesRenderControlClearBit(
