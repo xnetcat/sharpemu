@@ -1345,6 +1345,12 @@ public sealed partial class DirectExecutionBackend
 			}
 		}
 
+		// Take the waiter overload, not the resume/wake delegate pair: only
+		// BlockWaiter is honoured when the thread is resumed, so registering
+		// handlers here parked the thread and then resumed it without ever
+		// running its resume handler -- the guest sailed on through a wait it
+		// believed had completed (a cond wait would return without reacquiring
+		// its mutex, then spin on EPERM forever).
 		var consumedThreadBlock = GuestThreadExecution.TryConsumeCurrentThreadBlock(
 				out var blockReason,
 				out var blockContinuation,
