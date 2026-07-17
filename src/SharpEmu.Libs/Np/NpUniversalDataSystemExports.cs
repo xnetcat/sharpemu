@@ -141,6 +141,41 @@ public static class NpUniversalDataSystemExports
     }
 
     [SysAbiExport(
+        Nid = "4llLk7YJRTE",
+        ExportName = "sceNpUniversalDataSystemEventPropertyArraySetString",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNpUniversalDataSystem")]
+    public static int NpUniversalDataSystemEventPropertyArraySetString(CpuContext ctx)
+    {
+        // The PC SDK exposes (array, value), while the console SDK revision
+        // used by Silent Hill passes a leading context followed by
+        // (array, index, value). Probe the console form first, but do not use
+        // a merely nonzero rcx as the discriminator because unused SysV
+        // argument registers are caller-clobbered.
+        Span<byte> probe = stackalloc byte[1];
+        var consoleArrayAddress = ctx[CpuRegister.Rsi];
+        var consoleValueAddress = ctx[CpuRegister.Rcx];
+        if (consoleArrayAddress != 0 && consoleValueAddress != 0 &&
+            ctx.Memory.TryRead(consoleArrayAddress, probe) &&
+            ctx.Memory.TryRead(consoleValueAddress, probe))
+        {
+            return ctx.SetReturn(0, typeof(long));
+        }
+
+        var propertyArrayAddress = ctx[CpuRegister.Rdi];
+        var valueAddress = ctx[CpuRegister.Rsi];
+        if (propertyArrayAddress == 0 || valueAddress == 0)
+        {
+            return ctx.SetReturn(NpUniversalDataSystemErrorInvalidArgument, typeof(long));
+        }
+
+        return ctx.Memory.TryRead(propertyArrayAddress, probe) &&
+               ctx.Memory.TryRead(valueAddress, probe)
+            ? ctx.SetReturn(0, typeof(long))
+            : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT, typeof(long));
+    }
+
+    [SysAbiExport(
         Nid = "Wxbg5x3pTXA",
         ExportName = "sceNpUniversalDataSystemEventPropertyObjectSetArray",
         Target = Generation.Gen4 | Generation.Gen5,
