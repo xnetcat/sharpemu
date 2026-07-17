@@ -1719,6 +1719,11 @@ internal static unsafe class VulkanVideoPresenter
     internal static void AttachGuestMemory(SharpEmu.HLE.ICpuMemory memory) =>
         _guestMemory = memory;
 
+    internal static bool ShouldRefreshSnapshotBuffer(
+        bool mappedAllZero,
+        bool refreshAll) =>
+        mappedAllZero || refreshAll;
+
     internal static bool IsTextureContentCached(in TextureContentIdentity identity) =>
         _cachedTextureIdentities.ContainsKey(identity);
 
@@ -4677,6 +4682,14 @@ internal static unsafe class VulkanVideoPresenter
         private bool _batchOpen;
         private int _batchDrawCount;
         private readonly List<TranslatedDrawResources> _batchResources = new();
+        // Per-frame constants can be populated after command parsing and even
+        // after draw resources are built. Refreshing at batch flush gives the
+        // host shader the execution-time bytes a real GPU would fetch.
+        private static readonly bool _refreshAllSnapshotBuffers = !string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_REFRESH_ALL_CB_SNAPSHOTS"),
+            "0",
+            StringComparison.Ordinal);
+        private long _snapshotBufferRefreshCount;
         private readonly List<GuestImageResource> _batchTraceImages = new();
 
         // Consecutive draws into the same target stay inside one render pass:
@@ -4751,6 +4764,7 @@ internal static unsafe class VulkanVideoPresenter
 
             CloseOpenTranslatedRenderPass();
             _batchOpen = false;
+            RefreshSnapshotBuffers(_batchResources);
             try
             {
                 Check(_vk.EndCommandBuffer(_batchCommandBuffer), "vkEndCommandBuffer(batch)");
@@ -4785,6 +4799,82 @@ internal static unsafe class VulkanVideoPresenter
                 _batchTraceImages.Clear();
                 _batchRetireBuffers.Clear();
                 _batchCommandBuffer = default;
+            }
+        }
+
+        private void RefreshSnapshotBuffers(
+            IReadOnlyList<TranslatedDrawResources> batchResources)
+        {
+            var candidates = new List<GlobalBufferResource>();
+            var seen = new HashSet<(nint Mapped, ulong Size)>();
+            foreach (var resources in batchResources)
+            {
+                foreach (var buffer in resources.GlobalMemoryBuffers)
+                {
+                    if (buffer.Allocation is null ||
+                        buffer.Writable ||
+                        buffer.BaseAddress == 0 ||
+                        buffer.Mapped == 0 ||
+                        buffer.GuestSize == 0 ||
+                        buffer.GuestSize > 65536 ||
+                        buffer.GuestSize > int.MaxValue ||
+                        !seen.Add((buffer.Mapped, buffer.GuestSize)))
+                    {
+                        continue;
+                    }
+
+                    var mapped = new ReadOnlySpan<byte>(
+                        (void*)buffer.Mapped,
+                        checked((int)buffer.GuestSize));
+                    if (!VulkanVideoPresenter.ShouldRefreshSnapshotBuffer(
+                            mapped.IndexOfAnyExcept((byte)0) < 0,
+                            _refreshAllSnapshotBuffers))
+                    {
+                        continue;
+                    }
+
+                    var live = new byte[mapped.Length];
+                    if (_guestMemory?.TryRead(buffer.BaseAddress, live) == true &&
+                        live.AsSpan().IndexOfAnyExcept((byte)0) >= 0 &&
+                        !live.AsSpan().SequenceEqual(mapped))
+                    {
+                        candidates.Add(buffer);
+                    }
+                }
+            }
+
+            if (candidates.Count == 0)
+            {
+                return;
+            }
+
+            // These buffers come from the cross-queue shared read-only pool.
+            // HOST_COHERENT does not make a mapped CPU write legal while an
+            // earlier shader may still read the allocation, so retire prior
+            // readers once before publishing the refreshed batch snapshots.
+            WaitForAllGuestSubmissionsForCpuVisibility();
+            foreach (var buffer in candidates)
+            {
+                var live = new byte[checked((int)buffer.GuestSize)];
+                if (_guestMemory?.TryRead(buffer.BaseAddress, live) != true ||
+                    live.AsSpan().IndexOfAnyExcept((byte)0) < 0)
+                {
+                    continue;
+                }
+
+                var mapped = new Span<byte>((void*)buffer.Mapped, live.Length);
+                if (live.AsSpan().SequenceEqual(mapped))
+                {
+                    continue;
+                }
+
+                live.CopyTo(mapped);
+                if (Interlocked.Increment(ref _snapshotBufferRefreshCount) <= 64)
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] vk.snapshot_buffer_refreshed " +
+                        $"base=0x{buffer.BaseAddress:X16} bytes={live.Length}");
+                }
             }
         }
 
