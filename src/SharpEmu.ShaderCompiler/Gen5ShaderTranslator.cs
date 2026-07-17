@@ -452,24 +452,6 @@ public static class Gen5ShaderTranslator
                     out var sizeDwords,
                     out error))
             {
-                var context = new List<string>();
-                for (var relativeDword = -2; relativeDword <= 2; relativeDword++)
-                {
-                    var relativeBytes = relativeDword * sizeof(uint);
-                    if (relativeBytes < 0 && pc < (uint)-relativeBytes)
-                    {
-                        continue;
-                    }
-
-                    var contextPc = unchecked((uint)(pc + relativeBytes));
-                    if (TryReadUInt32(ctx, address + contextPc, out var contextWord))
-                    {
-                        context.Add($"{contextPc:X}:{contextWord:X8}");
-                    }
-                }
-
-                error = $"{error} pc=0x{pc:X} word=0x{word:X8} " +
-                    $"context={string.Join(',', context)}";
                 return false;
             }
 
@@ -590,6 +572,22 @@ public static class Gen5ShaderTranslator
                 _ => Gen5ShaderEncoding.Sop2,
             };
             return DecodeSop(word, out name, out sizeDwords, out error);
+        }
+
+        // gfx10 moved VOP3P (packed 16-bit math) to its own 0b110011000 prefix
+        // (word0 top byte 0xCC), separate from the VOP3 block. Match the full
+        // 9-bit prefix here, before the coarse major-opcode switch, so packed
+        // instructions are not misread as one of the neighbouring encodings.
+        if ((word & 0xFF800000u) == 0xCC000000u)
+        {
+            encoding = Gen5ShaderEncoding.Vop3p;
+            if (!ctx.TryReadUInt32(baseAddress + pc + sizeof(uint), out var vop3pExtra))
+            {
+                error = $"vop3p-extra-read-failed pc=0x{pc:X}";
+                return false;
+            }
+
+            return DecodeVop3p(word, vop3pExtra, out name, out sizeDwords, out error);
         }
 
         switch (word >> 26)

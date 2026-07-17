@@ -5,6 +5,11 @@ SPDX-License-Identifier: GPL-2.0-or-later
 
 # Contributing
 
+> [!IMPORTANT]
+> The pull request template is mandatory.
+>
+> Pull requests that do not follow the template or leave the required checklist incomplete will be closed without review, even if the proposed code is technically correct or beneficial. Please review these contribution guidelines before submitting a pull request.
+
 Contributions are always welcome!
 
 Before opening a pull request, please keep the following in mind:

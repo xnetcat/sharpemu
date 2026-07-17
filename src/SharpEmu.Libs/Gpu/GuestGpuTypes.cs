@@ -39,6 +39,21 @@ internal readonly record struct GuestSampler(
     uint Word2,
     uint Word3);
 
+/// <summary>Identity of a texture's content in a backend texture cache, keyed
+/// entirely on raw guest descriptor values; the AGC layer uses it to skip texel
+/// copies for content the backend already holds.</summary>
+internal readonly record struct TextureContentIdentity(
+    ulong Address,
+    uint Width,
+    uint Height,
+    uint Format,
+    uint NumberType,
+    uint DstSelect,
+    uint TileMode,
+    uint Pitch,
+    GuestSampler Sampler,
+    uint Depth = 1);
+
 internal sealed record GuestMemoryBuffer(
     ulong BaseAddress,
     byte[] Data,
@@ -127,12 +142,22 @@ internal readonly record struct GuestBlendState(
         WriteMask: 0xFu);
 }
 
+/// <summary>CB_BLEND_RED..ALPHA: the constant color referenced by the
+/// CONSTANT_COLOR / CONSTANT_ALPHA blend factors. One constant serves every
+/// render target of a draw; the hardware reset value is transparent black.</summary>
+internal readonly record struct GuestBlendConstant(
+    float Red,
+    float Green,
+    float Blue,
+    float Alpha);
+
 internal sealed record GuestRenderState(
     IReadOnlyList<GuestBlendState> Blends,
     GuestRect? Scissor,
     GuestViewport? Viewport,
     GuestRasterState Raster,
-    GuestDepthState Depth)
+    GuestDepthState Depth,
+    GuestBlendConstant BlendConstant = default)
 {
     public static GuestRenderState Default { get; } = new(
         [GuestBlendState.Default],

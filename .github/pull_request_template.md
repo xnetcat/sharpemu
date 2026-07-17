@@ -1,20 +1,27 @@
-<!--
-Copyright (C) 2026 SharpEmu Emulator Project
-SPDX-License-Identifier: GPL-2.0-or-later
--->
-
 ## Before submitting
 
 Please read our contribution guidelines before opening a pull request:
 
-➡️ [**CONTRIBUTING.md**](CONTRIBUTING.md)
+➡️ [**CONTRIBUTING.md**](https://github.com/sharpemu/sharpemu/blob/main/CONTRIBUTING.md)
 
 By opening this pull request, you confirm that you have read and agree to follow the contribution guidelines.
 
-## Checklist
-By submitting this PR, you confirm that:
+## Testing
 
-- [ ] I have read `CONTRIBUTING.md`.
-- [ ] I tested my changes.
-- [ ] I wrote this description myself and did not copy AI-generated explanations.
-- [ ] I listed the game(s) I tested, if applicable.
+If applicable, list the game(s) you tested and briefly describe the results.
+
+Example:
+
+- Demon's Souls (PPSA01341) – Boots to splash screen.
+- Dreaming Sarah – Save/load works correctly.
+
+If your changes do not affect runtime behavior (e.g. documentation, tooling, CI), write `N/A`.
+
+## Checklist
+
+By submitting this pull request, you confirm that:
+
+- [ ] I have read and followed `CONTRIBUTING.md`.
+- [ ] I tested my changes or marked the testing section as `N/A`.
+- [ ] I wrote this pull request description myself and did not paste AI-generated explanations.
+- [ ] I listed the game(s) I tested (or marked the testing section as `N/A`).

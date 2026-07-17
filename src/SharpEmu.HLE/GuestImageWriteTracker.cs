@@ -75,9 +75,33 @@ public static unsafe class GuestImageWriteTracker
         }
     }
 
-    // Snapshot array read lock-free from the signal handler; rebuilt on every
-    // mutation under the gate. Signal handlers must not take managed locks.
-    private static TrackedRange[] _rangeSnapshot = [];
+    /// <summary>Immutable snapshot read lock-free from the signal handler and
+    /// the managed-write pre-visit; rebuilt on every mutation under the gate
+    /// (signal handlers must not take managed locks). Carrying the overall
+    /// bounds inside the same object keeps the hot-path intersection test
+    /// consistent with the array it guards.</summary>
+    private sealed class RangeSnapshot
+    {
+        public static readonly RangeSnapshot Empty = new([]);
+
+        public readonly TrackedRange[] Ranges;
+        public readonly ulong Start;
+        public readonly ulong End;
+
+        public RangeSnapshot(TrackedRange[] ranges)
+        {
+            Ranges = ranges;
+            Start = ulong.MaxValue;
+            End = 0;
+            foreach (var range in ranges)
+            {
+                Start = Math.Min(Start, range.Start);
+                End = Math.Max(End, range.End);
+            }
+        }
+    }
+
+    private static RangeSnapshot _rangeSnapshot = RangeSnapshot.Empty;
 
     private static readonly bool _enabled = !OperatingSystem.IsWindows() &&
         Environment.GetEnvironmentVariable("SHARPEMU_GUEST_IMAGE_CPU_SYNC") != "0";
@@ -305,12 +329,24 @@ public static unsafe class GuestImageWriteTracker
             return false;
         }
 
+        var end = address + byteCount;
+        // Fast rejection for the hot path: this runs on every managed guest
+        // write, and almost none of them touch tracked texture pages. The
+        // bounds live inside the snapshot so they are always consistent with
+        // the ranges consulted after taking the gate.
+        var snapshot = Volatile.Read(ref _rangeSnapshot);
+        if (snapshot.Ranges.Length == 0 ||
+            end <= snapshot.Start ||
+            address >= snapshot.End)
+        {
+            return true;
+        }
+
         Monitor.Enter(_gate);
         var success = false;
         try
         {
-            var end = address + byteCount;
-            var ranges = Volatile.Read(ref _rangeSnapshot);
+            var ranges = Volatile.Read(ref _rangeSnapshot).Ranges;
             var writableStart = ulong.MaxValue;
             var writableEnd = 0UL;
             for (var index = 0; index < ranges.Length; index++)
@@ -442,7 +478,7 @@ public static unsafe class GuestImageWriteTracker
             return false;
         }
 
-        var ranges = Volatile.Read(ref _rangeSnapshot);
+        var ranges = Volatile.Read(ref _rangeSnapshot).Ranges;
         var writableStart = ulong.MaxValue;
         var writableEnd = 0UL;
         for (var index = 0; index < ranges.Length; index++)
@@ -589,7 +625,7 @@ public static unsafe class GuestImageWriteTracker
 
     private static void RebuildSnapshotLocked()
     {
-        _rangeSnapshot = _rangesByAddress.Values.ToArray();
+        Volatile.Write(ref _rangeSnapshot, new RangeSnapshot(_rangesByAddress.Values.ToArray()));
     }
 
     private static (ulong Start, ulong Length) PageAlign(ulong address, ulong byteCount)
