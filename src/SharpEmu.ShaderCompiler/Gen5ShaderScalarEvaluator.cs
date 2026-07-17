@@ -172,6 +172,18 @@ public static class Gen5ShaderScalarEvaluator
         // tables can be populated after command-list parsing, so execution can
         // re-read a stale vertex V# instead of dropping the whole draw.
         var scalarLoadSources = new Dictionary<uint, ulong>();
+        var scalarLoadChains = new Dictionary<uint, Gen5DescriptorChain>();
+        if (state.UserDataSources is { } userDataSources)
+        {
+            for (var index = 0; index < userDataSources.Count; index++)
+            {
+                if (userDataSources[index] != 0)
+                {
+                    scalarLoadSources[state.UserDataScalarRegisterBase + (uint)index] =
+                        userDataSources[index];
+                }
+            }
+        }
         var resolvedImageByPc = new Dictionary<uint, int>();
         var finalScalarRegisters = (uint[])scalarRegisters.Clone();
         var pendingPaths = new Stack<ScalarPathState>();
@@ -346,7 +358,8 @@ public static class Gen5ShaderScalarEvaluator
                         runtimeScalarRegisters,
                         recordBinding,
                         out error,
-                        scalarLoadSources))
+                        scalarLoadSources,
+                        scalarLoadChains))
                 {
                     return false;
                 }
@@ -442,10 +455,33 @@ public static class Gen5ShaderScalarEvaluator
                         strictType: true,
                         out var bufferDescriptor))
                 {
-                    error =
-                        $"buffer-descriptor-invalid pc=0x{instruction.Pc:X} " +
-                        $"s{bufferMemory.ScalarResource}";
-                    return false;
+                    if (_strictBufferLoad)
+                    {
+                        error =
+                            $"buffer-descriptor-invalid pc=0x{instruction.Pc:X} " +
+                            $"s{bufferMemory.ScalarResource}";
+                        return false;
+                    }
+
+                    // The decoder discovers resources in statically reachable
+                    // sibling blocks. The current uniform path can leave that
+                    // block's V# register holding a T# or other stale resource.
+                    // Dropping the shader here also drops all active work in
+                    // the valid path. Supply isolated zero storage instead;
+                    // inactive reads become zero and inactive writes remain
+                    // local to the synthetic buffer.
+                    AddSyntheticBufferBinding(
+                        globalMemoryBindings,
+                        globalMemoryByAddress,
+                        bufferMemory.ScalarResource,
+                        instruction.Pc,
+                        writable);
+                    TraceBufferDescriptorFallback(
+                        state,
+                        instruction,
+                        bufferMemory.ScalarResource,
+                        scalarRegisters);
+                    continue;
                 }
 
                 if (bufferDescriptor.BaseAddress == 0)
@@ -533,8 +569,10 @@ public static class Gen5ShaderScalarEvaluator
                                 (ulong)MaxGlobalMemoryBindingBytes)),
                             (uint)vertexInputBindings.Count,
                             scalarOffset,
-                            scalarLoadSources.TryGetValue(
+                            TryGetContiguousScalarSource(
+                                scalarLoadSources,
                                 bufferMemory.ScalarResource,
+                                4,
                                 out var descriptorSource)
                                 ? descriptorSource
                                 : 0,
@@ -661,7 +699,21 @@ public static class Gen5ShaderScalarEvaluator
                         image,
                         out var mipLevel)
                         ? mipLevel
-                        : null);
+                        : null)
+                {
+                    DescriptorSourceAddress = TryGetContiguousScalarSource(
+                        scalarLoadSources,
+                        image.ScalarResource,
+                        ImageDescriptorDwords,
+                        out var imageDescriptorSource)
+                            ? imageDescriptorSource
+                            : 0,
+                    DeferredChain = scalarLoadChains.TryGetValue(
+                        image.ScalarResource,
+                        out var descriptorChain)
+                            ? descriptorChain
+                            : null,
+                };
                 if (resolvedImageByPc.TryGetValue(instruction.Pc, out var existingIndex))
                 {
                     var existing = resolved[existingIndex];
@@ -729,6 +781,66 @@ public static class Gen5ShaderScalarEvaluator
         IReadOnlyList<Gen5GlobalMemoryBinding> bindings,
         uint pc) =>
         bindings.Any(binding => binding.InstructionPcs.Contains(pc));
+
+    private static void AddSyntheticBufferBinding(
+        List<Gen5GlobalMemoryBinding> bindings,
+        Dictionary<(uint ScalarAddress, ulong BaseAddress), Gen5GlobalMemoryBinding> bindingsByAddress,
+        uint scalarAddress,
+        uint instructionPc,
+        bool writable)
+    {
+        var key = (scalarAddress, 0UL);
+        if (bindingsByAddress.TryGetValue(key, out var existing))
+        {
+            existing.Writable |= writable;
+            if (existing.InstructionPcs is List<uint> instructionPcs &&
+                !instructionPcs.Contains(instructionPc))
+            {
+                instructionPcs.Add(instructionPc);
+            }
+            return;
+        }
+
+        var binding = new Gen5GlobalMemoryBinding(
+            scalarAddress,
+            0,
+            new List<uint> { instructionPc },
+            new byte[sizeof(uint)],
+            sizeof(uint),
+            DataPooled: false)
+        {
+            Writable = writable,
+            WriteBackToGuest = false,
+        };
+        bindingsByAddress.Add(key, binding);
+        bindings.Add(binding);
+    }
+
+    private static void TraceBufferDescriptorFallback(
+        Gen5ShaderState state,
+        Gen5ShaderInstruction instruction,
+        uint scalarAddress,
+        IReadOnlyList<uint> scalarRegisters)
+    {
+        lock (_scalarFallbackTraceGate)
+        {
+            if (!_tracedScalarFallbacks.Add((state.Program.Address, instruction.Pc)))
+            {
+                return;
+            }
+        }
+
+        var descriptor = string.Join(
+            ':',
+            Enumerable.Range(0, 4).Select(index =>
+                scalarAddress + index < scalarRegisters.Count
+                    ? $"{scalarRegisters[(int)scalarAddress + index]:X8}"
+                    : "out-of-range"));
+        Console.Error.WriteLine(
+            $"[LOADER][WARN] agc.buffer_descriptor_fallback " +
+            $"shader=0x{state.Program.Address:X16} pc=0x{instruction.Pc:X} " +
+            $"op={instruction.Opcode} s{scalarAddress}=[{descriptor}]");
+    }
 
     private static bool TryCreateVertexInputBinding(
         Gen5ShaderInstruction instruction,
@@ -1885,7 +1997,8 @@ public static class Gen5ShaderScalarEvaluator
         IReadOnlySet<uint> runtimeScalarRegisters,
         bool recordBinding,
         out string error,
-        Dictionary<uint, ulong>? scalarLoadSources = null)
+        Dictionary<uint, ulong>? scalarLoadSources = null,
+        Dictionary<uint, Gen5DescriptorChain>? scalarLoadChains = null)
     {
         error = string.Empty;
         if (instruction.Sources.Count == 0 ||
@@ -2054,13 +2167,50 @@ public static class Gen5ShaderScalarEvaluator
             }
 
             var componentOffset = unchecked(byteOffset + (ulong)(index * sizeof(uint)));
-            if (scalarLoadSources is not null && baseAddress != 0)
+            if (scalarLoadSources is not null && address != 0)
             {
                 // Keep provenance even when this parse-time read fails or
                 // returns zero; the GPU-timeline consumer may observe the
                 // completed descriptor table later.
                 scalarLoadSources[destination.Value] =
                     address + (ulong)(index * sizeof(uint));
+                scalarLoadChains?.Remove(destination.Value);
+            }
+            else if (scalarLoadChains is not null &&
+                     scalarLoadSources is not null &&
+                     baseAddress == 0)
+            {
+                Gen5DescriptorChain? parentChain = null;
+                if (scalarLoadSources.TryGetValue(
+                        scalarBase.Value,
+                        out var pointerSource) &&
+                    pointerSource != 0)
+                {
+                    parentChain = new Gen5DescriptorChain(
+                        pointerSource,
+                        scalarLoadSources.TryGetValue(
+                            scalarBase.Value + 1,
+                            out var pointerSourceHigh) &&
+                        pointerSourceHigh != 0
+                            ? pointerSourceHigh
+                            : pointerSource + sizeof(uint),
+                        []);
+                }
+                else
+                {
+                    scalarLoadChains.TryGetValue(scalarBase.Value, out parentChain);
+                }
+
+                if (parentChain is not null)
+                {
+                    var steps = new List<(ulong Offset, bool ViaBufferDescriptor)>(
+                        parentChain.Steps.Count + 1);
+                    steps.AddRange(parentChain.Steps);
+                    steps.Add((componentOffset, isBufferLoad));
+                    scalarLoadChains[destination.Value] =
+                        parentChain with { Steps = steps };
+                    scalarLoadSources.Remove(destination.Value);
+                }
             }
 
             if (bufferUnbound ||
@@ -2424,6 +2574,38 @@ public static class Gen5ShaderScalarEvaluator
         var copy = new uint[count];
         Array.Copy(registers, (int)start, copy, 0, count);
         values = copy;
+        return true;
+    }
+
+    private static bool TryGetContiguousScalarSource(
+        IReadOnlyDictionary<uint, ulong> sources,
+        uint startRegister,
+        int dwordCount,
+        out ulong address)
+    {
+        address = 0;
+        if (dwordCount <= 0 ||
+            !sources.TryGetValue(startRegister, out var first) ||
+            first == 0)
+        {
+            return false;
+        }
+
+        for (var index = 1; index < dwordCount; index++)
+        {
+            if (!sources.TryGetValue(
+                    startRegister + (uint)index,
+                    out var component) ||
+                component != first + (ulong)(index * sizeof(uint)))
+            {
+                // Indirect SH patch tables store {register,value} pairs, so
+                // their value cells are eight bytes apart and cannot be read
+                // back as a packed T#/V# descriptor.
+                return false;
+            }
+        }
+
+        address = first;
         return true;
     }
 

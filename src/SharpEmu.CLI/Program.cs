@@ -342,6 +342,7 @@ internal static partial class Program
             SetEnvironmentDefault("SHARPEMU_APR_BATCH_FAIL_ON_MISSING", "1");
             SetEnvironmentDefault("SHARPEMU_DISABLE_IMPORT_LOOP_GUARD", "1");
             SetEnvironmentDefault("SHARPEMU_IME_NO_KEYBOARD", "1");
+            SetEnvironmentDefault("SHARPEMU_PLAYGO_ASSUME_INSTALLED", "1");
             SetEnvironmentDefault("SHARPEMU_GUEST_ARGS", "-nothreadtimeout");
             Console.Error.WriteLine(
                 "[LOADER][INFO] SILENT HILL compatibility: enabling startup synchronization, " +

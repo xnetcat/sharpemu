@@ -680,6 +680,11 @@ public static class PlayGoExports
 
     private static PlayGoMetadata LoadPlayGoMetadata()
     {
+        var assumeInstalled =
+            string.Equals(
+                Environment.GetEnvironmentVariable("SHARPEMU_PLAYGO_ASSUME_INSTALLED"),
+                "1",
+                StringComparison.Ordinal);
         var app0Root = Environment.GetEnvironmentVariable("SHARPEMU_APP0_DIR");
         if (string.IsNullOrWhiteSpace(app0Root))
         {
@@ -688,7 +693,9 @@ public static class PlayGoExports
             return new PlayGoMetadata(
                 true,
                 [(ushort)0],
-                PlayGoChunkIdKnowledge.Authoritative);
+                assumeInstalled
+                    ? PlayGoChunkIdKnowledge.Unknown
+                    : PlayGoChunkIdKnowledge.Authoritative);
         }
 
         var playGoDat = Path.Combine(app0Root, "sce_sys", "playgo-chunk.dat");
@@ -698,15 +705,21 @@ public static class PlayGoExports
         var hasMetadata = File.Exists(playGoDat) || File.Exists(scenarioJson) || File.Exists(chunkDefsXml);
         if (!hasMetadata)
         {
-            // No PlayGo sidecar: report a fully-installed single chunk. Available must
-            // stay true or scePlayGoOpen fails with NotSupportPlayGo (fatal PS5-component
-            // init failure for UE titles); chunk 0 reports LocalFast and every other id
-            // returns BAD_CHUNK_ID, terminating title-side chunk enumeration.
-            TracePlayGo("metadata_missing; fully-installed single chunk");
+            // No PlayGo sidecar: keep the conservative single-chunk contract
+            // unless a known title is running from an unpacked, fully-installed
+            // app0. Those dumps omit the package chunk table even though every
+            // chunk is locally present, so accepting their queried ids as
+            // LOCAL_FAST is more accurate than reporting "not downloaded".
+            TracePlayGo(
+                assumeInstalled
+                    ? "metadata_missing; assume all queried chunks installed"
+                    : "metadata_missing; fully-installed single chunk");
             return new PlayGoMetadata(
                 true,
                 [(ushort)0],
-                PlayGoChunkIdKnowledge.Authoritative);
+                assumeInstalled
+                    ? PlayGoChunkIdKnowledge.Unknown
+                    : PlayGoChunkIdKnowledge.Authoritative);
         }
 
         var chunkIds = LoadChunkIds(chunkDefsXml);
