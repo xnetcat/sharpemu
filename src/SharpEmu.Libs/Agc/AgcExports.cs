@@ -42,6 +42,7 @@ public static partial class AgcExports
     private const uint ItWriteData = 0x37;
     private const uint ItDispatchDirect = 0x15;
     private const uint ItDispatchIndirect = 0x16;
+    private const uint ItSetPredication = 0x20;
     private const uint ItWaitRegMem = 0x3C;
     private const uint ItIndirectBuffer = 0x3F;
     private const uint ItEventWrite = 0x46;
@@ -233,6 +234,10 @@ public static partial class AgcExports
         Environment.GetEnvironmentVariable("SHARPEMU_LOG_AGC"),
         "1",
         StringComparison.Ordinal);
+    private static readonly bool _traceAgcPredication = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_LOG_AGC_PREDICATION"),
+        "1",
+        StringComparison.Ordinal);
     // Drop a draw on an undecodable texture descriptor instead of substituting
     // a 1x1 fallback binding. Off by default so a garbage descriptor degrades
     // the pass rather than dropping it (Demon's Souls composite feeders).
@@ -288,6 +293,7 @@ public static partial class AgcExports
     private static long _dcbWaitRegMemTraceCount;
     private static long _createShaderTraceCount;
     private static long _packetPayloadTraceCount;
+    private static long _predicationTraceCount;
     private static bool _tracedMissingPixelShaderBindings;
     private static long _unsatisfiedWaitTraceCount;
     private static long _labelProducerSequence;
@@ -576,6 +582,9 @@ public static partial class AgcExports
         public uint IndexSize { get; set; }
         public uint InstanceCount { get; set; } = 1;
         public uint DrawIndexOffset { get; set; }
+        public ulong PredicationAddress { get; set; }
+        public uint PredicationOperation { get; set; }
+        public int JumpDepth { get; set; }
         public string QueueName { get; set; } = "graphics";
         public ulong CompletionEventId { get; set; }
         public ulong ActiveSubmissionId { get; set; }
@@ -3551,6 +3560,22 @@ public static partial class AgcExports
 
             ApplySubmittedRegisters(ctx, state, currentAddress, length, op, register);
 
+            if (op == ItSetPredication && length >= 4)
+            {
+                ApplySubmittedPredication(ctx, state, currentAddress, tracePackets);
+            }
+
+            if (op == ItIndirectBuffer && length >= 4)
+            {
+                ExecuteSubmittedJump(
+                    ctx,
+                    gpuState,
+                    state,
+                    currentAddress,
+                    header,
+                    tracePackets);
+            }
+
             if (op == ItSetBase &&
                 length >= 4 &&
                 TryReadUInt32(ctx, currentAddress + 4, out var baseSelector) &&
@@ -4516,6 +4541,104 @@ public static partial class AgcExports
         state.IndexSize = 0;
         state.InstanceCount = 1;
         state.DrawIndexOffset = 0;
+        state.PredicationAddress = 0;
+        state.PredicationOperation = 0;
+    }
+
+    private static void ApplySubmittedPredication(
+        CpuContext ctx,
+        SubmittedDcbState state,
+        ulong packetAddress,
+        bool tracePacket)
+    {
+        if (!TryReadUInt32(ctx, packetAddress + 4, out var control) ||
+            !TryReadUInt32(ctx, packetAddress + 8, out var addressLow) ||
+            !TryReadUInt32(ctx, packetAddress + 12, out var addressHigh))
+        {
+            return;
+        }
+
+        state.PredicationAddress =
+            (addressLow & ~0xFu) | ((ulong)addressHigh << 32);
+        state.PredicationOperation = (control >> 16) & 0x7u;
+        if (tracePacket || _traceAgc)
+        {
+            TraceAgc(
+                $"agc.dcb.predication op={state.PredicationOperation} " +
+                $"condition=0x{state.PredicationAddress:X16}");
+        }
+        TraceAgcPredication(
+            $"parse.set_predication op={state.PredicationOperation} " +
+            $"condition=0x{state.PredicationAddress:X16}");
+    }
+
+    private static void ExecuteSubmittedJump(
+        CpuContext ctx,
+        SubmittedGpuState gpuState,
+        SubmittedDcbState state,
+        ulong packetAddress,
+        uint header,
+        bool tracePacket)
+    {
+        if (!TryReadUInt32(ctx, packetAddress + 4, out var targetLow) ||
+            !TryReadUInt32(ctx, packetAddress + 8, out var targetHigh) ||
+            !TryReadUInt32(ctx, packetAddress + 12, out var control))
+        {
+            return;
+        }
+
+        var targetAddress =
+            (targetLow & ~0x3u) | ((ulong)targetHigh << 32);
+        var targetDwordCount = control & 0xFFFFFu;
+        var predicated = (header & 1u) != 0;
+        if (targetAddress == 0 ||
+            targetDwordCount == 0 ||
+            targetDwordCount > 0x40000 ||
+            state.JumpDepth >= 8)
+        {
+            return;
+        }
+
+        ulong condition = 0;
+        var skip = predicated &&
+            state.PredicationAddress != 0 &&
+            ((state.PredicationAddress & 7) != 0 ||
+             !TryReadUInt64(ctx, state.PredicationAddress, out condition) ||
+             condition != 0);
+        if (tracePacket || _traceAgc)
+        {
+            TraceAgc(
+                $"agc.dcb.jump target=0x{targetAddress:X16} dwords={targetDwordCount} " +
+                $"predicated={predicated} condition=0x{condition:X16} " +
+                $"action={(skip ? "skip" : "execute")}");
+        }
+        TraceAgcPredication(
+            $"parse.jump target=0x{targetAddress:X16} dwords={targetDwordCount} " +
+            $"predicated={predicated} condition_address=0x{state.PredicationAddress:X16} " +
+            $"condition=0x{condition:X16} action={(skip ? "skip" : "execute")}");
+
+        if (skip)
+        {
+            return;
+        }
+
+        state.JumpDepth++;
+        try
+        {
+            // The AGC jump is a call-with-length: fold the side segment here,
+            // then resume parsing the parent immediately after this packet.
+            ParseSubmittedDcbCore(
+                ctx,
+                gpuState,
+                state,
+                targetAddress,
+                targetDwordCount,
+                tracePacket);
+        }
+        finally
+        {
+            state.JumpDepth--;
+        }
     }
 
     private static bool RangesOverlap(
@@ -8883,9 +9006,9 @@ public static partial class AgcExports
         IReadOnlyList<GuestDrawTexture> textures,
         IReadOnlyList<GuestVertexBuffer> vertexBuffers)
     {
-        if (!_traceDraws &&
-            (_traceDrawPixelShaderAddress != draw.PixelShaderAddress ||
-             sequence < _traceDrawSequenceMinimum))
+        if (sequence < _traceDrawSequenceMinimum ||
+            (!_traceDraws &&
+             _traceDrawPixelShaderAddress != draw.PixelShaderAddress))
         {
             return;
         }
@@ -11984,6 +12107,20 @@ public static partial class AgcExports
         Console.Error.WriteLine($"[LOADER][TRACE] {message}");
     }
 
+    private static void TraceAgcPredication(string message)
+    {
+        if (!_traceAgcPredication)
+        {
+            return;
+        }
+
+        var count = Interlocked.Increment(ref _predicationTraceCount);
+        if (count <= 128 || count % 4096 == 0)
+        {
+            Console.Error.WriteLine($"[LOADER][TRACE] agc.predication#{count} {message}");
+        }
+    }
+
     private static void TraceAgcShader(
         [System.Runtime.CompilerServices.InterpolatedStringHandlerArgument] ref AgcShaderTraceHandler message)
     {
@@ -12124,24 +12261,38 @@ public static partial class AgcExports
         LibraryName = "libSceAgc")]
     public static int DcbJump(CpuContext ctx)
     {
-        var dcb = ctx[CpuRegister.Rdi];
-        var target = ctx[CpuRegister.Rsi];
-        var sizeDwords = (uint)ctx[CpuRegister.Rdx];
-        if (dcb == 0)
+        var commandBufferAddress = ctx[CpuRegister.Rdi];
+        var mode = (uint)ctx[CpuRegister.Rsi] & 0x1u;
+        var cachePolicy = (uint)ctx[CpuRegister.Rdx] & 0x3u;
+        var targetAddress = ctx[CpuRegister.Rcx];
+        var targetDwordCount = (uint)ctx[CpuRegister.R8] & 0xFFFFFu;
+        if (commandBufferAddress == 0)
         {
             return ReturnPointer(ctx, 0);
         }
 
-        if (!TryAllocateCommandDwords(ctx, dcb, 4, out var cmd) ||
-            !ctx.TryWriteUInt32(cmd, Pm4(4, ItIndirectBuffer, RZero)) ||
-            !ctx.TryWriteUInt32(cmd + 4, (uint)(target & 0xFFFF_FFFFUL)) ||
-            !ctx.TryWriteUInt32(cmd + 8, (uint)((target >> 32) & 0xFFFFUL)) ||
-            !ctx.TryWriteUInt32(cmd + 12, sizeDwords & 0xFFFFF))
+        var control =
+            0x0F20_0000u |
+            (cachePolicy << 28) |
+            (mode << 20) |
+            targetDwordCount;
+        if (!TryAllocateCommandDwords(ctx, commandBufferAddress, 4, out var commandAddress) ||
+            !ctx.TryWriteUInt32(commandAddress, Pm4(4, ItIndirectBuffer, RZero)) ||
+            !ctx.TryWriteUInt32(commandAddress + 4, (uint)targetAddress & ~0x3u) ||
+            !ctx.TryWriteUInt32(commandAddress + 8, (uint)(targetAddress >> 32)) ||
+            !ctx.TryWriteUInt32(commandAddress + 12, control))
         {
             return ReturnPointer(ctx, 0);
         }
 
-        return ReturnPointer(ctx, cmd);
+        TraceAgc(
+            $"agc.dcb_jump buf=0x{commandBufferAddress:X16} cmd=0x{commandAddress:X16} " +
+            $"target=0x{targetAddress:X16} dwords={targetDwordCount} " +
+            $"mode={mode} cache={cachePolicy}");
+        TraceAgcPredication(
+            $"build.jump buf=0x{commandBufferAddress:X16} cmd=0x{commandAddress:X16} " +
+            $"target=0x{targetAddress:X16} dwords={targetDwordCount}");
+        return ReturnPointer(ctx, commandAddress);
     }
 
     [SysAbiExport(
@@ -12151,22 +12302,38 @@ public static partial class AgcExports
         LibraryName = "libSceAgc")]
     public static int DcbSetPredication(CpuContext ctx)
     {
-        var dcb = ctx[CpuRegister.Rdi];
-        var address = ctx[CpuRegister.Rsi];
-        if (dcb == 0)
+        var commandBufferAddress = ctx[CpuRegister.Rdi];
+        var condition = (uint)ctx[CpuRegister.Rsi] & 0x1u;
+        var operation = (uint)ctx[CpuRegister.Rdx] & 0x7u;
+        var waitOperation = (uint)ctx[CpuRegister.Rcx] & 0x1u;
+        var address = ctx[CpuRegister.R8];
+        if (commandBufferAddress == 0)
         {
             return ReturnPointer(ctx, 0);
         }
 
-        if (!TryAllocateCommandDwords(ctx, dcb, 3, out var cmd) ||
-            !ctx.TryWriteUInt32(cmd, Pm4(3, ItNop, RZero)) ||
-            !ctx.TryWriteUInt32(cmd + 4, (uint)(address & 0xFFFF_FFFFUL)) ||
-            !ctx.TryWriteUInt32(cmd + 8, (uint)(address >> 32)))
+        var control =
+            (condition << 8) |
+            (waitOperation << 12) |
+            (operation << 16);
+        if (!TryAllocateCommandDwords(ctx, commandBufferAddress, 4, out var commandAddress) ||
+            !ctx.TryWriteUInt32(commandAddress, Pm4(4, ItSetPredication, RZero)) ||
+            !ctx.TryWriteUInt32(commandAddress + 4, control) ||
+            !ctx.TryWriteUInt32(commandAddress + 8, (uint)address & ~0xFu) ||
+            !ctx.TryWriteUInt32(commandAddress + 12, (uint)(address >> 32)))
         {
             return ReturnPointer(ctx, 0);
         }
 
-        return ReturnPointer(ctx, cmd);
+        TraceAgc(
+            $"agc.dcb_set_predication buf=0x{commandBufferAddress:X16} " +
+            $"cmd=0x{commandAddress:X16} condition={condition} op={operation} " +
+            $"wait={waitOperation} addr=0x{address:X16}");
+        TraceAgcPredication(
+            $"build.set_predication buf=0x{commandBufferAddress:X16} " +
+            $"cmd=0x{commandAddress:X16} condition={condition} op={operation} " +
+            $"wait={waitOperation} addr=0x{address:X16}");
+        return ReturnPointer(ctx, commandAddress);
     }
 
     [SysAbiExport(
@@ -12176,9 +12343,22 @@ public static partial class AgcExports
         LibraryName = "libSceAgc")]
     public static int SetPacketPredication(CpuContext ctx)
     {
-        // Global predication toggle on a packet; a no-op is safe for rendering.
-        ctx[CpuRegister.Rax] = 0;
-        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        var packetAddress = ctx[CpuRegister.Rdi];
+        var predication = (uint)ctx[CpuRegister.Rsi] == 1 ? 1u : 0u;
+        if (packetAddress == 0 ||
+            !TryReadUInt32(ctx, packetAddress, out var header) ||
+            !TryWriteUInt32(ctx, packetAddress, (header & ~1u) | predication))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        TraceAgc(
+            $"agc.set_packet_predication packet=0x{packetAddress:X16} " +
+            $"predicated={predication != 0}");
+        TraceAgcPredication(
+            $"build.set_packet_predication packet=0x{packetAddress:X16} " +
+            $"predicated={predication != 0}");
+        return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
     }
 
     // ABI (reversed from Quake): rdi = array of DCB base addresses (u64 each),
