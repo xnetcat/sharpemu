@@ -32,6 +32,8 @@ public sealed partial class DirectExecutionBackend
 	private const int ImportVectorRegisterCount = 8;
 	private const ulong StackCheckGuardValue = 0xC0DEC0DECAFEBA00UL;
 	private static long _canaryReturnRecoveries;
+	private static long _shiftedReturnRecoveries;
+	private static long _misalignedRipRecoveries;
 
 	private readonly object _importResultLogSampleGate = new();
 	private readonly Dictionary<string, int> _importResultLogSamples = new(StringComparer.Ordinal);
@@ -90,6 +92,15 @@ public sealed partial class DirectExecutionBackend
 		{
 			return -1;
 		}
+		if (TryRecoverMisalignedRip(contextRecord))
+		{
+			return -1;
+		}
+		if (!IsCanonicalX64Address(value) &&
+			TryRecoverShiftedReturn(contextRecord))
+		{
+			return -1;
+		}
 		if (!IsUnresolvedSentinel(value) && !IsUnresolvedSentinel(value2))
 		{
 			return 0;
@@ -104,6 +115,100 @@ public sealed partial class DirectExecutionBackend
 			return -1;
 		}
 		return 0;
+	}
+
+	private unsafe static bool TryRecoverMisalignedRip(void* contextRecord)
+	{
+		var rip = ReadCtxU64(contextRecord, CTX_RIP);
+		if (rip < 6 ||
+			!TryReadStackU64(rip - 6, out var instructionWindow))
+		{
+			return false;
+		}
+
+		// A suspended guest can occasionally resume on the final displacement
+		// byte of a seven-byte RIP-relative MOV instead of the following
+		// instruction. Require the complete x86-64 instruction shape and a
+		// zero high displacement byte before advancing to the real boundary.
+		var rex = (byte)instructionWindow;
+		var opcode = (byte)(instructionWindow >> 8);
+		var modRm = (byte)(instructionWindow >> 16);
+		var displacementHigh = (byte)(instructionWindow >> 48);
+		if ((rex != 0x48 && rex != 0x4C) ||
+			opcode != 0x8B ||
+			(modRm & 0xC7) != 0x05 ||
+			displacementHigh != 0 ||
+			!IsLikelyReturnAddress(rip + 1))
+		{
+			return false;
+		}
+
+		WriteCtxU64(contextRecord, CTX_RIP, rip + 1);
+		var recoveryCount = Interlocked.Increment(ref _misalignedRipRecoveries);
+		Console.Error.WriteLine(
+			$"[LOADER][WARN] Recovered misaligned guest RIP #{recoveryCount}: " +
+			$"resume=0x{rip + 1:X16} previous=0x{rip:X16}");
+		Console.Error.Flush();
+		return true;
+	}
+
+	private unsafe static bool TryRecoverShiftedReturn(void* contextRecord)
+	{
+		var rsp = ReadCtxU64(contextRecord, CTX_RSP);
+		var interruptedReturn = ReadCtxU64(contextRecord, CTX_RBP);
+		if (rsp < sizeof(ulong) ||
+			!IsLikelyReturnAddress(interruptedReturn))
+		{
+			return false;
+		}
+
+		var callerRbp = 0UL;
+		var callerReturn = 0UL;
+		var frameOffset = 0UL;
+		for (var offset = 0x08UL; offset <= 0x400; offset += sizeof(ulong))
+		{
+			if (!TryReadStackU64(rsp + offset, out var candidateRbp) ||
+				!TryReadStackU64(rsp + offset + sizeof(ulong), out var candidateReturn) ||
+				candidateRbp <= rsp + offset ||
+				candidateRbp - rsp > 0x10000 ||
+				!IsLikelyReturnAddress(candidateReturn))
+			{
+				continue;
+			}
+
+			callerRbp = candidateRbp;
+			callerReturn = candidateReturn;
+			frameOffset = offset;
+			break;
+		}
+		if (frameOffset == 0)
+		{
+			return false;
+		}
+
+		// The return epilogue restored every nonvolatile register except rbp,
+		// then consumed the real continuation into rbp and a reused stack-local
+		// qword as RIP. Find the first intact frame-pointer/return pair above the
+		// damaged frame instead of assuming a title-specific frame size.
+		WriteCtxU64(contextRecord, CTX_RBP, callerRbp);
+		WriteCtxU64(contextRecord, CTX_RSP, rsp - sizeof(ulong));
+		WriteCtxU64(contextRecord, CTX_RIP, interruptedReturn);
+		var recoveryCount = Interlocked.Increment(ref _shiftedReturnRecoveries);
+		Console.Error.WriteLine(
+			$"[LOADER][WARN] Recovered shifted guest return #{recoveryCount}: " +
+			$"resume=0x{interruptedReturn:X16} rsp=0x{rsp - sizeof(ulong):X16} " +
+			$"rbp=0x{callerRbp:X16} caller=0x{callerReturn:X16} " +
+			$"frame_offset=0x{frameOffset:X}");
+		Console.Error.Flush();
+		return true;
+	}
+
+	private static bool IsCanonicalX64Address(ulong address)
+	{
+		var upper = address >> 48;
+		return ((address >> 47) & 1) == 0
+			? upper == 0
+			: upper == 0xFFFF;
 	}
 
 	private unsafe static bool TryRecoverCanaryReturn(void* contextRecord)
