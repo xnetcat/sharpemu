@@ -484,6 +484,15 @@ public static class PadExports
 
     private static readonly long PadStartTimestamp = Stopwatch.GetTimestamp();
     private static readonly double[] AutoCrossTimes = ParseAutoCrossTimes();
+    private static readonly bool AutoCrossCatchUp = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_AUTO_CROSS_CATCH_UP"),
+        "1",
+        StringComparison.Ordinal);
+    private static readonly object AutoCrossGate = new();
+    private static long _autoCrossLoggedMask;
+    private static int _autoCrossNextIndex;
+    private static double _autoCrossActiveUntil;
+    private static double _autoCrossReleaseUntil;
 
     private static double[] ParseAutoCrossTimes()
     {
@@ -516,15 +525,81 @@ public static class PadExports
         }
 
         var elapsed = (Stopwatch.GetTimestamp() - PadStartTimestamp) / (double)Stopwatch.Frequency;
-        foreach (var time in times)
+        if (AutoCrossCatchUp)
         {
+            lock (AutoCrossGate)
+            {
+                var active = TryAdvanceAutoCrossSequence(
+                    elapsed,
+                    times,
+                    ref _autoCrossNextIndex,
+                    ref _autoCrossActiveUntil,
+                    ref _autoCrossReleaseUntil,
+                    out var activatedIndex);
+                if (activatedIndex >= 0)
+                {
+                    LogAutoCross(activatedIndex, times[activatedIndex], elapsed, catchUp: true);
+                }
+
+                return active;
+            }
+        }
+
+        for (var index = 0; index < times.Length; index++)
+        {
+            var time = times[index];
             if (elapsed >= time && elapsed < time + 0.4)
             {
+                LogAutoCross(index, time, elapsed, catchUp: false);
                 return true;
             }
         }
 
         return false;
+    }
+
+    internal static bool TryAdvanceAutoCrossSequence(
+        double elapsed,
+        IReadOnlyList<double> times,
+        ref int nextIndex,
+        ref double activeUntil,
+        ref double releaseUntil,
+        out int activatedIndex)
+    {
+        activatedIndex = -1;
+        if (elapsed < activeUntil)
+        {
+            return true;
+        }
+
+        if (elapsed < releaseUntil ||
+            nextIndex >= times.Count ||
+            elapsed < times[nextIndex])
+        {
+            return false;
+        }
+
+        activatedIndex = nextIndex++;
+        activeUntil = elapsed + 0.4;
+        releaseUntil = activeUntil + 0.5;
+        return true;
+    }
+
+    private static void LogAutoCross(int index, double scheduled, double elapsed, bool catchUp)
+    {
+        if (index >= 64)
+        {
+            return;
+        }
+
+        var bit = 1L << index;
+        var previous = Interlocked.Or(ref _autoCrossLoggedMask, bit);
+        if ((previous & bit) == 0)
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] pad.auto_cross index={index} " +
+                $"scheduled={scheduled:F3}s elapsed={elapsed:F3}s catch_up={catchUp}");
+        }
     }
 
     /// <summary>Maps the host seam's neutral button flags onto SCE_PAD_BUTTON bits.</summary>
