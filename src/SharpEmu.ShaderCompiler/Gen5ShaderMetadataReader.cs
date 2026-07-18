@@ -9,6 +9,8 @@ namespace SharpEmu.ShaderCompiler;
 public static class Gen5ShaderMetadataReader
 {
     private const ulong ShaderUserDataOffset = 0x08;
+    private const ulong ShaderSpecialsOffset = 0x28;
+    private const ulong ShaderSpecialUserDataRangeOffset = 0x14;
     private const int ResourceClassCount = 4;
     private const int MaxMetadataEntries = 4096;
 
@@ -118,9 +120,31 @@ public static class Gen5ShaderMetadataReader
             }
         }
 
+        uint extendedUserDataRangeStart = 0;
+        uint extendedUserDataRangeEnd = 0;
+        if (TryReadUInt64(
+                ctx,
+                shaderHeaderAddress + ShaderSpecialsOffset,
+                out var specialsAddress) &&
+            specialsAddress != 0)
+        {
+            TryReadUInt16(
+                ctx,
+                specialsAddress + ShaderSpecialUserDataRangeOffset,
+                out var rangeStart);
+            TryReadUInt16(
+                ctx,
+                specialsAddress + ShaderSpecialUserDataRangeOffset + sizeof(ushort),
+                out var rangeEnd);
+            extendedUserDataRangeStart = rangeStart;
+            extendedUserDataRangeEnd = rangeEnd;
+        }
+
         metadata = new Gen5ShaderMetadata(
             extendedUserDataSize,
             shaderResourceTableSize,
+            extendedUserDataRangeStart,
+            extendedUserDataRangeEnd,
             directResources,
             resources);
         return true;

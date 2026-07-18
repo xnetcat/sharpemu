@@ -64,4 +64,41 @@ public sealed class VulkanVertexBindingPlanTests
         Assert.Equal([0, 1], plan.BindingSourceIndices);
         Assert.Equal([0u, 1u], plan.AttributeBindings);
     }
+
+    [Fact]
+    public void StaleDescriptorStride_IsExpandedToFitAttribute()
+    {
+        VulkanVertexBindingSource[] sources =
+        [
+            new(
+                BufferIdentity: 1,
+                Stride: 2,
+                Offset: 0,
+                MinimumAttributeBytes: 12),
+        ];
+
+        var plan = VulkanVideoPresenter.PlanVertexBindings(sources);
+
+        Assert.Equal([12u], plan.BindingStrides);
+        Assert.Equal([0u], plan.AttributeOffsets);
+    }
+
+    [Theory]
+    [InlineData(1u, 4u, 1u)]
+    [InlineData(5u, 2u, 4u)]
+    [InlineData(10u, 4u, 4u)]
+    [InlineData(13u, 3u, 12u)]
+    [InlineData(14u, 4u, 16u)]
+    [InlineData(0xFFFFu, 3u, 12u)]
+    public void VertexFormatSize_CoversMappedAndFallbackFormats(
+        uint dataFormat,
+        uint componentCount,
+        uint expectedBytes)
+    {
+        Assert.Equal(
+            expectedBytes,
+            VulkanVideoPresenter.GetVertexFormatByteSize(
+                dataFormat,
+                componentCount));
+    }
 }
