@@ -90,6 +90,20 @@ public sealed class ImportTrampolineAbiTests
         }
     }
 
+    [Fact]
+    public unsafe void DirectGuestReturnPath_PreservesFullWidthGuestRax()
+    {
+        Span<byte> code = stackalloc byte[16];
+        var offset = 0;
+        fixed (byte* codePointer = code)
+        {
+            DirectExecutionBackend.EmitDirectGuestReturnCapture(codePointer, ref offset);
+        }
+
+        Assert.Equal(4, offset);
+        Assert.Equal([0x49, 0x89, 0x42, 0x08], code[..offset].ToArray());
+    }
+
     private static unsafe byte[] CreateTrampolineBytes()
     {
         var backend = (DirectExecutionBackend)RuntimeHelpers.GetUninitializedObject(
