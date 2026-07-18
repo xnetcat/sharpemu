@@ -1114,7 +1114,8 @@ public static class AvPlayerExports
             extended,
             bufferAddress,
             timestamp,
-            checked((uint)(extended ? player.Width : framePitch)),
+            checked((uint)framePitch),
+            checked((uint)player.Width),
             checked((uint)(extended ? player.Height : frameHeight)),
             checked((uint)framePitch),
             player.FramesPerSecond);
@@ -1143,7 +1144,8 @@ public static class AvPlayerExports
             extended,
             player.LastGuestBuffer,
             player.LastVideoTimestamp,
-            checked((uint)(extended ? player.Width : framePitch)),
+            checked((uint)framePitch),
+            checked((uint)player.Width),
             checked((uint)(extended ? player.Height : frameHeight)),
             checked((uint)framePitch),
             player.FramesPerSecond);
@@ -1675,6 +1677,7 @@ public static class AvPlayerExports
         ulong bufferAddress,
         ulong timestamp,
         uint width,
+        uint visibleWidth,
         uint height,
         uint pitch,
         double framesPerSecond)
@@ -1697,6 +1700,12 @@ public static class AvPlayerExports
             return;
         }
 
+        // Width describes the padded allocation in the extended ABI. Tell the
+        // guest how much of that NV12 row is padding; width minus crop-right is
+        // the visible image (for a 378px movie in a 512px row, 512 - 134).
+        BinaryPrimitives.WriteUInt32LittleEndian(
+            info[48..],
+            width > visibleWidth ? width - visibleWidth : 0);
         BinaryPrimitives.WriteUInt32LittleEndian(info[60..], pitch);
         info[64] = 8;
         info[65] = 8;
