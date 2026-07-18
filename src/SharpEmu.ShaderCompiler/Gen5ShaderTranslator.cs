@@ -1667,6 +1667,33 @@ public static class Gen5ShaderTranslator
         name.StartsWith("ImageStore", StringComparison.Ordinal) ||
         name.StartsWith("ImageAtomic", StringComparison.Ordinal);
 
+    public static bool UsesStorageImageDescriptor(
+        string name,
+        IReadOnlyList<uint> resourceDescriptor)
+    {
+        if (!IsStorageImageOperation(name))
+        {
+            return false;
+        }
+
+        // Vulkan block-compressed formats are sampleable but do not expose
+        // storage-image support. RDNA IMAGE_LOAD is an unfiltered texel read,
+        // so compressed loads map exactly to a sampled image plus OpImageFetch.
+        // Writes and atomics must remain storage operations.
+        if (!name.StartsWith("ImageLoad", StringComparison.Ordinal) ||
+            resourceDescriptor.Count < 2)
+        {
+            return true;
+        }
+
+        var unifiedFormat = (resourceDescriptor[1] >> 20) & 0x1FFu;
+        return !Gfx10UnifiedFormat.TryDecode(
+                   unifiedFormat,
+                   out var dataFormat,
+                   out _) ||
+               dataFormat is < 169 or > 182;
+    }
+
     public static bool IsDataShareAtomic(string name) => name switch
     {
         "DsAddU32" or "DsSubU32" or "DsIncU32" or "DsDecU32" or

@@ -1050,7 +1050,9 @@ public static partial class Gen5SpirvTranslator
                 var binding = _evaluation.ImageBindings[index];
                 _imageBindingByPc.TryAdd(binding.Pc, index);
                 var isStorage =
-                    Gen5ShaderTranslator.IsStorageImageOperation(binding.Opcode);
+                    Gen5ShaderTranslator.UsesStorageImageDescriptor(
+                        binding.Opcode,
+                        binding.ResourceDescriptor);
                 // RDNA2 DIM is part of the shader ABI, independent of the
                 // descriptor's late-written TYPE. Cubes are exposed as 2D
                 // arrays because AMD supplies (x, y, face_id), not a Vulkan
@@ -3331,13 +3333,18 @@ public static partial class Gen5SpirvTranslator
                 return true;
             }
 
-            var storage = Gen5ShaderTranslator.IsStorageImageOperation(instruction.Opcode);
             for (var index = 0; index < _evaluation.ImageBindings.Count; index++)
             {
                 var candidate = _evaluation.ImageBindings[index];
+                var storage = Gen5ShaderTranslator.UsesStorageImageDescriptor(
+                    instruction.Opcode,
+                    candidate.ResourceDescriptor);
+                var candidateStorage = Gen5ShaderTranslator.UsesStorageImageDescriptor(
+                    candidate.Opcode,
+                    candidate.ResourceDescriptor);
                 if (candidate.Control.ScalarResource != control.ScalarResource ||
                     candidate.Control.ScalarSampler != control.ScalarSampler ||
-                    Gen5ShaderTranslator.IsStorageImageOperation(candidate.Opcode) != storage ||
+                    candidateStorage != storage ||
                     !HasSameScalarDefinitions(
                         candidate.Pc,
                         instruction.Pc,

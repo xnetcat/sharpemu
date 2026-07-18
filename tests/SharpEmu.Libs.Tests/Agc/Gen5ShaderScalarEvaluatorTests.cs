@@ -105,6 +105,52 @@ public sealed class Gen5ShaderScalarEvaluatorTests
     }
 
     [Fact]
+    public void NonCanonicalBufferDescriptor_UsesDescriptorFreeZeroStorage()
+    {
+        var memory = new FakeCpuMemory(ShaderAddress, 0x1000);
+        var ctx = new CpuContext(memory, Generation.Gen5);
+        Gen5ShaderAtomicDecodeTests.WriteProgram(
+            memory,
+            ShaderAddress,
+            [
+                // BUFFER_ATOMIC_UMAX v1, off, s[0:3], 128 offset:8 glc.
+                0xE0E04008,
+                0x80000100,
+            ]);
+
+        var shaderRegisters = new Dictionary<uint, uint>
+        {
+            [Gen5ShaderAtomicDecodeTests.ComputePgmRsrc2Register] = 4u << 1,
+            // Exact stale V# observed after Silent Hill's title movie. It
+            // decodes as address 0x0000F00000000092 and a 19.9-GiB range.
+            [Gen5ShaderAtomicDecodeTests.ComputeUserDataRegister] = 0x0000_0092,
+            [Gen5ShaderAtomicDecodeTests.ComputeUserDataRegister + 1] = 0x00FF_F000,
+            [Gen5ShaderAtomicDecodeTests.ComputeUserDataRegister + 2] = 0x0500_0000,
+            [Gen5ShaderAtomicDecodeTests.ComputeUserDataRegister + 3] = 0,
+        };
+        Assert.True(
+            Gen5ShaderTranslator.TryCreateState(
+                ctx,
+                ShaderAddress,
+                0,
+                shaderRegisters,
+                Gen5ShaderAtomicDecodeTests.ComputeUserDataRegister,
+                out var state,
+                out var error),
+            error);
+
+        Assert.True(
+            Gen5ShaderScalarEvaluator.TryEvaluate(
+                ctx,
+                state,
+                out var evaluation,
+                out error),
+            error);
+        Assert.Empty(evaluation.GlobalMemoryBindings);
+        Assert.Equal(new uint[] { 0 }, evaluation.SyntheticZeroBufferPcs);
+    }
+
+    [Fact]
     public void DuplicateBaseBufferDescriptors_ShareOneVulkanBinding()
     {
         const ulong bufferAddress = ShaderAddress + 0x800;
