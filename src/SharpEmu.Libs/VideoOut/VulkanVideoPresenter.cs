@@ -36,7 +36,8 @@ internal readonly record struct VulkanRenderTargetFormat(
 internal readonly record struct VulkanVertexBindingSource(
     ulong BufferIdentity,
     uint Stride,
-    ulong Offset);
+    ulong Offset,
+    uint MinimumAttributeBytes = 1);
 
 internal sealed record VulkanVertexBindingPlan(
     int[] BindingSourceIndices,
@@ -145,7 +146,14 @@ internal static unsafe class VulkanVideoPresenter
         for (var index = 0; index < sources.Count; index++)
         {
             var source = sources[index];
-            var stride = Math.Max(source.Stride, 1);
+            // Vulkan requires every attribute to fit within its binding
+            // stride. A late V# table may have been recycled before the
+            // ordered draw resolves it; never let that stale descriptor turn
+            // into an invalid Metal vertex descriptor and reject the entire
+            // graphics pipeline.
+            var stride = Math.Max(
+                Math.Max(source.Stride, source.MinimumAttributeBytes),
+                1);
             // Bind the start of the interleaved record and express the
             // attribute's byte position inside that record in pipeline state.
             // Attributes captured from one guest stream therefore consume one
@@ -172,6 +180,26 @@ internal static unsafe class VulkanVideoPresenter
             attributeBindings,
             attributeOffsets);
     }
+
+    internal static uint GetVertexFormatByteSize(
+        uint dataFormat,
+        uint componentCount) =>
+        dataFormat switch
+        {
+            1 => 1,  // R8
+            2 => 2,  // R16
+            3 => 2,  // R8G8
+            4 => 4,  // R32
+            5 => 4,  // R16G16
+            6 or 7 or 8 or 9 or 10 => 4, // packed 32-bit / R8G8B8A8
+            11 => 8, // R32G32
+            12 => 8, // R16G16B16A16
+            13 => 12, // R32G32B32
+            14 => 16, // R32G32B32A32
+            16 or 17 or 19 => 2, // packed 16-bit
+            34 => 4, // E5B9G9R9
+            _ => Math.Max(componentCount, 1) * sizeof(float),
+        };
 
     // The pending queue and per-render drain budget bound how much guest GPU
     // work can be buffered ahead of the presenter. Draws are batched into
@@ -8735,7 +8763,10 @@ internal static unsafe class VulkanVideoPresenter
                 sources[index] = new VulkanVertexBindingSource(
                     vertexBuffer.Buffer.Handle,
                     stride,
-                    GetVertexBindingOffset(vertexBuffer));
+                    GetVertexBindingOffset(vertexBuffer),
+                    GetVertexFormatByteSize(
+                        vertexBuffer.DataFormat,
+                        vertexBuffer.ComponentCount));
             }
 
             var plan = PlanVertexBindings(sources);

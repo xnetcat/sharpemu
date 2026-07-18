@@ -63,6 +63,8 @@ public readonly record struct Gen5ShaderResourceMapping(
 public sealed record Gen5ShaderMetadata(
     uint ExtendedUserDataSizeDwords,
     uint ShaderResourceTableSizeDwords,
+    uint ExtendedUserDataRangeStart,
+    uint ExtendedUserDataRangeEnd,
     IReadOnlyDictionary<uint, uint> DirectResources,
     IReadOnlyList<Gen5ShaderResourceMapping> Resources);
 
@@ -128,7 +130,13 @@ public sealed record Gen5ShaderState(
     // Guest addresses each user-data SGPR's value came from when the
     // register was loaded through an indirect SH-register patch table.
     // The patch table can be populated after command-list parsing.
-    IReadOnlyList<ulong>? UserDataSources = null);
+    IReadOnlyList<ulong>? UserDataSources = null,
+    // Gen5 can bulk-load an additional user-data block after the ordinary
+    // SPI_SHADER_USER_DATA_* register window. These values occupy s32 and
+    // above in the hardware scalar register file, including in merged NGG
+    // shaders whose ordinary user data begins at s8.
+    IReadOnlyList<uint>? ExtendedUserData = null,
+    uint ExtendedUserDataScalarRegisterBase = 32);
 
 /// <summary>
 /// Provenance for a descriptor reached through one or more late-written

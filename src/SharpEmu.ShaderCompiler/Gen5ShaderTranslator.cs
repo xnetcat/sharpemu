@@ -84,11 +84,17 @@ public static class Gen5ShaderTranslator
     private const uint PsUserDataRegister = 0x0C;
     private const uint VsUserDataRegister = 0x4C;
     private const uint GsUserDataRegister = 0x8C;
+    private const uint GsExtendedUserDataAddressLowRegister = 0x82;
+    private const uint GsExtendedUserDataAddressHighRegister = 0x83;
     private const uint EsUserDataRegister = 0xCC;
     private const uint ComputeUserDataRegister = 0x240;
     private const uint ComputePgmRsrc2Register = 0x213;
     private const int MaximumHardwareUserSgprs = 64;
+    private const int MaximumExtendedUserDataDwords = 64;
+    private const uint ExtendedUserDataScalarRegisterBase = 32;
     private static readonly ConditionalWeakTable<object, ShaderDecodeCache> _decodeCaches = new();
+    private static readonly object _extendedUserDataTraceGate = new();
+    private static readonly HashSet<ulong> _tracedExtendedUserDataShaders = [];
 
     private sealed class ShaderDecodeCache
     {
@@ -278,14 +284,99 @@ public static class Gen5ShaderTranslator
             }
         }
 
+        var extendedUserData = ReadExtendedUserData(
+            ctx,
+            shaderAddress,
+            metadata,
+            shaderRegisters,
+            userDataBaseRegister);
+
         state = new Gen5ShaderState(
             program,
             userData,
             metadata,
             computeSystemRegisters,
             userDataScalarRegisterBase,
-            userDataSources);
+            userDataSources,
+            extendedUserData,
+            ExtendedUserDataScalarRegisterBase);
         return true;
+    }
+
+    private static uint[]? ReadExtendedUserData(
+        CpuContext ctx,
+        ulong shaderAddress,
+        Gen5ShaderMetadata? metadata,
+        IReadOnlyDictionary<uint, uint> shaderRegisters,
+        uint userDataBaseRegister)
+    {
+        if (metadata is not { ExtendedUserDataSizeDwords: > 0 } ||
+            userDataBaseRegister != GsUserDataRegister)
+        {
+            return null;
+        }
+
+        if (!shaderRegisters.TryGetValue(
+                GsExtendedUserDataAddressLowRegister,
+                out var addressLow) ||
+            !shaderRegisters.TryGetValue(
+                GsExtendedUserDataAddressHighRegister,
+                out var addressHigh))
+        {
+            TraceExtendedUserDataFailure(
+                shaderAddress,
+                metadata,
+                0,
+                "missing-address-registers");
+            return null;
+        }
+
+        var linearAddress = ((ulong)addressHigh << 32) | addressLow;
+        var dwordCount = checked((int)Math.Min(
+            metadata.ExtendedUserDataSizeDwords,
+            MaximumExtendedUserDataDwords));
+        var bytes = new byte[checked(dwordCount * sizeof(uint))];
+        if (linearAddress == 0 || !ctx.Memory.TryRead(linearAddress, bytes))
+        {
+            TraceExtendedUserDataFailure(
+                shaderAddress,
+                metadata,
+                linearAddress,
+                "unreadable");
+            return null;
+        }
+
+        var values = new uint[dwordCount];
+        for (var index = 0; index < values.Length; index++)
+        {
+            values[index] = BinaryPrimitives.ReadUInt32LittleEndian(
+                bytes.AsSpan(index * sizeof(uint), sizeof(uint)));
+        }
+
+        return values;
+    }
+
+    private static void TraceExtendedUserDataFailure(
+        ulong shaderAddress,
+        Gen5ShaderMetadata metadata,
+        ulong address,
+        string reason)
+    {
+        lock (_extendedUserDataTraceGate)
+        {
+            if (!_tracedExtendedUserDataShaders.Add(shaderAddress))
+            {
+                return;
+            }
+        }
+
+        Console.Error.WriteLine(
+            $"[LOADER][WARN] agc.extended_user_data_unavailable " +
+            $"shader=0x{shaderAddress:X16} " +
+            $"range=0x{metadata.ExtendedUserDataRangeStart:X4}-" +
+            $"0x{metadata.ExtendedUserDataRangeEnd:X4} " +
+            $"dwords={metadata.ExtendedUserDataSizeDwords} " +
+            $"address=0x{address:X16} reason={reason}");
     }
 
     private static bool TryGetUserSgprCount(
@@ -384,6 +475,8 @@ public static class Gen5ShaderTranslator
             $"ud_base=s{state.UserDataScalarRegisterBase} hw_ud={state.UserData.Count} " +
             $"ud[{userData}]" +
             $"{systemRegisters} metadata[eud={metadata.ExtendedUserDataSizeDwords}," +
+            $"eud_range=0x{metadata.ExtendedUserDataRangeStart:X4}-" +
+            $"0x{metadata.ExtendedUserDataRangeEnd:X4}," +
             $"srt={metadata.ShaderResourceTableSizeDwords},direct={direct},resources={resources}]";
     }
 

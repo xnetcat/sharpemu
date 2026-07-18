@@ -155,6 +155,20 @@ public static class Gen5ShaderScalarEvaluator
                 state.UserData[index];
         }
 
+        if (state.ExtendedUserData is { } extendedUserData)
+        {
+            for (var index = 0;
+                 index < extendedUserData.Count &&
+                 state.ExtendedUserDataScalarRegisterBase + (uint)index <
+                     scalarRegisters.Length;
+                 index++)
+            {
+                scalarRegisters[
+                    state.ExtendedUserDataScalarRegisterBase + (uint)index] =
+                    extendedUserData[index];
+            }
+        }
+
         if (state.ComputeSystemRegisters is { } computeSystemRegisters)
         {
             computeSystemRegisters.ClearStaticValues(scalarRegisters);
