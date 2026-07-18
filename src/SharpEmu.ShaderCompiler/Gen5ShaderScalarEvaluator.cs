@@ -1138,6 +1138,23 @@ public static class Gen5ShaderScalarEvaluator
             return true;
         }
 
+        if (instruction.Opcode == "SBcnt1I32B64")
+        {
+            if (!TryEvaluateScalarOperand64(
+                    instruction.Sources[0],
+                    registers,
+                    execMask,
+                    out var value))
+            {
+                error = $"scalar-source64 pc=0x{instruction.Pc:X} op={instruction.Opcode}";
+                return false;
+            }
+
+            registers[destination.Value] = (uint)BitOperations.PopCount(value);
+            scalarConditionCode = registers[destination.Value] != 0;
+            return true;
+        }
+
         if (TryExecuteSaveExecScalarAlu(
                 instruction,
                 registers,

@@ -67,6 +67,36 @@ public sealed class Gen5SpirvAtomicTranslationTests
         Assert.Contains((ushort)SpirvOp.AtomicIAdd, opcodes);
     }
 
+    [Fact]
+    public void Rdna2SceneShaderOpcodes_TranslateToSpirv()
+    {
+        var opcodes = CompileCompute(
+            [
+                0xBE8A1000,             // S_BCNT1_I32_B64 s10, s[0:1]
+                0x7E06A4F9, 0x00061500, // V_CVT_U16_F16 v3, v0 (SDWA)
+                0x7E0CAEF9, 0x00251501, // V_LOG_F16 v6, v1 (SDWA)
+                0x7E12B0F9, 0x0005150A, // V_EXP_F16 v9, v10 (SDWA)
+                0xD5490003, 0x040A0300, // V_BFE_I32 v3, v0, v1, v2
+                0xD76A0003, 0x040A0300, // V_CVT_PK_U16_U32 v3, v0, v1
+                0xD1780003, 0x040A0300, // V_XOR3_B32 v3, v0, v1, v2
+                0xD2FF0003, 0x00020300, // V_LSHLREV_B64 v[3:4], v0, v[1:2]
+                0xD3000003, 0x00020300, // V_LSHRREV_B64 v[3:4], v0, v[1:2]
+                0xDAC00102, 0x00001700, // DS_WRITE_ADDTID_B32 v23 offset:0x102
+                0xDAC40100, 0x39000000, // DS_READ_ADDTID_B32 v57 offset:0x100
+            ],
+            new Dictionary<uint, uint>
+            {
+                [0] = 0xFFFF_FFFF,
+                [1] = 0x8000_0001,
+            });
+
+        Assert.Contains((ushort)SpirvOp.BitCount, opcodes);
+        Assert.Contains((ushort)SpirvOp.ConvertFToU, opcodes);
+        Assert.Contains((ushort)SpirvOp.BitFieldSExtract, opcodes);
+        Assert.Contains((ushort)SpirvOp.ShiftLeftLogical, opcodes);
+        Assert.Contains((ushort)SpirvOp.ShiftRightLogical, opcodes);
+    }
+
     private static Dictionary<uint, uint> BufferDescriptorRegisters() => new()
     {
         // V# in s[0:3]: base=BufferAddress, stride=0, numRecords=64 bytes, type=0.

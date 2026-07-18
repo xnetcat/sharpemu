@@ -1851,6 +1851,42 @@ public static partial class Gen5SpirvTranslator
 
             switch (instruction.Opcode)
             {
+                case "DsWriteAddtidB32":
+                {
+                    if (instruction.Sources.Count < 1)
+                    {
+                        error = "missing LDS add-thread-id write source";
+                        return false;
+                    }
+
+                    var laneOffset = ShiftLeftLogical(GuestWaveLane(), UInt(2));
+                    var baseAddress = BitwiseAnd(LoadS(124), UInt(ushort.MaxValue));
+                    var address = IAdd(
+                        IAdd(baseAddress, UInt(EffectiveDsSingleOffsetBytes(control))),
+                        laneOffset);
+                    StoreLds(
+                        LdsPointer(address, 0),
+                        GetRawSource(instruction, 0));
+                    return true;
+                }
+                case "DsReadAddtidB32":
+                {
+                    if (instruction.Destinations.Count < 1)
+                    {
+                        error = "missing LDS add-thread-id read destination";
+                        return false;
+                    }
+
+                    var laneOffset = ShiftLeftLogical(GuestWaveLane(), UInt(2));
+                    var baseAddress = BitwiseAnd(LoadS(124), UInt(ushort.MaxValue));
+                    var address = IAdd(
+                        IAdd(baseAddress, UInt(EffectiveDsSingleOffsetBytes(control))),
+                        laneOffset);
+                    StoreV(
+                        instruction.Destinations[0].Value,
+                        Load(_uintType, LdsPointer(address, 0)));
+                    return true;
+                }
                 case "DsWriteB32":
                 {
                     if (instruction.Sources.Count < 2)
@@ -1861,7 +1897,7 @@ public static partial class Gen5SpirvTranslator
 
                     var address = GetRawSource(instruction, 0);
                     StoreLds(
-                        LdsPointer(address, control.Offset0),
+                        LdsPointer(address, EffectiveDsSingleOffsetBytes(control)),
                         GetRawSource(instruction, 1));
                     return true;
                 }
@@ -1874,7 +1910,7 @@ public static partial class Gen5SpirvTranslator
                     }
 
                     var address = GetRawSource(instruction, 0);
-                    var offset = control.Offset0;
+                    var offset = EffectiveDsSingleOffsetBytes(control);
                     StoreLds(LdsPointer(address, offset), GetRawSource(instruction, 1));
                     StoreLds(
                         LdsPointer(address, offset + sizeof(uint)),
@@ -1894,7 +1930,7 @@ public static partial class Gen5SpirvTranslator
                     }
 
                     var address = GetRawSource(instruction, 0);
-                    var offset = control.Offset0;
+                    var offset = EffectiveDsSingleOffsetBytes(control);
                     for (var dword = 0; dword < dwordCount; dword++)
                     {
                         StoreLds(
@@ -1939,7 +1975,7 @@ public static partial class Gen5SpirvTranslator
                     var address = GetRawSource(instruction, 0);
                     var value = Load(
                         _uintType,
-                        LdsPointer(address, control.Offset0));
+                        LdsPointer(address, EffectiveDsSingleOffsetBytes(control)));
                     StoreV(instruction.Destinations[0].Value, value);
                     return true;
                 }
@@ -1957,7 +1993,7 @@ public static partial class Gen5SpirvTranslator
                     }
 
                     var address = GetRawSource(instruction, 0);
-                    var offset = control.Offset0;
+                    var offset = EffectiveDsSingleOffsetBytes(control);
                     for (var dword = 0; dword < dwordCount; dword++)
                     {
                         var value = Load(
@@ -2007,6 +2043,9 @@ public static partial class Gen5SpirvTranslator
 
         private static uint EffectiveDsPairOffsetBytes(uint offset, bool st64 = false) =>
             offset * (st64 ? 256u : sizeof(uint));
+
+        private static uint EffectiveDsSingleOffsetBytes(Gen5DataShareControl control) =>
+            control.Offset0 | control.Offset1 << 8;
 
         private uint LdsPointer(uint address, uint offsetBytes)
         {
@@ -2070,7 +2109,9 @@ public static partial class Gen5SpirvTranslator
             }
 
             var address = GetRawSource(instruction, 0);
-            var pointer = LdsPointer(address, control.Offset0);
+            var pointer = LdsPointer(
+                address,
+                EffectiveDsSingleOffsetBytes(control));
             EmitExecConditional(() =>
             {
                 var original = EmitAtomic(
@@ -5356,7 +5397,11 @@ public static partial class Gen5SpirvTranslator
              UsesSubgroupBroadcast() ||
              UsesWaveControl() ||
              _state.Program.Instructions.Any(static instruction =>
-                 instruction.Opcode is "VMbcntLoU32B32" or "VMbcntHiU32B32"));
+                 instruction.Opcode is
+                     "VMbcntLoU32B32" or
+                     "VMbcntHiU32B32" or
+                     "DsWriteAddtidB32" or
+                     "DsReadAddtidB32"));
 
         private static bool IsWaveMaskOperand(Gen5Operand operand) =>
             operand.Kind == Gen5OperandKind.ScalarRegister &&
