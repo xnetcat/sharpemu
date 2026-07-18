@@ -691,25 +691,44 @@ internal static unsafe class VulkanVideoPresenter
         return false;
     }
 
-    private static bool RenderTargetsMismatchedOrAliased(IReadOnlyList<GuestRenderTarget> targets, GuestRenderTarget first)
+    /// <summary>
+    /// Vulkan permits framebuffer attachments to be larger than the framebuffer,
+    /// so mixed-size MRTs use the smallest bound extent. The same image cannot
+    /// be used as multiple color attachments in one subpass, however, so true
+    /// guest-address aliases remain unsupported.
+    /// </summary>
+    internal static bool TryGetCompatibleRenderTargetExtent(
+        IReadOnlyList<GuestRenderTarget> targets,
+        out uint width,
+        out uint height)
     {
+        width = uint.MaxValue;
+        height = uint.MaxValue;
         for (var i = 0; i < targets.Count; i++)
         {
-            if (targets[i].Width != first.Width || targets[i].Height != first.Height)
+            var target = targets[i];
+            if (target.Width == 0 || target.Height == 0)
             {
-                return true;
+                width = 0;
+                height = 0;
+                return false;
             }
 
+            width = Math.Min(width, target.Width);
+            height = Math.Min(height, target.Height);
             for (var j = i + 1; j < targets.Count; j++)
             {
-                if (targets[i].Address == targets[j].Address)
+                if (target.Address != 0 &&
+                    target.Address == targets[j].Address)
                 {
-                    return true;
+                    width = 0;
+                    height = 0;
+                    return false;
                 }
             }
         }
 
-        return false;
+        return targets.Count != 0;
     }
 
     public static void SubmitOffscreenTranslatedDraw(
@@ -739,20 +758,26 @@ internal static unsafe class VulkanVideoPresenter
             return;
         }
 
-        var firstTarget = targets[0];
-        if (RenderTargetsMismatchedOrAliased(targets, firstTarget))
+        if (!TryGetCompatibleRenderTargetExtent(
+                targets,
+                out var renderWidth,
+                out var renderHeight))
         {
             Console.Error.WriteLine(
-                "[LOADER][WARN] Vulkan skipped MRT draw with mismatched dimensions or aliased targets.");
+                $"[LOADER][WARN] Vulkan skipped MRT draw with aliased targets " +
+                $"[{string.Join(',', targets.Select(target =>
+                    $"0x{target.Address:X16}:{target.Width}x{target.Height}"))}].");
             return;
         }
 
+        var firstTarget = targets[0];
         if (ShouldTraceGuestImageSubmissionsForDiagnostics())
         {
             Console.Error.WriteLine(
                 $"[LOADER][TRACE] vk.submit_call kind=SubmitOffscreenTranslatedDraw " +
                 $"targets={targets.Count} first=0x{firstTarget.Address:X16} " +
-                $"{firstTarget.Width}x{firstTarget.Height} textures={textures.Count}");
+                $"{firstTarget.Width}x{firstTarget.Height} " +
+                $"render={renderWidth}x{renderHeight} textures={textures.Count}");
         }
 
         var effectiveRenderState = renderState ?? GuestRenderState.Default;
@@ -10113,6 +10138,15 @@ internal static unsafe class VulkanVideoPresenter
 
         private void ExecuteOffscreenDrawCore(VulkanOffscreenGuestDraw work)
         {
+            if (!TryGetCompatibleRenderTargetExtent(
+                    work.Targets,
+                    out var renderWidth,
+                    out var renderHeight))
+            {
+                ReturnPooledGuestData(work.Draw);
+                return;
+            }
+
             work = work with
             {
                 Draw = work.Draw with
@@ -10247,7 +10281,7 @@ internal static unsafe class VulkanVideoPresenter
             Framebuffer transientFramebuffer = default;
             try
             {
-                var extent = new Extent2D(firstTarget.Width, firstTarget.Height);
+                var extent = new Extent2D(renderWidth, renderHeight);
                 var draw = work.Draw;
                 var clearDepthForDraw = draw.RenderState.Depth.ClearEnable;
                 if (work.DepthTarget?.ReadOnly == true && draw.RenderState.Depth.WriteEnable)
@@ -10268,12 +10302,12 @@ internal static unsafe class VulkanVideoPresenter
                     work.DepthTarget is { } depthTarget)
                 {
                     var effectiveDepthTarget = depthTarget;
-                    if (depthTarget.Width < firstTarget.Width || depthTarget.Height < firstTarget.Height)
+                    if (depthTarget.Width < renderWidth || depthTarget.Height < renderHeight)
                     {
                         var matchingTexture = work.Draw.Textures.FirstOrDefault(texture =>
                             texture.Address == depthTarget.Address &&
-                            texture.Width >= firstTarget.Width &&
-                            texture.Height >= firstTarget.Height);
+                            texture.Width >= renderWidth &&
+                            texture.Height >= renderHeight);
                         if (matchingTexture is not null)
                         {
                             effectiveDepthTarget = depthTarget with
@@ -10291,8 +10325,8 @@ internal static unsafe class VulkanVideoPresenter
                             // value literally discards the entire draw.
                             effectiveDepthTarget = depthTarget with
                             {
-                                Width = firstTarget.Width,
-                                Height = firstTarget.Height,
+                                Width = renderWidth,
+                                Height = renderHeight,
                             };
                         }
 
@@ -10312,8 +10346,8 @@ internal static unsafe class VulkanVideoPresenter
 
                     if (!GuestDepthCoversColorTarget(
                             effectiveDepthTarget,
-                            firstTarget.Width,
-                            firstTarget.Height))
+                            renderWidth,
+                            renderHeight))
                     {
                         // Vulkan framebuffers cannot use an attachment smaller
                         // than the render area. A stale low-resolution DB
@@ -10322,15 +10356,15 @@ internal static unsafe class VulkanVideoPresenter
                         // particular inherit these registers on Gen5).
                         if (_tracedDepthExtentFallbacks.Add(
                                 (effectiveDepthTarget.Address,
-                                 firstTarget.Width,
-                                 firstTarget.Height)))
+                                 renderWidth,
+                                 renderHeight)))
                         {
                             Console.Error.WriteLine(
                                 $"[LOADER][WARN] Vulkan omitted stale guest depth attachment " +
                                 $"addr=0x{effectiveDepthTarget.Address:X16} " +
                                 $"depth={effectiveDepthTarget.Width}x{effectiveDepthTarget.Height} " +
                                 $"color=0x{firstTarget.Address:X16}:" +
-                                $"{firstTarget.Width}x{firstTarget.Height}");
+                                $"{renderWidth}x{renderHeight}");
                         }
                     }
                     else
@@ -10387,8 +10421,8 @@ internal static unsafe class VulkanVideoPresenter
                         targets.Select(target => target.MipViews.Length > 0
                             ? target.MipViews[0]
                             : target.View).ToArray(),
-                        firstTarget.Width,
-                        firstTarget.Height,
+                        renderWidth,
+                        renderHeight,
                         targets.Select(target =>
                             target.Initialized || target.InitialUploadPending).ToArray(),
                         depth,
@@ -10412,7 +10446,7 @@ internal static unsafe class VulkanVideoPresenter
                 resources.DebugName =
                     $"SharpEmu offscreen mrt={targets.Length} " +
                     $"first=0x{work.Targets[0].Address:X16} " +
-                    $"{firstTarget.Width}x{firstTarget.Height}";
+                    $"{renderWidth}x{renderHeight}";
 
                 commandBuffer = BeginBatchedGuestCommands();
                 _commandBuffer = commandBuffer;
@@ -10693,7 +10727,7 @@ internal static unsafe class VulkanVideoPresenter
                 {
                     TraceVulkanShader(
                         $"vk.offscreen_draw mrt={targets.Length} " +
-                        $"size={firstTarget.Width}x{firstTarget.Height} " +
+                        $"size={renderWidth}x{renderHeight} " +
                         $"textures={work.Draw.Textures.Count}");
                 }
             }
