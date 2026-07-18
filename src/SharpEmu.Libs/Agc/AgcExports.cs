@@ -289,6 +289,7 @@ public static partial class AgcExports
         "1",
         StringComparison.Ordinal);
     private static long _dcbWriteDataTraceCount;
+    private static long _recycledLabelWriteTraceCount;
     private static int _tracedVertexRangeCount;
     private static long _dcbWaitRegMemTraceCount;
     private static long _recycledWaitLabelTraceCount;
@@ -4062,6 +4063,21 @@ public static partial class AgcExports
                 destinationAddress >= 0x10000 &&
                 (destinationAddress & 3) == 0 &&
                 sourceAddress <= uint.MaxValue;
+            if (immediateFill &&
+                IsCompletionLabelClearDma(
+                    compactLayout,
+                    byteCount,
+                    sourceAddress) &&
+                TrySuppressRecycledCompletionLabelWrite(
+                    ctx,
+                    destinationAddress,
+                    value: 0,
+                    byteCount,
+                    "dma-clear"))
+            {
+                return true;
+            }
+
             return byteCount != 0 &&
                    byteCount <= MaxEagerGpuDataWriteBytes &&
                    destinationAddress >= 0x10000 &&
@@ -4114,7 +4130,16 @@ public static partial class AgcExports
             {
                 eagerAttempted = true;
                 eagerApplied = ApplyDmaGuestMemory(out _);
-            });
+            },
+            // sceAgc emits a 4-byte immediate-zero DMA directly before the
+            // RELEASE_MEM that publishes a completion label. If the release
+            // is allowed through an active wait but this clear remains
+            // queued, the delayed clear can overwrite the completed value.
+            // Apply the pair eagerly and in parser order.
+            eagerWatchedLabelWrite: IsCompletionLabelClearDma(
+                compactLayout,
+                byteCount,
+                sourceAddress));
     }
 
     private static readonly bool _eagerGpuDataWritesEnabled = !string.Equals(
@@ -4254,6 +4279,14 @@ public static partial class AgcExports
 
     internal static bool ShouldRetryQueuedGuestWrite(bool eagerAttempted) =>
         !eagerAttempted;
+
+    internal static bool IsCompletionLabelClearDma(
+        bool compactLayout,
+        uint byteCount,
+        ulong sourceAddress) =>
+        compactLayout &&
+        byteCount == sizeof(uint) &&
+        sourceAddress == 0;
 
     private static LabelProducerTrace? RegisterLabelProducer(
         object memory,
@@ -5411,7 +5444,7 @@ public static partial class AgcExports
 
         if (!is64Bit &&
             TryReadUInt64(ctx, waitAddress, out var currentQword) &&
-            IsRecycledGpuLabelPointer(
+            IsRecycledGpuLabelStorage(
                 currentQword,
                 reference,
                 mask,
@@ -5493,14 +5526,97 @@ public static partial class AgcExports
         // completion-label condition (label == 1). A canonical, aligned
         // user-memory pointer in the same eight bytes proves that the 4-byte
         // label storage has been repurposed.
-        const ulong guestUserAddressStart = 0x0000_0070_0000_0000UL;
-        const ulong guestUserAddressEnd = 0x0000_0080_0000_0000UL;
         return compareFunction == 3 &&
                reference == 1 &&
                mask == uint.MaxValue &&
-               currentQword >= guestUserAddressStart &&
-               currentQword < guestUserAddressEnd &&
-               (currentQword & 0xFUL) == 0;
+               IsAlignedGuestUserPointer(currentQword);
+    }
+
+    internal static bool IsRecycledGpuLabelStorage(
+        ulong currentQword,
+        ulong reference,
+        ulong mask,
+        uint compareFunction) =>
+        compareFunction == 3 &&
+        reference == 1 &&
+        mask == uint.MaxValue &&
+        IsRecycledGpuLabelStorageValue(currentQword);
+
+    internal static bool ShouldRetireRegisteredGpuWait(
+        bool is64Bit,
+        ulong currentQword,
+        ulong reference,
+        ulong mask,
+        uint compareFunction) =>
+        !is64Bit &&
+        IsRecycledGpuLabelStorage(
+            currentQword,
+            reference,
+            mask,
+            compareFunction);
+
+    internal static bool ShouldSuppressRecycledCompletionLabelWrite(
+        ulong currentQword,
+        ulong value,
+        uint byteCount)
+    {
+        // AGC completion labels use a 4-byte clear followed by a 4- or 8-byte
+        // write of one. If command processing falls behind the guest and the
+        // label storage has already returned to Unreal's allocator, its first
+        // qword contains an aligned user pointer. Applying either stale packet
+        // would turn that pointer into 0x...00000000/01.
+        return IsRecycledGpuLabelStorageValue(currentQword) &&
+               ((byteCount == sizeof(uint) && value is 0 or 1) ||
+                (byteCount == sizeof(ulong) && value == 1));
+    }
+
+    private static bool IsRecycledGpuLabelStorageValue(ulong value)
+    {
+        // Unreal's 0x20-byte recycled records carry this exact first qword
+        // before their first field becomes a free-list pointer. Neither form
+        // can be a live AGC completion label, whose only values are zero/one.
+        const uint recycledRecordSignature = 0xE701_0002u;
+        var low = (uint)value;
+        var high = (uint)(value >> 32);
+        return (low == recycledRecordSignature && high <= 1) ||
+               IsAlignedGuestUserPointer(value);
+    }
+
+    private static bool IsAlignedGuestUserPointer(ulong value)
+    {
+        const ulong guestUserAddressStart = 0x0000_0070_0000_0000UL;
+        const ulong guestUserAddressEnd = 0x0000_0080_0000_0000UL;
+        return value >= guestUserAddressStart &&
+               value < guestUserAddressEnd &&
+               (value & 0xFUL) == 0;
+    }
+
+    private static bool TrySuppressRecycledCompletionLabelWrite(
+        CpuContext ctx,
+        ulong address,
+        ulong value,
+        uint byteCount,
+        string packetKind)
+    {
+        if (!TryReadUInt64(ctx, address, out var currentQword) ||
+            !ShouldSuppressRecycledCompletionLabelWrite(
+                currentQword,
+                value,
+                byteCount))
+        {
+            return false;
+        }
+
+        if (ShouldTraceHotPath(ref _recycledLabelWriteTraceCount))
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][WARN] agc.label_write_retired_recycled " +
+                $"kind={packetKind} label=0x{address:X16} " +
+                $"value=0x{value:X16} bytes={byteCount} " +
+                $"current=0x{currentQword:X16}");
+        }
+
+        return true;
     }
 
     private static void ReleaseDeferredWaitProducers(
@@ -5686,10 +5802,41 @@ public static partial class AgcExports
         for (var pass = 0; pass < 256; pass++)
         {
             var memoryStateKey = GetCpuMemoryStateKey(ctx.Memory);
-            var woken = GpuWaitRegistry.CollectSatisfied(memoryStateKey, (address, is64Bit) =>
-                is64Bit
-                    ? TryReadUInt64(ctx, address, out var value64) ? value64 : (ulong?)null
-                    : TryReadUInt32(ctx, address, out var value32) ? value32 : (ulong?)null);
+            var woken = GpuWaitRegistry.CollectSatisfied(
+                memoryStateKey,
+                (address, is64Bit) =>
+                {
+                    if (TryReadUInt64(ctx, address, out var value64))
+                    {
+                        return value64;
+                    }
+
+                    return !is64Bit &&
+                           TryReadUInt32(ctx, address, out var value32)
+                        ? value32
+                        : null;
+                },
+                (waiter, currentQword) =>
+                {
+                    var retired = ShouldRetireRegisteredGpuWait(
+                        waiter.Is64Bit,
+                        currentQword,
+                        waiter.ReferenceValue,
+                        waiter.Mask,
+                        waiter.CompareFunction);
+                    if (retired &&
+                        ShouldTraceHotPath(ref _recycledWaitLabelTraceCount))
+                    {
+                        Console.Error.WriteLine(
+                            $"[LOADER][WARN] agc.wait_monitor_retired_recycled " +
+                            $"label=0x{waiter.WaitAddress:X16} " +
+                            $"value=0x{currentQword:X16} " +
+                            $"queue={waiter.QueueName} " +
+                            $"submission={waiter.SubmissionId}");
+                    }
+
+                    return retired;
+                });
 
             if (woken is null)
             {
@@ -5878,8 +6025,20 @@ public static partial class AgcExports
             InvalidateDcbWindowIfOverlaps(destinationAddress, writeLength);
             return dataSelection switch
             {
-                1 => TryWriteUInt32(ctx, destinationAddress, dataLo),
-                2 => ctx.TryWriteUInt64(destinationAddress, data),
+                1 => TrySuppressRecycledCompletionLabelWrite(
+                         ctx,
+                         destinationAddress,
+                         dataLo,
+                         sizeof(uint),
+                         "release-mem-standard") ||
+                     TryWriteUInt32(ctx, destinationAddress, dataLo),
+                2 => TrySuppressRecycledCompletionLabelWrite(
+                         ctx,
+                         destinationAddress,
+                         data,
+                         sizeof(ulong),
+                         "release-mem-standard") ||
+                     ctx.TryWriteUInt64(destinationAddress, data),
                 // Hardware counter writes are timing values sampled at the
                 // release point, not the immediate payload in ordinal 6/7.
                 3 or 4 => ctx.TryWriteUInt64(
@@ -5972,8 +6131,20 @@ public static partial class AgcExports
             InvalidateDcbWindowIfOverlaps(destinationAddress, writeLength);
             return dataSelection switch
             {
-                1 => TryWriteUInt32(ctx, destinationAddress, dataLo),
-                2 => ctx.TryWriteUInt64(destinationAddress, data),
+                1 => TrySuppressRecycledCompletionLabelWrite(
+                         ctx,
+                         destinationAddress,
+                         dataLo,
+                         sizeof(uint),
+                         "release-mem") ||
+                     TryWriteUInt32(ctx, destinationAddress, dataLo),
+                2 => TrySuppressRecycledCompletionLabelWrite(
+                         ctx,
+                         destinationAddress,
+                         data,
+                         sizeof(ulong),
+                         "release-mem") ||
+                     ctx.TryWriteUInt64(destinationAddress, data),
                 // Data selection 3 samples the GPU clock at the release
                 // point. The packet payload is ignored by hardware; Unity
                 // uses the nonzero timestamp as submit-completion state.
