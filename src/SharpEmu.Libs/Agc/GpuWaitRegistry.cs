@@ -120,7 +120,8 @@ internal static class GpuWaitRegistry
     /// </summary>
     public static List<WaitingDcb>? CollectSatisfied(
         object memory,
-        Func<ulong, bool, ulong?> readValue)
+        Func<ulong, bool, ulong?> readValue,
+        Func<WaitingDcb, ulong, bool>? retireUnsatisfied = null)
     {
         List<WaitingDcb>? woken = null;
         lock (_gate)
@@ -135,14 +136,10 @@ internal static class GpuWaitRegistry
                         continue;
                     }
 
-                    var satisfied = list[i].Latched;
-                    if (!satisfied)
-                    {
-                        var value = readValue(address, list[i].Is64Bit);
-                        satisfied = value is not null && Compare(list[i], value.Value);
-                    }
-
-                    if (!satisfied)
+                    var value = readValue(address, list[i].Is64Bit);
+                    if (value is null ||
+                        (!Compare(list[i], value.Value) &&
+                         !(retireUnsatisfied?.Invoke(list[i], value.Value) ?? false)))
                     {
                         continue;
                     }

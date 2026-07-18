@@ -19,6 +19,7 @@ public sealed partial class DirectExecutionBackend
 	private static int _lazyCommitTraceCount;
 	private static int _guestAllocatorHoleRecoveries;
 	private static int _guestAllocatorFreeListRecoveries;
+	private static int _guestAllocatorCleanupRecoveries;
 	private static int _auxiliaryThreadExecuteFaultRecoveries;
 
 	private unsafe void SetupExceptionHandler()
@@ -131,6 +132,11 @@ public sealed partial class DirectExecutionBackend
 			}
 			if (exceptionCode == 3221225477u &&
 				TryRecoverGuestAllocatorFreeListCorruption(exceptionRecord, contextRecord, rip))
+			{
+				return -1;
+			}
+			if (exceptionCode == 3221225477u &&
+				TryRecoverGuestAllocatorCleanupCorruption(exceptionRecord, contextRecord, rip))
 			{
 				return -1;
 			}
@@ -637,6 +643,80 @@ public sealed partial class DirectExecutionBackend
 
 	private const ulong GuestAllocatorInlinedFreeListPopFaultOffset = 17;
 	private const ulong GuestAllocatorInlinedFreeListPopNullTestOffset = 14;
+
+	private unsafe static bool TryRecoverGuestAllocatorCleanupCorruption(
+		EXCEPTION_RECORD* exceptionRecord,
+		void* contextRecord,
+		ulong rip)
+	{
+		if (string.Equals(
+				Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_GUEST_ALLOCATOR_CLEANUP_RECOVERY"),
+				"1",
+				StringComparison.Ordinal) ||
+			exceptionRecord->NumberParameters < 2)
+		{
+			return false;
+		}
+
+		ulong accessType = exceptionRecord->ExceptionInformation[0];
+		ulong faultAddress = exceptionRecord->ExceptionInformation[1];
+		byte[] faultCode = new byte[GuestAllocatorCleanupRecoveryPattern.FaultCodeLength];
+		if (!TryReadHostBytes(rip, faultCode))
+		{
+			return false;
+		}
+
+		ulong epilogueDelta;
+		string form;
+		if (GuestAllocatorCleanupRecoveryPattern.IsInvalidRecordFault(
+				faultCode,
+				accessType,
+				faultAddress,
+				ReadCtxU64(contextRecord, CTX_R14)))
+		{
+			epilogueDelta = GuestAllocatorCleanupRecoveryPattern.InvalidRecordEpilogueDelta;
+			form = "record";
+		}
+		else if (GuestAllocatorCleanupRecoveryPattern.IsInvalidMetadataFault(
+				faultCode,
+				accessType,
+				faultAddress,
+				ReadCtxU64(contextRecord, CTX_R12),
+				ReadCtxU64(contextRecord, CTX_RBX)))
+		{
+			epilogueDelta = GuestAllocatorCleanupRecoveryPattern.InvalidMetadataEpilogueDelta;
+			form = "metadata";
+		}
+		else
+		{
+			return false;
+		}
+
+		ulong epilogueRip = rip + epilogueDelta;
+		byte[] epilogueCode = new byte[GuestAllocatorCleanupRecoveryPattern.EpilogueCodeLength];
+		if (!TryReadHostBytes(epilogueRip, epilogueCode) ||
+			!GuestAllocatorCleanupRecoveryPattern.IsEpilogue(epilogueCode))
+		{
+			return false;
+		}
+
+		// This routine only retires allocator cleanup records. Abandon the
+		// damaged list through its own epilogue rather than dereferencing a
+		// small stale value and corrupting the allocator further.
+		WriteCtxU64(contextRecord, CTX_RAX, 0);
+		WriteCtxU64(contextRecord, CTX_RIP, epilogueRip);
+		var recovery = Interlocked.Increment(ref _guestAllocatorCleanupRecoveries);
+		if (recovery <= 16 || (recovery & (recovery - 1)) == 0)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][WARN] Guest allocator cleanup recovery #{recovery}: " +
+				$"form={form} fault=0x{faultAddress:X16} " +
+				$"rip=0x{rip:X16} -> 0x{epilogueRip:X16}");
+			Console.Error.Flush();
+		}
+
+		return true;
+	}
 
 	private static bool IsWritableProtection(uint protect)
 	{
