@@ -30,7 +30,9 @@ internal sealed record GuestDrawTexture(
     GuestSampler Sampler = default,
     uint Depth = 1,
     ulong DeferredDescriptorAddress = 0,
-    SharpEmu.ShaderCompiler.Gen5DescriptorChain? DeferredChain = null);
+    SharpEmu.ShaderCompiler.Gen5DescriptorChain? DeferredChain = null,
+    bool PixelStage = true,
+    bool VertexStage = true);
 
 /// <summary>Raw guest sampler descriptor dwords, copied verbatim from guest memory.</summary>
 internal readonly record struct GuestSampler(

@@ -34,6 +34,18 @@ internal readonly record struct VulkanRenderTargetFormat(
     public bool IsInteger => OutputKind is Gen5PixelOutputKind.Uint or Gen5PixelOutputKind.Sint;
 }
 
+internal readonly record struct VulkanVertexBindingSource(
+    ulong BufferIdentity,
+    uint Stride,
+    ulong Offset);
+
+internal sealed record VulkanVertexBindingPlan(
+    int[] BindingSourceIndices,
+    uint[] BindingStrides,
+    ulong[] BindingOffsets,
+    uint[] AttributeBindings,
+    uint[] AttributeOffsets);
+
 internal sealed record VulkanTranslatedGuestDraw(
     byte[] VertexSpirv,
     byte[] PixelSpirv,
@@ -340,6 +352,57 @@ internal static unsafe class VulkanVideoPresenter
     // thread's physical-device query) gives shader translation and descriptor
     // creation one stable aliasing contract on every conformant device.
     internal const ulong GuestStorageBufferOffsetAlignment = 256;
+    // Guest draw snapshots churn through a small set of 128 KiB-16 MiB size
+    // classes thousands of times per second. The process-wide shared pool
+    // trims and repartitions those large arrays aggressively under GC load,
+    // causing hundreds of MiB/s of replacement byte[] allocations. Keep a
+    // bounded, non-shared pool for AGC-to-presenter ownership transfers.
+    internal static System.Buffers.ArrayPool<byte> GuestDataPool { get; } =
+        System.Buffers.ArrayPool<byte>.Create(
+            maxArrayLength: 16 * 1024 * 1024,
+            maxArraysPerBucket: 96);
+
+    internal static VulkanVertexBindingPlan PlanVertexBindings(
+        IReadOnlyList<VulkanVertexBindingSource> sources)
+    {
+        var bindingSourceIndices = new List<int>(sources.Count);
+        var bindingStrides = new List<uint>(sources.Count);
+        var bindingOffsets = new List<ulong>(sources.Count);
+        var attributeBindings = new uint[sources.Count];
+        var attributeOffsets = new uint[sources.Count];
+        var bindings = new Dictionary<(ulong Buffer, uint Stride, ulong RecordOffset), uint>();
+
+        for (var index = 0; index < sources.Count; index++)
+        {
+            var source = sources[index];
+            var stride = Math.Max(source.Stride, 1);
+            // Bind the start of the interleaved record and express the
+            // attribute's byte position inside that record in pipeline state.
+            // Attributes captured from one guest stream therefore consume one
+            // Metal vertex-buffer slot instead of one slot per attribute.
+            var recordOffset = source.Offset - (source.Offset % stride);
+            var key = (source.BufferIdentity, stride, recordOffset);
+            if (!bindings.TryGetValue(key, out var binding))
+            {
+                binding = checked((uint)bindingSourceIndices.Count);
+                bindings.Add(key, binding);
+                bindingSourceIndices.Add(index);
+                bindingStrides.Add(stride);
+                bindingOffsets.Add(recordOffset);
+            }
+
+            attributeBindings[index] = binding;
+            attributeOffsets[index] = checked((uint)(source.Offset - recordOffset));
+        }
+
+        return new VulkanVertexBindingPlan(
+            bindingSourceIndices.ToArray(),
+            bindingStrides.ToArray(),
+            bindingOffsets.ToArray(),
+            attributeBindings,
+            attributeOffsets);
+    }
+
     // The pending queue and per-render drain budget bound how much guest GPU
     // work can be buffered ahead of the presenter. Draws are batched into
     // shared command buffers, so draining a large batch per render tick is
@@ -3050,11 +3113,13 @@ internal static unsafe class VulkanVideoPresenter
             public DescriptorPool DescriptorPool;
             public DescriptorSet DescriptorSet;
             public TextureResource[] Textures = [];
+            public ShaderStageFlags[] TextureStageFlags = [];
             public GlobalBufferResource[] GlobalMemoryBuffers = [];
             // -1 keeps the legacy one-array layout. Otherwise the flat array
             // is [pixel][vertex] and each graphics stage gets its own binding.
             public int PixelGlobalBufferCount = -1;
             public VertexBufferResource[] VertexBuffers = [];
+            public VertexInputLayout? VertexInput;
             public VkBuffer IndexBuffer;
             public DeviceMemory IndexMemory;
             public bool Index32Bit;
@@ -3144,6 +3209,14 @@ internal static unsafe class VulkanVideoPresenter
             public uint NumberFormat;
             public uint Stride;
             public uint OffsetBytes;
+        }
+
+        private sealed class VertexInputLayout
+        {
+            public VertexInputBindingDescription[] BindingDescriptions = [];
+            public VertexInputAttributeDescription[] AttributeDescriptions = [];
+            public VkBuffer[] Buffers = [];
+            public ulong[] Offsets = [];
         }
 
         private const Format DepthFormat = Format.D32Sfloat;
@@ -4304,6 +4377,16 @@ internal static unsafe class VulkanVideoPresenter
                 return;
             }
 
+            // Record the attempt before asking the driver for its cache blob.
+            // MoltenVK serializes this query with pipeline compilation. If an
+            // oversized cache or transient export failure leaves the dirty bit
+            // set, retrying after every subsequent pipeline turns one failure
+            // into a multi-minute startup stall.
+            if (!force)
+            {
+                _lastPipelineCacheSaveTick = Environment.TickCount64;
+            }
+
             try
             {
                 nuint size = 0;
@@ -4312,7 +4395,7 @@ internal static unsafe class VulkanVideoPresenter
                     _pipelineCache,
                     &size,
                     null);
-                if (result != Result.Success || size == 0 || size > 256u * 1024u * 1024u)
+                if (result != Result.Success || size == 0 || size > 512u * 1024u * 1024u)
                 {
                     Console.Error.WriteLine(
                         $"[LOADER][WARN] Vulkan pipeline cache query failed: result={result} size={size}");
@@ -6055,6 +6138,9 @@ internal static unsafe class VulkanVideoPresenter
             {
                 DebugName = "SharpEmu draw",
                 Textures = new TextureResource[draw.Textures.Count],
+                TextureStageFlags = draw.Textures
+                    .Select(static texture => GetGraphicsTextureStageFlags(texture))
+                    .ToArray(),
                 GlobalMemoryBuffers =
                     new GlobalBufferResource[draw.GlobalMemoryBuffers.Count],
                 PixelGlobalBufferCount = draw.PixelGlobalBufferCount,
@@ -6188,6 +6274,7 @@ internal static unsafe class VulkanVideoPresenter
                         sharedVertexResources.Add(guestVertex.Data, vertexResource);
                     }
                 }
+                resources.VertexInput = CreateVertexInputLayout(resources.VertexBuffers);
 
                 if (draw.IndexBuffer is { Length: > 0 } indexBuffer)
                 {
@@ -6629,32 +6716,10 @@ internal static unsafe class VulkanVideoPresenter
                     PName = entryPoint,
                 };
 
-                var vertexBindingDescriptions =
-                    new VertexInputBindingDescription[resources.VertexBuffers.Length];
-                var vertexAttributeDescriptions =
-                    new VertexInputAttributeDescription[resources.VertexBuffers.Length];
-                for (var index = 0; index < resources.VertexBuffers.Length; index++)
-                {
-                    var vertexBuffer = resources.VertexBuffers[index];
-                    vertexBindingDescriptions[index] = new VertexInputBindingDescription
-                    {
-                        Binding = (uint)index,
-                        Stride = vertexBuffer.Stride == 0
-                            ? Math.Max(vertexBuffer.ComponentCount, 1) * sizeof(float)
-                            : vertexBuffer.Stride,
-                        InputRate = VertexInputRate.Vertex,
-                    };
-                    vertexAttributeDescriptions[index] = new VertexInputAttributeDescription
-                    {
-                        Location = vertexBuffer.Location,
-                        Binding = (uint)index,
-                        Format = ToVkVertexFormat(
-                            vertexBuffer.DataFormat,
-                            vertexBuffer.NumberFormat,
-                            vertexBuffer.ComponentCount),
-                        Offset = 0,
-                    };
-                }
+                var vertexLayout = resources.VertexInput ??=
+                    CreateVertexInputLayout(resources.VertexBuffers);
+                var vertexBindingDescriptions = vertexLayout.BindingDescriptions;
+                var vertexAttributeDescriptions = vertexLayout.AttributeDescriptions;
 
                 fixed (VertexInputBindingDescription* vertexBindingPointerBase = vertexBindingDescriptions)
                 fixed (VertexInputAttributeDescription* vertexAttributePointerBase = vertexAttributeDescriptions)
@@ -6885,7 +6950,11 @@ internal static unsafe class VulkanVideoPresenter
                             ? DescriptorType.StorageImage
                             : DescriptorType.CombinedImageSampler,
                         DescriptorCount = 1,
-                        StageFlags = stageFlags,
+                        StageFlags =
+                            (stageFlags & ShaderStageFlags.ComputeBit) != 0 ||
+                            index >= resources.TextureStageFlags.Length
+                                ? stageFlags
+                                : resources.TextureStageFlags[index],
                     };
                 }
 
@@ -6971,22 +7040,52 @@ internal static unsafe class VulkanVideoPresenter
             {
                 key.Append(texture.IsStorage ? 'S' : 'T');
             }
+            key.Append('/');
+            foreach (var textureStages in resources.TextureStageFlags)
+            {
+                key.Append((uint)textureStages).Append(',');
+            }
 
             return key.ToString();
         }
 
+        private static ShaderStageFlags GetGraphicsTextureStageFlags(
+            GuestDrawTexture texture)
+        {
+            var stages = (ShaderStageFlags)0;
+            if (texture.PixelStage)
+            {
+                stages |= ShaderStageFlags.FragmentBit;
+            }
+            if (texture.VertexStage)
+            {
+                stages |= ShaderStageFlags.VertexBit;
+            }
+
+            return stages == 0
+                ? ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit
+                : stages;
+        }
+
         private static string BuildVertexLayoutKey(TranslatedDrawResources resources)
         {
+            var layout = resources.VertexInput ??=
+                CreateVertexInputLayout(resources.VertexBuffers);
             var key = new StringBuilder();
-            foreach (var buffer in resources.VertexBuffers)
+            foreach (var binding in layout.BindingDescriptions)
             {
-                key.Append(buffer.Location).Append(',')
-                    .Append(buffer.ComponentCount).Append(',')
-                    .Append(buffer.DataFormat).Append(',')
-                    .Append(buffer.NumberFormat).Append(',')
-                    .Append(buffer.Stride == 0
-                        ? Math.Max(buffer.ComponentCount, 1) * sizeof(float)
-                        : buffer.Stride)
+                key.Append(binding.Binding).Append(',')
+                    .Append(binding.Stride).Append(',')
+                    .Append((uint)binding.InputRate)
+                    .Append(';');
+            }
+            key.Append('/');
+            foreach (var attribute in layout.AttributeDescriptions)
+            {
+                key.Append(attribute.Location).Append(',')
+                    .Append(attribute.Binding).Append(',')
+                    .Append((uint)attribute.Format).Append(',')
+                    .Append(attribute.Offset)
                     .Append(';');
             }
 
@@ -9160,6 +9259,62 @@ internal static unsafe class VulkanVideoPresenter
                 _ => Format.R32Sfloat,
             };
 
+        private static VertexInputLayout CreateVertexInputLayout(
+            IReadOnlyList<VertexBufferResource> vertexBuffers)
+        {
+            var sources = new VulkanVertexBindingSource[vertexBuffers.Count];
+            for (var index = 0; index < vertexBuffers.Count; index++)
+            {
+                var vertexBuffer = vertexBuffers[index];
+                var stride = vertexBuffer.Stride == 0
+                    ? Math.Max(vertexBuffer.ComponentCount, 1) * sizeof(float)
+                    : vertexBuffer.Stride;
+                sources[index] = new VulkanVertexBindingSource(
+                    vertexBuffer.Buffer.Handle,
+                    stride,
+                    GetVertexBindingOffset(vertexBuffer));
+            }
+
+            var plan = PlanVertexBindings(sources);
+            var layout = new VertexInputLayout
+            {
+                BindingDescriptions =
+                    new VertexInputBindingDescription[plan.BindingSourceIndices.Length],
+                AttributeDescriptions =
+                    new VertexInputAttributeDescription[vertexBuffers.Count],
+                Buffers = new VkBuffer[plan.BindingSourceIndices.Length],
+                Offsets = plan.BindingOffsets,
+            };
+            for (var binding = 0; binding < plan.BindingSourceIndices.Length; binding++)
+            {
+                var source = vertexBuffers[plan.BindingSourceIndices[binding]];
+                layout.BindingDescriptions[binding] = new VertexInputBindingDescription
+                {
+                    Binding = (uint)binding,
+                    Stride = plan.BindingStrides[binding],
+                    InputRate = VertexInputRate.Vertex,
+                };
+                layout.Buffers[binding] = source.Buffer;
+            }
+
+            for (var index = 0; index < vertexBuffers.Count; index++)
+            {
+                var vertexBuffer = vertexBuffers[index];
+                layout.AttributeDescriptions[index] = new VertexInputAttributeDescription
+                {
+                    Location = vertexBuffer.Location,
+                    Binding = plan.AttributeBindings[index],
+                    Format = ToVkVertexFormat(
+                        vertexBuffer.DataFormat,
+                        vertexBuffer.NumberFormat,
+                        vertexBuffer.ComponentCount),
+                    Offset = plan.AttributeOffsets[index],
+                };
+            }
+
+            return layout;
+        }
+
         private static ulong GetVertexBindingOffset(VertexBufferResource vertexBuffer)
         {
             if (vertexBuffer.OffsetBytes < vertexBuffer.Size)
@@ -11258,6 +11413,9 @@ internal static unsafe class VulkanVideoPresenter
                     $"shader=0x{work.ShaderAddress:X16} " +
                     $"vs_bytes={work.Draw.VertexSpirv.Length} " +
                     $"ps_bytes={work.Draw.PixelSpirv.Length} " +
+                    $"vertex_buffers={work.Draw.VertexBuffers.Count} " +
+                    $"textures={work.Draw.Textures.Count} " +
+                    $"storage_textures={work.Draw.Textures.Count(static texture => texture.IsStorage)} " +
                     $"global_buffers={work.Draw.GlobalMemoryBuffers.Count} " +
                     $"pixel_global_buffers={work.Draw.PixelGlobalBufferCount}: " +
                     exception.Message);
@@ -14753,22 +14911,20 @@ internal static unsafe class VulkanVideoPresenter
                 resources.BlendConstant.Alpha,
             };
             _vk.CmdSetBlendConstants(_commandBuffer, blendConstants);
-            if (resources.VertexBuffers.Length != 0)
+            var vertexInput = resources.VertexInput ??=
+                CreateVertexInputLayout(resources.VertexBuffers);
+            if (vertexInput.Buffers.Length != 0)
             {
-                var buffers = stackalloc VkBuffer[resources.VertexBuffers.Length];
-                var offsets = stackalloc ulong[resources.VertexBuffers.Length];
-                for (var index = 0; index < resources.VertexBuffers.Length; index++)
+                fixed (VkBuffer* buffers = vertexInput.Buffers)
+                fixed (ulong* offsets = vertexInput.Offsets)
                 {
-                    buffers[index] = resources.VertexBuffers[index].Buffer;
-                    offsets[index] = GetVertexBindingOffset(resources.VertexBuffers[index]);
+                    _vk.CmdBindVertexBuffers(
+                        _commandBuffer,
+                        0,
+                        (uint)vertexInput.Buffers.Length,
+                        buffers,
+                        offsets);
                 }
-
-                _vk.CmdBindVertexBuffers(
-                    _commandBuffer,
-                    0,
-                    (uint)resources.VertexBuffers.Length,
-                    buffers,
-                    offsets);
             }
 
             // Replaying a full-screen primitive once per 512x512 scissor tile
