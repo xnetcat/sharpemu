@@ -485,12 +485,20 @@ public static class AvPlayerExports
         LibraryName = "libSceAvPlayer")]
     public static int AvPlayerIsActive(CpuContext ctx)
     {
-        DeliverPendingEvents(ctx, ctx[CpuRegister.Rdi]);
+        var handle = ctx[CpuRegister.Rdi];
+        lock (StateGate)
+        {
+            if (Players.TryGetValue(handle, out var player))
+            {
+                TryFinishPlaybackByClock(player);
+            }
+        }
+        DeliverPendingEvents(ctx, handle);
         lock (StateGate)
         {
             return SetReturn(
                 ctx,
-                Players.TryGetValue(ctx[CpuRegister.Rdi], out var player) &&
+                Players.TryGetValue(handle, out var player) &&
                 player.Started && !player.EndOfStream ? 1 : 0);
         }
     }
@@ -582,10 +590,18 @@ public static class AvPlayerExports
         LibraryName = "libSceAvPlayer")]
     public static int AvPlayerCurrentTime(CpuContext ctx)
     {
-        DeliverPendingEvents(ctx, ctx[CpuRegister.Rdi]);
+        var handle = ctx[CpuRegister.Rdi];
         lock (StateGate)
         {
-            if (!Players.TryGetValue(ctx[CpuRegister.Rdi], out var player))
+            if (Players.TryGetValue(handle, out var player))
+            {
+                TryFinishPlaybackByClock(player);
+            }
+        }
+        DeliverPendingEvents(ctx, handle);
+        lock (StateGate)
+        {
+            if (!Players.TryGetValue(handle, out var player))
             {
                 return SetReturn(ctx, InvalidParameters);
             }
@@ -744,7 +760,7 @@ public static class AvPlayerExports
 
             if (!EnsureDecoder(player))
             {
-                player.EndOfStream = true;
+                CompletePlayback(player);
                 return SetReturn(ctx, 0);
             }
 
@@ -789,10 +805,73 @@ public static class AvPlayerExports
         }
         else
         {
-            player.EndOfStream = true;
-            player.PlaybackClock.Stop();
+            CompletePlayback(player);
         }
         return SetReturn(ctx, 0);
+    }
+
+    private static bool TryFinishPlaybackByClock(PlayerState player)
+    {
+        if (!player.Started ||
+            player.Paused ||
+            player.Looping ||
+            player.EndOfStream ||
+            player.LastGuestBuffer == 0 ||
+            !HasPlaybackReachedEnd(
+                player.DurationMilliseconds,
+                player.LastVideoTimestamp,
+                player.FramesPerSecond,
+                checked((ulong)player.PlaybackClock.ElapsedMilliseconds)))
+        {
+            return false;
+        }
+
+        CompletePlayback(player);
+        return true;
+    }
+
+    /// <summary>
+    /// The native player completes independently of another frame-data poll.
+    /// Require both the media clock and the final frame interval to reach the
+    /// probed duration so a slow guest cannot end playback before seeing the
+    /// last decoded frame.
+    /// </summary>
+    internal static bool HasPlaybackReachedEnd(
+        ulong durationMilliseconds,
+        ulong lastVideoTimestamp,
+        double framesPerSecond,
+        ulong elapsedMilliseconds)
+    {
+        if (durationMilliseconds == 0 ||
+            elapsedMilliseconds < durationMilliseconds ||
+            !double.IsFinite(framesPerSecond) ||
+            framesPerSecond <= 0)
+        {
+            return false;
+        }
+
+        var frameDurationMilliseconds = checked((ulong)Math.Ceiling(1000.0 / framesPerSecond));
+        return lastVideoTimestamp >= durationMilliseconds ||
+            durationMilliseconds - lastVideoTimestamp <= frameDurationMilliseconds;
+    }
+
+    // StateGate must be held. Queue directly to avoid recursively acquiring it
+    // from frame-decoder paths which already own the player state.
+    private static void CompletePlayback(PlayerState player)
+    {
+        if (player.EndOfStream)
+        {
+            return;
+        }
+
+        player.EndOfStream = true;
+        player.PlaybackClock.Stop();
+        player.PendingEvents.Enqueue(1); // StateStop
+        Trace(
+            $"completed handle=0x{player.Handle:X16} " +
+            $"time_ms={player.PlaybackClock.ElapsedMilliseconds} " +
+            $"last_video_ts={player.LastVideoTimestamp}");
+        Trace($"event queued handle=0x{player.Handle:X16} id=1");
     }
 
     private static bool EnsureDecoder(PlayerState player)
@@ -1722,6 +1801,10 @@ public static class AvPlayerExports
                 return;
             }
 
+            foreach (var player in Players.Values)
+            {
+                TryFinishPlaybackByClock(player);
+            }
             handles = Players.Keys.ToArray();
         }
 

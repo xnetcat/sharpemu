@@ -109,4 +109,27 @@ public sealed class AvPlayerAbiTests
     {
         Assert.Equal(expected, AvPlayerExports.NormalizeGuestMediaPath(input));
     }
+
+    [Theory]
+    [InlineData(9_109UL, 9_076UL, 29.97, 9_108UL, false)]
+    [InlineData(9_109UL, 9_076UL, 29.97, 9_109UL, true)]
+    [InlineData(9_109UL, 8_000UL, 29.97, 12_000UL, false)]
+    [InlineData(9_109UL, 9_109UL, 29.97, 9_109UL, true)]
+    [InlineData(0UL, 0UL, 29.97, 12_000UL, false)]
+    [InlineData(9_109UL, 9_076UL, 0.0, 12_000UL, false)]
+    public void PlaybackEnd_RequiresElapsedDurationAndFinalFrame(
+        ulong durationMilliseconds,
+        ulong lastVideoTimestamp,
+        double framesPerSecond,
+        ulong elapsedMilliseconds,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            AvPlayerExports.HasPlaybackReachedEnd(
+                durationMilliseconds,
+                lastVideoTimestamp,
+                framesPerSecond,
+                elapsedMilliseconds));
+    }
 }
