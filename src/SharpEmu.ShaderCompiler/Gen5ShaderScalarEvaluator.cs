@@ -376,6 +376,7 @@ public static class Gen5ShaderScalarEvaluator
                         globalMemoryByAddress,
                         runtimeScalarRegisters,
                         recordBinding,
+                        traceScalarPointerFallback: !path.Supplemental,
                         out error,
                         scalarLoadSources,
                         scalarLoadChains))
@@ -2145,6 +2146,7 @@ public static class Gen5ShaderScalarEvaluator
         Dictionary<(uint ScalarAddress, ulong BaseAddress), Gen5GlobalMemoryBinding> globalMemoryByAddress,
         IReadOnlySet<uint> runtimeScalarRegisters,
         bool recordBinding,
+        bool traceScalarPointerFallback,
         out string error,
         Dictionary<uint, ulong>? scalarLoadSources = null,
         Dictionary<uint, Gen5DescriptorChain>? scalarLoadChains = null)
@@ -2193,7 +2195,7 @@ public static class Gen5ShaderScalarEvaluator
             isBufferLoad,
             address,
             _strictScalarLoad);
-        if (scalarPointerUnbound)
+        if (scalarPointerUnbound && traceScalarPointerFallback)
         {
             TraceScalarPointerFallback(
                 state,

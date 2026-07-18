@@ -1209,6 +1209,12 @@ public static partial class Gen5SpirvTranslator
                     _subgroupInvocationIdInput,
                     SpirvDecoration.BuiltIn,
                     (uint)SpirvBuiltIn.SubgroupLocalInvocationId);
+                if (_stage == Gen5SpirvStage.Pixel)
+                {
+                    _module.AddDecoration(
+                        _subgroupInvocationIdInput,
+                        SpirvDecoration.Flat);
+                }
                 _interfaces.Add(_subgroupInvocationIdInput);
 
                 if (_waveLaneCount == 64)
@@ -5582,7 +5588,7 @@ public static partial class Gen5SpirvTranslator
                 instruction.Destinations.Any(IsWaveMaskOperand));
 
         private bool UsesSubgroupOperations() =>
-            _stage == Gen5SpirvStage.Compute &&
+            _stage is Gen5SpirvStage.Pixel or Gen5SpirvStage.Compute &&
             (UsesSubgroupShuffle() ||
              UsesSubgroupBroadcast() ||
              UsesWaveControl() ||

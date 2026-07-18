@@ -641,7 +641,7 @@ public static partial class AgcExports
         public uint NextResource { get; set; } = 1;
         public ulong WorkSequence { get; set; }
         public ulong SubmissionSequence { get; set; }
-        public bool WaitMonitorRunning { get; set; }
+        public int WaitMonitorRunning;
     }
 
     private readonly record struct SubmittedCommandRange(ulong Start, ulong End);
@@ -4218,7 +4218,8 @@ public static partial class AgcExports
             // Apply the pair eagerly and in parser order.
             eagerWatchedLabelWrite: IsCompletionLabelClearDma(
                 byteCount,
-                sourceAddress));
+                sourceAddress),
+            actionMayEnqueueGuestWork: true);
     }
 
     private static readonly bool _eagerGpuDataWritesEnabled = !string.Equals(
@@ -4237,7 +4238,8 @@ public static partial class AgcExports
         ulong producerAddress = 0,
         ulong producerLength = 0,
         Action? eagerGuestMemoryApply = null,
-        bool eagerWatchedLabelWrite = false)
+        bool eagerWatchedLabelWrite = false,
+        bool actionMayEnqueueGuestWork = false)
     {
         if (_gpuWaitDeferEffectsEnabled && state.DeferredWaitCount > 0)
         {
@@ -4263,7 +4265,8 @@ public static partial class AgcExports
                         debugName,
                         packetAddress,
                         producerAddress,
-                        producerLength),
+                        producerLength,
+                        actionMayEnqueueGuestWork: actionMayEnqueueGuestWork),
                     producerAddress,
                     producerLength,
                     debugName));
@@ -4302,37 +4305,34 @@ public static partial class AgcExports
         void CompleteAndWake()
         {
             CompleteLabelProducer(producer);
-            if (GpuWaitRegistry.Count == 0)
+            if (GpuWaitRegistry.CountForMemory(
+                    GetCpuMemoryStateKey(ctx.Memory)) == 0)
             {
                 return;
             }
 
             // Resuming a DCB can enqueue another compute dispatch and wait for
-            // it. Never do that reentrantly on the Vulkan render thread.
-            ThreadPool.UnsafeQueueUserWorkItem(
-                static state =>
-                {
-                    var (resumeContext, resumeGpuState) = state;
-                    lock (resumeGpuState.Gate)
-                    {
-                        DrainResumableDcbs(
-                            resumeContext,
-                            resumeGpuState,
-                            tracePackets: _traceAgc);
-                    }
-                },
-                (ctx, gpuState),
-                preferLocal: false);
+            // it. Never do that reentrantly on the Vulkan render thread. The
+            // per-memory wait monitor already performs this drain off-thread;
+            // keep it alive instead of queuing one contending ThreadPool item
+            // for every ordered GPU side effect.
+            EnsureGpuWaitMonitor(ctx, gpuState);
         }
 
         void ApplyAndQueueCompletion()
         {
             action();
+            if (!actionMayEnqueueGuestWork)
+            {
+                CompleteAndWake();
+                return;
+            }
+
             // DMA side effects can enqueue a Vulkan image mirror while this
             // ordered action is executing. Completing the label here would
-            // wake another queue before that mirror is visible. Queue a
-            // second same-queue ordered action after all immediate follow-up
-            // writes; it fences those writes before publishing the producer.
+            // wake another queue before that mirror is visible. Only those
+            // actions need a second same-queue marker to fence the immediate
+            // follow-up write before publishing the producer.
             if (VulkanVideoPresenter.SubmitOrderedGuestAction(
                     CompleteAndWake,
                     $"{debugName} completion") == 0)
@@ -4989,7 +4989,8 @@ public static partial class AgcExports
                     command,
                     mirrorToImages: false,
                     skipMemoryCopy: false);
-            });
+            },
+            actionMayEnqueueGuestWork: true);
     }
 
     private static void ApplySubmittedStandardDmaDataSnapshot(
@@ -5828,12 +5829,14 @@ public static partial class AgcExports
         CpuContext submitContext,
         SubmittedGpuState gpuState)
     {
-        if (gpuState.WaitMonitorRunning)
+        if (Interlocked.CompareExchange(
+                ref gpuState.WaitMonitorRunning,
+                1,
+                0) != 0)
         {
             return;
         }
 
-        gpuState.WaitMonitorRunning = true;
         var monitorContext = new CpuContext(
             submitContext.Memory,
             submitContext.TargetGeneration);
@@ -5857,7 +5860,7 @@ public static partial class AgcExports
                 var before = GpuWaitRegistry.CountForMemory(memoryStateKey);
                 if (before == 0)
                 {
-                    gpuState.WaitMonitorRunning = false;
+                    Volatile.Write(ref gpuState.WaitMonitorRunning, 0);
                     return;
                 }
 
@@ -5872,7 +5875,7 @@ public static partial class AgcExports
                 }
                 if (after == 0)
                 {
-                    gpuState.WaitMonitorRunning = false;
+                    Volatile.Write(ref gpuState.WaitMonitorRunning, 0);
                     return;
                 }
             }
@@ -6992,7 +6995,8 @@ public static partial class AgcExports
                 exportShaderAddress,
                 exportFingerprint,
                 vertexShader!,
-                exportState.Program);
+                exportState.Program,
+                exportEvaluation.SyntheticZeroBufferPcs?.Count > 0);
             VulkanVideoPresenter.CountSpirvCompilation();
             _depthOnlyVertexShaderCache.TryAdd(cacheKey, vertexShader!);
         }
@@ -7451,13 +7455,15 @@ public static partial class AgcExports
                 exportShaderAddress,
                 exportStateFingerprint,
                 compiled.Vertex,
-                exportState.Program);
+                exportState.Program,
+                exportEvaluation.SyntheticZeroBufferPcs?.Count > 0);
             DumpCompiledShader(
                 "ps",
                 pixelShaderAddress,
                 pixelStateFingerprint,
                 compiled.Pixel,
-                pixelState.Program);
+                pixelState.Program,
+                pixelEvaluation.SyntheticZeroBufferPcs?.Count > 0);
             VulkanVideoPresenter.CountSpirvCompilation();
             _graphicsShaderCache.TryAdd(shaderKey, compiled);
         }
@@ -10281,14 +10287,15 @@ public static partial class AgcExports
 
         if (dispatchEndX == 0 || dispatchEndY == 0 || dispatchEndZ == 0)
         {
-            return RejectComputeDispatch(
-                dimensionsAddress,
-                initiator,
-                dispatchSource,
-                dispatchEndX,
-                dispatchEndY,
-                dispatchEndZ,
-                "zero-dimension");
+            // Vulkan permits zero workgroup counts and executes no shader
+            // invocations. Keep the guest no-op out of the submission path,
+            // but do not classify it as a malformed dispatch.
+            TraceAgcShader(
+                $"agc.dispatch_empty source={dispatchSource} " +
+                $"dims=0x{dimensionsAddress:X16} " +
+                $"raw={dispatchEndX:X8}/{dispatchEndY:X8}/{dispatchEndZ:X8} " +
+                $"initiator=0x{initiator:X8}");
+            return false;
         }
 
         // When FORCE_START_AT_000 is clear, RDNA2 interprets the three packet
@@ -10684,7 +10691,8 @@ public static partial class AgcExports
                     shaderAddress,
                     shaderKey.Item2,
                     computeShader!,
-                    shaderState.Program);
+                    shaderState.Program,
+                    evaluation.SyntheticZeroBufferPcs?.Count > 0);
             }
 
             if (computeShader is not null)
@@ -13095,13 +13103,23 @@ public static partial class AgcExports
         ulong shaderAddress,
         ulong stateFingerprint,
         IGuestCompiledShader shader,
-        Gen5ShaderProgram program)
+        Gen5ShaderProgram program,
+        bool usedDescriptorFallback = false)
     {
         if (shader.Payload.Length == 0 ||
             !string.Equals(
                 Environment.GetEnvironmentVariable("SHARPEMU_DUMP_SPIRV"),
                 "1",
                 StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        if (string.Equals(
+                Environment.GetEnvironmentVariable("SHARPEMU_DUMP_SPIRV_FALLBACK_ONLY"),
+                "1",
+                StringComparison.Ordinal) &&
+            !usedDescriptorFallback)
         {
             return;
         }
