@@ -346,6 +346,49 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private long _probeImportReturnAddressCount;
 
+	// SHARPEMU_VCALL_PROBE: comma-separated guest instruction addresses. Each
+	// site is replaced with UD2 before entry execution; the POSIX signal bridge
+	// records the live stack and emulates the original instruction. This is an
+	// opt-in diagnostic for locating stack corruption across native guest calls.
+	private const int VcallProbeMaxSites = 8;
+
+	private static readonly ulong[] _vcallProbeAddresses = new ulong[VcallProbeMaxSites];
+
+	private static readonly byte[][] _vcallProbeOriginalBytesBySite =
+		Enumerable.Range(0, VcallProbeMaxSites).Select(static _ => new byte[6]).ToArray();
+
+	private static int _vcallProbeSiteCount;
+
+	private static long _vcallProbeHitCount;
+
+	private static bool _vcallProbeRestored;
+
+	private const long VcallProbeLogLimit = 4096;
+
+	private const long VcallProbeRestoreThreshold = long.MaxValue;
+
+	private const int VcallProbeTraceLength = 1024;
+
+	private struct VcallProbeTraceEntry
+	{
+		public long Sequence;
+		public int Site;
+		public ulong Rip;
+		public ulong Rsp;
+		public ulong Rbp;
+		public ulong Rax;
+		public ulong R8;
+		public ulong Target;
+		public ulong TargetCode;
+		public ulong Stack0;
+		public ulong Stack1;
+		public ulong Stack2;
+		public ulong Stack3;
+	}
+
+	private static readonly VcallProbeTraceEntry[] _vcallProbeTrace =
+		new VcallProbeTraceEntry[VcallProbeTraceLength];
+
 	private string? _importFilter;
 
 	private bool _disableImportLoopGuard;

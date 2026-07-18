@@ -244,6 +244,11 @@ public sealed unsafe partial class DirectExecutionBackend
 			return false;
 		}
 
+		if (signal == PosixSigIll && !_posixSignalWarmup && TryHandleVcallProbe(registers))
+		{
+			return true;
+		}
+
 		byte* contextRecord = stackalloc byte[Win64ContextSize];
 		new Span<byte>(contextRecord, Win64ContextSize).Clear();
 		int[] offsets = PosixRegisterOffsets;
@@ -401,6 +406,320 @@ public sealed unsafe partial class DirectExecutionBackend
 		else
 		{
 			((delegate* unmanaged<int, void>)handler)(signal);
+		}
+	}
+
+	/// <summary>
+	/// Arms opt-in instruction probes after the guest images and import stubs are
+	/// ready, but before guest code has been executed or translated by Rosetta.
+	/// </summary>
+	private void TryArmVcallProbe()
+	{
+		var raw = Environment.GetEnvironmentVariable("SHARPEMU_VCALL_PROBE");
+		if (string.IsNullOrWhiteSpace(raw) || _vcallProbeSiteCount != 0)
+		{
+			return;
+		}
+
+		int count = 0;
+		foreach (var token in raw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+		{
+			if (count >= VcallProbeMaxSites)
+			{
+				break;
+			}
+
+			ulong address = ParseOptionalHexAddress(token);
+			if (address == 0)
+			{
+				continue;
+			}
+
+			byte* code = (byte*)address;
+			uint oldProtect = 0;
+			if (!VirtualProtect(code, 6u, 64u, &oldProtect))
+			{
+				Console.Error.WriteLine(
+					$"[LOADER][WARN] vcall_probe: VirtualProtect failed at 0x{address:X16}; site skipped.");
+				continue;
+			}
+
+			var original = _vcallProbeOriginalBytesBySite[count];
+			try
+			{
+				for (int i = 0; i < original.Length; i++)
+				{
+					original[i] = code[i];
+				}
+				code[0] = 0x0F;
+				code[1] = 0x0B;
+			}
+			finally
+			{
+				VirtualProtect(code, 6u, oldProtect, &oldProtect);
+				FlushInstructionCache(GetCurrentProcess(), code, 6u);
+			}
+
+			_vcallProbeAddresses[count] = address;
+			Console.Error.WriteLine(
+				$"[LOADER][INFO] vcall_probe armed site#{count} at 0x{address:X16} original=" +
+				$"{original[0]:X2} {original[1]:X2} {original[2]:X2} {original[3]:X2} {original[4]:X2} {original[5]:X2}");
+			count++;
+		}
+
+		_vcallProbeHitCount = 0;
+		_vcallProbeRestored = false;
+		Volatile.Write(ref _vcallProbeSiteCount, count);
+	}
+
+	private static bool TryHandleVcallProbe(byte* registers)
+	{
+		int siteCount = Volatile.Read(ref _vcallProbeSiteCount);
+		if (siteCount == 0)
+		{
+			return false;
+		}
+
+		ulong rip = *(ulong*)(registers + PosixRegisterOffsets[16]);
+		int site = -1;
+		for (int i = 0; i < siteCount; i++)
+		{
+			if (_vcallProbeAddresses[i] == rip)
+			{
+				site = i;
+				break;
+			}
+		}
+		if (site < 0)
+		{
+			return false;
+		}
+
+		var original = _vcallProbeOriginalBytesBySite[site];
+		ulong rax = *(ulong*)(registers + PosixRegisterOffsets[0]);
+		ulong rdx = *(ulong*)(registers + PosixRegisterOffsets[2]);
+		ulong rsp = *(ulong*)(registers + PosixRegisterOffsets[4]);
+		ulong rbp = *(ulong*)(registers + PosixRegisterOffsets[5]);
+		ulong rdi = *(ulong*)(registers + PosixRegisterOffsets[7]);
+		ulong r8 = *(ulong*)(registers + PosixRegisterOffsets[8]);
+
+		var context = _posixSignalBackend?.ActiveCpuContext;
+		ulong klass = 0;
+		ulong target = 0;
+		ulong methodInfo = 0;
+		ulong targetCode = 0;
+		if (context is not null)
+		{
+			_ = TryReadGuestU64(context, rdi, out klass);
+			_ = TryReadGuestU64(context, rax + 0x1F0, out target);
+			_ = TryReadGuestU64(context, rax + 0x1F8, out methodInfo);
+			_ = TryReadGuestU64(context, r8, out targetCode);
+		}
+
+		long hit = Interlocked.Increment(ref _vcallProbeHitCount);
+		ref VcallProbeTraceEntry trace = ref _vcallProbeTrace[
+			(int)(hit & (VcallProbeTraceLength - 1))];
+		trace.Site = site;
+		trace.Rip = rip;
+		trace.Rsp = rsp;
+		trace.Rbp = rbp;
+		trace.Rax = rax;
+		trace.R8 = r8;
+		trace.Target = target;
+		trace.TargetCode = targetCode;
+		if (context is not null)
+		{
+			_ = TryReadGuestU64(context, rsp, out trace.Stack0);
+			_ = TryReadGuestU64(context, rsp + 8, out trace.Stack1);
+			_ = TryReadGuestU64(context, rsp + 16, out trace.Stack2);
+			_ = TryReadGuestU64(context, rsp + 24, out trace.Stack3);
+		}
+		Volatile.Write(ref trace.Sequence, hit);
+
+		if (hit <= VcallProbeLogLimit)
+		{
+			var stack = new System.Text.StringBuilder();
+			for (int i = 0; i < 8; i++)
+			{
+				ulong slot = 0;
+				if (context is not null)
+				{
+					_ = TryReadGuestU64(context, rsp + (ulong)(i * 8), out slot);
+				}
+				stack.Append($" [rsp+0x{i * 8:X2}]=0x{slot:X16}");
+			}
+			Console.Error.WriteLine(
+				$"[LOADER][TRACE] vcall_probe#{hit} site#{site}@0x{rip:X16}: target=0x{target:X16} klass=0x{klass:X16} " +
+				$"method=0x{methodInfo:X16} rdi=0x{rdi:X16} rax=0x{rax:X16} rdx=0x{rdx:X16} r8=0x{r8:X16} " +
+				$"r8_code=0x{targetCode:X16} rsp=0x{rsp:X16} rbp=0x{rbp:X16}");
+			Console.Error.WriteLine($"[LOADER][TRACE] vcall_probe#{hit} site#{site}: stack{stack}");
+			Console.Error.Flush();
+		}
+
+		byte b0 = original[0];
+		byte b1 = original[1];
+		if (b0 == 0xFF && (b1 & 0x38) == 0x10)
+		{
+			if (target >= 0x10000 && context is not null)
+			{
+				ulong newRsp = rsp - sizeof(ulong);
+				if (context.TryWriteUInt64(newRsp, rip + 6))
+				{
+					*(ulong*)(registers + PosixRegisterOffsets[4]) = newRsp;
+					*(ulong*)(registers + PosixRegisterOffsets[16]) = target;
+					MaybeRestoreVcallProbe(hit);
+					return true;
+				}
+			}
+		}
+		else if (b0 == 0xE8)
+		{
+			int rel = original[1] | (original[2] << 8) | (original[3] << 16) | (original[4] << 24);
+			ulong callTarget = rip + 5 + unchecked((ulong)(long)rel);
+			if (context is not null)
+			{
+				ulong newRsp = rsp - sizeof(ulong);
+				if (context.TryWriteUInt64(newRsp, rip + 5))
+				{
+					*(ulong*)(registers + PosixRegisterOffsets[4]) = newRsp;
+					*(ulong*)(registers + PosixRegisterOffsets[16]) = callTarget;
+					MaybeRestoreVcallProbe(hit);
+					return true;
+				}
+			}
+		}
+		else if (b0 == 0xFF && b1 == 0x4B)
+		{
+			if (context is not null)
+			{
+				ulong rbx = *(ulong*)(registers + PosixRegisterOffsets[3]);
+				ulong address = rbx + (ulong)(sbyte)original[2];
+				if (TryReadGuestU64(context, address, out ulong value))
+				{
+					uint low = unchecked((uint)value) - 1u;
+					ulong next = (value & 0xFFFFFFFF00000000UL) | low;
+					if (context.TryWriteUInt64(address, next))
+					{
+						*(ulong*)(registers + PosixRegisterOffsets[16]) = rip + 3;
+						MaybeRestoreVcallProbe(hit);
+						return true;
+					}
+				}
+			}
+		}
+		else if (b0 == 0x48 && b1 == 0x83 && original[2] == 0xC4)
+		{
+			sbyte immediate = (sbyte)original[3];
+			*(ulong*)(registers + PosixRegisterOffsets[4]) = rsp + unchecked((ulong)(long)immediate);
+			*(ulong*)(registers + PosixRegisterOffsets[16]) = rip + 4;
+			MaybeRestoreVcallProbe(hit);
+			return true;
+		}
+		else if (b0 == 0x41 && b1 == 0xFF && original[2] == 0xE0)
+		{
+			*(ulong*)(registers + PosixRegisterOffsets[16]) = r8;
+			MaybeRestoreVcallProbe(hit);
+			return true;
+		}
+		else if (b0 == 0xE9)
+		{
+			int rel = original[1] | (original[2] << 8) | (original[3] << 16) | (original[4] << 24);
+			*(ulong*)(registers + PosixRegisterOffsets[16]) = rip + 5 + unchecked((ulong)(long)rel);
+			MaybeRestoreVcallProbe(hit);
+			return true;
+		}
+		else if (b0 == 0xB8)
+		{
+			uint immediate = (uint)(original[1] | (original[2] << 8) | (original[3] << 16) | (original[4] << 24));
+			*(ulong*)(registers + PosixRegisterOffsets[0]) = immediate;
+			*(ulong*)(registers + PosixRegisterOffsets[16]) = rip + 5;
+			MaybeRestoreVcallProbe(hit);
+			return true;
+		}
+		else if (b0 == 0x55 && b1 == 0x48 && original[2] == 0x89 && original[3] == 0xE5)
+		{
+			if (context is not null)
+			{
+				ulong newRsp = rsp - sizeof(ulong);
+				if (context.TryWriteUInt64(newRsp, rbp))
+				{
+					*(ulong*)(registers + PosixRegisterOffsets[4]) = newRsp;
+					*(ulong*)(registers + PosixRegisterOffsets[5]) = newRsp;
+					*(ulong*)(registers + PosixRegisterOffsets[16]) = rip + 4;
+					MaybeRestoreVcallProbe(hit);
+					return true;
+				}
+			}
+		}
+
+		RestoreVcallProbeSite(site);
+		_vcallProbeAddresses[site] = 0;
+		Console.Error.WriteLine(
+			$"[LOADER][WARN] vcall_probe: could not emulate site#{site} at hit#{hit} (b0=0x{b0:X2}); site disarmed.");
+		return true;
+	}
+
+	private static void MaybeRestoreVcallProbe(long hit)
+	{
+		if (hit == VcallProbeRestoreThreshold && !_vcallProbeRestored)
+		{
+			_vcallProbeRestored = true;
+			for (int i = 0; i < _vcallProbeSiteCount; i++)
+			{
+				RestoreVcallProbeSite(i);
+			}
+			Console.Error.WriteLine(
+				$"[LOADER][INFO] vcall_probe: restored original bytes after {hit} hits.");
+		}
+	}
+
+	private static void RestoreVcallProbeSite(int site)
+	{
+		ulong probe = _vcallProbeAddresses[site];
+		if (probe == 0)
+		{
+			return;
+		}
+
+		byte* code = (byte*)probe;
+		uint oldProtect = 0;
+		if (!VirtualProtect(code, 6u, 64u, &oldProtect))
+		{
+			return;
+		}
+		var original = _vcallProbeOriginalBytesBySite[site];
+		code[0] = original[0];
+		code[1] = original[1];
+		VirtualProtect(code, 6u, oldProtect, &oldProtect);
+		FlushInstructionCache(GetCurrentProcess(), code, 6u);
+	}
+
+	private static void DumpRecentVcallProbeTrace()
+	{
+		long end = Volatile.Read(ref _vcallProbeHitCount);
+		if (end == 0)
+		{
+			return;
+		}
+
+		long start = Math.Max(1, end - VcallProbeTraceLength + 1);
+		Console.Error.WriteLine(
+			$"[LOADER][INFO]   Recent vcall probe trace ({start}..{end}):");
+		for (long sequence = start; sequence <= end; sequence++)
+		{
+			ref VcallProbeTraceEntry entry = ref _vcallProbeTrace[
+				(int)(sequence & (VcallProbeTraceLength - 1))];
+			if (Volatile.Read(ref entry.Sequence) != sequence)
+			{
+				continue;
+			}
+
+			Console.Error.WriteLine(
+				$"[LOADER][INFO]     probe#{sequence} site#{entry.Site} rip=0x{entry.Rip:X16} " +
+				$"rsp=0x{entry.Rsp:X16} rbp=0x{entry.Rbp:X16} rax=0x{entry.Rax:X16} " +
+				$"r8=0x{entry.R8:X16} target=0x{entry.Target:X16} code=0x{entry.TargetCode:X16} " +
+				$"stack=0x{entry.Stack0:X16},0x{entry.Stack1:X16}," +
+				$"0x{entry.Stack2:X16},0x{entry.Stack3:X16}");
 		}
 	}
 
