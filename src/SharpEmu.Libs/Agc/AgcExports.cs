@@ -5684,15 +5684,23 @@ public static partial class AgcExports
         }
 
         GpuWaitRegistry.Register(waitAddress, waiter);
+        var gpuState = GetSubmittedGpuState(ctx.Memory);
         if (_gpuWaitDeferEffectsEnabled)
         {
             state.DeferredWaitCount++;
-            ReleaseDeferredWaitProducers(
+            // The producer for this label may already sit in ANY stream's
+            // deferred-effects pile — cross-queue drain barriers (graphics
+            // release feeding a compute wait and vice versa) are routine.
+            // Searching only this stream's pile leaves such waits without a
+            // producer forever: the deferred write never flows, the monitor
+            // polls a label nobody will store to, and every later effect of
+            // this stream (including flips) stays deferred behind it.
+            ReleaseDeferredWaitProducersAcrossQueues(
+                gpuState,
                 state,
                 waitAddress,
                 is64Bit ? (ulong)sizeof(ulong) : sizeof(uint));
         }
-        var gpuState = GetSubmittedGpuState(ctx.Memory);
         EnsureGpuWaitMonitor(ctx, gpuState);
         TraceWaitProducerState(
             memoryStateKey,
@@ -5864,6 +5872,27 @@ public static partial class AgcExports
         return true;
     }
 
+    private static void ReleaseDeferredWaitProducersAcrossQueues(
+        SubmittedGpuState gpuState,
+        SubmittedDcbState waitingState,
+        ulong waitAddress,
+        ulong waitLength)
+    {
+        ReleaseDeferredWaitProducers(waitingState, waitAddress, waitLength);
+        if (!ReferenceEquals(gpuState.Graphics, waitingState))
+        {
+            ReleaseDeferredWaitProducers(gpuState.Graphics, waitAddress, waitLength);
+        }
+
+        foreach (var computeState in gpuState.ComputeQueues.Values)
+        {
+            if (!ReferenceEquals(computeState, waitingState))
+            {
+                ReleaseDeferredWaitProducers(computeState, waitAddress, waitLength);
+            }
+        }
+    }
+
     private static void ReleaseDeferredWaitProducers(
         SubmittedDcbState state,
         ulong waitAddress,
@@ -5886,6 +5915,10 @@ public static partial class AgcExports
                     waitAddress,
                     waitLength))
             {
+                TraceAgc(
+                    $"agc.deferred_producer_released queue={state.QueueName} " +
+                    $"submission={state.ActiveSubmissionId} " +
+                    $"label=0x{waitAddress:X16} action='{deferred.DebugName}'");
                 deferred.Effect();
             }
             else
