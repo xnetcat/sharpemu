@@ -1632,6 +1632,31 @@ public static class AvPlayerExports
         Trace($"event queued handle=0x{player.Handle:X16} id={eventId}");
     }
 
+    /// <summary>
+    /// Delivers queued state events for every live player. The native
+    /// avplayer service posts events from its worker thread; guests which
+    /// wait for StateReady before touching avplayer again would otherwise
+    /// leave the event stranded in the queue.
+    /// </summary>
+    public static void PumpPendingEvents(CpuContext ctx)
+    {
+        ulong[] handles;
+        lock (StateGate)
+        {
+            if (Players.Count == 0)
+            {
+                return;
+            }
+
+            handles = Players.Keys.ToArray();
+        }
+
+        foreach (var handle in handles)
+        {
+            DeliverPendingEvents(ctx, handle);
+        }
+    }
+
     private static void DeliverPendingEvents(CpuContext ctx, ulong handle)
     {
         PlayerState? player;
