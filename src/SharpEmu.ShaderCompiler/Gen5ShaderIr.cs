@@ -63,6 +63,8 @@ public readonly record struct Gen5ShaderResourceMapping(
 public sealed record Gen5ShaderMetadata(
     uint ExtendedUserDataSizeDwords,
     uint ShaderResourceTableSizeDwords,
+    uint ExtendedUserDataRangeStart,
+    uint ExtendedUserDataRangeEnd,
     IReadOnlyDictionary<uint, uint> DirectResources,
     IReadOnlyList<Gen5ShaderResourceMapping> Resources);
 
@@ -124,7 +126,13 @@ public sealed record Gen5ShaderState(
     IReadOnlyList<uint> UserData,
     Gen5ShaderMetadata? Metadata,
     Gen5ComputeSystemRegisters? ComputeSystemRegisters = null,
-    uint UserDataScalarRegisterBase = 0);
+    uint UserDataScalarRegisterBase = 0,
+    // Gen5 can bulk-load an additional user-data block after the ordinary
+    // SPI_SHADER_USER_DATA_* register window. These values occupy s32 and
+    // above in the hardware scalar register file, including in merged NGG
+    // shaders whose ordinary user data begins at s8.
+    IReadOnlyList<uint>? ExtendedUserData = null,
+    uint ExtendedUserDataScalarRegisterBase = 32);
 
 public readonly record struct Gen5Operand(Gen5OperandKind Kind, uint Value)
 {
