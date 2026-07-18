@@ -712,13 +712,26 @@ public static class AvPlayerExports
         var infoAddress = ctx[CpuRegister.Rsi];
         lock (StateGate)
         {
-            if (!Players.TryGetValue(ctx[CpuRegister.Rdi], out var player) ||
-                infoAddress == 0 || !player.Started || player.EndOfStream ||
-                player.SourcePath is null)
+            if (!Players.TryGetValue(ctx[CpuRegister.Rdi], out var player))
             {
+                TracePoll(
+                    $"video_poll handle=0x{ctx[CpuRegister.Rdi]:X16} ex={extended} " +
+                    "result=unknown-player");
                 return SetReturn(ctx, 0);
             }
 
+            if (infoAddress == 0 || !player.Started || player.EndOfStream ||
+                player.SourcePath is null)
+            {
+                TracePoll(
+                    $"video_poll handle=0x{player.Handle:X16} ex={extended} " +
+                    $"result=inactive info=0x{infoAddress:X16} started={player.Started} " +
+                    $"eos={player.EndOfStream} source={player.SourcePath is not null}");
+                return SetReturn(ctx, 0);
+            }
+
+            TracePoll(
+                $"video_poll handle=0x{player.Handle:X16} ex={extended} result=decode");
             if (player.Paused)
             {
                 return SetReturn(
@@ -1605,5 +1618,21 @@ public static class AvPlayerExports
         {
             Console.Error.WriteLine($"[AVPLAYER][INFO] {message}");
         }
+    }
+
+    private static int _pollTraceCount;
+
+    private static void TracePoll(string message)
+    {
+        if (!string.Equals(
+                Environment.GetEnvironmentVariable("SHARPEMU_TRACE_AVPLAYER_POLL"),
+                "1",
+                StringComparison.Ordinal) ||
+            Interlocked.Increment(ref _pollTraceCount) > 32)
+        {
+            return;
+        }
+
+        Console.Error.WriteLine($"[AVPLAYER][DIAG] {message}");
     }
 }

@@ -216,7 +216,8 @@ public static partial class AgcExports
         (ulong Es, ulong EsState, ulong Ps, ulong PsState, ulong OutputLayout,
          uint OutputCount, uint Attributes, ulong Interpolants,
          uint PsInputEna, uint PsInputAddr,
-         ulong AliasAlignment, bool BakedScalars),
+         ulong AliasAlignment, bool BakedScalars,
+         bool SplitStageBuffers, int PixelBuffers, int VertexBuffers),
         (IGuestCompiledShader Vertex, IGuestCompiledShader Pixel)> _graphicsShaderCache = new();
     private static readonly ConcurrentDictionary<
         (ulong Cs, ulong State, uint LocalX, uint LocalY, uint LocalZ,
@@ -479,9 +480,11 @@ public static partial class AgcExports
         uint MipLevel,
         IReadOnlyList<uint> SamplerDescriptor,
         ulong DeferredDescriptorAddress = 0,
-        Gen5DescriptorChain? DeferredChain = null);
+        Gen5DescriptorChain? DeferredChain = null,
+        bool PixelStage = true,
+        bool VertexStage = true);
 
-    private sealed record GraphicsGlobalBufferPackingPlan(
+    internal sealed record GraphicsGlobalBufferPackingPlan(
         bool Packed,
         int DescriptorCount,
         IReadOnlyList<int>? DescriptorIndices,
@@ -7034,7 +7037,9 @@ public static partial class AgcExports
                 binding.MipLevel ?? 0,
                 binding.SamplerDescriptor,
                 binding.DescriptorSourceAddress,
-                descriptorUnusable ? binding.DeferredChain : null));
+                descriptorUnusable ? binding.DeferredChain : null,
+                PixelStage: false,
+                VertexStage: true));
         }
 
         IReadOnlyList<Gen5VertexInputBinding> vertexInputs =
@@ -7279,18 +7284,74 @@ public static partial class AgcExports
             : checked((int)pixelInputLocations.Values.Max() + 1);
         var interpolantFingerprint = ComputePixelInputLocationFingerprint(
             pixelInputLocations);
-        var logicalGlobalMemoryBindings = MergeGraphicsGlobalMemoryBindings(
+        var mergedGlobalMemoryBindings = MergeGraphicsGlobalMemoryBindings(
             pixelEvaluation,
             exportEvaluation,
             out var alignedPixelEvaluation,
             out var alignedExportEvaluation,
             out var discardedGlobalBindings);
-        var guestGlobalBuffers = logicalGlobalMemoryBindings.Count;
-        var bakeScalars = ShouldBakeGraphicsScalars(guestGlobalBuffers);
+        var splitStageBufferCandidate =
+            RequiresSplitStageGraphicsGlobalBuffers(
+                mergedGlobalMemoryBindings.Count,
+                pixelEvaluation.GlobalMemoryBindings.Count,
+                exportEvaluation.GlobalMemoryBindings.Count,
+                OperatingSystem.IsMacOS());
+        var bakeScalars =
+            ShouldBakeGraphicsScalars(mergedGlobalMemoryBindings.Count) ||
+            splitStageBufferCandidate;
         var globalBufferPacking = CreateGraphicsGlobalBufferPackingPlan(
-            logicalGlobalMemoryBindings,
+            mergedGlobalMemoryBindings,
             bakeScalars);
-        const bool splitStageGlobalBuffers = false;
+        var splitStageGlobalBuffers =
+            splitStageBufferCandidate && !globalBufferPacking.Packed;
+        IReadOnlyList<Gen5GlobalMemoryBinding> logicalGlobalMemoryBindings;
+        if (splitStageGlobalBuffers)
+        {
+            var splitBindings = new Gen5GlobalMemoryBinding[
+                pixelEvaluation.GlobalMemoryBindings.Count +
+                exportEvaluation.GlobalMemoryBindings.Count];
+            for (var index = 0;
+                 index < pixelEvaluation.GlobalMemoryBindings.Count;
+                 index++)
+            {
+                splitBindings[index] =
+                    pixelEvaluation.GlobalMemoryBindings[index];
+            }
+            for (var index = 0;
+                 index < exportEvaluation.GlobalMemoryBindings.Count;
+                 index++)
+            {
+                splitBindings[pixelEvaluation.GlobalMemoryBindings.Count + index] =
+                    exportEvaluation.GlobalMemoryBindings[index];
+            }
+            logicalGlobalMemoryBindings = splitBindings;
+            alignedPixelEvaluation = pixelEvaluation;
+            alignedExportEvaluation = exportEvaluation;
+            discardedGlobalBindings = [];
+        }
+        else
+        {
+            logicalGlobalMemoryBindings = mergedGlobalMemoryBindings;
+        }
+
+        var guestGlobalBuffers = logicalGlobalMemoryBindings.Count;
+        var pixelGlobalBufferCount = splitStageGlobalBuffers
+            ? pixelEvaluation.GlobalMemoryBindings.Count
+            : guestGlobalBuffers;
+        var vertexGlobalBufferCount = splitStageGlobalBuffers
+            ? exportEvaluation.GlobalMemoryBindings.Count
+            : guestGlobalBuffers;
+        var pixelTotalGlobalBuffers = splitStageGlobalBuffers
+            ? pixelGlobalBufferCount
+            : globalBufferPacking.DescriptorCount + (bakeScalars ? 0 : 1);
+        var vertexTotalGlobalBuffers = splitStageGlobalBuffers
+            ? vertexGlobalBufferCount
+            : pixelTotalGlobalBuffers;
+        var vertexGlobalDescriptorBinding = splitStageGlobalBuffers
+            ? pixelEvaluation.ImageBindings.Count +
+              exportEvaluation.ImageBindings.Count +
+              1
+            : 0;
         var exportStateFingerprint = bakeScalars
             ? ComputeShaderStateFingerprint(exportEvaluation)
             : ComputeShaderStructuralFingerprint(exportEvaluation);
@@ -7309,13 +7370,10 @@ public static partial class AgcExports
             psInputEna,
             psInputAddr,
             VulkanVideoPresenter.GuestStorageBufferOffsetAlignment,
-            bakeScalars);
-
-        // One per-draw buffer containing both initial-scalar blocks rides
-        // after the guest buffers:
-        // [pixel guest][vertex guest][pixel sgprs + vertex sgprs].
-        var totalGlobalBuffers = globalBufferPacking.DescriptorCount +
-            (bakeScalars ? 0 : 1);
+            bakeScalars,
+            splitStageGlobalBuffers,
+            pixelGlobalBufferCount,
+            vertexGlobalBufferCount);
         _graphicsShaderCache.TryGetValue(shaderKey, out var compiled);
 
         if (compiled.Vertex is null || compiled.Pixel is null)
@@ -7336,9 +7394,11 @@ public static partial class AgcExports
                     out var pixelShader,
                     out error,
                     globalBufferBase: 0,
-                    totalGlobalBufferCount: totalGlobalBuffers,
+                    totalGlobalBufferCount: pixelTotalGlobalBuffers,
                     imageBindingBase: 0,
-                    scalarRegisterBufferIndex: bakeScalars ? -1 : guestGlobalBuffers,
+                    scalarRegisterBufferIndex: bakeScalars
+                        ? -1
+                        : guestGlobalBuffers,
                     pixelInputEnable: psInputEna,
                     pixelInputAddress: psInputAddr,
                     pixelInputLocations: pixelInputLocations,
@@ -7346,26 +7406,36 @@ public static partial class AgcExports
                         VulkanVideoPresenter.GuestStorageBufferOffsetAlignment,
                     globalDescriptorBinding: 0,
                     globalDescriptorIndices:
-                        globalBufferPacking.DescriptorIndices,
+                        splitStageGlobalBuffers
+                            ? null
+                            : globalBufferPacking.DescriptorIndices,
                     globalDwordOffsets:
-                        globalBufferPacking.DwordOffsets) ||
+                        splitStageGlobalBuffers
+                            ? null
+                            : globalBufferPacking.DwordOffsets) ||
                 !GuestGpu.Current.TryCompileVertexShader(
                     exportState,
                     alignedExportEvaluation,
                     out var vertexShader,
                     out error,
                     globalBufferBase: 0,
-                    totalGlobalBufferCount: totalGlobalBuffers,
+                    totalGlobalBufferCount: vertexTotalGlobalBuffers,
                     imageBindingBase: pixelEvaluation.ImageBindings.Count,
-                    scalarRegisterBufferIndex: bakeScalars ? -1 : guestGlobalBuffers,
+                    scalarRegisterBufferIndex: bakeScalars
+                        ? -1
+                        : guestGlobalBuffers,
                     requiredVertexOutputCount: requiredVertexOutputCount,
                     storageBufferOffsetAlignment:
                         VulkanVideoPresenter.GuestStorageBufferOffsetAlignment,
-                    globalDescriptorBinding: 0,
+                    globalDescriptorBinding: vertexGlobalDescriptorBinding,
                     globalDescriptorIndices:
-                        globalBufferPacking.DescriptorIndices,
+                        splitStageGlobalBuffers
+                            ? null
+                            : globalBufferPacking.DescriptorIndices,
                     globalDwordOffsets:
-                        globalBufferPacking.DwordOffsets))
+                        splitStageGlobalBuffers
+                            ? null
+                            : globalBufferPacking.DwordOffsets))
             {
                 ReturnPooledEvaluationArrays(exportEvaluation);
                 ReturnPooledEvaluationArrays(pixelEvaluation);
@@ -7397,12 +7467,16 @@ public static partial class AgcExports
                 textures,
                 pixelShaderAddress,
                 exportShaderAddress,
+                pixelStage: true,
+                vertexStage: false,
                 out error) ||
             !TryAppendTranslatedImageBindings(
                 exportEvaluation.ImageBindings,
                 textures,
                 pixelShaderAddress,
                 exportShaderAddress,
+                pixelStage: false,
+                vertexStage: true,
                 out error))
         {
             ReturnPooledEvaluationArrays(exportEvaluation);
@@ -7418,13 +7492,17 @@ public static partial class AgcExports
             exportState,
             alignedExportEvaluation,
             globalBufferBase: 0,
-            totalGlobalBufferCount: totalGlobalBuffers,
-            globalDescriptorBinding: 0,
+            totalGlobalBufferCount: vertexTotalGlobalBuffers,
+            globalDescriptorBinding: vertexGlobalDescriptorBinding,
             imageBindingBase: pixelEvaluation.ImageBindings.Count,
             scalarRegisterBufferIndex: bakeScalars ? -1 : guestGlobalBuffers,
             requiredVertexOutputCount: requiredVertexOutputCount,
-            globalDescriptorIndices: globalBufferPacking.DescriptorIndices,
-            globalDwordOffsets: globalBufferPacking.DwordOffsets,
+            globalDescriptorIndices: splitStageGlobalBuffers
+                ? null
+                : globalBufferPacking.DescriptorIndices,
+            globalDwordOffsets: splitStageGlobalBuffers
+                ? null
+                : globalBufferPacking.DwordOffsets,
             bufferMappingFingerprint: globalBufferPacking.Fingerprint);
         IReadOnlyList<Gen5GlobalMemoryBinding> globalMemoryBindings;
         if (globalBufferPacking.Packed)
@@ -7433,6 +7511,7 @@ public static partial class AgcExports
                 logicalGlobalMemoryBindings,
                 globalBufferPacking);
             ReturnEvaluationGlobalBindingArrays(
+                globalMemoryBindings,
                 pixelEvaluation,
                 exportEvaluation);
         }
@@ -7491,7 +7570,7 @@ public static partial class AgcExports
             pixelEvaluation.InitialScalarRegisters,
             exportEvaluation.InitialScalarRegisters,
             bakeScalars,
-            alignedPixelEvaluation.GlobalMemoryBindings.Count,
+            pixelGlobalBufferCount,
             splitStageGlobalBuffers,
             deferredVertexCompiler);
         return true;
@@ -7502,6 +7581,8 @@ public static partial class AgcExports
         List<TranslatedImageBinding> textures,
         ulong pixelShaderAddress,
         ulong exportShaderAddress,
+        bool pixelStage,
+        bool vertexStage,
         out string error)
     {
         foreach (var binding in bindings)
@@ -7549,7 +7630,9 @@ public static partial class AgcExports
                     binding.MipLevel ?? 0,
                     binding.SamplerDescriptor,
                     binding.DescriptorSourceAddress,
-                    descriptorUnusable ? binding.DeferredChain : null));
+                    descriptorUnusable ? binding.DeferredChain : null,
+                    pixelStage,
+                    vertexStage));
         }
 
         error = string.Empty;
@@ -7885,6 +7968,23 @@ public static partial class AgcExports
         // descriptor slots available after MoltenVK's two internal resources.
         // Bake before the array grows from 14 to 15.
         isMacOs && guestBufferCount >= 14;
+
+    internal static bool RequiresSplitStageGraphicsGlobalBuffers(
+        int mergedGuestBufferCount,
+        int pixelGuestBufferCount,
+        int vertexGuestBufferCount,
+        bool isMacOs) =>
+        // MoltenVK lowers one Vulkan descriptor set to Metal argument-buffer
+        // resources. A storage-buffer array visible to both graphics stages is
+        // charged in both stages; Silent Hill's G-buffer passes exceed Metal's
+        // 31-buffer limit with only 12 logical guest buffers once internal
+        // resources are included. Separate stage-visible arrays retain the
+        // same shared VkBuffer backing while exposing only the bindings each
+        // shader actually uses.
+        isMacOs &&
+        mergedGuestBufferCount >= 12 &&
+        pixelGuestBufferCount != 0 &&
+        vertexGuestBufferCount != 0;
 
     /// <summary>
     /// Fingerprint of everything that shapes the translated SPIR-V besides
@@ -8592,6 +8692,11 @@ public static partial class AgcExports
                     };
                 }
 
+                texture = texture with
+                {
+                    PixelStage = binding.PixelStage,
+                    VertexStage = binding.VertexStage,
+                };
                 textures.Add(texture);
                 if (texture.IsFallback)
                 {
@@ -8946,7 +9051,7 @@ public static partial class AgcExports
         return merged.ToArray();
     }
 
-    private static GraphicsGlobalBufferPackingPlan
+    internal static GraphicsGlobalBufferPackingPlan
         CreateGraphicsGlobalBufferPackingPlan(
             IReadOnlyList<Gen5GlobalMemoryBinding> bindings,
             bool bakeScalars)
@@ -8972,17 +9077,19 @@ public static partial class AgcExports
         var fingerprint = 14695981039346656037UL;
         for (var index = 0; index < bindings.Count; index++)
         {
+            var binding = bindings[index];
+            descriptorIndices[index] = 0;
             cursor = checked((cursor + alignment - 1) & ~(alignment - 1));
             dwordOffsets[index] = checked((uint)(cursor / sizeof(uint)));
-            var byteBias = bindings[index].BaseAddress & (alignment - 1);
+            var byteBias = binding.BaseAddress & (alignment - 1);
             cursor = checked(
                 cursor +
                 byteBias +
-                (ulong)Math.Max(bindings[index].DataLength, sizeof(uint)));
+                (ulong)Math.Max(binding.DataLength, sizeof(uint)));
             cursor = checked((cursor + sizeof(uint) - 1) & ~(sizeof(uint) - 1UL));
-            fingerprint = (fingerprint ^ bindings[index].BaseAddress) * prime;
+            fingerprint = (fingerprint ^ binding.BaseAddress) * prime;
             fingerprint = (fingerprint ^ dwordOffsets[index]) * prime;
-            fingerprint = (fingerprint ^ (uint)bindings[index].DataLength) * prime;
+            fingerprint = (fingerprint ^ (uint)binding.DataLength) * prime;
         }
 
         return new GraphicsGlobalBufferPackingPlan(
@@ -8994,17 +9101,19 @@ public static partial class AgcExports
             fingerprint);
     }
 
-    private static IReadOnlyList<Gen5GlobalMemoryBinding>
+    internal static IReadOnlyList<Gen5GlobalMemoryBinding>
         PackGraphicsGlobalMemoryBindings(
             IReadOnlyList<Gen5GlobalMemoryBinding> bindings,
             GraphicsGlobalBufferPackingPlan plan)
     {
         if (!plan.Packed ||
+            plan.DescriptorIndices is null ||
+            plan.DescriptorIndices.Count != bindings.Count ||
             plan.DwordOffsets is null ||
             plan.DwordOffsets.Count != bindings.Count)
         {
             throw new ArgumentException(
-                "graphics buffer packing requires one packed offset per binding",
+                "graphics buffer packing requires one descriptor and offset per binding",
                 nameof(plan));
         }
 
@@ -9038,15 +9147,21 @@ public static partial class AgcExports
     }
 
     private static void ReturnEvaluationGlobalBindingArrays(
+        IReadOnlyList<Gen5GlobalMemoryBinding> retainedBindings,
         params Gen5ShaderEvaluation[] evaluations)
     {
+        var retained = new HashSet<byte[]>(
+            retainedBindings.Select(static binding => binding.Data),
+            System.Collections.Generic.ReferenceEqualityComparer.Instance);
         var returned = new HashSet<byte[]>(
             System.Collections.Generic.ReferenceEqualityComparer.Instance);
         foreach (var evaluation in evaluations)
         {
             foreach (var binding in evaluation.GlobalMemoryBindings)
             {
-                if (binding.DataPooled && returned.Add(binding.Data))
+                if (binding.DataPooled &&
+                    !retained.Contains(binding.Data) &&
+                    returned.Add(binding.Data))
                 {
                     VulkanVideoPresenter.GuestDataPool.Return(binding.Data);
                 }
