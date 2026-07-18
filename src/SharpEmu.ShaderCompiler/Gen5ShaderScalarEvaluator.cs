@@ -496,11 +496,14 @@ public static class Gen5ShaderScalarEvaluator
                         bufferMemory.ScalarResource,
                         instruction.Pc,
                         writable);
-                    TraceBufferDescriptorFallback(
-                        state,
-                        instruction,
-                        bufferMemory.ScalarResource,
-                        scalarRegisters);
+                    if (!path.Supplemental)
+                    {
+                        TraceBufferDescriptorFallback(
+                            state,
+                            instruction,
+                            bufferMemory.ScalarResource,
+                            scalarRegisters);
+                    }
                     continue;
                 }
 
@@ -567,11 +570,14 @@ public static class Gen5ShaderScalarEvaluator
                         bufferMemory.ScalarResource,
                         instruction.Pc,
                         writable);
-                    TraceBufferDescriptorFallback(
-                        state,
-                        instruction,
-                        bufferMemory.ScalarResource,
-                        scalarRegisters);
+                    if (!path.Supplemental)
+                    {
+                        TraceBufferDescriptorFallback(
+                            state,
+                            instruction,
+                            bufferMemory.ScalarResource,
+                            scalarRegisters);
+                    }
                     continue;
                 }
 
@@ -684,11 +690,14 @@ public static class Gen5ShaderScalarEvaluator
                         data = new byte[Math.Max(dataLength, sizeof(uint))];
                         dataLength = data.Length;
                         dataPooled = false;
-                        Console.Error.WriteLine(
-                            $"[LOADER][WARN] AGC buffer read unavailable; using zero buffer " +
-                            $"pc=0x{instruction.Pc:X} address=0x{bufferDescriptor.BaseAddress:X16} " +
-                            $"bytes={bufferDescriptor.SizeBytes} guest_writeback=disabled " +
-                            $"s{bufferMemory.ScalarResource}=[{descriptorWords}]");
+                        if (!path.Supplemental)
+                        {
+                            Console.Error.WriteLine(
+                                $"[LOADER][WARN] AGC buffer read unavailable; using zero buffer " +
+                                $"pc=0x{instruction.Pc:X} address=0x{bufferDescriptor.BaseAddress:X16} " +
+                                $"bytes={bufferDescriptor.SizeBytes} guest_writeback=disabled " +
+                                $"s{bufferMemory.ScalarResource}=[{descriptorWords}]");
+                        }
                     }
 
                     var binding = new Gen5GlobalMemoryBinding(

@@ -5556,8 +5556,8 @@ public static partial class AgcExports
             // Retire the obsolete wait without mutating recycled memory.
             if (ShouldTraceHotPath(ref _recycledWaitLabelTraceCount))
             {
-                Console.Error.WriteLine(
-                    $"[LOADER][WARN] agc.wait_retired_recycled label=0x{waitAddress:X16} " +
+                TraceAgc(
+                    $"agc.wait_retired_recycled label=0x{waitAddress:X16} " +
                     $"value=0x{currentQword:X16} queue={state.QueueName} " +
                     $"submission={state.ActiveSubmissionId}");
             }
@@ -5752,8 +5752,8 @@ public static partial class AgcExports
 
         if (ShouldTraceHotPath(ref _recycledLabelWriteTraceCount))
         {
-            Console.Error.WriteLine(
-                $"[LOADER][WARN] agc.label_write_retired_recycled " +
+            TraceAgc(
+                $"agc.label_write_retired_recycled " +
                 $"kind={packetKind} label=0x{address:X16} " +
                 $"value=0x{value:X16} bytes={byteCount} " +
                 $"current=0x{currentQword:X16} " +
@@ -5975,8 +5975,8 @@ public static partial class AgcExports
                     if (retired &&
                         ShouldTraceHotPath(ref _recycledWaitLabelTraceCount))
                     {
-                        Console.Error.WriteLine(
-                            $"[LOADER][WARN] agc.wait_monitor_retired_recycled " +
+                        TraceAgc(
+                            $"agc.wait_monitor_retired_recycled " +
                             $"label=0x{waiter.WaitAddress:X16} " +
                             $"value=0x{currentQword:X16} " +
                             $"queue={waiter.QueueName} " +
