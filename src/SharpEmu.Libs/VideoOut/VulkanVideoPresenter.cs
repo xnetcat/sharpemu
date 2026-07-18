@@ -1796,6 +1796,25 @@ internal static unsafe class VulkanVideoPresenter
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<
         TextureContentIdentity, byte> _cachedTextureIdentities = new();
 
+    internal readonly record struct GuestTextureShape(
+        bool Is3D,
+        bool IsLayered,
+        uint VolumeDepth,
+        uint ArrayLayers);
+
+    internal static GuestTextureShape GetGuestTextureShape(uint type, uint depth)
+    {
+        var extent = Math.Max(depth, 1u);
+        var is3D = type == 10;
+        var isLayered = type is 11 or 12 or 13 or 15;
+        return new GuestTextureShape(
+            is3D,
+            isLayered,
+            is3D ? extent : 1u,
+            isLayered ? extent : 1u);
+    }
+
+
     // Guest memory handle for render-thread self-healing: when a draw whose
     // texel copy was skipped misses the texture cache (eviction, cache
     // clear, or any other race), the presenter re-reads the texels itself
@@ -3157,6 +3176,7 @@ internal static unsafe class VulkanVideoPresenter
             public uint Width;
             public uint Height;
             public uint Depth = 1;
+            public uint ArrayLayers = 1;
             public uint RowLength;
             public uint DstSelect;
             public bool NeedsUpload;
@@ -7159,14 +7179,19 @@ internal static unsafe class VulkanVideoPresenter
                 return ResolveStorageImageResource(texture);
             }
 
-            if (texture.Address != 0 &&
+            var shape = VulkanVideoPresenter.GetGuestTextureShape(
+                texture.Type,
+                texture.Depth);
+            if (!shape.IsLayered &&
+                texture.Address != 0 &&
                 TryResolveGuestDepthTexture(texture, out var depthTexture))
             {
                 return depthTexture;
             }
 
             var vkFormat = GetTextureFormat(texture.Format, texture.NumberType);
-            if (texture.Address != 0 &&
+            if (!shape.IsLayered &&
+                texture.Address != 0 &&
                 TryResolveGuestImageAlias(texture, vkFormat, out var guestImage) &&
                 TryGetOrCreateGuestImageView(
                     guestImage,
@@ -7524,7 +7549,8 @@ internal static unsafe class VulkanVideoPresenter
                 texture.TileMode,
                 texture.Pitch,
                 texture.Sampler,
-                texture.Depth);
+                texture.Depth,
+                texture.Type);
             if (_textureCache.TryGetValue(key, out var cached))
             {
                 return cached;
@@ -7927,8 +7953,13 @@ internal static unsafe class VulkanVideoPresenter
         {
             var width = Math.Max(texture.Width, 1);
             var height = Math.Max(texture.Height, 1);
-            var depth = Math.Max(texture.Depth, 1u);
-            var is3D = depth > 1;
+            var descriptorDepth = Math.Max(texture.Depth, 1u);
+            var shape = VulkanVideoPresenter.GetGuestTextureShape(
+                texture.Type,
+                descriptorDepth);
+            var depth = shape.VolumeDepth;
+            var arrayLayers = shape.ArrayLayers;
+            var is3D = shape.Is3D;
             var rowLength = texture.TileMode == 0
                 ? Math.Max(texture.Pitch, width)
                 : width;
@@ -7938,14 +7969,21 @@ internal static unsafe class VulkanVideoPresenter
                 texture.Format,
                 rowLength,
                 height,
-                depth);
+                descriptorDepth);
             if (ShouldTraceVulkanResources() &&
-                _tracedTextureUploads.Add((texture.Address, width, height, depth, vkFormat)))
+                _tracedTextureUploads.Add((
+                    texture.Address,
+                    width,
+                    height,
+                    descriptorDepth,
+                    vkFormat)))
             {
                 Console.Error.WriteLine(
                     $"[LOADER][TRACE] vk.texture addr=0x{texture.Address:X16} " +
                     $"fmt={texture.Format} num={texture.NumberType} vk={vkFormat} " +
-                    $"size={width}x{height}x{depth} row={rowLength} tile={texture.TileMode} " +
+                    $"size={width}x{height}x{descriptorDepth} " +
+                    $"type={texture.Type} layers={arrayLayers} " +
+                    $"row={rowLength} tile={texture.TileMode} " +
                     $"dst=0x{texture.DstSelect:X3} " +
                     $"bytes={texture.RgbaPixels.Length} expected={expectedSize}");
             }
@@ -7971,7 +8009,10 @@ internal static unsafe class VulkanVideoPresenter
                 uploadPixels,
                 $"{TextureDebugName(texture, vkFormat)} staging");
 
-            var supportsAttachmentUsage = !is3D && !IsBlockCompressedFormat(vkFormat);
+            var supportsAttachmentUsage =
+                !is3D &&
+                !shape.IsLayered &&
+                !IsBlockCompressedFormat(vkFormat);
             var supportsStorageUsage = !IsBlockCompressedFormat(vkFormat) &&
                 SupportsStorageImage(vkFormat);
             var imageInfo = new ImageCreateInfo
@@ -7984,7 +8025,7 @@ internal static unsafe class VulkanVideoPresenter
                 Format = vkFormat,
                 Extent = new Extent3D(width, height, is3D ? depth : 1),
                 MipLevels = 1,
-                ArrayLayers = 1,
+                ArrayLayers = arrayLayers,
                 Samples = SampleCountFlags.Count1Bit,
                 Tiling = ImageTiling.Optimal,
                 Usage = is3D
@@ -8019,10 +8060,15 @@ internal static unsafe class VulkanVideoPresenter
             {
                 SType = StructureType.ImageViewCreateInfo,
                 Image = image,
-                ViewType = is3D ? ImageViewType.Type3D : ImageViewType.Type2D,
+                ViewType = is3D
+                    ? ImageViewType.Type3D
+                    : shape.IsLayered
+                        ? ImageViewType.Type2DArray
+                        : ImageViewType.Type2D,
                 Format = vkFormat,
                 Components = ToVkComponentMapping(texture.DstSelect),
-                SubresourceRange = ColorSubresourceRange(),
+                SubresourceRange = ColorSubresourceRange(
+                    layerCount: arrayLayers),
             };
             Check(_vk.CreateImageView(_device, &viewInfo, null, out var view), "vkCreateImageView(texture)");
             var debugName = TextureDebugName(texture, vkFormat);
@@ -8039,6 +8085,7 @@ internal static unsafe class VulkanVideoPresenter
                 Width = width,
                 Height = height,
                 Depth = depth,
+                ArrayLayers = arrayLayers,
                 RowLength = rowLength,
                 DstSelect = texture.DstSelect,
                 NeedsUpload = true,
@@ -8049,6 +8096,7 @@ internal static unsafe class VulkanVideoPresenter
             };
 
             if (texture.Address != 0 &&
+                !shape.IsLayered &&
                 !_guestImages.ContainsKey(texture.Address))
             {
                 var guestFormat = GetGuestTextureFormat(texture.Format, texture.NumberType);
@@ -13736,7 +13784,8 @@ internal static unsafe class VulkanVideoPresenter
                     SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
                     DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
                     Image = texture.Image,
-                    SubresourceRange = ColorSubresourceRange(),
+                    SubresourceRange = ColorSubresourceRange(
+                        layerCount: texture.ArrayLayers),
                 };
                 _vk.CmdPipelineBarrier(
                     _commandBuffer,
@@ -13758,7 +13807,7 @@ internal static unsafe class VulkanVideoPresenter
                     ImageSubresource = new ImageSubresourceLayers
                     {
                         AspectMask = ImageAspectFlags.ColorBit,
-                        LayerCount = 1,
+                        LayerCount = texture.ArrayLayers,
                     },
                     ImageExtent = new Extent3D(
                         texture.Width,
@@ -13783,7 +13832,8 @@ internal static unsafe class VulkanVideoPresenter
                     SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
                     DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
                     Image = texture.Image,
-                    SubresourceRange = ColorSubresourceRange(),
+                    SubresourceRange = ColorSubresourceRange(
+                        layerCount: texture.ArrayLayers),
                 };
                 _vk.CmdPipelineBarrier(
                     _commandBuffer,
@@ -15568,13 +15618,16 @@ internal static unsafe class VulkanVideoPresenter
 
         private static ImageSubresourceRange ColorSubresourceRange(
             uint baseMipLevel = 0,
-            uint levelCount = 1) =>
+            uint levelCount = 1,
+            uint baseArrayLayer = 0,
+            uint layerCount = 1) =>
             new()
             {
                 AspectMask = ImageAspectFlags.ColorBit,
                 BaseMipLevel = baseMipLevel,
                 LevelCount = levelCount,
-                LayerCount = 1,
+                BaseArrayLayer = baseArrayLayer,
+                LayerCount = layerCount,
             };
 
         private static byte[] ScaleBgra(byte[] source, uint sourceWidth, uint sourceHeight, uint width, uint height)
