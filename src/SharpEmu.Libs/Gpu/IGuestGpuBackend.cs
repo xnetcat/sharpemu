@@ -35,7 +35,10 @@ internal interface IGuestGpuBackend
         int imageBindingBase = 0,
         int scalarRegisterBufferIndex = -1,
         int requiredVertexOutputCount = 0,
-        ulong storageBufferOffsetAlignment = 1);
+        ulong storageBufferOffsetAlignment = 1,
+        int globalDescriptorBinding = 0,
+        IReadOnlyList<int>? globalDescriptorIndices = null,
+        IReadOnlyList<uint>? globalDwordOffsets = null);
 
     bool TryCompilePixelShader(
         Gen5ShaderState state,
@@ -50,7 +53,10 @@ internal interface IGuestGpuBackend
         uint pixelInputEnable = 0,
         uint pixelInputAddress = 0,
         IReadOnlyDictionary<uint, uint>? pixelInputLocations = null,
-        ulong storageBufferOffsetAlignment = 1);
+        ulong storageBufferOffsetAlignment = 1,
+        int globalDescriptorBinding = 0,
+        IReadOnlyList<int>? globalDescriptorIndices = null,
+        IReadOnlyList<uint>? globalDwordOffsets = null);
 
     bool TryCompileComputeShader(
         Gen5ShaderState state,
@@ -91,7 +97,8 @@ internal interface IGuestGpuBackend
         IReadOnlyList<GuestVertexBuffer>? vertexBuffers = null,
         GuestRenderState? renderState = null,
         Func<IReadOnlyList<GuestVertexBuffer>, IGuestCompiledShader?>?
-            deferredVertexCompiler = null);
+            deferredVertexCompiler = null,
+        int pixelGlobalBufferCount = -1);
 
     void SubmitDepthOnlyTranslatedDraw(
         IGuestCompiledShader pixelShader,
@@ -108,7 +115,8 @@ internal interface IGuestGpuBackend
         GuestRenderState? renderState = null,
         ulong shaderAddress = 0,
         Func<IReadOnlyList<GuestVertexBuffer>, IGuestCompiledShader?>?
-            deferredVertexCompiler = null);
+            deferredVertexCompiler = null,
+        int pixelGlobalBufferCount = -1);
 
     void SubmitOffscreenTranslatedDraw(
         IGuestCompiledShader pixelShader,
@@ -126,7 +134,8 @@ internal interface IGuestGpuBackend
         GuestDepthTarget? depthTarget = null,
         ulong shaderAddress = 0,
         Func<IReadOnlyList<GuestVertexBuffer>, IGuestCompiledShader?>?
-            deferredVertexCompiler = null);
+            deferredVertexCompiler = null,
+        int pixelGlobalBufferCount = -1);
 
     void SubmitStorageTranslatedDraw(
         IGuestCompiledShader pixelShader,

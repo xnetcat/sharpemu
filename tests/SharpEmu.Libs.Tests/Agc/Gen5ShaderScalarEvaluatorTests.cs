@@ -60,7 +60,7 @@ public sealed class Gen5ShaderScalarEvaluatorTests
     }
 
     [Fact]
-    public void NonBufferDescriptor_InSiblingBufferBlock_UsesSyntheticStorage()
+    public void NonBufferDescriptor_InSiblingBufferBlock_UsesDescriptorFreeZeroStorage()
     {
         var memory = new FakeCpuMemory(ShaderAddress, 0x1000);
         var ctx = new CpuContext(memory, Generation.Gen5);
@@ -100,12 +100,63 @@ public sealed class Gen5ShaderScalarEvaluatorTests
                 out var evaluation,
                 out error),
             error);
+        Assert.Empty(evaluation.GlobalMemoryBindings);
+        Assert.Equal(new uint[] { 0 }, evaluation.SyntheticZeroBufferPcs);
+    }
+
+    [Fact]
+    public void DuplicateBaseBufferDescriptors_ShareOneVulkanBinding()
+    {
+        const ulong bufferAddress = ShaderAddress + 0x800;
+        var memory = new FakeCpuMemory(ShaderAddress, 0x2000);
+        var ctx = new CpuContext(memory, Generation.Gen5);
+        Gen5ShaderAtomicDecodeTests.WriteProgram(
+            memory,
+            ShaderAddress,
+            [
+                // Same guest allocation through V#s s[0:3] and s[4:7].
+                0xE0E04008, 0x80000100,
+                0xE0E04008, 0x80010100,
+            ]);
+
+        var shaderRegisters = new Dictionary<uint, uint>
+        {
+            [Gen5ShaderAtomicDecodeTests.ComputePgmRsrc2Register] = 8u << 1,
+        };
+        for (uint scalar = 0; scalar < 8; scalar += 4)
+        {
+            shaderRegisters[Gen5ShaderAtomicDecodeTests.ComputeUserDataRegister + scalar] =
+                unchecked((uint)bufferAddress);
+            shaderRegisters[Gen5ShaderAtomicDecodeTests.ComputeUserDataRegister + scalar + 1] =
+                (uint)(bufferAddress >> 32);
+            shaderRegisters[Gen5ShaderAtomicDecodeTests.ComputeUserDataRegister + scalar + 2] =
+                64;
+            shaderRegisters[Gen5ShaderAtomicDecodeTests.ComputeUserDataRegister + scalar + 3] =
+                0;
+        }
+
+        Assert.True(
+            Gen5ShaderTranslator.TryCreateState(
+                ctx,
+                ShaderAddress,
+                0,
+                shaderRegisters,
+                Gen5ShaderAtomicDecodeTests.ComputeUserDataRegister,
+                out var state,
+                out var error),
+            error);
+        Assert.True(
+            Gen5ShaderScalarEvaluator.TryEvaluate(
+                ctx,
+                state,
+                out var evaluation,
+                out error),
+            error);
+
         var binding = Assert.Single(evaluation.GlobalMemoryBindings);
-        Assert.Equal(0UL, binding.BaseAddress);
-        Assert.Equal(new uint[] { 0 }, binding.InstructionPcs);
+        Assert.Equal(bufferAddress, binding.BaseAddress);
+        Assert.Equal(new uint[] { 0, 8 }, binding.InstructionPcs);
         Assert.True(binding.Writable);
-        Assert.False(binding.WriteBackToGuest);
-        Assert.Equal(sizeof(uint), binding.DataLength);
     }
 
     [Fact]

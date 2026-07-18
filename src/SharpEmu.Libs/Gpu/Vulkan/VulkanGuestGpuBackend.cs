@@ -28,7 +28,10 @@ internal sealed class VulkanGuestGpuBackend : IGuestGpuBackend
         int imageBindingBase = 0,
         int scalarRegisterBufferIndex = -1,
         int requiredVertexOutputCount = 0,
-        ulong storageBufferOffsetAlignment = 1)
+        ulong storageBufferOffsetAlignment = 1,
+        int globalDescriptorBinding = 0,
+        IReadOnlyList<int>? globalDescriptorIndices = null,
+        IReadOnlyList<uint>? globalDwordOffsets = null)
     {
         shader = null;
         if (!Gen5SpirvTranslator.TryCompileVertexShader(
@@ -41,7 +44,10 @@ internal sealed class VulkanGuestGpuBackend : IGuestGpuBackend
                 imageBindingBase,
                 scalarRegisterBufferIndex,
                 requiredVertexOutputCount,
-                storageBufferOffsetAlignment))
+                storageBufferOffsetAlignment,
+                globalDescriptorBinding,
+                globalDescriptorIndices,
+                globalDwordOffsets))
         {
             return false;
         }
@@ -63,7 +69,10 @@ internal sealed class VulkanGuestGpuBackend : IGuestGpuBackend
         uint pixelInputEnable = 0,
         uint pixelInputAddress = 0,
         IReadOnlyDictionary<uint, uint>? pixelInputLocations = null,
-        ulong storageBufferOffsetAlignment = 1)
+        ulong storageBufferOffsetAlignment = 1,
+        int globalDescriptorBinding = 0,
+        IReadOnlyList<int>? globalDescriptorIndices = null,
+        IReadOnlyList<uint>? globalDwordOffsets = null)
     {
         shader = null;
         if (!Gen5SpirvTranslator.TryCompilePixelShader(
@@ -79,7 +88,10 @@ internal sealed class VulkanGuestGpuBackend : IGuestGpuBackend
                 pixelInputEnable,
                 pixelInputAddress,
                 pixelInputLocations,
-                storageBufferOffsetAlignment))
+                storageBufferOffsetAlignment,
+                globalDescriptorBinding,
+                globalDescriptorIndices,
+                globalDwordOffsets))
         {
             return false;
         }
@@ -152,7 +164,8 @@ internal sealed class VulkanGuestGpuBackend : IGuestGpuBackend
         IReadOnlyList<GuestVertexBuffer>? vertexBuffers = null,
         GuestRenderState? renderState = null,
         Func<IReadOnlyList<GuestVertexBuffer>, IGuestCompiledShader?>?
-            deferredVertexCompiler = null) =>
+            deferredVertexCompiler = null,
+        int pixelGlobalBufferCount = -1) =>
         VulkanVideoPresenter.SubmitTranslatedDraw(
             Spirv(pixelShader),
             textures,
@@ -167,7 +180,8 @@ internal sealed class VulkanGuestGpuBackend : IGuestGpuBackend
             indexBuffer,
             vertexBuffers,
             renderState,
-            ToSpirvCompiler(deferredVertexCompiler));
+            ToSpirvCompiler(deferredVertexCompiler),
+            pixelGlobalBufferCount);
 
     public void SubmitDepthOnlyTranslatedDraw(
         IGuestCompiledShader pixelShader,
@@ -184,7 +198,8 @@ internal sealed class VulkanGuestGpuBackend : IGuestGpuBackend
         GuestRenderState? renderState = null,
         ulong shaderAddress = 0,
         Func<IReadOnlyList<GuestVertexBuffer>, IGuestCompiledShader?>?
-            deferredVertexCompiler = null) =>
+            deferredVertexCompiler = null,
+        int pixelGlobalBufferCount = -1) =>
         VulkanVideoPresenter.SubmitDepthOnlyTranslatedDraw(
             Spirv(pixelShader),
             textures,
@@ -199,7 +214,8 @@ internal sealed class VulkanGuestGpuBackend : IGuestGpuBackend
             vertexBuffers,
             renderState,
             shaderAddress,
-            ToSpirvCompiler(deferredVertexCompiler));
+            ToSpirvCompiler(deferredVertexCompiler),
+            pixelGlobalBufferCount);
 
     public void SubmitOffscreenTranslatedDraw(
         IGuestCompiledShader pixelShader,
@@ -217,7 +233,8 @@ internal sealed class VulkanGuestGpuBackend : IGuestGpuBackend
         GuestDepthTarget? depthTarget = null,
         ulong shaderAddress = 0,
         Func<IReadOnlyList<GuestVertexBuffer>, IGuestCompiledShader?>?
-            deferredVertexCompiler = null) =>
+            deferredVertexCompiler = null,
+        int pixelGlobalBufferCount = -1) =>
         VulkanVideoPresenter.SubmitOffscreenTranslatedDraw(
             Spirv(pixelShader),
             textures,
@@ -233,7 +250,8 @@ internal sealed class VulkanGuestGpuBackend : IGuestGpuBackend
             renderState,
             depthTarget,
             shaderAddress,
-            ToSpirvCompiler(deferredVertexCompiler));
+            ToSpirvCompiler(deferredVertexCompiler),
+            pixelGlobalBufferCount);
 
     public void SubmitStorageTranslatedDraw(
         IGuestCompiledShader pixelShader,

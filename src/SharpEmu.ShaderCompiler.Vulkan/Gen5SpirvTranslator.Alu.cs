@@ -302,6 +302,42 @@ public static partial class Gen5SpirvTranslator
                         instruction,
                         Ext(32, _floatType, GetFloatSource(instruction, 0)));
                     break;
+                case "VRcpF16":
+                {
+                    // V_RCP_F16 consumes the selected half and rounds the
+                    // reciprocal back to f16. SDWA source selection has
+                    // already moved the requested half into the low word.
+                    var sourcePair = Ext(
+                        62,
+                        _vec2Type,
+                        BitwiseAnd(GetRawSource(instruction, 0), UInt(0xFFFF)));
+                    var source = _module.AddInstruction(
+                        SpirvOp.CompositeExtract,
+                        _floatType,
+                        sourcePair,
+                        0);
+                    var reciprocal = _module.AddInstruction(
+                        SpirvOp.FDiv,
+                        _floatType,
+                        Float(1),
+                        source);
+                    var packed = Ext(
+                        58,
+                        _uintType,
+                        _module.AddInstruction(
+                            SpirvOp.CompositeConstruct,
+                            _vec2Type,
+                            reciprocal,
+                            Float(0)));
+                    result = BitwiseAnd(packed, UInt(0xFFFF));
+                    if (instruction.Control is not Gen5SdwaControl)
+                    {
+                        result = BitwiseOr(
+                            BitwiseAnd(LoadV(destination), UInt(0xFFFF_0000)),
+                            result);
+                    }
+                    break;
+                }
                 case "VRsqF16":
                 {
                     // Convert the selected half to f32 for the operation, then
@@ -855,6 +891,15 @@ public static partial class Gen5SpirvTranslator
                             GetRawSource(instruction, 1)),
                         GetRawSource(instruction, 2));
                     break;
+                case "VXadU32":
+                    result = IAdd(
+                        _module.AddInstruction(
+                            SpirvOp.BitwiseXor,
+                            _uintType,
+                            GetRawSource(instruction, 0),
+                            GetRawSource(instruction, 1)),
+                        GetRawSource(instruction, 2));
+                    break;
                 case "VOr3U32":
                     result = BitwiseOr(
                         BitwiseOr(
@@ -873,7 +918,9 @@ public static partial class Gen5SpirvTranslator
                     var added = IAdd(
                         GetRawSource(instruction, 0),
                         GetRawSource(instruction, 1));
-                    result = ShiftLeftLogical(added, GetRawSource(instruction, 2));
+                    result = ShiftLeftLogical(
+                        added,
+                        BitwiseAnd(GetRawSource(instruction, 2), UInt(31)));
                     break;
                 }
                 case "VAdd3U32":
@@ -1329,6 +1376,7 @@ public static partial class Gen5SpirvTranslator
                     break;
                 }
                 case "VFmaF16":
+                case "VMin3F16":
                 {
                     if (instruction.Control is not Gen5Vop3Control halfControl)
                     {
@@ -1360,12 +1408,35 @@ public static partial class Gen5SpirvTranslator
                         return value;
                     }
 
-                    var halfResult = Ext(
-                        50,
-                        _floatType,
-                        GetVop3HalfSource(0),
-                        GetVop3HalfSource(1),
-                        GetVop3HalfSource(2));
+                    var first = GetVop3HalfSource(0);
+                    var second = GetVop3HalfSource(1);
+                    var third = GetVop3HalfSource(2);
+                    var halfResult = instruction.Opcode == "VFmaF16"
+                        ? Ext(50, _floatType, first, second, third)
+                        : Ext(
+                            37,
+                            _floatType,
+                            Ext(37, _floatType, first, second),
+                            third);
+                    halfResult = halfControl.OutputModifier switch
+                    {
+                        1 => _module.AddInstruction(
+                            SpirvOp.FMul,
+                            _floatType,
+                            halfResult,
+                            Float(2)),
+                        2 => _module.AddInstruction(
+                            SpirvOp.FMul,
+                            _floatType,
+                            halfResult,
+                            Float(4)),
+                        3 => _module.AddInstruction(
+                            SpirvOp.FMul,
+                            _floatType,
+                            halfResult,
+                            Float(0.5f)),
+                        _ => halfResult,
+                    };
                     if (halfControl.Clamp)
                     {
                         halfResult = Ext(43, _floatType, halfResult, Float(0), Float(1));
@@ -1399,9 +1470,6 @@ public static partial class Gen5SpirvTranslator
                         first,
                         second);
                     result = Ext(58, _uintType, vector);
-                    StorePackedHalf(
-                        destination,
-                        vector);
                     break;
                 }
                 case "VCvtPknormI16F32":

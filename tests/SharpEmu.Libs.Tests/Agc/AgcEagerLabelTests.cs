@@ -45,12 +45,10 @@ public sealed class AgcEagerLabelTests
     }
 
     [Theory]
-    [InlineData(true, 4u, 0UL, true)]
-    [InlineData(false, 4u, 0UL, false)]
-    [InlineData(true, 8u, 0UL, false)]
-    [InlineData(true, 4u, 1UL, false)]
+    [InlineData(4u, 0UL, true)]
+    [InlineData(8u, 0UL, false)]
+    [InlineData(4u, 1UL, false)]
     public void CompletionLabelClearDma_IsRecognizedNarrowly(
-        bool compactLayout,
         uint byteCount,
         ulong sourceAddress,
         bool expected)
@@ -58,9 +56,43 @@ public sealed class AgcEagerLabelTests
         Assert.Equal(
             expected,
             AgcExports.IsCompletionLabelClearDma(
-                compactLayout,
                 byteCount,
                 sourceAddress));
+    }
+
+    [Theory]
+    [InlineData(4u, 0x0000007021071EA0UL, 0UL, true)]
+    [InlineData(4u, 0x0000007021071EA0UL, 1UL, true)]
+    [InlineData(0u, 0x0000007021071EA0UL, 0UL, false)]
+    [InlineData(4u, 0x1000UL, 0UL, false)]
+    [InlineData(4u, 0x0000007021071EA1UL, 0UL, false)]
+    [InlineData(4u, 0x0000007021071EA0UL, 0x0000000100000000UL, false)]
+    public void CustomDmaImmediateFill_AcceptsDcbAndAcbImmediateDomain(
+        uint byteCount,
+        ulong destinationAddress,
+        ulong sourceAddress,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            AgcExports.IsCustomDmaImmediateFill(
+                byteCount,
+                destinationAddress,
+                sourceAddress));
+    }
+
+    [Theory]
+    [InlineData(0, false)]
+    [InlineData(1, true)]
+    [InlineData(7, true)]
+    public void ComputeCompletionEvent_WaitsForDeferredGpuEffects(
+        int deferredWaitCount,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            AgcExports.ShouldDeferCompatibilityCompletionEvent(
+                deferredWaitCount));
     }
 
     [Theory]
@@ -112,9 +144,14 @@ public sealed class AgcEagerLabelTests
     [Theory]
     [InlineData(0x00000001E7010002UL, 1UL, 0xFFFFFFFFUL, 3u, true)]
     [InlineData(0x00000000E7010002UL, 1UL, 0xFFFFFFFFUL, 3u, true)]
+    [InlineData(0x0000000021074820UL, 1UL, 0xFFFFFFFFUL, 3u, true)]
+    [InlineData(0x0000000080015F00UL, 1UL, 0xFFFFFFFFUL, 3u, true)]
     [InlineData(0x00000001E7010002UL, 2UL, 0xFFFFFFFFUL, 3u, false)]
     [InlineData(0x00000002E7010002UL, 1UL, 0xFFFFFFFFUL, 3u, false)]
     [InlineData(0x00000001E7010003UL, 1UL, 0xFFFFFFFFUL, 3u, false)]
+    [InlineData(0x0000000121074820UL, 1UL, 0xFFFFFFFFUL, 3u, false)]
+    [InlineData(0x0000000021074821UL, 1UL, 0xFFFFFFFFUL, 3u, false)]
+    [InlineData(0x0000000001074820UL, 1UL, 0xFFFFFFFFUL, 3u, false)]
     public void RecycledRecordSignature_IsRecognizedNarrowly(
         ulong currentQword,
         ulong reference,
@@ -138,11 +175,15 @@ public sealed class AgcEagerLabelTests
     [InlineData(0x00000001E7010002UL, 0UL, 4u, true)]
     [InlineData(0x00000001E7010002UL, 1UL, 4u, true)]
     [InlineData(0x00000000E7010002UL, 1UL, 4u, true)]
+    [InlineData(0x0000000021074820UL, 0UL, 4u, true)]
+    [InlineData(0x0000000021074820UL, 1UL, 4u, true)]
+    [InlineData(0x0000000080015F00UL, 1UL, 8u, true)]
     [InlineData(0x0000007021071EA0UL, 2UL, 4u, false)]
     [InlineData(0x0000007021071EA0UL, 0UL, 8u, false)]
     [InlineData(0x0000007021071EA1UL, 0UL, 4u, false)]
     [InlineData(0x0000008021071EA0UL, 1UL, 4u, false)]
     [InlineData(0x0000000000000000UL, 1UL, 4u, false)]
+    [InlineData(0x0000000021074821UL, 1UL, 4u, false)]
     public void RecycledCompletionLabelWrite_IsSuppressedNarrowly(
         ulong currentQword,
         ulong value,

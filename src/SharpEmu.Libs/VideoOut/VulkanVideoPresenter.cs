@@ -46,7 +46,8 @@ internal sealed record VulkanTranslatedGuestDraw(
     GuestIndexBuffer? IndexBuffer,
     GuestRenderState RenderState,
     Func<IReadOnlyList<GuestVertexBuffer>, byte[]?>?
-        DeferredVertexCompiler = null);
+        DeferredVertexCompiler = null,
+    int PixelGlobalBufferCount = -1);
 
 internal sealed record VulkanOffscreenGuestDraw(
     VulkanTranslatedGuestDraw Draw,
@@ -534,7 +535,8 @@ internal static unsafe class VulkanVideoPresenter
         IReadOnlyList<GuestVertexBuffer>? vertexBuffers = null,
         GuestRenderState? renderState = null,
         Func<IReadOnlyList<GuestVertexBuffer>, byte[]?>?
-            deferredVertexCompiler = null)
+            deferredVertexCompiler = null,
+        int pixelGlobalBufferCount = -1)
     {
         if (pixelSpirv.Length == 0 || width == 0 || height == 0)
         {
@@ -567,7 +569,8 @@ internal static unsafe class VulkanVideoPresenter
                     primitiveType,
                     indexBuffer,
                     renderState ?? GuestRenderState.Default,
-                    deferredVertexCompiler),
+                    deferredVertexCompiler,
+                    pixelGlobalBufferCount),
                 RequiredGuestWorkSequence: CurrentSubmittingQueueTailLocked(),
                 IsSplash: false);
             if (_thread is not null)
@@ -597,7 +600,8 @@ internal static unsafe class VulkanVideoPresenter
         GuestDepthTarget? depthTarget = null,
         ulong shaderAddress = 0,
         Func<IReadOnlyList<GuestVertexBuffer>, byte[]?>?
-            deferredVertexCompiler = null)
+            deferredVertexCompiler = null,
+        int pixelGlobalBufferCount = -1)
     {
         SubmitOffscreenTranslatedDraw(
             pixelSpirv,
@@ -614,7 +618,8 @@ internal static unsafe class VulkanVideoPresenter
             renderState,
             depthTarget,
             shaderAddress,
-            deferredVertexCompiler);
+            deferredVertexCompiler,
+            pixelGlobalBufferCount);
     }
 
     // Manual scans (targets are <= 8) so the per-draw validation does not
@@ -669,7 +674,8 @@ internal static unsafe class VulkanVideoPresenter
         GuestDepthTarget? depthTarget = null,
         ulong shaderAddress = 0,
         Func<IReadOnlyList<GuestVertexBuffer>, byte[]?>?
-            deferredVertexCompiler = null)
+            deferredVertexCompiler = null,
+        int pixelGlobalBufferCount = -1)
     {
         if (pixelSpirv.Length == 0 ||
             targets.Count == 0 ||
@@ -737,7 +743,8 @@ internal static unsafe class VulkanVideoPresenter
                         primitiveType,
                         indexBuffer,
                         effectiveRenderState,
-                        deferredVertexCompiler),
+                        deferredVertexCompiler,
+                        pixelGlobalBufferCount),
                     targets.ToArray(),
                     depthTarget,
                     PublishTarget: true,
@@ -764,7 +771,8 @@ internal static unsafe class VulkanVideoPresenter
         GuestRenderState? renderState = null,
         ulong shaderAddress = 0,
         Func<IReadOnlyList<GuestVertexBuffer>, byte[]?>?
-            deferredVertexCompiler = null)
+            deferredVertexCompiler = null,
+        int pixelGlobalBufferCount = -1)
     {
         if (pixelSpirv.Length == 0 ||
             depthTarget.Address == 0 ||
@@ -795,7 +803,8 @@ internal static unsafe class VulkanVideoPresenter
                         primitiveType,
                         indexBuffer,
                         renderState ?? GuestRenderState.Default,
-                        deferredVertexCompiler),
+                        deferredVertexCompiler,
+                        pixelGlobalBufferCount),
                     [new GuestRenderTarget(
                         Address: 0,
                         depthTarget.Width,
@@ -1532,6 +1541,9 @@ internal static unsafe class VulkanVideoPresenter
     {
         var format = (dataFormat, numberType) switch
         {
+            (2, 4) => Format.R16Uint,
+            (2, 5) => Format.R16Sint,
+            (2, 7) => Format.R16Sfloat,
             (4, 4) => Format.R32Uint,
             (4, 5) => Format.R32Sint,
             (4, 7) => Format.R32Sfloat,
@@ -1572,9 +1584,9 @@ internal static unsafe class VulkanVideoPresenter
 
         var outputKind = format switch
         {
-            Format.R8Uint or Format.R32Uint or Format.R16G16Uint or
+            Format.R8Uint or Format.R16Uint or Format.R32Uint or Format.R16G16Uint or
                 Format.R8G8B8A8Uint or Format.R16G16B16A16Uint => Gen5PixelOutputKind.Uint,
-            Format.R32Sint or Format.R16G16Sint or Format.R8G8B8A8Sint or
+            Format.R16Sint or Format.R32Sint or Format.R16G16Sint or Format.R8G8B8A8Sint or
                 Format.R16G16B16A16Sint => Gen5PixelOutputKind.Sint,
             _ => Gen5PixelOutputKind.Float,
         };
@@ -2561,6 +2573,9 @@ internal static unsafe class VulkanVideoPresenter
             public DescriptorSet DescriptorSet;
             public TextureResource[] Textures = [];
             public GlobalBufferResource[] GlobalMemoryBuffers = [];
+            // -1 keeps the legacy one-array layout. Otherwise the flat array
+            // is [pixel][vertex] and each graphics stage gets its own binding.
+            public int PixelGlobalBufferCount = -1;
             public VertexBufferResource[] VertexBuffers = [];
             public VkBuffer IndexBuffer;
             public DeviceMemory IndexMemory;
@@ -5384,6 +5399,7 @@ internal static unsafe class VulkanVideoPresenter
                 Textures = new TextureResource[draw.Textures.Count],
                 GlobalMemoryBuffers =
                     new GlobalBufferResource[draw.GlobalMemoryBuffers.Count],
+                PixelGlobalBufferCount = draw.PixelGlobalBufferCount,
                 VertexBuffers = new VertexBufferResource[draw.VertexBuffers.Count],
                 VertexCount = GetDrawVertexCount(draw.PrimitiveType, draw.VertexCount, draw.IndexBuffer),
                 InstanceCount = Math.Max(draw.InstanceCount, 1),
@@ -5709,7 +5725,18 @@ internal static unsafe class VulkanVideoPresenter
             var sampledImageCount = resources.Textures.Count(texture => !texture.IsStorage);
             var storageImageCount = textureCount - sampledImageCount;
             var globalBufferCount = resources.GlobalMemoryBuffers.Length;
-            var bindingCount = textureCount + (globalBufferCount == 0 ? 0 : 1);
+            var splitStageBuffers = resources.PixelGlobalBufferCount >= 0;
+            var pixelGlobalBufferCount = splitStageBuffers
+                ? Math.Clamp(resources.PixelGlobalBufferCount, 0, globalBufferCount)
+                : globalBufferCount;
+            var vertexGlobalBufferCount = splitStageBuffers
+                ? globalBufferCount - pixelGlobalBufferCount
+                : 0;
+            var globalBindingCount = splitStageBuffers
+                ? (pixelGlobalBufferCount == 0 ? 0 : 1) +
+                  (vertexGlobalBufferCount == 0 ? 0 : 1)
+                : globalBufferCount == 0 ? 0 : 1;
+            var bindingCount = textureCount + globalBindingCount;
             var layout = GetOrCreateDescriptorLayout(resources, stageFlags, bindingCount);
             resources.DescriptorSetLayout = layout.DescriptorSetLayout;
             resources.PipelineLayout = layout.PipelineLayout;
@@ -5834,15 +5861,33 @@ internal static unsafe class VulkanVideoPresenter
                         };
                     }
 
-                    writePointer[writeIndex++] = new WriteDescriptorSet
+                    if (!splitStageBuffers || pixelGlobalBufferCount != 0)
                     {
-                        SType = StructureType.WriteDescriptorSet,
-                        DstSet = resources.DescriptorSet,
-                        DstBinding = 0,
-                        DescriptorCount = (uint)globalBufferCount,
-                        DescriptorType = DescriptorType.StorageBuffer,
-                        PBufferInfo = bufferInfoPointer,
-                    };
+                        writePointer[writeIndex++] = new WriteDescriptorSet
+                        {
+                            SType = StructureType.WriteDescriptorSet,
+                            DstSet = resources.DescriptorSet,
+                            DstBinding = 0,
+                            DescriptorCount = (uint)(splitStageBuffers
+                                ? pixelGlobalBufferCount
+                                : globalBufferCount),
+                            DescriptorType = DescriptorType.StorageBuffer,
+                            PBufferInfo = bufferInfoPointer,
+                        };
+                    }
+
+                    if (splitStageBuffers && vertexGlobalBufferCount != 0)
+                    {
+                        writePointer[writeIndex++] = new WriteDescriptorSet
+                        {
+                            SType = StructureType.WriteDescriptorSet,
+                            DstSet = resources.DescriptorSet,
+                            DstBinding = (uint)(textureCount + 1),
+                            DescriptorCount = (uint)vertexGlobalBufferCount,
+                            DescriptorType = DescriptorType.StorageBuffer,
+                            PBufferInfo = bufferInfoPointer + pixelGlobalBufferCount,
+                        };
+                    }
                 }
 
                 for (var index = 0; index < textureCount; index++)
@@ -6147,13 +6192,41 @@ internal static unsafe class VulkanVideoPresenter
                 var bindingOffset = 0;
                 if (resources.GlobalMemoryBuffers.Length != 0)
                 {
-                    bindings[bindingOffset++] = new DescriptorSetLayoutBinding
+                    var splitStageBuffers = resources.PixelGlobalBufferCount >= 0;
+                    var pixelGlobalBufferCount = splitStageBuffers
+                        ? Math.Clamp(
+                            resources.PixelGlobalBufferCount,
+                            0,
+                            resources.GlobalMemoryBuffers.Length)
+                        : resources.GlobalMemoryBuffers.Length;
+                    var vertexGlobalBufferCount = splitStageBuffers
+                        ? resources.GlobalMemoryBuffers.Length - pixelGlobalBufferCount
+                        : 0;
+                    if (!splitStageBuffers || pixelGlobalBufferCount != 0)
                     {
-                        Binding = 0,
-                        DescriptorType = DescriptorType.StorageBuffer,
-                        DescriptorCount = (uint)resources.GlobalMemoryBuffers.Length,
-                        StageFlags = stageFlags,
-                    };
+                        bindings[bindingOffset++] = new DescriptorSetLayoutBinding
+                        {
+                            Binding = 0,
+                            DescriptorType = DescriptorType.StorageBuffer,
+                            DescriptorCount = (uint)(splitStageBuffers
+                                ? pixelGlobalBufferCount
+                                : resources.GlobalMemoryBuffers.Length),
+                            StageFlags = splitStageBuffers
+                                ? ShaderStageFlags.FragmentBit
+                                : stageFlags,
+                        };
+                    }
+
+                    if (splitStageBuffers && vertexGlobalBufferCount != 0)
+                    {
+                        bindings[bindingOffset++] = new DescriptorSetLayoutBinding
+                        {
+                            Binding = (uint)(resources.Textures.Length + 1),
+                            DescriptorType = DescriptorType.StorageBuffer,
+                            DescriptorCount = (uint)vertexGlobalBufferCount,
+                            StageFlags = ShaderStageFlags.VertexBit,
+                        };
+                    }
                 }
 
                 for (var index = 0; index < resources.Textures.Length; index++)
@@ -6243,7 +6316,10 @@ internal static unsafe class VulkanVideoPresenter
         private static string BuildResourceLayoutKey(TranslatedDrawResources resources)
         {
             var key = new StringBuilder();
-            key.Append(resources.GlobalMemoryBuffers.Length).Append(':');
+            key.Append(resources.GlobalMemoryBuffers.Length)
+                .Append('/')
+                .Append(resources.PixelGlobalBufferCount)
+                .Append(':');
             foreach (var texture in resources.Textures)
             {
                 key.Append(texture.IsStorage ? 'S' : 'T');
@@ -8852,6 +8928,9 @@ internal static unsafe class VulkanVideoPresenter
         private static Format GetRenderTargetFormat(uint format, uint numberType) =>
             (format, numberType) switch
             {
+                (2, 4) => Format.R16Uint,
+                (2, 5) => Format.R16Sint,
+                (2, 7) => Format.R16Sfloat,
                 (4, 4) => Format.R32Uint,
                 (4, 5) => Format.R32Sint,
                 (4, 7) => Format.R32Sfloat,
@@ -10453,7 +10532,10 @@ internal static unsafe class VulkanVideoPresenter
                         $"resource={(targets[index] is null ? "null" : targets[index].Format)}"))}] " +
                     $"shader=0x{work.ShaderAddress:X16} " +
                     $"vs_bytes={work.Draw.VertexSpirv.Length} " +
-                    $"ps_bytes={work.Draw.PixelSpirv.Length}: {exception.Message}");
+                    $"ps_bytes={work.Draw.PixelSpirv.Length} " +
+                    $"global_buffers={work.Draw.GlobalMemoryBuffers.Count} " +
+                    $"pixel_global_buffers={work.Draw.PixelGlobalBufferCount}: " +
+                    exception.Message);
             }
             finally
             {

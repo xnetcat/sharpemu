@@ -342,7 +342,8 @@ public sealed record Gen5ShaderEvaluation(
     IReadOnlyList<Gen5GlobalMemoryBinding> GlobalMemoryBindings,
     Gen5ComputeSystemRegisters? ComputeSystemRegisters = null,
     IReadOnlySet<uint>? RuntimeScalarRegisters = null,
-    IReadOnlyList<Gen5VertexInputBinding>? VertexInputs = null);
+    IReadOnlyList<Gen5VertexInputBinding>? VertexInputs = null,
+    IReadOnlySet<uint>? SyntheticZeroBufferPcs = null);
 
 public sealed record Gen5ShaderInstruction(
     uint Pc,

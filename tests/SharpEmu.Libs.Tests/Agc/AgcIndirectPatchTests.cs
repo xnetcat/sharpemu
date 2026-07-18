@@ -4,6 +4,8 @@
 using System.Buffers.Binary;
 using SharpEmu.HLE;
 using SharpEmu.Libs.Agc;
+using SharpEmu.Libs.VideoOut;
+using SharpEmu.ShaderCompiler;
 using Xunit;
 
 namespace SharpEmu.Libs.Tests.Agc;
@@ -14,6 +16,58 @@ public sealed class AgcIndirectPatchTests
     private const ulong CommandBufferAddress = BaseAddress + 0x100;
     private const ulong CommandAddress = BaseAddress + 0x400;
     private const ulong CommandEndAddress = BaseAddress + 0x800;
+
+    [Theory]
+    [InlineData(30, true, false)]
+    [InlineData(31, true, true)]
+    [InlineData(32, true, true)]
+    [InlineData(31, false, false)]
+    public void MetalSingleStageDescriptorLimitBakesOnlyOverflowingScalarState(
+        int guestBufferCount,
+        bool isMacOs,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            AgcExports.RequiresBakedScalarsForStorageDescriptorLimit(
+                guestBufferCount,
+                isMacOs));
+    }
+
+    [Theory]
+    [InlineData(13, true, false)]
+    [InlineData(14, true, true)]
+    [InlineData(15, true, true)]
+    [InlineData(16, true, true)]
+    [InlineData(14, false, false)]
+    public void MetalGraphicsDescriptorLimitAccountsForBothShaderStages(
+        int guestBufferCount,
+        bool isMacOs,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            AgcExports.RequiresBakedGraphicsScalarsForStorageDescriptorLimit(
+                guestBufferCount,
+                isMacOs));
+    }
+
+    [Theory]
+    [InlineData(2, 4, Gen5PixelOutputKind.Uint)]
+    [InlineData(2, 5, Gen5PixelOutputKind.Sint)]
+    [InlineData(2, 7, Gen5PixelOutputKind.Float)]
+    public void Format16RenderTargetsUseTheirNativePixelOutputKind(
+        uint dataFormat,
+        uint numberType,
+        Gen5PixelOutputKind expected)
+    {
+        Assert.True(
+            VulkanVideoPresenter.TryDecodeRenderTargetFormat(
+                dataFormat,
+                numberType,
+                out var format));
+        Assert.Equal(expected, format.OutputKind);
+    }
 
     [Fact]
     public void DcbDrawIndirectUsesThreeArgumentAbiAndRealPacket()
