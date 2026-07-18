@@ -35,6 +35,8 @@ public static class Gen5ShaderScalarEvaluator
             StringComparison.Ordinal);
     private static readonly object _scalarFallbackTraceGate = new();
     private static readonly HashSet<(ulong Shader, uint Pc)> _tracedScalarFallbacks = [];
+    private static readonly HashSet<(ulong Shader, uint Pc)>
+        _tracedNonCanonicalBufferDescriptors = [];
 
     // Uniform forward branches select material/resource bodies that remain
     // statically present in the translated shader. Discover the skipped body's
@@ -441,32 +443,47 @@ public static class Gen5ShaderScalarEvaluator
                     // for the statically present block, so bind a bounded zero
                     // buffer to this exact PC. It is never reused for another
                     // resource register or instruction.
-                    var nullKey = (bufferMemory.ScalarResource, 0UL);
-                    if (globalMemoryByAddress.TryGetValue(nullKey, out var nullBinding))
+                    AddNullBufferBinding(
+                        globalMemoryBindings,
+                        globalMemoryByAddress,
+                        bufferMemory.ScalarResource,
+                        instruction.Pc,
+                        writable);
+                    continue;
+                }
+
+                // SharpEmu host-maps guest allocations in the lower canonical
+                // address range. A stale descriptor can still pass the V#
+                // type checks while assembling a non-canonical address from
+                // unrelated scalar data. Binding a large zero-filled Vulkan
+                // buffer for that impossible address leaves the translated
+                // instruction live and has caused Metal to hang in post-movie
+                // compute passes. Preserve the architectural unbound-resource
+                // behavior instead and bind the same bounded zero buffer the
+                // null-descriptor path uses.
+                if (!IsLowerCanonicalGuestAddress(bufferDescriptor.BaseAddress))
+                {
+                    if (_strictBufferLoad)
                     {
-                        nullBinding.Writable |= writable;
-                        if (nullBinding.InstructionPcs is List<uint> nullInstructionPcs &&
-                            !nullInstructionPcs.Contains(instruction.Pc))
-                        {
-                            nullInstructionPcs.Add(instruction.Pc);
-                        }
-                    }
-                    else
-                    {
-                        var binding = new Gen5GlobalMemoryBinding(
-                            bufferMemory.ScalarResource,
-                            0,
-                            new List<uint> { instruction.Pc },
-                            new byte[sizeof(uint)],
-                            sizeof(uint),
-                            DataPooled: false)
-                        {
-                            Writable = writable,
-                        };
-                        globalMemoryByAddress.Add(nullKey, binding);
-                        globalMemoryBindings.Add(binding);
+                        error =
+                            $"buffer-address-noncanonical pc=0x{instruction.Pc:X} " +
+                            $"address=0x{bufferDescriptor.BaseAddress:X16} " +
+                            $"s{bufferMemory.ScalarResource}";
+                        return false;
                     }
 
+                    TraceNonCanonicalBufferDescriptor(
+                        state,
+                        instruction,
+                        bufferMemory.ScalarResource,
+                        scalarRegisters,
+                        bufferDescriptor.BaseAddress);
+                    AddNullBufferBinding(
+                        globalMemoryBindings,
+                        globalMemoryByAddress,
+                        bufferMemory.ScalarResource,
+                        instruction.Pc,
+                        writable);
                     continue;
                 }
 
@@ -704,6 +721,71 @@ public static class Gen5ShaderScalarEvaluator
         opcode.StartsWith("TBufferStore", StringComparison.Ordinal) ||
         opcode.StartsWith("BufferAtomic", StringComparison.Ordinal) ||
         opcode.StartsWith("TBufferAtomic", StringComparison.Ordinal);
+
+    private static bool IsLowerCanonicalGuestAddress(ulong address) =>
+        address < 0x0000_8000_0000_0000UL;
+
+    private static void AddNullBufferBinding(
+        List<Gen5GlobalMemoryBinding> globalMemoryBindings,
+        Dictionary<(uint ScalarAddress, ulong BaseAddress), Gen5GlobalMemoryBinding>
+            globalMemoryByAddress,
+        uint scalarResource,
+        uint pc,
+        bool writable)
+    {
+        var nullKey = (scalarResource, 0UL);
+        if (globalMemoryByAddress.TryGetValue(nullKey, out var nullBinding))
+        {
+            nullBinding.Writable |= writable;
+            if (nullBinding.InstructionPcs is List<uint> nullInstructionPcs &&
+                !nullInstructionPcs.Contains(pc))
+            {
+                nullInstructionPcs.Add(pc);
+            }
+
+            return;
+        }
+
+        var binding = new Gen5GlobalMemoryBinding(
+            scalarResource,
+            0,
+            new List<uint> { pc },
+            new byte[sizeof(uint)],
+            sizeof(uint),
+            DataPooled: false)
+        {
+            Writable = writable,
+        };
+        globalMemoryByAddress.Add(nullKey, binding);
+        globalMemoryBindings.Add(binding);
+    }
+
+    private static void TraceNonCanonicalBufferDescriptor(
+        Gen5ShaderState state,
+        Gen5ShaderInstruction instruction,
+        uint scalarResource,
+        IReadOnlyList<uint> scalarRegisters,
+        ulong baseAddress)
+    {
+        lock (_scalarFallbackTraceGate)
+        {
+            if (!_tracedNonCanonicalBufferDescriptors.Add(
+                    (state.Program.Address, instruction.Pc)))
+            {
+                return;
+            }
+        }
+
+        var descriptorWords = string.Join(
+            ':',
+            Enumerable.Range(0, 4).Select(index =>
+                $"{scalarRegisters[(int)(scalarResource + (uint)index)]:X8}"));
+        Console.Error.WriteLine(
+            $"[LOADER][WARN] agc.buffer_descriptor_noncanonical " +
+            $"shader=0x{state.Program.Address:X16} pc=0x{instruction.Pc:X} " +
+            $"op={instruction.Opcode} address=0x{baseAddress:X16} " +
+            $"s{scalarResource}=[{descriptorWords}]; binding zero buffer");
+    }
 
     private static bool HasGlobalMemoryBindingForPc(
         IReadOnlyList<Gen5GlobalMemoryBinding> bindings,
