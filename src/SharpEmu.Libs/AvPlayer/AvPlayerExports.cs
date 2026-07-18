@@ -438,18 +438,13 @@ public static class AvPlayerExports
 
             Span<byte> info = stackalloc byte[StreamInfoExSize];
             info.Clear();
-            BinaryPrimitives.WriteUInt64LittleEndian(info[0..], StreamInfoExSize);
-            BinaryPrimitives.WriteUInt32LittleEndian(
-                info[8..],
-                GetStreamType(ctx.TargetGeneration, streamIndex));
-            if (streamIndex == 0)
-            {
-                BinaryPrimitives.WriteUInt32LittleEndian(info[16..], checked((uint)player.Width));
-                BinaryPrimitives.WriteUInt32LittleEndian(info[20..], checked((uint)player.Height));
-                BinaryPrimitives.WriteDoubleLittleEndian(info[0x40..], player.FramesPerSecond);
-            }
-
-            BinaryPrimitives.WriteUInt64LittleEndian(info[24..], player.DurationMilliseconds);
+            WriteGen5StreamInfoEx(
+                info,
+                GetStreamType(ctx.TargetGeneration, streamIndex),
+                streamIndex == 0 ? checked((uint)player.Width) : 0,
+                streamIndex == 0 ? checked((uint)player.Height) : 0,
+                streamIndex == 0 ? player.FramesPerSecond : 0,
+                player.DurationMilliseconds);
             return SetReturn(
                 ctx,
                 ctx.Memory.TryWrite(infoAddress, info) ? 0 : InvalidParameters);
@@ -1021,17 +1016,16 @@ public static class AvPlayerExports
             ? stackalloc byte[FrameInfoExSize]
             : stackalloc byte[FrameInfoSize];
         info.Clear();
-        BinaryPrimitives.WriteUInt64LittleEndian(info[0..], bufferAddress);
-        BinaryPrimitives.WriteUInt64LittleEndian(info[16..], timestamp);
-        BinaryPrimitives.WriteUInt32LittleEndian(info[24..], checked((uint)(extended ? player.Width : framePitch)));
-        BinaryPrimitives.WriteUInt32LittleEndian(info[28..], checked((uint)(extended ? player.Height : frameHeight)));
-        BinaryPrimitives.WriteSingleLittleEndian(info[32..], 1.0f);
-        if (extended)
-        {
-            BinaryPrimitives.WriteUInt32LittleEndian(info[60..], checked((uint)framePitch));
-            info[64] = 8;
-            info[65] = 8;
-        }
+        WriteVideoFrameInfo(
+            info,
+            ctx.TargetGeneration,
+            extended,
+            bufferAddress,
+            timestamp,
+            checked((uint)(extended ? player.Width : framePitch)),
+            checked((uint)(extended ? player.Height : frameHeight)),
+            checked((uint)framePitch),
+            player.FramesPerSecond);
         return ctx.Memory.TryWrite(infoAddress, info);
     }
 
@@ -1051,21 +1045,16 @@ public static class AvPlayerExports
             ? stackalloc byte[FrameInfoExSize]
             : stackalloc byte[FrameInfoSize];
         info.Clear();
-        BinaryPrimitives.WriteUInt64LittleEndian(info[0..], player.LastGuestBuffer);
-        BinaryPrimitives.WriteUInt64LittleEndian(info[16..], player.LastVideoTimestamp);
-        BinaryPrimitives.WriteUInt32LittleEndian(
-            info[24..],
-            checked((uint)(extended ? player.Width : framePitch)));
-        BinaryPrimitives.WriteUInt32LittleEndian(
-            info[28..],
-            checked((uint)(extended ? player.Height : frameHeight)));
-        BinaryPrimitives.WriteSingleLittleEndian(info[32..], 1.0f);
-        if (extended)
-        {
-            BinaryPrimitives.WriteUInt32LittleEndian(info[60..], checked((uint)framePitch));
-            info[64] = 8;
-            info[65] = 8;
-        }
+        WriteVideoFrameInfo(
+            info,
+            ctx.TargetGeneration,
+            extended,
+            player.LastGuestBuffer,
+            player.LastVideoTimestamp,
+            checked((uint)(extended ? player.Width : framePitch)),
+            checked((uint)(extended ? player.Height : frameHeight)),
+            checked((uint)framePitch),
+            player.FramesPerSecond);
         return ctx.Memory.TryWrite(infoAddress, info);
     }
 
@@ -1560,6 +1549,72 @@ public static class AvPlayerExports
         (generation & Generation.Gen5) != 0
             ? streamIndex + 1
             : streamIndex;
+
+    internal static void WriteGen5StreamInfoEx(
+        Span<byte> info,
+        uint streamType,
+        uint width,
+        uint height,
+        double framesPerSecond,
+        ulong durationMilliseconds)
+    {
+        if (info.Length < StreamInfoExSize)
+        {
+            throw new ArgumentException(
+                $"Stream-info buffer must contain at least {StreamInfoExSize} bytes.",
+                nameof(info));
+        }
+
+        BinaryPrimitives.WriteUInt64LittleEndian(info[0..], StreamInfoExSize);
+        BinaryPrimitives.WriteUInt32LittleEndian(info[8..], streamType);
+        BinaryPrimitives.WriteUInt32LittleEndian(info[16..], width);
+        BinaryPrimitives.WriteUInt32LittleEndian(info[20..], height);
+        BinaryPrimitives.WriteDoubleLittleEndian(info[0x40..], framesPerSecond);
+        // Gen5 places duration after the complete 80-byte stream-details
+        // union. Writing it at +0x18 corrupts the video details and leaves the
+        // actual duration zero, which makes Unity pause playback immediately.
+        BinaryPrimitives.WriteUInt64LittleEndian(info[0x60..], durationMilliseconds);
+    }
+
+    internal static void WriteVideoFrameInfo(
+        Span<byte> info,
+        Generation generation,
+        bool extended,
+        ulong bufferAddress,
+        ulong timestamp,
+        uint width,
+        uint height,
+        uint pitch,
+        double framesPerSecond)
+    {
+        var requiredSize = extended ? FrameInfoExSize : FrameInfoSize;
+        if (info.Length < requiredSize)
+        {
+            throw new ArgumentException(
+                $"Frame-info buffer must contain at least {requiredSize} bytes.",
+                nameof(info));
+        }
+
+        BinaryPrimitives.WriteUInt64LittleEndian(info[0..], bufferAddress);
+        BinaryPrimitives.WriteUInt64LittleEndian(info[16..], timestamp);
+        BinaryPrimitives.WriteUInt32LittleEndian(info[24..], width);
+        BinaryPrimitives.WriteUInt32LittleEndian(info[28..], height);
+        BinaryPrimitives.WriteSingleLittleEndian(info[32..], 1.0f);
+        if (!extended)
+        {
+            return;
+        }
+
+        BinaryPrimitives.WriteUInt32LittleEndian(info[60..], pitch);
+        info[64] = 8;
+        info[65] = 8;
+        if ((generation & Generation.Gen5) != 0)
+        {
+            // On Gen5 AvPlayerVideoEx reserves the dword at details+0x10 and
+            // carries frame rate as a double at details+0x30.
+            BinaryPrimitives.WriteDoubleLittleEndian(info[0x48..], framesPerSecond);
+        }
+    }
 
     private static bool TryReadNullTerminatedUtf8(CpuContext ctx, ulong address, int maxLength, out string value)
     {
