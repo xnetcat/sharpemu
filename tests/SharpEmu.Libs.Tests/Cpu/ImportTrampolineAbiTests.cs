@@ -14,6 +14,44 @@ namespace SharpEmu.Libs.Tests.Cpu;
 public sealed class ImportTrampolineAbiTests
 {
     [Fact]
+    public void MutexTrylockBusy_IsExpectedForBothGuestAbis()
+    {
+        var classifier = typeof(DirectExecutionBackend).GetMethod(
+            "IsExpectedMutexTrylockBusy",
+            BindingFlags.Static | BindingFlags.NonPublic);
+        Assert.NotNull(classifier);
+
+        Assert.True((bool)classifier.Invoke(
+            null,
+            ["upoVrzMHFeE", OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY])!);
+        Assert.True((bool)classifier.Invoke(
+            null,
+            ["K-jXhbt2gn4", OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY])!);
+        Assert.False((bool)classifier.Invoke(
+            null,
+            ["upoVrzMHFeE", OrbisGen2Result.ORBIS_GEN2_OK])!);
+    }
+
+    [Fact]
+    public void DirectMemoryAllocationTryAgain_IsExpectedBackoff()
+    {
+        var classifier = typeof(DirectExecutionBackend).GetMethod(
+            "IsExpectedDirectMemoryAllocationBackoff",
+            BindingFlags.Static | BindingFlags.NonPublic);
+        Assert.NotNull(classifier);
+
+        Assert.True((bool)classifier.Invoke(
+            null,
+            ["rTXw65xmLIA", OrbisGen2Result.ORBIS_GEN2_ERROR_TRY_AGAIN])!);
+        Assert.True((bool)classifier.Invoke(
+            null,
+            ["B+vc2AO2Zrc", OrbisGen2Result.ORBIS_GEN2_ERROR_TRY_AGAIN])!);
+        Assert.False((bool)classifier.Invoke(
+            null,
+            ["B+vc2AO2Zrc", OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT])!);
+    }
+
+    [Fact]
     public unsafe void GeneratedTrampoline_PreservesVolatileGuestState()
     {
         if (RuntimeInformation.ProcessArchitecture != Architecture.X64)

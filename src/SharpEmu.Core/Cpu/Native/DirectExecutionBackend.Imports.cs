@@ -1422,7 +1422,7 @@ public sealed partial class DirectExecutionBackend
 			"xk0AcarP3V4" or // scePadOpen
 			"yH17Q6NWtVg" or // sceUserServiceGetEvent
 			"D-CzAxQL0XI" or // sceUserServiceGetPlatformPrivacySetting
-			"K-jXhbt2gn4";   // scePthreadMutexTrylock
+			"K-jXhbt2gn4";   // pthread_mutex_trylock
 
 	private bool ShouldLogImportResult(string nid, OrbisGen2Result result)
 	{
@@ -1441,9 +1441,9 @@ public sealed partial class DirectExecutionBackend
 		var expectedEqueueTimeout =
 			string.Equals(nid, "fzyMKs9kim0", StringComparison.Ordinal) &&
 			result == OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT;
-		var expectedMutexTrylockBusy =
-			string.Equals(nid, "K-jXhbt2gn4", StringComparison.Ordinal) &&
-			result == OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY;
+		var expectedMutexTrylockBusy = IsExpectedMutexTrylockBusy(nid, result);
+		var expectedDirectMemoryAllocationBackoff =
+			IsExpectedDirectMemoryAllocationBackoff(nid, result);
 		var expectedSemaphoreTrywaitAgain =
 			string.Equals(nid, "H2a+IN9TP0E", StringComparison.Ordinal) &&
 			result == OrbisGen2Result.ORBIS_GEN2_ERROR_TRY_AGAIN;
@@ -1469,6 +1469,7 @@ public sealed partial class DirectExecutionBackend
 			!expectedEqueueTimeout &&
 			!expectedMutexTrylockBusy &&
 			!expectedSemaphoreTrywaitAgain &&
+			!expectedDirectMemoryAllocationBackoff &&
 			!expectedNetAcceptWouldBlock &&
 			!expectedUserServiceNoEvent &&
 			!expectedPrivacyInvalidParameter &&
@@ -1501,10 +1502,24 @@ public sealed partial class DirectExecutionBackend
 			"1",
 			StringComparison.Ordinal);
 
+	private static bool IsExpectedMutexTrylockBusy(
+		string nid,
+		OrbisGen2Result result) =>
+		(nid is "upoVrzMHFeE" or "K-jXhbt2gn4") &&
+		result == OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY;
+
+	private static bool IsExpectedDirectMemoryAllocationBackoff(
+		string nid,
+		OrbisGen2Result result) =>
+		(nid is "rTXw65xmLIA" or "B+vc2AO2Zrc") &&
+		result == OrbisGen2Result.ORBIS_GEN2_ERROR_TRY_AGAIN;
+
 	private static bool IsExpectedFileProbeNotFoundNid(string nid) =>
 		nid is
 			"eV9wAD2riIA" or // sceKernelStat
 			"1G3lF1Gg1k8" or // sceKernelOpen
+			"1-LFLmRFxxM" or // sceKernelMkdir
+			"naInUjYt3so" or // sceKernelRmdir
 			"gEpBkcwxUjw";   // sceKernelAprResolveFilepathsToIdsAndFileSizes
 
 	private bool IsLeafImport(string nid)

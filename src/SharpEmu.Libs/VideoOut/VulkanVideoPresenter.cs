@@ -2792,6 +2792,8 @@ internal static unsafe class VulkanVideoPresenter
                 $" textures_mb={SumTextures(compute.Textures)}" +
                 $" globals_mb={SumGlobals(compute.GlobalMemoryBuffers)}" +
                 $" global_lengths=[{string.Join(',', compute.GlobalMemoryBuffers.Select(static buffer => buffer.Length))}]",
+            VulkanOrderedGuestAction action =>
+                $" name='{action.DebugName}'",
             _ => string.Empty,
         };
     }
@@ -13071,6 +13073,8 @@ internal static unsafe class VulkanVideoPresenter
                                 $"draw mrt={d.Targets.Count} " +
                                 $"rt=0x{d.Targets[0].Address:X16} " +
                                 $"{d.Targets[0].Width}x{d.Targets[0].Height}",
+                            VulkanOrderedGuestAction a =>
+                                $"ordered action='{a.DebugName}'",
                             _ => work.GetType().Name,
                         };
                         Console.Error.WriteLine(
