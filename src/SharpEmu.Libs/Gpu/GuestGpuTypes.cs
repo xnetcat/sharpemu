@@ -32,7 +32,10 @@ internal sealed record GuestDrawTexture(
     ulong DeferredDescriptorAddress = 0,
     SharpEmu.ShaderCompiler.Gen5DescriptorChain? DeferredChain = null,
     bool PixelStage = true,
-    bool VertexStage = true);
+    bool VertexStage = true,
+    // Raw RDNA2 T# type (8=1D, 9=2D, 10=3D, 11=cube,
+    // 12=1D array, 13=2D array, 14=2D MSAA, 15=2D MSAA array).
+    uint Type = 9);
 
 /// <summary>Raw guest sampler descriptor dwords, copied verbatim from guest memory.</summary>
 internal readonly record struct GuestSampler(
