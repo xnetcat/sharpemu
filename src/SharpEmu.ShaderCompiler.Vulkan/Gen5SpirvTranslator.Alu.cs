@@ -222,6 +222,31 @@ public static partial class Gen5SpirvTranslator
                     result = Bitcast(_uintType, value);
                     break;
                 }
+                case "VCvtU16F16":
+                {
+                    var unpacked = Ext(
+                        62,
+                        _vec2Type,
+                        BitwiseAnd(GetRawSource(instruction, 0), UInt(0xFFFF)));
+                    var value = _module.AddInstruction(
+                        SpirvOp.CompositeExtract,
+                        _floatType,
+                        unpacked,
+                        0);
+                    var saturated = Ext(
+                        43,
+                        _floatType,
+                        value,
+                        Float(0),
+                        Float(ushort.MaxValue));
+                    result = BitwiseAnd(
+                        _module.AddInstruction(
+                            SpirvOp.ConvertFToU,
+                            _uintType,
+                            saturated),
+                        UInt(ushort.MaxValue));
+                    break;
+                }
                 case "VCvtOffF32I4":
                     result = EmitCvtOffF32I4(instruction);
                     break;
@@ -299,6 +324,70 @@ public static partial class Gen5SpirvTranslator
                             SpirvOp.CompositeConstruct,
                             _vec2Type,
                             reciprocalSquareRoot,
+                            Float(0)));
+                    result = BitwiseAnd(packed, UInt(0xFFFF));
+                    if (instruction.Control is not Gen5SdwaControl)
+                    {
+                        result = BitwiseOr(
+                            BitwiseAnd(LoadV(destination), UInt(0xFFFF_0000)),
+                            result);
+                    }
+                    break;
+                }
+                case "VLogF16":
+                {
+                    // V_LOG_F16 operates on the selected low half and writes a
+                    // rounded f16 result. SDWA destination handling below
+                    // applies its own byte/word placement and preservation.
+                    var sourcePair = Ext(
+                        62,
+                        _vec2Type,
+                        BitwiseAnd(GetRawSource(instruction, 0), UInt(0xFFFF)));
+                    var source = _module.AddInstruction(
+                        SpirvOp.CompositeExtract,
+                        _floatType,
+                        sourcePair,
+                        0);
+                    var logarithm = Ext(30, _floatType, source);
+                    var packed = Ext(
+                        58,
+                        _uintType,
+                        _module.AddInstruction(
+                            SpirvOp.CompositeConstruct,
+                            _vec2Type,
+                            logarithm,
+                            Float(0)));
+                    result = BitwiseAnd(packed, UInt(0xFFFF));
+                    if (instruction.Control is not Gen5SdwaControl)
+                    {
+                        result = BitwiseOr(
+                            BitwiseAnd(LoadV(destination), UInt(0xFFFF_0000)),
+                            result);
+                    }
+                    break;
+                }
+                case "VExpF16":
+                {
+                    // V_EXP_F16 is exp2 on the selected half. Perform the
+                    // operation at f32 precision, then round and pack the
+                    // low-half result according to the RDNA instruction.
+                    var sourcePair = Ext(
+                        62,
+                        _vec2Type,
+                        BitwiseAnd(GetRawSource(instruction, 0), UInt(0xFFFF)));
+                    var source = _module.AddInstruction(
+                        SpirvOp.CompositeExtract,
+                        _floatType,
+                        sourcePair,
+                        0);
+                    var exponential = Ext(29, _floatType, source);
+                    var packed = Ext(
+                        58,
+                        _uintType,
+                        _module.AddInstruction(
+                            SpirvOp.CompositeConstruct,
+                            _vec2Type,
+                            exponential,
                             Float(0)));
                     result = BitwiseAnd(packed, UInt(0xFFFF));
                     if (instruction.Control is not Gen5SdwaControl)
@@ -993,6 +1082,54 @@ public static partial class Gen5SpirvTranslator
                     StoreCarryOut(instruction, carry);
                     break;
                 }
+                case "VLshlrevB64":
+                {
+                    // V_LSHLREV_B64 takes a 32-bit shift count in SRC0 and a
+                    // 64-bit VGPR/SGPR pair in SRC1. The VOP3 decoder exposes
+                    // the low destination register; write the high half to the
+                    // adjacent VGPR just like V_MAD_U64_U32.
+                    var shift = _module.AddInstruction(
+                        SpirvOp.UConvert,
+                        _ulongType,
+                        GetRawSource(instruction, 0));
+                    var wideResult = ShiftLeftLogical64(
+                        GetRawSource64(instruction, 1),
+                        shift);
+                    result = _module.AddInstruction(
+                        SpirvOp.UConvert,
+                        _uintType,
+                        wideResult);
+                    var high = _module.AddInstruction(
+                        SpirvOp.UConvert,
+                        _uintType,
+                        ShiftRightLogical64(
+                            wideResult,
+                            _module.Constant64(_ulongType, 32)));
+                    StoreV(destination + 1, high);
+                    break;
+                }
+                case "VLshrrevB64":
+                {
+                    var shift = _module.AddInstruction(
+                        SpirvOp.UConvert,
+                        _ulongType,
+                        GetRawSource(instruction, 0));
+                    var wideResult = ShiftRightLogical64(
+                        GetRawSource64(instruction, 1),
+                        shift);
+                    result = _module.AddInstruction(
+                        SpirvOp.UConvert,
+                        _uintType,
+                        wideResult);
+                    var high = _module.AddInstruction(
+                        SpirvOp.UConvert,
+                        _uintType,
+                        ShiftRightLogical64(
+                            wideResult,
+                            _module.Constant64(_ulongType, 32)));
+                    StoreV(destination + 1, high);
+                    break;
+                }
                 case "VBfeU32":
                 {
                     var width = BitwiseAnd(GetRawSource(instruction, 2), UInt(31));
@@ -1002,6 +1139,19 @@ public static partial class Gen5SpirvTranslator
                         GetRawSource(instruction, 0),
                         BitwiseAnd(GetRawSource(instruction, 1), UInt(31)),
                         width);
+                    break;
+                }
+                case "VBfeI32":
+                {
+                    var width = BitwiseAnd(GetRawSource(instruction, 2), UInt(31));
+                    result = Bitcast(
+                        _uintType,
+                        _module.AddInstruction(
+                            SpirvOp.BitFieldSExtract,
+                            _intType,
+                            Bitcast(_intType, GetRawSource(instruction, 0)),
+                            BitwiseAnd(GetRawSource(instruction, 1), UInt(31)),
+                            width));
                     break;
                 }
                 case "VBfiB32":
@@ -1270,6 +1420,30 @@ public static partial class Gen5SpirvTranslator
                         vector);
                     break;
                 }
+                case "VCvtPkU16U32":
+                {
+                    var low = Ext(
+                        38,
+                        _uintType,
+                        GetRawSource(instruction, 0),
+                        UInt(ushort.MaxValue));
+                    var high = Ext(
+                        38,
+                        _uintType,
+                        GetRawSource(instruction, 1),
+                        UInt(ushort.MaxValue));
+                    result = BitwiseOr(
+                        low,
+                        ShiftLeftLogical(high, UInt(16)));
+                    break;
+                }
+                case "VXor3B32":
+                    result = BitwiseXor(
+                        BitwiseXor(
+                            GetRawSource(instruction, 0),
+                            GetRawSource(instruction, 1)),
+                        GetRawSource(instruction, 2));
+                    break;
                 default:
                     error = $"unsupported vector opcode {instruction.Opcode}";
                     return false;
@@ -1702,6 +1876,21 @@ public static partial class Gen5SpirvTranslator
                     (ulong)(instruction.Words.Count * sizeof(uint));
                 StoreS(destination, UInt((uint)pc));
                 StoreS(destination + 1, UInt((uint)(pc >> 32)));
+                return true;
+            }
+
+            if (instruction.Opcode == "SBcnt1I32B64")
+            {
+                var count64 = _module.AddInstruction(
+                    SpirvOp.BitCount,
+                    _ulongType,
+                    GetRawSource64(instruction, 0));
+                var count = _module.AddInstruction(
+                    SpirvOp.UConvert,
+                    _uintType,
+                    count64);
+                StoreS(destination, count);
+                Store(_scc, IsNotZero(count));
                 return true;
             }
 

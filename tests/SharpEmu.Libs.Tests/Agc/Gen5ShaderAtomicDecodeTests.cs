@@ -103,6 +103,82 @@ public sealed class Gen5ShaderAtomicDecodeTests
         Assert.Equal(new[] { Gen5Operand.Vector(3) }, instruction.Destinations);
     }
 
+    [Fact]
+    public void SilentHillRdna2Opcodes_DecodeWithArchitecturalOperands()
+    {
+        var scalarBitCount = DecodeSingle(0xBE8A1000);
+        Assert.Equal("SBcnt1I32B64", scalarBitCount.Opcode);
+        Assert.Equal(new[] { Gen5Operand.Scalar(0) }, scalarBitCount.Sources);
+        Assert.Equal(new[] { Gen5Operand.Scalar(10) }, scalarBitCount.Destinations);
+
+        // V_CVT_U16_F16 v3, v0 with the title's SDWA source-selection word.
+        var halfConversion = DecodeSingle(0x7E06A4F9, 0x00061500);
+        Assert.Equal("VCvtU16F16", halfConversion.Opcode);
+        Assert.Equal(new[] { Gen5Operand.Vector(0) }, halfConversion.Sources);
+        Assert.Equal(new[] { Gen5Operand.Vector(3) }, halfConversion.Destinations);
+        Assert.IsType<Gen5SdwaControl>(halfConversion.Control);
+
+        // V_LOG_F16 v6, v1 using the title's SDWA selectors.
+        var halfLogarithm = DecodeSingle(0x7E0CAEF9, 0x00251501);
+        Assert.Equal("VLogF16", halfLogarithm.Opcode);
+        Assert.Equal(new[] { Gen5Operand.Vector(1) }, halfLogarithm.Sources);
+        Assert.Equal(new[] { Gen5Operand.Vector(6) }, halfLogarithm.Destinations);
+        Assert.IsType<Gen5SdwaControl>(halfLogarithm.Control);
+
+        // V_EXP_F16 v9, v10 using the first scene shader's SDWA selectors.
+        var halfExponential = DecodeSingle(0x7E12B0F9, 0x0005150A);
+        Assert.Equal("VExpF16", halfExponential.Opcode);
+        Assert.Equal(new[] { Gen5Operand.Vector(10) }, halfExponential.Sources);
+        Assert.Equal(new[] { Gen5Operand.Vector(9) }, halfExponential.Destinations);
+        Assert.IsType<Gen5SdwaControl>(halfExponential.Control);
+
+        // V_BFE_I32 v3, v0, v1, v2 and V_CVT_PK_U16_U32 v3, v0, v1.
+        var signedBitfield = DecodeSingle(0xD5490003, 0x040A0300);
+        Assert.Equal("VBfeI32", signedBitfield.Opcode);
+        Assert.Equal(
+            new[] { Gen5Operand.Vector(0), Gen5Operand.Vector(1), Gen5Operand.Vector(2) },
+            signedBitfield.Sources);
+
+        var packedUnsigned = DecodeSingle(0xD76A0003, 0x040A0300);
+        Assert.Equal("VCvtPkU16U32", packedUnsigned.Opcode);
+
+        var xorThree = DecodeSingle(0xD1780003, 0x040A0300);
+        Assert.Equal("VXor3B32", xorThree.Opcode);
+        Assert.Equal(
+            new[] { Gen5Operand.Vector(0), Gen5Operand.Vector(1), Gen5Operand.Vector(2) },
+            xorThree.Sources);
+
+        // V_LSHLREV_B64 v[3:4], v0, v[1:2].
+        var shiftLeft64 = DecodeSingle(0xD2FF0003, 0x00020300);
+        Assert.Equal("VLshlrevB64", shiftLeft64.Opcode);
+        Assert.Equal(
+            new[] { Gen5Operand.Vector(0), Gen5Operand.Vector(1) },
+            shiftLeft64.Sources.Take(2));
+
+        // V_LSHRREV_B64 v[3:4], v0, v[1:2].
+        var shiftRight64 = DecodeSingle(0xD3000003, 0x00020300);
+        Assert.Equal("VLshrrevB64", shiftRight64.Opcode);
+        Assert.Equal(
+            new[] { Gen5Operand.Vector(0), Gen5Operand.Vector(1) },
+            shiftRight64.Sources.Take(2));
+
+        // DS_WRITE_ADDTID_B32 v23 offset:0x102 has no ADDR operand. The
+        // effective address is M0[15:0] + offset + lane_id * 4.
+        var addThreadIdWrite = DecodeSingle(0xDAC00102, 0x00001700);
+        Assert.Equal("DsWriteAddtidB32", addThreadIdWrite.Opcode);
+        Assert.Equal(new[] { Gen5Operand.Vector(23) }, addThreadIdWrite.Sources);
+        Assert.Empty(addThreadIdWrite.Destinations);
+        var control = Assert.IsType<Gen5DataShareControl>(addThreadIdWrite.Control);
+        Assert.Equal(2u, control.Offset0);
+        Assert.Equal(1u, control.Offset1);
+
+        // DS_READ_ADDTID_B32 v57 offset:0x100 also has no ADDR operand.
+        var addThreadIdRead = DecodeSingle(0xDAC40100, 0x39000000);
+        Assert.Equal("DsReadAddtidB32", addThreadIdRead.Opcode);
+        Assert.Empty(addThreadIdRead.Sources);
+        Assert.Equal(new[] { Gen5Operand.Vector(57) }, addThreadIdRead.Destinations);
+    }
+
     private static Gen5ShaderInstruction DecodeSingle(params uint[] words)
     {
         var memory = new FakeCpuMemory(ShaderAddress, 0x1000);

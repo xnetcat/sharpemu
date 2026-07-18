@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using SharpEmu.HLE;
+using SharpEmu.Libs.Agc;
 using SharpEmu.ShaderCompiler;
 using Xunit;
 
@@ -154,7 +155,96 @@ public sealed class Gen5ShaderScalarEvaluatorTests
                 out _,
                 out _,
                 out _,
-                out _,
-                out _));
+            out _,
+            out _));
+    }
+
+    [Fact]
+    public void VertexInputs_RespectMetalAttributeLimit()
+    {
+        const ulong vertexAddress = ShaderAddress + 0x1000;
+        const uint stride = 16;
+        const int expectedNativeVertexInputs = 31;
+        var memory = new FakeCpuMemory(ShaderAddress, 0x4000);
+        var ctx = new CpuContext(memory, Generation.Gen5);
+        var instructions = Enumerable
+            .Range(0, expectedNativeVertexInputs + 2)
+            .Select(index =>
+                new Gen5ShaderInstruction(
+                    checked((uint)(index * 8)),
+                    Gen5ShaderEncoding.Mubuf,
+                    "BufferLoadFormatXyzw",
+                    [],
+                    [
+                        Gen5Operand.Vector(0),
+                        Gen5Operand.Scalar(0),
+                        Gen5Operand.Source(128),
+                    ],
+                    [
+                        Gen5Operand.Vector(4),
+                        Gen5Operand.Vector(5),
+                        Gen5Operand.Vector(6),
+                        Gen5Operand.Vector(7),
+                    ],
+                    new Gen5BufferMemoryControl(
+                        DwordCount: 4,
+                        VectorAddress: 0,
+                        VectorData: 4,
+                        ScalarResource: 0,
+                        OffsetBytes: 0,
+                        IndexEnabled: true,
+                        OffsetEnabled: false,
+                        Glc: false,
+                        Slc: false)))
+            .ToArray();
+        var userData = new uint[]
+        {
+            unchecked((uint)vertexAddress),
+            unchecked((uint)(vertexAddress >> 32)) | stride << 16,
+            4,
+            // Unified FORMAT 77 is R32G32B32A32_FLOAT.
+            77u << 12,
+        };
+        var state = new Gen5ShaderState(
+            new Gen5ShaderProgram(ShaderAddress, instructions),
+            userData,
+            Metadata: null);
+
+        Assert.True(
+            Gen5ShaderScalarEvaluator.TryEvaluate(
+                ctx,
+                state,
+                out var evaluation,
+                out var error,
+                resolveVertexInputs: true,
+                requiredVertexRecordCount: 4),
+            error);
+        Assert.Equal(
+            expectedNativeVertexInputs,
+            evaluation.VertexInputs!.Count);
+        Assert.Equal(
+            Enumerable.Range(0, expectedNativeVertexInputs)
+                .Select(static index => (uint)(index * 8)),
+            evaluation.VertexInputs.Select(static input => input.Pc));
+
+        var overflow = Assert.Single(evaluation.GlobalMemoryBindings);
+        Assert.Equal(vertexAddress, overflow.BaseAddress);
+        Assert.Equal(new uint[] { 31u * 8, 32u * 8 }, overflow.InstructionPcs);
+    }
+
+    [Fact]
+    public void RuntimeGuestBufferLength_IncludesAlignedDescriptorBias()
+    {
+        var binding = new Gen5GlobalMemoryBinding(
+            ScalarAddress: 0,
+            BaseAddress: ShaderAddress + 3,
+            InstructionPcs: [0],
+            Data: new byte[5],
+            DataLength: 5,
+            DataPooled: false);
+
+        Assert.Equal(
+            2u,
+            AgcExports.GetRuntimeGuestBufferDwordLength(binding));
     }
 }

@@ -67,6 +67,11 @@ public static class Gen5ShaderScalarEvaluator
     private const int ImageDescriptorDwords = 8;
     private const int SamplerDescriptorDwords = 4;
     private const int MaxGlobalMemoryBindingBytes = 16 * 1024 * 1024;
+    // Metal vertex attribute indices are limited to 0...30. Translate any
+    // additional formatted loads through the existing storage-buffer path.
+    // Runtime bounds now come from SharpEmu's scalar metadata rather than
+    // SPIR-V OpArrayLength, so MoltenVK does not need a hidden buffer-size slot.
+    internal const int MaxNativeVertexInputCount = 31;
     public static long GlobalMemoryReadCount;
     public static long GlobalMemoryReadBytes;
     public static long GlobalMemoryReadCacheHits;
@@ -522,6 +527,7 @@ public static class Gen5ShaderScalarEvaluator
                 }
 
                 if (resolveVertexInputs &&
+                    vertexInputBindings.Count < MaxNativeVertexInputCount &&
                     IsVertexFetchCandidate(instruction, bufferMemory, bufferDescriptor))
                 {
                     if (instruction.Sources.Count <= 2 ||
@@ -1292,6 +1298,23 @@ public static class Gen5ShaderScalarEvaluator
         {
             var pc = programAddress + instruction.Pc + (ulong)(instruction.Words.Count * sizeof(uint));
             WriteScalarPair(registers, destination.Value, pc, ref execMask);
+            return true;
+        }
+
+        if (instruction.Opcode == "SBcnt1I32B64")
+        {
+            if (!TryEvaluateScalarOperand64(
+                    instruction.Sources[0],
+                    registers,
+                    execMask,
+                    out var value))
+            {
+                error = $"scalar-source64 pc=0x{instruction.Pc:X} op={instruction.Opcode}";
+                return false;
+            }
+
+            registers[destination.Value] = (uint)BitOperations.PopCount(value);
+            scalarConditionCode = registers[destination.Value] != 0;
             return true;
         }
 
