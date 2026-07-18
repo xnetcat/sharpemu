@@ -10,6 +10,32 @@ namespace SharpEmu.Libs.Tests.Agc;
 
 public sealed class AgcIndirectPatchTests
 {
+    private const ulong BaseAddress = 0x1_0000_0000;
+    private const ulong CommandBufferAddress = BaseAddress + 0x100;
+    private const ulong CommandAddress = BaseAddress + 0x400;
+    private const ulong CommandEndAddress = BaseAddress + 0x800;
+
+    [Fact]
+    public void DcbDrawIndirectUsesThreeArgumentAbiAndRealPacket()
+    {
+        var memory = new FakeCpuMemory(BaseAddress, 0x1000);
+        WriteUInt64(memory, CommandBufferAddress + 0x10, CommandAddress);
+        WriteUInt64(memory, CommandBufferAddress + 0x18, CommandEndAddress);
+        var ctx = new CpuContext(memory, Generation.Gen5);
+        ctx[CpuRegister.Rdi] = CommandBufferAddress;
+        ctx[CpuRegister.Rsi] = 0x234;
+        ctx[CpuRegister.Rdx] = 0x4000_0000;
+
+        Assert.Equal(0, AgcExports.DcbDrawIndirect(ctx));
+        Assert.Equal(CommandAddress, ctx[CpuRegister.Rax]);
+        Assert.Equal(0xC003_2400u, ReadUInt32(memory, CommandAddress));
+        Assert.Equal(0x234u, ReadUInt32(memory, CommandAddress + 4));
+        Assert.Equal(0u, ReadUInt32(memory, CommandAddress + 8));
+        Assert.Equal(0u, ReadUInt32(memory, CommandAddress + 12));
+        Assert.Equal(0x4000_0000u, ReadUInt32(memory, CommandAddress + 16));
+        Assert.Equal(CommandAddress + 20, ReadUInt64(memory, CommandBufferAddress + 0x10));
+    }
+
     [Fact]
     public void NullPacketPatchHelpersAreSuccessfulNoOps()
     {
@@ -48,5 +74,26 @@ public sealed class AgcIndirectPatchTests
         Assert.Equal(0, AgcExports.SetCxRegIndirectPatchAddRegisters(ctx));
         Assert.True(memory.TryRead(packetAddress + sizeof(uint), count));
         Assert.Equal(5U, BinaryPrimitives.ReadUInt32LittleEndian(count));
+    }
+
+    private static uint ReadUInt32(FakeCpuMemory memory, ulong address)
+    {
+        Span<byte> bytes = stackalloc byte[sizeof(uint)];
+        Assert.True(memory.TryRead(address, bytes));
+        return BinaryPrimitives.ReadUInt32LittleEndian(bytes);
+    }
+
+    private static ulong ReadUInt64(FakeCpuMemory memory, ulong address)
+    {
+        Span<byte> bytes = stackalloc byte[sizeof(ulong)];
+        Assert.True(memory.TryRead(address, bytes));
+        return BinaryPrimitives.ReadUInt64LittleEndian(bytes);
+    }
+
+    private static void WriteUInt64(FakeCpuMemory memory, ulong address, ulong value)
+    {
+        Span<byte> bytes = stackalloc byte[sizeof(ulong)];
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes, value);
+        Assert.True(memory.TryWrite(address, bytes));
     }
 }

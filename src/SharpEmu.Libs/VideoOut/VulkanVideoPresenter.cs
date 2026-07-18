@@ -2739,6 +2739,30 @@ internal static unsafe class VulkanVideoPresenter
         target is not null &&
         (state.TestEnable || state.WriteEnable || state.ClearEnable);
 
+    internal static bool GuestDepthCoversColorTarget(
+        GuestDepthTarget target,
+        uint colorWidth,
+        uint colorHeight) =>
+        target.Width >= colorWidth && target.Height >= colorHeight;
+
+    internal static Format GetStorageCompatibleFormat(Format format) =>
+        format is Format.BC1RgbaUnormBlock or
+            Format.BC1RgbaSrgbBlock or
+            Format.BC2UnormBlock or
+            Format.BC2SrgbBlock or
+            Format.BC3UnormBlock or
+            Format.BC3SrgbBlock or
+            Format.BC4UnormBlock or
+            Format.BC4SNormBlock or
+            Format.BC5UnormBlock or
+            Format.BC5SNormBlock or
+            Format.BC6HUfloatBlock or
+            Format.BC6HSfloatBlock or
+            Format.BC7UnormBlock or
+            Format.BC7SrgbBlock
+                ? Format.R8G8B8A8Unorm
+                : format;
+
     private readonly record struct Presentation(
         byte[]? Pixels,
         uint Width,
@@ -2901,6 +2925,8 @@ internal static unsafe class VulkanVideoPresenter
         private readonly HashSet<(ulong Address, uint Width, uint Height, Format Format)> _tracedTextureCacheHits = new();
         private readonly HashSet<(ulong Address, uint Width, uint Height, uint DstSelect)> _tracedDepthTextureAliases = new();
         private readonly HashSet<(ulong Address, uint Width, uint Height)> _tracedDepthExtentFallbacks = new();
+        private readonly HashSet<(ulong Address, Format DescriptorFormat)>
+            _tracedStorageFormatFallbacks = new();
         private readonly HashSet<(ulong Address, uint Width, uint Height, uint Depth, Format Format)> _tracedTextureUploads = new();
         private readonly HashSet<(
             ulong Address,
@@ -7466,14 +7492,11 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             var guestImage = ResolveStorageGuestImage(texture);
-            var vkFormat = GetStorageImageFormat(
-                GetTextureFormat(texture.Format, texture.NumberType));
-            if (!SupportsStorageImage(vkFormat))
-            {
-                throw new InvalidOperationException(
-                    $"Storage image format {vkFormat} is unsupported for guest " +
-                    $"format={texture.Format}/num={texture.NumberType}.");
-            }
+            var descriptorFormat = GetTextureFormat(
+                texture.Format,
+                texture.NumberType);
+            var vkFormat = VulkanVideoPresenter.GetStorageCompatibleFormat(
+                descriptorFormat);
             var selectedMipLevel = GetStorageMipLevel(texture);
             var view = GetOrCreateGuestImageIdentityView(
                 guestImage,
@@ -7495,7 +7518,8 @@ internal static unsafe class VulkanVideoPresenter
                 GuestImage = guestImage,
             };
 
-            if (!guestImage.Initialized &&
+            if (vkFormat == descriptorFormat &&
+                !guestImage.Initialized &&
                 !guestImage.InitialUploadPending &&
                 texture.MipLevel == 0)
             {
@@ -7660,8 +7684,17 @@ internal static unsafe class VulkanVideoPresenter
                 throw new InvalidOperationException("Storage image has no guest address.");
             }
 
-            var format = GetStorageImageFormat(
-                GetTextureFormat(texture.Format, texture.NumberType));
+            var descriptorFormat = GetTextureFormat(texture.Format, texture.NumberType);
+            var format = VulkanVideoPresenter.GetStorageCompatibleFormat(
+                descriptorFormat);
+            if (format != descriptorFormat &&
+                _tracedStorageFormatFallbacks.Add(
+                    (texture.Address, descriptorFormat)))
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][WARN] Vulkan normalized impossible compressed storage image " +
+                    $"addr=0x{texture.Address:X16} {descriptorFormat} -> {format}");
+            }
             var guestImage = GetOrCreateGuestImage(
                 new GuestRenderTarget(
                     texture.Address,

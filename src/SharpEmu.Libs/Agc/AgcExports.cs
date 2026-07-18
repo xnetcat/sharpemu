@@ -1863,6 +1863,44 @@ public static partial class AgcExports
     }
 
     [SysAbiExport(
+        Nid = "1q1titRBL6o",
+        ExportName = "sceAgcDcbDrawIndirect",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int DcbDrawIndirect(CpuContext ctx)
+    {
+        var commandBufferAddress = ctx[CpuRegister.Rdi];
+        var dataOffset = (uint)ctx[CpuRegister.Rsi];
+        var modifier = (uint)ctx[CpuRegister.Rdx];
+        if (commandBufferAddress == 0 ||
+            !TryAllocateCommandDwords(ctx, commandBufferAddress, 5, out var commandAddress) ||
+            !TryWriteUInt32(ctx, commandAddress, Pm4(5, ItDrawIndirect, 0)) ||
+            !TryWriteUInt32(ctx, commandAddress + 4, dataOffset) ||
+            !TryWriteUInt32(ctx, commandAddress + 8, 0) ||
+            !TryWriteUInt32(ctx, commandAddress + 12, 0) ||
+            !TryWriteUInt32(ctx, commandAddress + 16, modifier))
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        TraceAgc(
+            $"agc.dcb_draw_indirect buf=0x{commandBufferAddress:X16} " +
+            $"cmd=0x{commandAddress:X16} offset=0x{dataOffset:X8} modifier=0x{modifier:X8}");
+        return ReturnPointer(ctx, commandAddress);
+    }
+
+    [SysAbiExport(
+        Nid = "cxPZ4Wgvdj8",
+        ExportName = "sceAgcDcbDrawIndirectGetSize",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int DcbDrawIndirectGetSize(CpuContext ctx)
+    {
+        ctx[CpuRegister.Rax] = 5u * sizeof(uint);
+        return (int)ctx[CpuRegister.Rax];
+    }
+
+    [SysAbiExport(
         Nid = "rUuVjyR+Rd4",
         ExportName = "sceAgcDcbGetLodStatsGetSize",
         Target = Generation.Gen5,
@@ -6981,12 +7019,12 @@ public static partial class AgcExports
         if (vertexShader is null)
         {
             var guestGlobalBufferCount = exportEvaluation.GlobalMemoryBindings.Count;
-            // CreateTranslatedDrawGlobalBuffers appends both stage scalar
-            // blocks.  The pixel block is unused by the fixed fragment stage;
-            // the vertex block remains at guestCount+1, matching this layout.
+            // CreateTranslatedDrawGlobalBuffers packs both stage scalar blocks
+            // into one descriptor. The fixed fragment stage leaves the first
+            // half unused; the vertex stage reads the second half.
             var totalGlobalBufferCount = _bakeScalars
                 ? guestGlobalBufferCount
-                : guestGlobalBufferCount + 2;
+                : guestGlobalBufferCount + 1;
             if (!GuestGpu.Current.TryCompileVertexShader(
                     exportState,
                     exportEvaluation,
@@ -6997,7 +7035,7 @@ public static partial class AgcExports
                     imageBindingBase: 0,
                     scalarRegisterBufferIndex: _bakeScalars
                         ? -1
-                        : guestGlobalBufferCount + 1,
+                        : guestGlobalBufferCount,
                     requiredVertexOutputCount: 0,
                     storageBufferOffsetAlignment:
                         _storageBufferOffsetAlignment))
@@ -7323,11 +7361,12 @@ public static partial class AgcExports
         var guestGlobalBuffers =
             pixelEvaluation.GlobalMemoryBindings.Count +
             exportEvaluation.GlobalMemoryBindings.Count;
-        // Two per-draw initial-scalar buffers ride after the guest buffers:
-        // [pixel guest][vertex guest][pixel sgprs][vertex sgprs].
+        // One per-draw buffer containing both initial-scalar blocks rides
+        // after the guest buffers:
+        // [pixel guest][vertex guest][pixel sgprs + vertex sgprs].
         var totalGlobalBuffers = _bakeScalars
             ? guestGlobalBuffers
-            : guestGlobalBuffers + 2;
+            : guestGlobalBuffers + 1;
         _graphicsShaderCache.TryGetValue(shaderKey, out var compiled);
 
         if (compiled.Vertex is null || compiled.Pixel is null)
@@ -7364,7 +7403,7 @@ public static partial class AgcExports
                     globalBufferBase: pixelEvaluation.GlobalMemoryBindings.Count,
                     totalGlobalBufferCount: totalGlobalBuffers,
                     imageBindingBase: pixelEvaluation.ImageBindings.Count,
-                    scalarRegisterBufferIndex: _bakeScalars ? -1 : guestGlobalBuffers + 1,
+                    scalarRegisterBufferIndex: _bakeScalars ? -1 : guestGlobalBuffers,
                     requiredVertexOutputCount: requiredVertexOutputCount,
                     storageBufferOffsetAlignment:
                         _storageBufferOffsetAlignment))
@@ -7438,7 +7477,7 @@ public static partial class AgcExports
             exportEvaluation,
             totalGlobalBuffers,
             pixelEvaluation.ImageBindings.Count,
-            _bakeScalars ? -1 : guestGlobalBuffers + 1,
+            _bakeScalars ? -1 : guestGlobalBuffers,
             requiredVertexOutputCount);
         state.UcRegisters.TryGetValue(VgtPrimitiveType, out var primitiveType);
         var guestTargets = new GuestRenderTarget[renderTargets.Length];
@@ -8593,8 +8632,9 @@ public static partial class AgcExports
 
     /// <summary>
     /// Guest storage buffers for a translated draw, followed by the per-draw
-    /// initial scalar registers of each stage (pixel then vertex), matching
-    /// the binding layout the shaders were compiled against.
+    /// one packed runtime buffer containing the initial scalar registers of
+    /// each stage (pixel then vertex), matching the binding layout the shaders
+    /// were compiled against.
     /// </summary>
     private static IReadOnlyList<GuestMemoryBuffer> CreateTranslatedDrawGlobalBuffers(
         TranslatedGuestDraw translatedDraw)
@@ -8605,23 +8645,17 @@ public static partial class AgcExports
             return buffers;
         }
 
-        var combined = new List<GuestMemoryBuffer>(buffers.Count + 2);
+        var combined = new List<GuestMemoryBuffer>(buffers.Count + 1);
         combined.AddRange(buffers);
         var runtimeStateLength = GetRuntimeScalarBufferLength(
             translatedDraw.GlobalMemoryBindings.Count);
         combined.Add(new GuestMemoryBuffer(
             0,
-            PackRuntimeScalarState(
+            PackGraphicsRuntimeScalarState(
                 translatedDraw.PixelInitialScalars,
-                translatedDraw.GlobalMemoryBindings),
-            runtimeStateLength,
-            Pooled: true));
-        combined.Add(new GuestMemoryBuffer(
-            0,
-            PackRuntimeScalarState(
                 translatedDraw.VertexInitialScalars,
                 translatedDraw.GlobalMemoryBindings),
-            runtimeStateLength,
+            checked(runtimeStateLength * 2),
             Pooled: true));
         return combined;
     }
@@ -8655,7 +8689,7 @@ public static partial class AgcExports
         TranslatedGuestDraw translatedDraw)
     {
         var bindings = translatedDraw.GlobalMemoryBindings;
-        var combined = new List<GuestMemoryBuffer>(bindings.Count + 2);
+        var combined = new List<GuestMemoryBuffer>(bindings.Count + 1);
         foreach (var binding in bindings)
         {
             var data = new byte[Math.Max(binding.DataLength, sizeof(uint))];
@@ -8681,17 +8715,11 @@ public static partial class AgcExports
             var runtimeStateLength = GetRuntimeScalarBufferLength(bindings.Count);
             combined.Add(new GuestMemoryBuffer(
                 0,
-                PackRuntimeScalarStateUnpooled(
+                PackGraphicsRuntimeScalarStateUnpooled(
                     translatedDraw.PixelInitialScalars,
-                    bindings),
-                runtimeStateLength,
-                Pooled: false));
-            combined.Add(new GuestMemoryBuffer(
-                0,
-                PackRuntimeScalarStateUnpooled(
                     translatedDraw.VertexInitialScalars,
                     bindings),
-                runtimeStateLength,
+                checked(runtimeStateLength * 2),
                 Pooled: false));
         }
 
@@ -8699,7 +8727,7 @@ public static partial class AgcExports
     }
 
     private static int GetRuntimeScalarBufferLength(int bindingCount) =>
-        checked((256 + bindingCount) * sizeof(uint));
+        checked((256 + bindingCount * 2) * sizeof(uint));
 
     private static byte[] PackRuntimeScalarState(
         IReadOnlyList<uint> registers,
@@ -8720,13 +8748,49 @@ public static partial class AgcExports
         return bytes;
     }
 
+    private static byte[] PackGraphicsRuntimeScalarState(
+        IReadOnlyList<uint> pixelRegisters,
+        IReadOnlyList<uint> vertexRegisters,
+        IReadOnlyList<Gen5GlobalMemoryBinding> bindings)
+    {
+        var stateLength = GetRuntimeScalarBufferLength(bindings.Count);
+        var bytes = VulkanVideoPresenter.GuestDataPool.Rent(
+            checked(stateLength * 2));
+        PackRuntimeScalarStateInto(bytes, pixelRegisters, bindings, 0);
+        PackRuntimeScalarStateInto(
+            bytes,
+            vertexRegisters,
+            bindings,
+            stateLength);
+        return bytes;
+    }
+
+    private static byte[] PackGraphicsRuntimeScalarStateUnpooled(
+        IReadOnlyList<uint> pixelRegisters,
+        IReadOnlyList<uint> vertexRegisters,
+        IReadOnlyList<Gen5GlobalMemoryBinding> bindings)
+    {
+        var stateLength = GetRuntimeScalarBufferLength(bindings.Count);
+        var bytes = new byte[checked(stateLength * 2)];
+        PackRuntimeScalarStateInto(bytes, pixelRegisters, bindings, 0);
+        PackRuntimeScalarStateInto(
+            bytes,
+            vertexRegisters,
+            bindings,
+            stateLength);
+        return bytes;
+    }
+
     private static void PackRuntimeScalarStateInto(
         byte[] bytes,
         IReadOnlyList<uint> registers,
-        IReadOnlyList<Gen5GlobalMemoryBinding> bindings)
+        IReadOnlyList<Gen5GlobalMemoryBinding> bindings,
+        int byteOffset = 0)
     {
-        PackScalarRegistersInto(bytes, registers);
-        var biasOffset = 256 * sizeof(uint);
+        PackScalarRegistersInto(bytes.AsSpan(byteOffset), registers);
+        var biasOffset = checked(byteOffset + 256 * sizeof(uint));
+        var lengthOffset = checked(
+            byteOffset + (256 + bindings.Count) * sizeof(uint));
         for (var index = 0; index < bindings.Count; index++)
         {
             var byteBias = checked((uint)(
@@ -8735,10 +8799,26 @@ public static partial class AgcExports
             BinaryPrimitives.WriteUInt32LittleEndian(
                 bytes.AsSpan(biasOffset + index * sizeof(uint), sizeof(uint)),
                 byteBias);
+            BinaryPrimitives.WriteUInt32LittleEndian(
+                bytes.AsSpan(lengthOffset + index * sizeof(uint), sizeof(uint)),
+                GetRuntimeGuestBufferDwordLength(bindings[index]));
         }
     }
 
-    private static void PackScalarRegistersInto(byte[] bytes, IReadOnlyList<uint> registers)
+    internal static uint GetRuntimeGuestBufferDwordLength(
+        Gen5GlobalMemoryBinding binding)
+    {
+        var byteBias =
+            binding.BaseAddress &
+            (VulkanVideoPresenter.GuestStorageBufferOffsetAlignment - 1);
+        return checked((uint)(
+            ((ulong)binding.DataLength + byteBias + sizeof(uint) - 1) /
+            sizeof(uint)));
+    }
+
+    private static void PackScalarRegistersInto(
+        Span<byte> bytes,
+        IReadOnlyList<uint> registers)
     {
         if (registers is uint[] { Length: >= 256 } array)
         {
@@ -8751,12 +8831,12 @@ public static partial class AgcExports
         }
 
         // Rented arrays carry stale bytes; clear the packed window first.
-        Array.Clear(bytes, 0, 256 * sizeof(uint));
+        bytes[..(256 * sizeof(uint))].Clear();
         var count = Math.Min(registers.Count, 256);
         for (var index = 0; index < count; index++)
         {
             BinaryPrimitives.WriteUInt32LittleEndian(
-                bytes.AsSpan(index * sizeof(uint)),
+                bytes[(index * sizeof(uint))..],
                 registers[index]);
         }
     }

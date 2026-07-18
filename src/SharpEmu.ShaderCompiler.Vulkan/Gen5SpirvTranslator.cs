@@ -187,6 +187,12 @@ public static partial class Gen5SpirvTranslator
         private readonly IReadOnlyList<Gen5PixelOutputBinding> _pixelOutputBindings;
         private readonly uint _waveLaneCount;
         private readonly bool _emulateWave64;
+        // The scalar evaluator caps every recovered guest binding at 16 MiB.
+        // A statically-sized storage-block member avoids MoltenVK reserving a
+        // hidden buffer-length entry for OpTypeRuntimeArray, which otherwise
+        // pushes Silent Hill's 31-buffer scene shaders over Metal's limit.
+        private const uint MaxGuestBufferDwordCount =
+            16u * 1024u * 1024u / sizeof(uint);
 
         // Safety valve for the PC-dispatcher loop. Each iteration executes one
         // GCN basic block; a correctly-translated shader always reaches its
@@ -233,6 +239,7 @@ public static partial class Gen5SpirvTranslator
         private readonly int _totalGlobalBufferCount;
         private readonly int _imageBindingBase;
         private readonly int _initialScalarBufferIndex;
+        private readonly uint _initialScalarWordOffset;
         private readonly uint _pixelInputEnable;
         private readonly uint _pixelInputAddress;
         // Pixel interpolation instructions address logical attributes. The
@@ -266,6 +273,7 @@ public static partial class Gen5SpirvTranslator
         private uint _privateVec2Pointer;
         private uint _privateBoolPointer;
         private uint _runtimeBufferBiases;
+        private uint _runtimeBufferLengths;
         private uint _scalarRegisters;
         private uint _vectorRegisters;
         private uint _packedHalfRegisters;
@@ -374,6 +382,13 @@ public static partial class Gen5SpirvTranslator
                 : totalGlobalBufferCount;
             _imageBindingBase = imageBindingBase;
             _initialScalarBufferIndex = initialScalarBufferIndex;
+            // Graphics keeps the pixel and vertex runtime state in one
+            // descriptor to remain below Metal's 31 indirect-buffer resource
+            // limit. Pixel occupies the first half and vertex the second.
+            _initialScalarWordOffset =
+                initialScalarBufferIndex >= 0 && stage == Gen5SpirvStage.Vertex
+                    ? checked((uint)(256 + RuntimeGuestBufferCount() * 2))
+                    : 0;
             _pixelInputEnable = pixelInputEnable;
             _pixelInputAddress = pixelInputAddress;
             _pixelInputLocations = pixelInputLocations;
@@ -829,6 +844,12 @@ public static partial class Gen5SpirvTranslator
                     _module.ConstantNull(biasArrayType));
                 _module.AddName(_runtimeBufferBiases, "guestBufferByteBias");
                 _interfaces.Add(_runtimeBufferBiases);
+                _runtimeBufferLengths = _module.AddGlobalVariable(
+                    privateBiasArrayPointer,
+                    SpirvStorageClass.Private,
+                    _module.ConstantNull(biasArrayType));
+                _module.AddName(_runtimeBufferLengths, "guestBufferDwordLength");
+                _interfaces.Add(_runtimeBufferLengths);
             }
 
             DeclareBuffers();
@@ -958,9 +979,11 @@ public static partial class Gen5SpirvTranslator
                 return;
             }
 
-            var runtimeArray = _module.TypeRuntimeArray(_uintType);
-            _module.AddDecoration(runtimeArray, SpirvDecoration.ArrayStride, sizeof(uint));
-            var block = _module.TypeStruct(runtimeArray);
+            var guestWords = _module.TypeArray(
+                _uintType,
+                MaxGuestBufferDwordCount);
+            _module.AddDecoration(guestWords, SpirvDecoration.ArrayStride, sizeof(uint));
+            var block = _module.TypeStruct(guestWords);
             _module.AddDecoration(block, SpirvDecoration.Block);
             _module.AddMemberDecoration(block, 0, SpirvDecoration.Offset, 0);
             var descriptors = _module.TypeArray(
@@ -1393,12 +1416,15 @@ public static partial class Gen5SpirvTranslator
                     {
                         StoreS(
                             index,
-                            LoadBufferWord(_initialScalarBufferIndex, UInt(index)));
+                            LoadBufferWord(
+                                _initialScalarBufferIndex,
+                                UInt(checked(_initialScalarWordOffset + index))));
                     }
                 }
 
                 var runtimeBufferBiasCount =
                     _globalBufferBase + _evaluation.GlobalMemoryBindings.Count;
+                var runtimeGuestBufferCount = RuntimeGuestBufferCount();
                 for (var binding = 0;
                      binding < runtimeBufferBiasCount;
                      binding++)
@@ -1407,7 +1433,19 @@ public static partial class Gen5SpirvTranslator
                         RuntimeBufferBiasPointer(binding),
                         LoadBufferWord(
                             _initialScalarBufferIndex,
-                            UInt(checked(256u + (uint)binding))));
+                            UInt(checked(
+                                _initialScalarWordOffset +
+                                256u +
+                                (uint)binding))));
+                    Store(
+                        RuntimeBufferLengthPointer(binding),
+                        LoadBufferWord(
+                            _initialScalarBufferIndex,
+                            UInt(checked(
+                                _initialScalarWordOffset +
+                                256u +
+                                (uint)runtimeGuestBufferCount +
+                                (uint)binding))));
                 }
             }
             else
@@ -1883,6 +1921,42 @@ public static partial class Gen5SpirvTranslator
 
             switch (instruction.Opcode)
             {
+                case "DsWriteAddtidB32":
+                {
+                    if (instruction.Sources.Count < 1)
+                    {
+                        error = "missing LDS add-thread-id write source";
+                        return false;
+                    }
+
+                    var laneOffset = ShiftLeftLogical(GuestWaveLane(), UInt(2));
+                    var baseAddress = BitwiseAnd(LoadS(124), UInt(ushort.MaxValue));
+                    var address = IAdd(
+                        IAdd(baseAddress, UInt(EffectiveDsSingleOffsetBytes(control))),
+                        laneOffset);
+                    StoreLds(
+                        LdsPointer(address, 0),
+                        GetRawSource(instruction, 0));
+                    return true;
+                }
+                case "DsReadAddtidB32":
+                {
+                    if (instruction.Destinations.Count < 1)
+                    {
+                        error = "missing LDS add-thread-id read destination";
+                        return false;
+                    }
+
+                    var laneOffset = ShiftLeftLogical(GuestWaveLane(), UInt(2));
+                    var baseAddress = BitwiseAnd(LoadS(124), UInt(ushort.MaxValue));
+                    var address = IAdd(
+                        IAdd(baseAddress, UInt(EffectiveDsSingleOffsetBytes(control))),
+                        laneOffset);
+                    StoreV(
+                        instruction.Destinations[0].Value,
+                        Load(_uintType, LdsPointer(address, 0)));
+                    return true;
+                }
                 case "DsWriteB32":
                 {
                     if (instruction.Sources.Count < 2)
@@ -1893,7 +1967,7 @@ public static partial class Gen5SpirvTranslator
 
                     var address = GetRawSource(instruction, 0);
                     StoreLds(
-                        LdsPointer(address, control.Offset0),
+                        LdsPointer(address, EffectiveDsSingleOffsetBytes(control)),
                         GetRawSource(instruction, 1));
                     return true;
                 }
@@ -1906,7 +1980,7 @@ public static partial class Gen5SpirvTranslator
                     }
 
                     var address = GetRawSource(instruction, 0);
-                    var offset = control.Offset0;
+                    var offset = EffectiveDsSingleOffsetBytes(control);
                     StoreLds(LdsPointer(address, offset), GetRawSource(instruction, 1));
                     StoreLds(
                         LdsPointer(address, offset + sizeof(uint)),
@@ -1926,7 +2000,7 @@ public static partial class Gen5SpirvTranslator
                     }
 
                     var address = GetRawSource(instruction, 0);
-                    var offset = control.Offset0;
+                    var offset = EffectiveDsSingleOffsetBytes(control);
                     for (var dword = 0; dword < dwordCount; dword++)
                     {
                         StoreLds(
@@ -1971,7 +2045,7 @@ public static partial class Gen5SpirvTranslator
                     var address = GetRawSource(instruction, 0);
                     var value = Load(
                         _uintType,
-                        LdsPointer(address, control.Offset0));
+                        LdsPointer(address, EffectiveDsSingleOffsetBytes(control)));
                     StoreV(instruction.Destinations[0].Value, value);
                     return true;
                 }
@@ -1989,7 +2063,7 @@ public static partial class Gen5SpirvTranslator
                     }
 
                     var address = GetRawSource(instruction, 0);
-                    var offset = control.Offset0;
+                    var offset = EffectiveDsSingleOffsetBytes(control);
                     for (var dword = 0; dword < dwordCount; dword++)
                     {
                         var value = Load(
@@ -2039,6 +2113,9 @@ public static partial class Gen5SpirvTranslator
 
         private static uint EffectiveDsPairOffsetBytes(uint offset, bool st64 = false) =>
             offset * (st64 ? 256u : sizeof(uint));
+
+        private static uint EffectiveDsSingleOffsetBytes(Gen5DataShareControl control) =>
+            control.Offset0 | control.Offset1 << 8;
 
         private uint LdsPointer(uint address, uint offsetBytes)
         {
@@ -2102,7 +2179,9 @@ public static partial class Gen5SpirvTranslator
             }
 
             var address = GetRawSource(instruction, 0);
-            var pointer = LdsPointer(address, control.Offset0);
+            var pointer = LdsPointer(
+                address,
+                EffectiveDsSingleOffsetBytes(control));
             EmitExecConditional(() =>
             {
                 var original = EmitAtomic(
@@ -5028,21 +5107,67 @@ public static partial class Gen5SpirvTranslator
 
         private uint IsBufferWordInRange(int binding, uint dwordAddress)
         {
-            var buffer = _module.AddInstruction(
-                SpirvOp.AccessChain,
-                _storageBlockPointer,
-                _globalBuffers,
-                UInt((uint)binding));
-            var length = _module.AddInstruction(
-                SpirvOp.ArrayLength,
-                _uintType,
-                buffer,
-                0);
+            uint length;
+            if (_initialScalarBufferIndex >= 0 &&
+                binding == _initialScalarBufferIndex)
+            {
+                // The runtime block contains 256 SGPRs followed by one
+                // byte-bias and one dword-length value per guest buffer. A
+                // graphics descriptor contains one such block per stage.
+                length = UInt(checked((uint)(
+                    (256 + RuntimeGuestBufferCount() * 2) *
+                    (_stage == Gen5SpirvStage.Compute ? 1 : 2))));
+            }
+            else if (_initialScalarBufferIndex >= 0 &&
+                     binding >= 0 &&
+                     binding < RuntimeGuestBufferCount() &&
+                     _runtimeBufferLengths != 0)
+            {
+                length = Load(
+                    _uintType,
+                    RuntimeBufferLengthPointer(binding));
+            }
+            else
+            {
+                var evaluationBinding = binding - _globalBufferBase;
+                if ((uint)evaluationBinding >=
+                    (uint)_evaluation.GlobalMemoryBindings.Count)
+                {
+                    return _module.ConstantBool(false);
+                }
+
+                var evaluationBuffer =
+                    _evaluation.GlobalMemoryBindings[evaluationBinding];
+                var byteBias =
+                    evaluationBuffer.BaseAddress &
+                    (_storageBufferOffsetAlignment - 1);
+                length = UInt(checked((uint)(
+                    ((ulong)evaluationBuffer.DataLength +
+                     byteBias +
+                     sizeof(uint) - 1) /
+                    sizeof(uint))));
+            }
+
             return _module.AddInstruction(
                 SpirvOp.ULessThan,
                 _boolType,
                 dwordAddress,
                 length);
+        }
+
+        private int RuntimeGuestBufferCount()
+        {
+            if (_initialScalarBufferIndex < 0)
+            {
+                return 0;
+            }
+
+            // Compute appends one SGPR buffer. Graphics packs both stage SGPR
+            // blocks into one shared descriptor.
+            return Math.Max(
+                _totalGlobalBufferCount -
+                1,
+                0);
         }
 
         private uint BufferWordPointer(int binding, uint dwordAddress) =>
@@ -5066,6 +5191,13 @@ public static partial class Gen5SpirvTranslator
                 SpirvOp.AccessChain,
                 _privateUintPointer,
                 _runtimeBufferBiases,
+                UInt(checked((uint)binding)));
+
+        private uint RuntimeBufferLengthPointer(int binding) =>
+            _module.AddInstruction(
+                SpirvOp.AccessChain,
+                _privateUintPointer,
+                _runtimeBufferLengths,
                 UInt(checked((uint)binding)));
 
         private uint VectorPointer(uint register) =>
@@ -5482,7 +5614,11 @@ public static partial class Gen5SpirvTranslator
              UsesSubgroupBroadcast() ||
              UsesWaveControl() ||
              _state.Program.Instructions.Any(static instruction =>
-                 instruction.Opcode is "VMbcntLoU32B32" or "VMbcntHiU32B32"));
+                 instruction.Opcode is
+                     "VMbcntLoU32B32" or
+                     "VMbcntHiU32B32" or
+                     "DsWriteAddtidB32" or
+                     "DsReadAddtidB32"));
 
         private static bool IsWaveMaskOperand(Gen5Operand operand) =>
             operand.Kind == Gen5OperandKind.ScalarRegister &&
