@@ -332,6 +332,725 @@ internal static unsafe class VulkanVideoPresenter
         return vulkanFormat != Format.Undefined;
     }
 
+    /// <summary>
+    /// Expands AMD RECTLIST primitives from their three guest control vertices
+    /// into an ordinary indexed triangle list. The hardware derives the fourth
+    /// corner after the vertex shader; this CPU compatibility path performs the
+    /// same affine interpolation on every input attribute. It is exact for the
+    /// linear UI vertex shaders which use RECTLIST and avoids asking Vulkan to
+    /// read a fourth guest record which does not exist.
+    /// </summary>
+    internal static bool TryExpandRectListVertexBuffers(
+        IReadOnlyList<GuestVertexBuffer> vertexBuffers,
+        uint vertexCount,
+        out GuestVertexBuffer[] expandedVertexBuffers,
+        out byte[] indexData,
+        out bool index32Bit,
+        out uint indexCount)
+    {
+        expandedVertexBuffers = [];
+        indexData = [];
+        index32Bit = false;
+        indexCount = 0;
+
+        if (vertexBuffers.Count == 0 ||
+            vertexCount == 0 ||
+            vertexCount % 3 != 0 ||
+            vertexCount > int.MaxValue)
+        {
+            return false;
+        }
+
+        var rectangleCount = vertexCount / 3;
+        uint expandedVertexCount;
+        try
+        {
+            expandedVertexCount = checked(rectangleCount * 4);
+            indexCount = checked(rectangleCount * 6);
+        }
+        catch (OverflowException)
+        {
+            indexCount = 0;
+            return false;
+        }
+
+        var corners = new int[checked((int)rectangleCount)];
+        var foundPositionStream = false;
+        // Float inputs are overwhelmingly more likely to be positions or UVs
+        // than normalized color inputs. Prefer them, then the conventional
+        // location zero, while still accepting integer/scaled position data.
+        foreach (var candidate in vertexBuffers
+                     .Select((buffer, index) => (Buffer: buffer, Index: index))
+                     .Where(static candidate =>
+                         candidate.Buffer.ComponentCount >= 2 &&
+                         TryGetRectListScalarLayout(
+                             candidate.Buffer.DataFormat,
+                             candidate.Buffer.ComponentCount,
+                             out _,
+                             out _))
+                     .OrderByDescending(static candidate =>
+                         candidate.Buffer.NumberFormat == 7)
+                     .ThenBy(static candidate =>
+                         candidate.Buffer.Location == 0 ? 0 : 1)
+                     .ThenBy(static candidate => candidate.Index))
+        {
+            var resolvedAllCorners = true;
+            var positions = new (double X, double Y)[3];
+            for (var rectangle = 0; rectangle < corners.Length; rectangle++)
+            {
+                for (var vertex = 0; vertex < 3; vertex++)
+                {
+                    var sourceVertex = checked(rectangle * 3 + vertex);
+                    if (!TryReadRectListPosition(
+                            candidate.Buffer,
+                            sourceVertex,
+                            out positions[vertex]))
+                    {
+                        resolvedAllCorners = false;
+                        break;
+                    }
+                }
+
+                if (!resolvedAllCorners ||
+                    !TryResolveRectListCorner(positions, out corners[rectangle]))
+                {
+                    resolvedAllCorners = false;
+                    break;
+                }
+            }
+
+            if (resolvedAllCorners)
+            {
+                foundPositionStream = true;
+                break;
+            }
+        }
+
+        if (!foundPositionStream)
+        {
+            indexCount = 0;
+            return false;
+        }
+
+        var groups = new List<RectListVertexStream>();
+        var groupByBuffer = new int[vertexBuffers.Count];
+        for (var bufferIndex = 0; bufferIndex < vertexBuffers.Count; bufferIndex++)
+        {
+            var buffer = vertexBuffers[bufferIndex];
+            if (buffer.ComponentCount is < 1 or > 4)
+            {
+                indexCount = 0;
+                return false;
+            }
+
+            var attributeSize = GetVertexFormatByteSize(
+                buffer.DataFormat,
+                buffer.ComponentCount);
+            var stride = Math.Max(Math.Max(buffer.Stride, attributeSize), 1);
+            var recordOffset = buffer.OffsetBytes - buffer.OffsetBytes % stride;
+            var attributeOffset = buffer.OffsetBytes - recordOffset;
+            if ((ulong)attributeOffset + attributeSize > stride)
+            {
+                indexCount = 0;
+                return false;
+            }
+
+            var groupIndex = groups.FindIndex(group =>
+                ReferenceEquals(group.Source, buffer.Data) &&
+                group.Stride == stride &&
+                group.RecordOffset == recordOffset);
+            if (groupIndex < 0)
+            {
+                groupIndex = groups.Count;
+                groups.Add(new RectListVertexStream(
+                    buffer.Data,
+                    Math.Clamp(buffer.Length, 0, buffer.Data.Length),
+                    stride,
+                    recordOffset));
+            }
+            else
+            {
+                groups[groupIndex].SourceLength = Math.Max(
+                    groups[groupIndex].SourceLength,
+                    Math.Clamp(buffer.Length, 0, buffer.Data.Length));
+            }
+
+            groups[groupIndex].BufferIndices.Add(bufferIndex);
+            groupByBuffer[bufferIndex] = groupIndex;
+        }
+
+        try
+        {
+            foreach (var group in groups)
+            {
+                group.Expanded = new byte[checked((int)(expandedVertexCount * group.Stride))];
+                for (var rectangle = 0; rectangle < corners.Length; rectangle++)
+                {
+                    var inputRectangleStart = rectangle * 3;
+                    var outputRectangleStart = rectangle * 4;
+                    for (var vertex = 0; vertex < 3; vertex++)
+                    {
+                        TryCopyRectListRecord(
+                            group,
+                            inputRectangleStart + vertex,
+                            group.Expanded,
+                            outputRectangleStart + vertex);
+                    }
+
+                    // Preserve otherwise-unused padding from a real record.
+                    // Every shader-visible attribute is overwritten below.
+                    TryCopyRectListRecord(
+                        group,
+                        inputRectangleStart + (corners[rectangle] + 1) % 3,
+                        group.Expanded,
+                        outputRectangleStart + 3);
+                }
+            }
+        }
+        catch (OverflowException)
+        {
+            indexCount = 0;
+            return false;
+        }
+
+        expandedVertexBuffers = new GuestVertexBuffer[vertexBuffers.Count];
+        for (var bufferIndex = 0; bufferIndex < vertexBuffers.Count; bufferIndex++)
+        {
+            var sourceBuffer = vertexBuffers[bufferIndex];
+            var group = groups[groupByBuffer[bufferIndex]];
+            var attributeOffset = sourceBuffer.OffsetBytes - group.RecordOffset;
+            var attributeSize = GetVertexFormatByteSize(
+                sourceBuffer.DataFormat,
+                sourceBuffer.ComponentCount);
+            for (var rectangle = 0; rectangle < corners.Length; rectangle++)
+            {
+                SynthesizeRectListAttribute(
+                    group,
+                    attributeOffset,
+                    attributeSize,
+                    sourceBuffer.DataFormat,
+                    sourceBuffer.NumberFormat,
+                    sourceBuffer.ComponentCount,
+                    rectangle,
+                    corners[rectangle]);
+            }
+
+            expandedVertexBuffers[bufferIndex] = sourceBuffer with
+            {
+                Stride = group.Stride,
+                OffsetBytes = attributeOffset,
+                Data = group.Expanded,
+                Length = group.Expanded.Length,
+                Pooled = false,
+            };
+        }
+
+        index32Bit = expandedVertexCount > (uint)ushort.MaxValue + 1;
+        indexData = new byte[checked((int)indexCount * (index32Bit ? 4 : 2))];
+        Span<uint> indices = stackalloc uint[6];
+        for (var rectangle = 0; rectangle < corners.Length; rectangle++)
+        {
+            var baseVertex = checked((uint)rectangle * 4);
+            var corner = checked((uint)corners[rectangle]);
+            var next = (corner + 1) % 3;
+            var previous = (corner + 2) % 3;
+            indices[0] = baseVertex + corner;
+            indices[1] = baseVertex + next;
+            indices[2] = baseVertex + previous;
+            indices[3] = baseVertex + previous;
+            indices[4] = baseVertex + next;
+            indices[5] = baseVertex + 3;
+            for (var index = 0; index < indices.Length; index++)
+            {
+                var byteOffset =
+                    checked((rectangle * 6 + index) * (index32Bit ? 4 : 2));
+                if (index32Bit)
+                {
+                    BinaryPrimitives.WriteUInt32LittleEndian(
+                        indexData.AsSpan(byteOffset, 4),
+                        indices[index]);
+                }
+                else
+                {
+                    BinaryPrimitives.WriteUInt16LittleEndian(
+                        indexData.AsSpan(byteOffset, 2),
+                        checked((ushort)indices[index]));
+                }
+            }
+        }
+
+        return true;
+    }
+
+    private sealed class RectListVertexStream(
+        byte[] source,
+        int sourceLength,
+        uint stride,
+        uint recordOffset)
+    {
+        public byte[] Source { get; } = source;
+        public int SourceLength { get; set; } = sourceLength;
+        public uint Stride { get; } = stride;
+        public uint RecordOffset { get; } = recordOffset;
+        public List<int> BufferIndices { get; } = [];
+        public byte[] Expanded { get; set; } = [];
+    }
+
+    private static bool TryGetRectListScalarLayout(
+        uint dataFormat,
+        uint componentCount,
+        out int scalarBytes,
+        out int scalarCount)
+    {
+        if (componentCount is < 1 or > 4 ||
+            dataFormat is 6 or 7 or 8 or 9 or 16 or 17 or 19 or 34)
+        {
+            scalarBytes = 0;
+            scalarCount = 0;
+            return false;
+        }
+
+        (scalarBytes, scalarCount) = dataFormat switch
+        {
+            1 => (1, 1),
+            2 => (2, 1),
+            3 => (1, 2),
+            4 => (4, 1),
+            5 => (2, 2),
+            10 => (1, 4),
+            11 => (4, 2),
+            12 => (2, 4),
+            13 => (4, 3),
+            14 => (4, 4),
+            _ => (4, (int)componentCount),
+        };
+        return true;
+    }
+
+    private static bool TryReadRectListPosition(
+        GuestVertexBuffer buffer,
+        int vertex,
+        out (double X, double Y) position)
+    {
+        position = default;
+        if (!TryGetRectListScalarLayout(
+                buffer.DataFormat,
+                buffer.ComponentCount,
+                out var scalarBytes,
+                out var scalarCount) ||
+            scalarCount < 2)
+        {
+            return false;
+        }
+
+        var attributeSize = GetVertexFormatByteSize(
+            buffer.DataFormat,
+            buffer.ComponentCount);
+        var stride = Math.Max(Math.Max(buffer.Stride, attributeSize), 1);
+        var recordOffset = buffer.OffsetBytes - buffer.OffsetBytes % stride;
+        var attributeOffset = buffer.OffsetBytes - recordOffset;
+        var sourceOffset =
+            (ulong)recordOffset + checked((ulong)vertex * stride) + attributeOffset;
+        var sourceLength = Math.Clamp(buffer.Length, 0, buffer.Data.Length);
+        if (sourceOffset + checked((ulong)(scalarBytes * 2)) > (ulong)sourceLength)
+        {
+            return false;
+        }
+
+        var source = buffer.Data.AsSpan(checked((int)sourceOffset), scalarBytes * 2);
+        if (!TryReadRectListScalar(
+                source,
+                scalarBytes,
+                buffer.NumberFormat,
+                out var x) ||
+            !TryReadRectListScalar(
+                source[scalarBytes..],
+                scalarBytes,
+                buffer.NumberFormat,
+                out var y) ||
+            !double.IsFinite(x) ||
+            !double.IsFinite(y))
+        {
+            return false;
+        }
+
+        position = (x, y);
+        return true;
+    }
+
+    private static bool TryReadRectListScalar(
+        ReadOnlySpan<byte> source,
+        int scalarBytes,
+        uint numberFormat,
+        out double value)
+    {
+        value = 0;
+        if (numberFormat == 7)
+        {
+            if (scalarBytes == 2)
+            {
+                value = (double)BitConverter.UInt16BitsToHalf(
+                    BinaryPrimitives.ReadUInt16LittleEndian(source));
+                return true;
+            }
+
+            if (scalarBytes == 4)
+            {
+                value = BitConverter.Int32BitsToSingle(
+                    BinaryPrimitives.ReadInt32LittleEndian(source));
+                return true;
+            }
+
+            return false;
+        }
+
+        var signed = numberFormat is 1 or 3 or 5 or 6;
+        value = (scalarBytes, signed) switch
+        {
+            (1, false) => source[0],
+            (1, true) => unchecked((sbyte)source[0]),
+            (2, false) => BinaryPrimitives.ReadUInt16LittleEndian(source),
+            (2, true) => BinaryPrimitives.ReadInt16LittleEndian(source),
+            (4, false) => BinaryPrimitives.ReadUInt32LittleEndian(source),
+            (4, true) => BinaryPrimitives.ReadInt32LittleEndian(source),
+            _ => double.NaN,
+        };
+        return double.IsFinite(value);
+    }
+
+    private static bool TryResolveRectListCorner(
+        ReadOnlySpan<(double X, double Y)> positions,
+        out int corner)
+    {
+        corner = 0;
+        if (positions.Length != 3)
+        {
+            return false;
+        }
+
+        for (var candidate = 0; candidate < 3; candidate++)
+        {
+            var next = (candidate + 1) % 3;
+            var previous = (candidate + 2) % 3;
+            if ((NearlyEqualRectCoordinate(
+                     positions[candidate].X,
+                     positions[next].X) &&
+                 NearlyEqualRectCoordinate(
+                     positions[candidate].Y,
+                     positions[previous].Y) ||
+                 NearlyEqualRectCoordinate(
+                     positions[candidate].Y,
+                     positions[next].Y) &&
+                 NearlyEqualRectCoordinate(
+                     positions[candidate].X,
+                     positions[previous].X)) &&
+                RectEdgeLengthSquared(positions[candidate], positions[next]) > 1e-20 &&
+                RectEdgeLengthSquared(positions[candidate], positions[previous]) > 1e-20)
+            {
+                corner = candidate;
+                return true;
+            }
+        }
+
+        // Raw attributes can be rotated before the vertex shader. Pick the
+        // control point whose two edges are closest to perpendicular, which
+        // is the affine equivalent of the screen-axis equality test above.
+        var bestScore = double.PositiveInfinity;
+        var found = false;
+        for (var candidate = 0; candidate < 3; candidate++)
+        {
+            var next = (candidate + 1) % 3;
+            var previous = (candidate + 2) % 3;
+            var ax = positions[next].X - positions[candidate].X;
+            var ay = positions[next].Y - positions[candidate].Y;
+            var bx = positions[previous].X - positions[candidate].X;
+            var by = positions[previous].Y - positions[candidate].Y;
+            var aLengthSquared = ax * ax + ay * ay;
+            var bLengthSquared = bx * bx + by * by;
+            if (aLengthSquared <= 1e-20 || bLengthSquared <= 1e-20)
+            {
+                continue;
+            }
+
+            var score = Math.Abs(ax * bx + ay * by) /
+                Math.Sqrt(aLengthSquared * bLengthSquared);
+            if (score < bestScore)
+            {
+                bestScore = score;
+                corner = candidate;
+                found = true;
+            }
+        }
+
+        return found;
+    }
+
+    private static bool NearlyEqualRectCoordinate(double left, double right)
+    {
+        var scale = Math.Max(Math.Max(Math.Abs(left), Math.Abs(right)), 1);
+        return Math.Abs(left - right) <= scale * 1e-6;
+    }
+
+    private static double RectEdgeLengthSquared(
+        (double X, double Y) left,
+        (double X, double Y) right)
+    {
+        var x = right.X - left.X;
+        var y = right.Y - left.Y;
+        return x * x + y * y;
+    }
+
+    private static void TryCopyRectListRecord(
+        RectListVertexStream group,
+        int sourceVertex,
+        byte[] destination,
+        int destinationVertex)
+    {
+        var sourceOffset =
+            (ulong)group.RecordOffset + checked((ulong)sourceVertex * group.Stride);
+        var destinationOffset = checked((ulong)destinationVertex * group.Stride);
+        if (sourceOffset >= (ulong)group.SourceLength ||
+            destinationOffset >= (ulong)destination.LongLength)
+        {
+            return;
+        }
+
+        var copyLength = (int)Math.Min(
+            group.Stride,
+            Math.Min(
+                (ulong)group.SourceLength - sourceOffset,
+                (ulong)destination.LongLength - destinationOffset));
+        group.Source.AsSpan(checked((int)sourceOffset), copyLength).CopyTo(
+            destination.AsSpan(checked((int)destinationOffset), copyLength));
+    }
+
+    private static void SynthesizeRectListAttribute(
+        RectListVertexStream group,
+        uint attributeOffset,
+        uint attributeSize,
+        uint dataFormat,
+        uint numberFormat,
+        uint componentCount,
+        int rectangle,
+        int corner)
+    {
+        var inputBase = rectangle * 3;
+        var next = (corner + 1) % 3;
+        var previous = (corner + 2) % 3;
+        var cornerOffset =
+            (ulong)group.RecordOffset +
+            checked((ulong)(inputBase + corner) * group.Stride) +
+            attributeOffset;
+        var nextOffset =
+            (ulong)group.RecordOffset +
+            checked((ulong)(inputBase + next) * group.Stride) +
+            attributeOffset;
+        var previousOffset =
+            (ulong)group.RecordOffset +
+            checked((ulong)(inputBase + previous) * group.Stride) +
+            attributeOffset;
+        var destinationOffset =
+            checked((ulong)(rectangle * 4 + 3) * group.Stride) +
+            attributeOffset;
+        if (cornerOffset + attributeSize > (ulong)group.SourceLength ||
+            nextOffset + attributeSize > (ulong)group.SourceLength ||
+            previousOffset + attributeSize > (ulong)group.SourceLength ||
+            destinationOffset + attributeSize > (ulong)group.Expanded.LongLength)
+        {
+            return;
+        }
+
+        var cornerBytes = group.Source.AsSpan(
+            checked((int)cornerOffset),
+            checked((int)attributeSize));
+        var nextBytes = group.Source.AsSpan(
+            checked((int)nextOffset),
+            checked((int)attributeSize));
+        var previousBytes = group.Source.AsSpan(
+            checked((int)previousOffset),
+            checked((int)attributeSize));
+        var destinationBytes = group.Expanded.AsSpan(
+            checked((int)destinationOffset),
+            checked((int)attributeSize));
+        if (cornerBytes.SequenceEqual(nextBytes) &&
+            cornerBytes.SequenceEqual(previousBytes))
+        {
+            cornerBytes.CopyTo(destinationBytes);
+            return;
+        }
+
+        if (!TryGetRectListScalarLayout(
+                dataFormat,
+                componentCount,
+                out var scalarBytes,
+                out var scalarCount) ||
+            checked(scalarBytes * scalarCount) > destinationBytes.Length)
+        {
+            // Packed float formats are unusual for RECTLIST attributes. Keep a
+            // valid fourth record even when their nonlinear encoding prevents
+            // an affine byte-domain reconstruction.
+            nextBytes.CopyTo(destinationBytes);
+            return;
+        }
+
+        for (var component = 0; component < scalarCount; component++)
+        {
+            var componentOffset = component * scalarBytes;
+            SynthesizeRectListScalar(
+                cornerBytes.Slice(componentOffset, scalarBytes),
+                nextBytes.Slice(componentOffset, scalarBytes),
+                previousBytes.Slice(componentOffset, scalarBytes),
+                destinationBytes.Slice(componentOffset, scalarBytes),
+                scalarBytes,
+                numberFormat);
+        }
+    }
+
+    private static void SynthesizeRectListScalar(
+        ReadOnlySpan<byte> corner,
+        ReadOnlySpan<byte> next,
+        ReadOnlySpan<byte> previous,
+        Span<byte> destination,
+        int scalarBytes,
+        uint numberFormat)
+    {
+        if (numberFormat == 7 &&
+            TryReadRectListScalar(corner, scalarBytes, numberFormat, out var floatCorner) &&
+            TryReadRectListScalar(next, scalarBytes, numberFormat, out var floatNext) &&
+            TryReadRectListScalar(previous, scalarBytes, numberFormat, out var floatPrevious))
+        {
+            var result = floatNext + floatPrevious - floatCorner;
+            if (scalarBytes == 2)
+            {
+                BinaryPrimitives.WriteUInt16LittleEndian(
+                    destination,
+                    BitConverter.HalfToUInt16Bits((Half)result));
+            }
+            else
+            {
+                BinaryPrimitives.WriteInt32LittleEndian(
+                    destination,
+                    BitConverter.SingleToInt32Bits((float)result));
+            }
+
+            return;
+        }
+
+        var signed = numberFormat is 1 or 3 or 5 or 6;
+        if (signed)
+        {
+            var signedCorner = ReadRectListSignedScalar(corner, scalarBytes);
+            var signedNext = ReadRectListSignedScalar(next, scalarBytes);
+            var signedPrevious = ReadRectListSignedScalar(previous, scalarBytes);
+            var bits = scalarBytes * 8;
+            var minimum = bits == 32 ? int.MinValue : -(1L << (bits - 1));
+            var maximum = bits == 32 ? int.MaxValue : (1L << (bits - 1)) - 1;
+            WriteRectListSignedScalar(
+                destination,
+                scalarBytes,
+                Math.Clamp(signedNext + signedPrevious - signedCorner, minimum, maximum));
+        }
+        else
+        {
+            var unsignedCorner = ReadRectListUnsignedScalar(corner, scalarBytes);
+            var unsignedNext = ReadRectListUnsignedScalar(next, scalarBytes);
+            var unsignedPrevious = ReadRectListUnsignedScalar(previous, scalarBytes);
+            var maximum = scalarBytes == 4
+                ? uint.MaxValue
+                : (1L << (scalarBytes * 8)) - 1;
+            WriteRectListUnsignedScalar(
+                destination,
+                scalarBytes,
+                Math.Clamp(
+                    unsignedNext + unsignedPrevious - unsignedCorner,
+                    0,
+                    maximum));
+        }
+    }
+
+    private static long ReadRectListSignedScalar(
+        ReadOnlySpan<byte> source,
+        int scalarBytes) =>
+        scalarBytes switch
+        {
+            1 => unchecked((sbyte)source[0]),
+            2 => BinaryPrimitives.ReadInt16LittleEndian(source),
+            4 => BinaryPrimitives.ReadInt32LittleEndian(source),
+            _ => 0,
+        };
+
+    private static long ReadRectListUnsignedScalar(
+        ReadOnlySpan<byte> source,
+        int scalarBytes) =>
+        scalarBytes switch
+        {
+            1 => source[0],
+            2 => BinaryPrimitives.ReadUInt16LittleEndian(source),
+            4 => BinaryPrimitives.ReadUInt32LittleEndian(source),
+            _ => 0,
+        };
+
+    private static void WriteRectListSignedScalar(
+        Span<byte> destination,
+        int scalarBytes,
+        long value)
+    {
+        switch (scalarBytes)
+        {
+            case 1:
+                destination[0] = unchecked((byte)(sbyte)value);
+                break;
+            case 2:
+                BinaryPrimitives.WriteInt16LittleEndian(destination, (short)value);
+                break;
+            case 4:
+                BinaryPrimitives.WriteInt32LittleEndian(destination, (int)value);
+                break;
+        }
+    }
+
+    private static void WriteRectListUnsignedScalar(
+        Span<byte> destination,
+        int scalarBytes,
+        long value)
+    {
+        switch (scalarBytes)
+        {
+            case 1:
+                destination[0] = (byte)value;
+                break;
+            case 2:
+                BinaryPrimitives.WriteUInt16LittleEndian(destination, (ushort)value);
+                break;
+            case 4:
+                BinaryPrimitives.WriteUInt32LittleEndian(destination, (uint)value);
+                break;
+        }
+    }
+
+
+    // Attribute byte width for the raw guest DataFormat codes handled by the
+    // RECTLIST expansion above.
+    private static uint GetVertexFormatByteSize(
+        uint dataFormat,
+        uint componentCount) =>
+        dataFormat switch
+        {
+            1 => 1,  // R8
+            2 => 2,  // R16
+            3 => 2,  // R8G8
+            4 => 4,  // R32
+            5 => 4,  // R16G16
+            6 or 7 or 8 or 9 or 10 => 4, // packed 32-bit / R8G8B8A8
+            11 => 8, // R32G32
+            12 => 8, // R16G16B16A16
+            13 => 12, // R32G32B32
+            14 => 16, // R32G32B32A32
+            16 or 17 or 19 => 2, // packed 16-bit
+            34 => 4, // E5B9G9R9
+            _ => Math.Max(componentCount, 1) * sizeof(float),
+        };
+
     // Vulkan's portable upper bound for minStorageBufferOffsetAlignment is
     // 256 bytes. Using that fixed power of two (instead of racing the render
     // thread's physical-device query) gives shader translation and descriptor
@@ -5876,6 +6595,7 @@ internal static unsafe class VulkanVideoPresenter
             bool hasDepthAttachment = false,
             GuestDepthResource? feedbackDepth = null)
         {
+            var vertexBuffersToReturn = draw.VertexBuffers;
             var isTitleDraw = IsTitleDraw(draw.VertexBuffers);
             var forceFullscreenVertex = _forceFullscreenPipeline ||
                 _forceFullscreenVertex ||
@@ -5931,6 +6651,42 @@ internal static unsafe class VulkanVideoPresenter
                 throw new InvalidOperationException($"translated vertex shader failed: {vertexError}");
             }
 
+            var expandedRectList = false;
+            if (!forceFullscreenVertex &&
+                draw.PrimitiveType == GuestPrimitiveRectList &&
+                draw.IndexBuffer is null)
+            {
+                if (TryExpandRectListVertexBuffers(
+                        draw.VertexBuffers,
+                        draw.VertexCount,
+                        out var expandedVertexBuffers,
+                        out var expandedIndices,
+                        out var expandedIndices32Bit,
+                        out var expandedIndexCount))
+                {
+                    draw = draw with
+                    {
+                        VertexBuffers = expandedVertexBuffers,
+                        VertexCount = expandedIndexCount,
+                        IndexBuffer = new GuestIndexBuffer(
+                            expandedIndices,
+                            expandedIndices.Length,
+                            expandedIndices32Bit,
+                            Pooled: false),
+                    };
+                    expandedRectList = true;
+                    TraceVulkanShader(
+                        $"vk.rect_list_expanded controls={expandedIndexCount / 2} " +
+                        $"indices={expandedIndexCount} buffers={expandedVertexBuffers.Length}");
+                }
+                else
+                {
+                    TraceVulkanShader(
+                        $"vk.rect_list_expand_failed controls={draw.VertexCount} " +
+                        $"buffers={draw.VertexBuffers.Count}");
+                }
+            }
+
             var resources = new TranslatedDrawResources
             {
                 DebugName = "SharpEmu draw",
@@ -5938,9 +6694,11 @@ internal static unsafe class VulkanVideoPresenter
                 GlobalMemoryBuffers =
                     new GlobalBufferResource[draw.GlobalMemoryBuffers.Count],
                 VertexBuffers = new VertexBufferResource[draw.VertexBuffers.Count],
-                VertexCount = GetDrawVertexCount(draw.PrimitiveType, draw.VertexCount, draw.IndexBuffer),
+                VertexCount = draw.VertexCount,
                 InstanceCount = Math.Max(draw.InstanceCount, 1),
-                Topology = GetPrimitiveTopology(draw.PrimitiveType),
+                Topology = expandedRectList
+                    ? PrimitiveTopology.TriangleList
+                    : GetPrimitiveTopology(draw.PrimitiveType),
                 Blends = draw.RenderState.Blends.ToArray(),
                 BlendConstant = draw.RenderState.BlendConstant,
                 Scissor = draw.RenderState.Scissor,
@@ -5965,6 +6723,16 @@ internal static unsafe class VulkanVideoPresenter
                 resources.Viewport = null;
                 resources.Raster = GuestRasterState.Default;
                 resources.Depth = GuestDepthState.Default;
+            }
+            if (draw.PrimitiveType == GuestPrimitiveRectList)
+            {
+                // AMD RECTLIST primitives are screen-aligned rectangles and
+                // bypass face culling regardless of the current cull state.
+                resources.Raster = resources.Raster with
+                {
+                    CullFront = false,
+                    CullBack = false,
+                };
             }
             if (isTitleDraw && _forceTitleDefaultBlend)
             {
@@ -6103,7 +6871,7 @@ internal static unsafe class VulkanVideoPresenter
             {
                 var returnedVertexData = new HashSet<byte[]>(
                     System.Collections.Generic.ReferenceEqualityComparer.Instance);
-                foreach (var vertex in draw.VertexBuffers)
+                foreach (var vertex in vertexBuffersToReturn)
                 {
                     if (vertex.Pooled && returnedVertexData.Add(vertex.Data))
                     {
@@ -6581,7 +7349,7 @@ internal static unsafe class VulkanVideoPresenter
                         colorBlendAttachments[index] = new PipelineColorBlendAttachmentState
                         {
                             BlendEnable = blend.Enable &&
-                                IsBlendableFormat(renderTargetFormats[index]),
+                                SupportsColorAttachmentBlend(renderTargetFormats[index]),
                             SrcColorBlendFactor = ToVkBlendFactor(blend.ColorSrcFactor),
                             DstColorBlendFactor = ToVkBlendFactor(blend.ColorDstFactor),
                             ColorBlendOp = ToVkBlendOp(blend.ColorFunc),
@@ -8830,7 +9598,10 @@ internal static unsafe class VulkanVideoPresenter
                 3 => PrimitiveTopology.LineStrip,
                 5 => PrimitiveTopology.TriangleFan,
                 6 => PrimitiveTopology.TriangleStrip,
-                GuestPrimitiveRectList => PrimitiveTopology.TriangleStrip,
+                // Successfully expanded RECTLIST draws override this with the
+                // same topology. If expansion fails, a three-vertex triangle
+                // is safer than an out-of-bounds synthetic strip vertex.
+                GuestPrimitiveRectList => PrimitiveTopology.TriangleList,
                 _ => PrimitiveTopology.TriangleList,
             };
 
@@ -8941,19 +9712,6 @@ internal static unsafe class VulkanVideoPresenter
                 $"vk.vertex_offset_oob loc={vertexBuffer.Location} " +
                 $"offset={vertexBuffer.OffsetBytes} size={vertexBuffer.Size}");
             return 0;
-        }
-
-        private static uint GetDrawVertexCount(
-            uint primitiveType,
-            uint vertexCount,
-            GuestIndexBuffer? indexBuffer)
-        {
-            if (primitiveType == GuestPrimitiveRectList && indexBuffer is null)
-            {
-                return 4;
-            }
-
-            return vertexCount;
         }
 
         private static BlendFactor ToVkBlendFactor(uint factor) =>
@@ -9239,6 +9997,18 @@ internal static unsafe class VulkanVideoPresenter
         {
             _vk.GetPhysicalDeviceFormatProperties(_physicalDevice, format, out var properties);
             return (properties.OptimalTilingFeatures & FormatFeatureFlags.ColorAttachmentBit) != 0;
+        }
+
+        // Whether the device can blend into a color attachment of this format.
+        // Integer formats never report the capability; Metal additionally
+        // cannot blend into 32-bit-per-channel float targets. Enabling blend
+        // on such a target makes vkCreateGraphicsPipelines fail with
+        // ErrorInitializationFailed, silently dropping the draw.
+        private bool SupportsColorAttachmentBlend(Format format)
+        {
+            _vk.GetPhysicalDeviceFormatProperties(_physicalDevice, format, out var properties);
+            return (properties.OptimalTilingFeatures &
+                FormatFeatureFlags.ColorAttachmentBlendBit) != 0;
         }
 
         private bool SupportsStorageImage(Format format)
@@ -10332,9 +11102,16 @@ internal static unsafe class VulkanVideoPresenter
                 return;
             }
 
-            var normalizedBlends = GuestBlendStateNormalizer.NormalizeIntegerAttachments(
+            var supportsBlend = new bool[targetFormats.Length];
+            for (var index = 0; index < targetFormats.Length; index++)
+            {
+                supportsBlend[index] =
+                    SupportsColorAttachmentBlend(targetFormats[index].Format);
+            }
+
+            var normalizedBlends = GuestBlendStateNormalizer.NormalizeNonBlendableAttachments(
                 work.Draw.RenderState.Blends,
-                targetFormats.Select(static format => format.IsInteger).ToArray(),
+                supportsBlend,
                 out var normalizedBlendCount);
             var draw = normalizedBlendCount == 0
                 ? work.Draw
@@ -13035,28 +13812,6 @@ internal static unsafe class VulkanVideoPresenter
                 $"{sequence:D4}-0x{image.Address:X16}-{image.Width}x{image.Height}-{image.Format}.rgba");
             File.WriteAllBytes(path, bytes.ToArray());
         }
-
-        // Metal cannot blend into integer render targets or 32-bit-per-channel
-        // float targets (unsupported on Apple-family GPUs). Enabling blend on
-        // one makes vkCreateGraphicsPipelines fail with ErrorInitializationFailed
-        // (and trips a Metal "not blendable" validation assertion), so the draw
-        // is silently dropped. Force blend off for those; blending on an integer
-        // target is meaningless on real hardware anyway.
-        private static bool IsBlendableFormat(Format format) =>
-            format switch
-            {
-                Format.R8Uint or Format.R8Sint or
-                Format.R8G8B8A8Uint or Format.R8G8B8A8Sint or
-                Format.R16G16Uint or Format.R16G16Sint or
-                Format.R16G16B16A16Uint or Format.R16G16B16A16Sint or
-                Format.R32Uint or Format.R32Sint or
-                Format.R32G32Uint or Format.R32G32Sint or
-                Format.R32G32B32A32Uint or Format.R32G32B32A32Sint or
-                Format.R32Sfloat or
-                Format.R32G32Sfloat or
-                Format.R32G32B32A32Sfloat => false,
-                _ => true,
-            };
 
         private static uint GetReadbackBytesPerPixel(Format format) =>
             format switch

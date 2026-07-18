@@ -7,16 +7,23 @@ namespace SharpEmu.Libs.VideoOut;
 
 internal static class GuestBlendStateNormalizer
 {
-    public static GuestBlendState[] NormalizeIntegerAttachments(
+    /// <summary>
+    /// Disables blending only for attachments whose backend format cannot
+    /// blend (integer formats, and formats whose device reports no
+    /// color-attachment-blend capability). The draw and every other MRT
+    /// attachment remain valid; blending on such a target is meaningless on
+    /// real hardware anyway.
+    /// </summary>
+    public static GuestBlendState[] NormalizeNonBlendableAttachments(
         IReadOnlyList<GuestBlendState> blends,
-        IReadOnlyList<bool> integerAttachments,
+        IReadOnlyList<bool> supportsBlend,
         out int normalizedCount)
     {
-        if (blends.Count != integerAttachments.Count)
+        if (blends.Count != supportsBlend.Count)
         {
             throw new ArgumentException(
-                "color attachment and blend-state counts must match",
-                nameof(integerAttachments));
+                "color attachment blend capabilities and blend states must have matching counts",
+                nameof(supportsBlend));
         }
 
         var normalized = new GuestBlendState[blends.Count];
@@ -24,7 +31,7 @@ internal static class GuestBlendStateNormalizer
         for (var index = 0; index < blends.Count; index++)
         {
             var blend = blends[index];
-            if (integerAttachments[index] && blend.Enable)
+            if (!supportsBlend[index] && blend.Enable)
             {
                 blend = blend with { Enable = false };
                 normalizedCount++;
