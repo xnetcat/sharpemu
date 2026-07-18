@@ -518,6 +518,7 @@ public static class Gen5ShaderScalarEvaluator
                             DataPooled: false)
                         {
                             Writable = writable,
+                            WriteBackToGuest = false,
                         };
                         globalMemoryByAddress.Add(nullKey, binding);
                         globalMemoryBindings.Add(binding);
@@ -766,6 +767,80 @@ public static class Gen5ShaderScalarEvaluator
             vertexInputBindings = capturedVertexInputs;
         }
 
+        // Unbound descriptors are architecturally zero-read/no-write resources.
+        // Recording one Vulkan storage descriptor for every statically reachable
+        // null V# needlessly consumes Metal's 31-buffer argument-table limit.
+        // Keep their instruction PCs so the SPIR-V translator can emit those
+        // semantics directly, and remove the synthetic host buffers entirely.
+        var syntheticZeroBufferPcs = new HashSet<uint>();
+        for (var index = globalMemoryBindings.Count - 1; index >= 0; index--)
+        {
+            var binding = globalMemoryBindings[index];
+            if (binding.BaseAddress != 0)
+            {
+                continue;
+            }
+
+            syntheticZeroBufferPcs.UnionWith(binding.InstructionPcs);
+            if (binding.DataPooled)
+            {
+                GlobalMemoryPool.Return(binding.Data);
+            }
+            globalMemoryBindings.RemoveAt(index);
+        }
+
+        // The same guest allocation is frequently installed in several V#
+        // registers. Each instruction still addresses bytes relative to the
+        // identical base, so those aliases can share one Vulkan descriptor.
+        // Metal counts descriptor-array elements across both graphics stages;
+        // keeping redundant aliases can otherwise exceed its 31-buffer limit
+        // even though the guest draw references far fewer unique allocations.
+        var globalMemoryIndexByBase = new Dictionary<ulong, int>();
+        for (var index = 0; index < globalMemoryBindings.Count; index++)
+        {
+            var binding = globalMemoryBindings[index];
+            if (!globalMemoryIndexByBase.TryGetValue(
+                    binding.BaseAddress,
+                    out var existingIndex))
+            {
+                globalMemoryIndexByBase.Add(binding.BaseAddress, index);
+                continue;
+            }
+
+            var existing = globalMemoryBindings[existingIndex];
+            var instructionPcs = existing.InstructionPcs is List<uint> existingPcs
+                ? existingPcs
+                : new List<uint>(existing.InstructionPcs);
+            foreach (var pc in binding.InstructionPcs)
+            {
+                if (!instructionPcs.Contains(pc))
+                {
+                    instructionPcs.Add(pc);
+                }
+            }
+
+            var useIncomingData = binding.DataLength > existing.DataLength;
+            var discarded = useIncomingData ? existing : binding;
+            var retained = useIncomingData ? binding : existing;
+            if (discarded.DataPooled &&
+                !ReferenceEquals(discarded.Data, retained.Data))
+            {
+                GlobalMemoryPool.Return(discarded.Data);
+            }
+
+            var merged = retained with
+            {
+                ScalarAddress = existing.ScalarAddress,
+                InstructionPcs = instructionPcs,
+            };
+            merged.Writable = existing.Writable || binding.Writable;
+            merged.WriteBackToGuest =
+                existing.WriteBackToGuest || binding.WriteBackToGuest;
+            globalMemoryBindings[existingIndex] = merged;
+            globalMemoryBindings.RemoveAt(index);
+            index--;
+        }
+
         evaluation = new Gen5ShaderEvaluation(
             initialScalarRegisters,
             finalScalarRegisters,
@@ -773,7 +848,8 @@ public static class Gen5ShaderScalarEvaluator
             globalMemoryBindings,
             state.ComputeSystemRegisters,
             runtimeScalarRegisters,
-            vertexInputBindings);
+            vertexInputBindings,
+            syntheticZeroBufferPcs);
         return true;
     }
 

@@ -470,7 +470,7 @@ public static class Gen5ShaderTranslator
             instructionCount++;
 
             pc += sizeDwords * sizeof(uint);
-            if (string.Equals(name, "SEndpgm", StringComparison.Ordinal))
+            if (name is "SEndpgm" or "SSetpcB64")
             {
                 program = new Gen5ShaderProgram(address, instructions);
                 return true;
@@ -944,6 +944,7 @@ public static class Gen5ShaderTranslator
             0x43 => "VMovrelsB32",
             0x44 => "VMovrelsdB32",
             0x52 => "VCvtU16F16",
+            0x54 => "VRcpF16",
             0x56 => "VRsqF16",
             0x57 => "VLogF16",
             0x58 => "VExpF16",
@@ -1203,6 +1204,7 @@ public static class Gen5ShaderTranslator
             0x178 => "VXor3B32",
             0x2FF => "VLshlrevB64",
             0x300 => "VLshrrevB64",
+            0x345 => "VXadU32",
             0x360 => "VReadlaneB32",
             0x361 => "VWritelaneB32",
             0x362 => "VLdexpF32",
@@ -1223,6 +1225,7 @@ public static class Gen5ShaderTranslator
             0x377 => "VPermlane16B32",
             0x378 => "VPermlanex16B32",
             0x34B => "VFmaF16",
+            0x351 => "VMin3F16",
             _ => $"Vop3Raw{opcode:X3}",
         };
 

@@ -222,18 +222,19 @@ public static partial class AgcExports
         (ulong Es, ulong EsState, ulong Ps, ulong PsState, ulong OutputLayout,
          uint OutputCount, uint Attributes, ulong Interpolants,
          uint PsInputEna, uint PsInputAddr,
-         ulong AliasAlignment),
+         ulong AliasAlignment, bool BakedScalars),
         (IGuestCompiledShader Vertex, IGuestCompiledShader Pixel)> _graphicsShaderCache = new();
     private static readonly ConcurrentDictionary<
         (ulong Cs, ulong State, uint LocalX, uint LocalY, uint LocalZ,
-         uint WaveLanes, ulong AliasAlignment),
+         uint WaveLanes, ulong AliasAlignment, bool BakedScalars),
         IGuestCompiledShader> _computeShaderCache = new();
     private static readonly ConcurrentDictionary<
-        (ulong Es, ulong State, ulong AliasAlignment),
+        (ulong Es, ulong State, ulong AliasAlignment, bool BakedScalars),
         IGuestCompiledShader> _depthOnlyVertexShaderCache = new();
     private static readonly ConcurrentDictionary<
-        (ulong Es, ulong State, ulong Layout, int GlobalBuffers, int ImageBase,
-         int ScalarBuffer, int Outputs, ulong AliasAlignment),
+        (ulong Es, ulong State, ulong Layout, int GlobalBase, int GlobalBuffers,
+         int GlobalBinding, int ImageBase, int ScalarBuffer, int Outputs,
+         ulong BufferMapping, ulong AliasAlignment),
         IGuestCompiledShader> _deferredVertexShaderCache = new();
     private static readonly Dictionary<ulong, ulong> _shaderHeadersByCode = new();
     private static readonly bool _traceAgc = string.Equals(
@@ -472,6 +473,9 @@ public static partial class AgcExports
         uint RawColorInfo,
         IReadOnlyList<uint> PixelInitialScalars,
         IReadOnlyList<uint> VertexInitialScalars,
+        bool BakeScalars,
+        int PixelGlobalBufferCount,
+        bool SplitStageGlobalBuffers,
         Func<IReadOnlyList<GuestVertexBuffer>, IGuestCompiledShader?>?
             DeferredVertexCompiler = null);
 
@@ -482,6 +486,14 @@ public static partial class AgcExports
         IReadOnlyList<uint> SamplerDescriptor,
         ulong DeferredDescriptorAddress = 0,
         Gen5DescriptorChain? DeferredChain = null);
+
+    private sealed record GraphicsGlobalBufferPackingPlan(
+        bool Packed,
+        int DescriptorCount,
+        IReadOnlyList<int>? DescriptorIndices,
+        IReadOnlyList<uint>? DwordOffsets,
+        int PackedByteLength,
+        ulong Fingerprint);
 
     private readonly record struct RenderTargetWriter(
         ulong Sequence,
@@ -3389,6 +3401,28 @@ public static partial class AgcExports
             return;
         }
 
+        if (ShouldDeferCompatibilityCompletionEvent(state.DeferredWaitCount))
+        {
+            // In defer-effects mode WAIT_REG_MEM lets parsing continue while
+            // keeping later GPU-visible writes behind the barrier. Publishing
+            // the compute-submit event here would let Unreal recycle those
+            // completion records before the deferred writes execute. Keep an
+            // event marker in the same FIFO so it is scheduled at the exact
+            // submission boundary after the wait becomes true.
+            state.DeferredGpuSideEffects.Enqueue(new(
+                () => NotifySubmittedDcbCompleted(
+                    gpuState,
+                    state,
+                    submissionId),
+                0,
+                0,
+                $"completion_event submission={submissionId}"));
+            TraceAgc(
+                $"agc.completion_event_deferred submission={submissionId} " +
+                $"event=0x{state.CompletionEventId:X} waits={state.DeferredWaitCount}");
+            return;
+        }
+
         state.CompletionEventNotifiedSubmissionId = submissionId;
         var completionEventId = state.CompletionEventId;
         void QueueCompletionEvent() =>
@@ -3405,6 +3439,10 @@ public static partial class AgcExports
             QueueCompletionEvent();
         }
     }
+
+    internal static bool ShouldDeferCompatibilityCompletionEvent(
+        int deferredWaitCount) =>
+        deferredWaitCount > 0;
 
     private static void EnqueueCompletionEvent(
         ulong submissionId,
@@ -3897,7 +3935,10 @@ public static partial class AgcExports
                         pendingComposite.RenderState,
                         pendingComposite.DepthTarget,
                         pendingComposite.PixelShaderAddress,
-                        pendingComposite.DeferredVertexCompiler);
+                        pendingComposite.DeferredVertexCompiler,
+                        pendingComposite.SplitStageGlobalBuffers
+                            ? pendingComposite.PixelGlobalBufferCount
+                            : -1);
                     TraceAgcShader(
                         $"agc.deferred_composite ps=0x{pendingComposite.PixelShaderAddress:X16} " +
                         $"src=0x{pendingComposite.Textures.FirstOrDefault()?.Descriptor.Address ?? 0:X16} " +
@@ -3946,7 +3987,11 @@ public static partial class AgcExports
                         globalMemoryBuffers,
                         translatedDisplayBuffer.Width,
                         translatedDisplayBuffer.Height,
-                        translatedDraw.AttributeCount);
+                        translatedDraw.AttributeCount,
+                        pixelGlobalBufferCount:
+                            translatedDraw.SplitStageGlobalBuffers
+                                ? translatedDraw.PixelGlobalBufferCount
+                                : -1);
                     TraceAgcShader(
                         $"agc.shader_present ps=0x{translatedDraw.PixelShaderAddress:X16} " +
                         $"spirv={translatedDraw.PixelShader.Payload.Length} textures={textures.Count} " +
@@ -4105,16 +4150,12 @@ public static partial class AgcExports
         bool ApplyDmaGuestMemory(out bool immediateFill)
         {
             InvalidateDcbWindowIfOverlaps(destinationAddress, byteCount);
-            immediateFill =
-                compactLayout &&
-                byteCount != 0 &&
-                byteCount <= MaxEagerGpuDataWriteBytes &&
-                destinationAddress >= 0x10000 &&
-                (destinationAddress & 3) == 0 &&
-                sourceAddress <= uint.MaxValue;
+            immediateFill = IsCustomDmaImmediateFill(
+                byteCount,
+                destinationAddress,
+                sourceAddress);
             if (immediateFill &&
                 IsCompletionLabelClearDma(
-                    compactLayout,
                     byteCount,
                     sourceAddress) &&
                 TrySuppressRecycledCompletionLabelWrite(
@@ -4142,13 +4183,10 @@ public static partial class AgcExports
             state,
             () =>
             {
-                var immediateFill =
-                    compactLayout &&
-                    byteCount != 0 &&
-                    byteCount <= MaxEagerGpuDataWriteBytes &&
-                    destinationAddress >= 0x10000 &&
-                    (destinationAddress & 3) == 0 &&
-                    sourceAddress <= uint.MaxValue;
+                var immediateFill = IsCustomDmaImmediateFill(
+                    byteCount,
+                    destinationAddress,
+                    sourceAddress);
                 var copied = eagerApplied;
                 if (ShouldRetryQueuedGuestWrite(eagerAttempted))
                 {
@@ -4186,7 +4224,6 @@ public static partial class AgcExports
             // queued, the delayed clear can overwrite the completed value.
             // Apply the pair eagerly and in parser order.
             eagerWatchedLabelWrite: IsCompletionLabelClearDma(
-                compactLayout,
                 byteCount,
                 sourceAddress));
     }
@@ -4313,11 +4350,19 @@ public static partial class AgcExports
     internal static bool ShouldRetryQueuedGuestWrite(bool eagerAttempted) =>
         !eagerAttempted;
 
+    internal static bool IsCustomDmaImmediateFill(
+        uint byteCount,
+        ulong destinationAddress,
+        ulong sourceAddress) =>
+        byteCount != 0 &&
+        byteCount <= MaxEagerGpuDataWriteBytes &&
+        destinationAddress >= 0x10000 &&
+        (destinationAddress & 3) == 0 &&
+        sourceAddress <= uint.MaxValue;
+
     internal static bool IsCompletionLabelClearDma(
-        bool compactLayout,
         uint byteCount,
         ulong sourceAddress) =>
-        compactLayout &&
         byteCount == sizeof(uint) &&
         sourceAddress == 0;
 
@@ -5068,7 +5113,14 @@ public static partial class AgcExports
             {
                 var targetAddress = destinationAddress +
                     (incrementAddress ? (ulong)index * sizeof(uint) : 0);
-                wroteData = TryWriteUInt32(ctx, targetAddress, values[index]);
+                wroteData =
+                    TrySuppressRecycledCompletionLabelWrite(
+                        ctx,
+                        targetAddress,
+                        values[index],
+                        sizeof(uint),
+                        "write-data") ||
+                    TryWriteUInt32(ctx, targetAddress, values[index]);
             }
 
             return wroteData;
@@ -5567,11 +5619,15 @@ public static partial class AgcExports
 
         if (!is64Bit &&
             TryReadUInt64(ctx, waitAddress, out var currentQword) &&
-            IsRecycledGpuLabelStorage(
-                currentQword,
-                reference,
-                mask,
-                compareFunction))
+            (IsRecycledGpuLabelStorage(
+                 currentQword,
+                 reference,
+                 mask,
+                 compareFunction) ||
+             MallocBinned3FreeListTracker.TryFindFreeBlock(
+                 ctx,
+                 waitAddress,
+                 out _)))
         {
             // The command reached HLE after its 32-bit completion label had
             // already been returned to Unreal's allocator. Its first eight
@@ -5696,13 +5752,16 @@ public static partial class AgcExports
     private static bool IsRecycledGpuLabelStorageValue(ulong value)
     {
         // Unreal's 0x20-byte recycled records carry this exact first qword
-        // before their first field becomes a free-list pointer. Neither form
+        // before their first field becomes a free-list pointer. On Gen5 the
+        // same allocator also stores some next pointers as their aligned low
+        // 32 bits (for example 0x21074820 in Silent Hill). None of these forms
         // can be a live AGC completion label, whose only values are zero/one.
         const uint recycledRecordSignature = 0xE701_0002u;
         var low = (uint)value;
         var high = (uint)(value >> 32);
         return (low == recycledRecordSignature && high <= 1) ||
-               IsAlignedGuestUserPointer(value);
+               IsAlignedGuestUserPointer(value) ||
+               IsCompressedAlignedGuestPointer(value);
     }
 
     private static bool IsAlignedGuestUserPointer(ulong value)
@@ -5714,6 +5773,18 @@ public static partial class AgcExports
                (value & 0xFUL) == 0;
     }
 
+    private static bool IsCompressedAlignedGuestPointer(ulong value)
+    {
+        // These values occur only after a 0x20-byte completion record has
+        // returned to Unreal's small-block allocator. Keep the match above
+        // the immediate/offset range and require the allocator's alignment so
+        // ordinary label values and packed control words remain untouched.
+        const uint compressedGuestPointerStart = 0x1000_0000u;
+        return value <= uint.MaxValue &&
+               value >= compressedGuestPointerStart &&
+               (value & 0xFUL) == 0;
+    }
+
     private static bool TrySuppressRecycledCompletionLabelWrite(
         CpuContext ctx,
         ulong address,
@@ -5721,7 +5792,29 @@ public static partial class AgcExports
         uint byteCount,
         string packetKind)
     {
-        if (!TryReadUInt64(ctx, address, out var currentQword) ||
+        if (!TryReadUInt64(ctx, address, out var currentQword))
+        {
+            return false;
+        }
+
+        var isDmaClear =
+            packetKind == "dma-clear" &&
+            byteCount == sizeof(uint) &&
+            value == 0;
+        var isReleaseOne =
+            packetKind.StartsWith("release-mem", StringComparison.Ordinal) &&
+            value == 1 &&
+            byteCount is sizeof(uint) or sizeof(ulong);
+        var consumedDmaDebt =
+            isReleaseOne &&
+            MallocBinned3FreeListTracker.TryConsumeSuppressedDma(address);
+        var freeListMember =
+            MallocBinned3FreeListTracker.TryFindFreeBlock(
+                ctx,
+                address,
+                out var freeListMatch);
+        if (!consumedDmaDebt &&
+            !freeListMember &&
             !ShouldSuppressRecycledCompletionLabelWrite(
                 currentQword,
                 value,
@@ -5730,13 +5823,23 @@ public static partial class AgcExports
             return false;
         }
 
+        if (isDmaClear)
+        {
+            // Keep the paired release suppressed even if Unreal pops or
+            // reuses this block between the two GPU packets.
+            MallocBinned3FreeListTracker.RecordSuppressedDma(address);
+        }
+
         if (ShouldTraceHotPath(ref _recycledLabelWriteTraceCount))
         {
             Console.Error.WriteLine(
                 $"[LOADER][WARN] agc.label_write_retired_recycled " +
                 $"kind={packetKind} label=0x{address:X16} " +
                 $"value=0x{value:X16} bytes={byteCount} " +
-                $"current=0x{currentQword:X16}");
+                $"current=0x{currentQword:X16} " +
+                $"reason={(consumedDmaDebt ? "dma-debt" : freeListMember ? "mb3-membership" : "content")} " +
+                $"pool=0x{freeListMatch.PoolBase:X16} list={freeListMatch.List} " +
+                $"hops={freeListMatch.Hops}");
         }
 
         return true;
@@ -6802,7 +6905,10 @@ public static partial class AgcExports
                     translatedDraw.RenderState,
                     translatedDraw.DepthTarget,
                     translatedDraw.PixelShaderAddress,
-                    translatedDraw.DeferredVertexCompiler);
+                    translatedDraw.DeferredVertexCompiler,
+                    translatedDraw.SplitStageGlobalBuffers
+                        ? translatedDraw.PixelGlobalBufferCount
+                        : -1);
             }
             else
             {
@@ -7007,22 +7113,24 @@ public static partial class AgcExports
             return false;
         }
 
-        var exportFingerprint = _bakeScalars
+        var guestGlobalBufferCount = exportEvaluation.GlobalMemoryBindings.Count;
+        var bakeScalars = ShouldBakeScalars(guestGlobalBufferCount);
+        var exportFingerprint = bakeScalars
             ? ComputeShaderStateFingerprint(exportEvaluation)
             : ComputeShaderStructuralFingerprint(exportEvaluation);
         var cacheKey = (
             exportShaderAddress,
             exportFingerprint,
-            _storageBufferOffsetAlignment);
+            VulkanVideoPresenter.GuestStorageBufferOffsetAlignment,
+            bakeScalars);
         _depthOnlyVertexShaderCache.TryGetValue(cacheKey, out var vertexShader);
 
         if (vertexShader is null)
         {
-            var guestGlobalBufferCount = exportEvaluation.GlobalMemoryBindings.Count;
             // CreateTranslatedDrawGlobalBuffers packs both stage scalar blocks
             // into one descriptor. The fixed fragment stage leaves the first
             // half unused; the vertex stage reads the second half.
-            var totalGlobalBufferCount = _bakeScalars
+            var totalGlobalBufferCount = bakeScalars
                 ? guestGlobalBufferCount
                 : guestGlobalBufferCount + 1;
             if (!GuestGpu.Current.TryCompileVertexShader(
@@ -7033,7 +7141,7 @@ public static partial class AgcExports
                     globalBufferBase: 0,
                     totalGlobalBufferCount: totalGlobalBufferCount,
                     imageBindingBase: 0,
-                    scalarRegisterBufferIndex: _bakeScalars
+                    scalarRegisterBufferIndex: bakeScalars
                         ? -1
                         : guestGlobalBufferCount,
                     requiredVertexOutputCount: 0,
@@ -7169,7 +7277,10 @@ public static partial class AgcExports
             RawBlendControl: 0,
             RawColorInfo: 0,
             PixelInitialScalars: [],
-            exportEvaluation.InitialScalarRegisters);
+            exportEvaluation.InitialScalarRegisters,
+            bakeScalars,
+            PixelGlobalBufferCount: 0,
+            SplitStageGlobalBuffers: false);
         return true;
     }
 
@@ -7339,10 +7450,22 @@ public static partial class AgcExports
             : checked((int)pixelInputLocations.Values.Max() + 1);
         var interpolantFingerprint = ComputePixelInputLocationFingerprint(
             pixelInputLocations);
-        var exportStateFingerprint = _bakeScalars
+        var logicalGlobalMemoryBindings = MergeGraphicsGlobalMemoryBindings(
+            pixelEvaluation,
+            exportEvaluation,
+            out var alignedPixelEvaluation,
+            out var alignedExportEvaluation,
+            out var discardedGlobalBindings);
+        var guestGlobalBuffers = logicalGlobalMemoryBindings.Count;
+        var bakeScalars = ShouldBakeGraphicsScalars(guestGlobalBuffers);
+        var globalBufferPacking = CreateGraphicsGlobalBufferPackingPlan(
+            logicalGlobalMemoryBindings,
+            bakeScalars);
+        const bool splitStageGlobalBuffers = false;
+        var exportStateFingerprint = bakeScalars
             ? ComputeShaderStateFingerprint(exportEvaluation)
             : ComputeShaderStructuralFingerprint(exportEvaluation);
-        var pixelStateFingerprint = _bakeScalars
+        var pixelStateFingerprint = bakeScalars
             ? ComputeShaderStateFingerprint(pixelEvaluation)
             : ComputeShaderStructuralFingerprint(pixelEvaluation);
         var shaderKey = (
@@ -7356,17 +7479,14 @@ public static partial class AgcExports
             interpolantFingerprint,
             psInputEna,
             psInputAddr,
-            _storageBufferOffsetAlignment);
+            VulkanVideoPresenter.GuestStorageBufferOffsetAlignment,
+            bakeScalars);
 
-        var guestGlobalBuffers =
-            pixelEvaluation.GlobalMemoryBindings.Count +
-            exportEvaluation.GlobalMemoryBindings.Count;
         // One per-draw buffer containing both initial-scalar blocks rides
         // after the guest buffers:
         // [pixel guest][vertex guest][pixel sgprs + vertex sgprs].
-        var totalGlobalBuffers = _bakeScalars
-            ? guestGlobalBuffers
-            : guestGlobalBuffers + 1;
+        var totalGlobalBuffers = globalBufferPacking.DescriptorCount +
+            (bakeScalars ? 0 : 1);
         _graphicsShaderCache.TryGetValue(shaderKey, out var compiled);
 
         if (compiled.Vertex is null || compiled.Pixel is null)
@@ -7382,31 +7502,41 @@ public static partial class AgcExports
 
             if (!GuestGpu.Current.TryCompilePixelShader(
                     pixelState,
-                    pixelEvaluation,
+                    alignedPixelEvaluation,
                     pixelOutputs,
                     out var pixelShader,
                     out error,
                     globalBufferBase: 0,
                     totalGlobalBufferCount: totalGlobalBuffers,
                     imageBindingBase: 0,
-                    scalarRegisterBufferIndex: _bakeScalars ? -1 : guestGlobalBuffers,
+                    scalarRegisterBufferIndex: bakeScalars ? -1 : guestGlobalBuffers,
                     pixelInputEnable: psInputEna,
                     pixelInputAddress: psInputAddr,
                     pixelInputLocations: pixelInputLocations,
                     storageBufferOffsetAlignment:
-                        _storageBufferOffsetAlignment) ||
+                        VulkanVideoPresenter.GuestStorageBufferOffsetAlignment,
+                    globalDescriptorBinding: 0,
+                    globalDescriptorIndices:
+                        globalBufferPacking.DescriptorIndices,
+                    globalDwordOffsets:
+                        globalBufferPacking.DwordOffsets) ||
                 !GuestGpu.Current.TryCompileVertexShader(
                     exportState,
-                    exportEvaluation,
+                    alignedExportEvaluation,
                     out var vertexShader,
                     out error,
-                    globalBufferBase: pixelEvaluation.GlobalMemoryBindings.Count,
+                    globalBufferBase: 0,
                     totalGlobalBufferCount: totalGlobalBuffers,
                     imageBindingBase: pixelEvaluation.ImageBindings.Count,
-                    scalarRegisterBufferIndex: _bakeScalars ? -1 : guestGlobalBuffers,
+                    scalarRegisterBufferIndex: bakeScalars ? -1 : guestGlobalBuffers,
                     requiredVertexOutputCount: requiredVertexOutputCount,
                     storageBufferOffsetAlignment:
-                        _storageBufferOffsetAlignment))
+                        VulkanVideoPresenter.GuestStorageBufferOffsetAlignment,
+                    globalDescriptorBinding: 0,
+                    globalDescriptorIndices:
+                        globalBufferPacking.DescriptorIndices,
+                    globalDwordOffsets:
+                        globalBufferPacking.DwordOffsets))
             {
                 ReturnPooledEvaluationArrays(exportEvaluation);
                 ReturnPooledEvaluationArrays(pixelEvaluation);
@@ -7456,29 +7586,37 @@ public static partial class AgcExports
             return false;
         }
 
-        var globalMemoryBindings = new Gen5GlobalMemoryBinding[
-            pixelEvaluation.GlobalMemoryBindings.Count +
-            exportEvaluation.GlobalMemoryBindings.Count];
-        for (var index = 0; index < pixelEvaluation.GlobalMemoryBindings.Count; index++)
-        {
-            globalMemoryBindings[index] = pixelEvaluation.GlobalMemoryBindings[index];
-        }
-        for (var index = 0; index < exportEvaluation.GlobalMemoryBindings.Count; index++)
-        {
-            globalMemoryBindings[pixelEvaluation.GlobalMemoryBindings.Count + index] =
-                exportEvaluation.GlobalMemoryBindings[index];
-        }
         IReadOnlyList<Gen5VertexInputBinding> vertexInputs =
             exportEvaluation.VertexInputs ?? [];
         var deferredVertexCompiler = CreateDeferredVertexCompiler(
             exportShaderAddress,
             exportStateFingerprint,
             exportState,
-            exportEvaluation,
-            totalGlobalBuffers,
-            pixelEvaluation.ImageBindings.Count,
-            _bakeScalars ? -1 : guestGlobalBuffers,
-            requiredVertexOutputCount);
+            alignedExportEvaluation,
+            globalBufferBase: 0,
+            totalGlobalBufferCount: totalGlobalBuffers,
+            globalDescriptorBinding: 0,
+            imageBindingBase: pixelEvaluation.ImageBindings.Count,
+            scalarRegisterBufferIndex: bakeScalars ? -1 : guestGlobalBuffers,
+            requiredVertexOutputCount: requiredVertexOutputCount,
+            globalDescriptorIndices: globalBufferPacking.DescriptorIndices,
+            globalDwordOffsets: globalBufferPacking.DwordOffsets,
+            bufferMappingFingerprint: globalBufferPacking.Fingerprint);
+        IReadOnlyList<Gen5GlobalMemoryBinding> globalMemoryBindings;
+        if (globalBufferPacking.Packed)
+        {
+            globalMemoryBindings = PackGraphicsGlobalMemoryBindings(
+                logicalGlobalMemoryBindings,
+                globalBufferPacking);
+            ReturnEvaluationGlobalBindingArrays(
+                pixelEvaluation,
+                exportEvaluation);
+        }
+        else
+        {
+            globalMemoryBindings = logicalGlobalMemoryBindings;
+            ReturnDiscardedGlobalBindingArrays(discardedGlobalBindings);
+        }
         state.UcRegisters.TryGetValue(VgtPrimitiveType, out var primitiveType);
         var guestTargets = new GuestRenderTarget[renderTargets.Length];
         for (var index = 0; index < renderTargets.Length; index++)
@@ -7528,6 +7666,9 @@ public static partial class AgcExports
                 : 0,
             pixelEvaluation.InitialScalarRegisters,
             exportEvaluation.InitialScalarRegisters,
+            bakeScalars,
+            alignedPixelEvaluation.GlobalMemoryBindings.Count,
+            splitStageGlobalBuffers,
             deferredVertexCompiler);
         return true;
     }
@@ -7894,6 +8035,33 @@ public static partial class AgcExports
         Environment.GetEnvironmentVariable("SHARPEMU_BAKE_SGPRS"),
         "1",
         StringComparison.Ordinal);
+
+    private static bool ShouldBakeScalars(int guestBufferCount) =>
+        _bakeScalars ||
+        RequiresBakedScalarsForStorageDescriptorLimit(
+            guestBufferCount,
+            OperatingSystem.IsMacOS());
+
+    private static bool ShouldBakeGraphicsScalars(int guestBufferCount) =>
+        _bakeScalars ||
+        RequiresBakedGraphicsScalarsForStorageDescriptorLimit(
+            guestBufferCount,
+            OperatingSystem.IsMacOS());
+
+    internal static bool RequiresBakedScalarsForStorageDescriptorLimit(
+        int guestBufferCount,
+        bool isMacOs) =>
+        isMacOs && guestBufferCount >= 31;
+
+    internal static bool RequiresBakedGraphicsScalarsForStorageDescriptorLimit(
+        int guestBufferCount,
+        bool isMacOs) =>
+        // MoltenVK counts the storage-buffer descriptor array in both the
+        // vertex and fragment stages. With the runtime scalar block appended,
+        // 14 guest descriptors plus that scalar block consume all 15 Vulkan
+        // descriptor slots available after MoltenVK's two internal resources.
+        // Bake before the array grows from 14 to 15.
+        isMacOs && guestBufferCount >= 14;
 
     /// <summary>
     /// Fingerprint of everything that shapes the translated SPIR-V besides
@@ -8640,7 +8808,7 @@ public static partial class AgcExports
         TranslatedGuestDraw translatedDraw)
     {
         var buffers = CreateGuestMemoryBuffers(translatedDraw.GlobalMemoryBindings);
-        if (_bakeScalars)
+        if (translatedDraw.BakeScalars)
         {
             return buffers;
         }
@@ -8710,7 +8878,7 @@ public static partial class AgcExports
                 WriteBackToGuest: binding.WriteBackToGuest && guestMemoryBacked));
         }
 
-        if (!_bakeScalars)
+        if (!translatedDraw.BakeScalars)
         {
             var runtimeStateLength = GetRuntimeScalarBufferLength(bindings.Count);
             combined.Add(new GuestMemoryBuffer(
@@ -8871,6 +9039,233 @@ public static partial class AgcExports
     }
 
     /// <summary>
+    /// Pixel and vertex evaluation happen independently, so the same guest
+    /// allocation can otherwise occupy one descriptor in each stage. MoltenVK
+    /// counts those duplicate descriptors toward the 31-resource Metal limit.
+    /// Build one exact-address descriptor space and align each stage's sparse
+    /// evaluation view to it; empty slots have no instruction PCs and therefore
+    /// cannot become accidental bindings even though shader PCs overlap.
+    /// </summary>
+    private static IReadOnlyList<Gen5GlobalMemoryBinding>
+        MergeGraphicsGlobalMemoryBindings(
+            Gen5ShaderEvaluation pixelEvaluation,
+            Gen5ShaderEvaluation vertexEvaluation,
+            out Gen5ShaderEvaluation alignedPixelEvaluation,
+            out Gen5ShaderEvaluation alignedVertexEvaluation,
+            out IReadOnlyList<Gen5GlobalMemoryBinding> discardedBindings)
+    {
+        var merged = new List<Gen5GlobalMemoryBinding>(
+            pixelEvaluation.GlobalMemoryBindings.Count +
+            vertexEvaluation.GlobalMemoryBindings.Count);
+        var indicesByAddress = new Dictionary<ulong, int>();
+        var discarded = new List<Gen5GlobalMemoryBinding>();
+        var pixelIndices = new int[pixelEvaluation.GlobalMemoryBindings.Count];
+        var vertexIndices = new int[vertexEvaluation.GlobalMemoryBindings.Count];
+
+        void AddBindings(
+            IReadOnlyList<Gen5GlobalMemoryBinding> bindings,
+            int[] indices)
+        {
+            for (var sourceIndex = 0; sourceIndex < bindings.Count; sourceIndex++)
+            {
+                var binding = bindings[sourceIndex];
+                if (binding.BaseAddress != 0 &&
+                    indicesByAddress.TryGetValue(binding.BaseAddress, out var mergedIndex))
+                {
+                    indices[sourceIndex] = mergedIndex;
+                    var existing = merged[mergedIndex];
+                    var selected = existing.DataLength >= binding.DataLength
+                        ? existing
+                        : binding;
+                    var rejected = ReferenceEquals(selected.Data, existing.Data)
+                        ? binding
+                        : existing;
+                    var combined = selected with
+                    {
+                        Writable = existing.Writable || binding.Writable,
+                        WriteBackToGuest =
+                            existing.WriteBackToGuest || binding.WriteBackToGuest,
+                    };
+                    merged[mergedIndex] = combined;
+                    if (!ReferenceEquals(rejected.Data, selected.Data))
+                    {
+                        discarded.Add(rejected);
+                    }
+                    continue;
+                }
+
+                indices[sourceIndex] = merged.Count;
+                if (binding.BaseAddress != 0)
+                {
+                    indicesByAddress.Add(binding.BaseAddress, merged.Count);
+                }
+                merged.Add(binding);
+            }
+        }
+
+        AddBindings(pixelEvaluation.GlobalMemoryBindings, pixelIndices);
+        AddBindings(vertexEvaluation.GlobalMemoryBindings, vertexIndices);
+
+        Gen5ShaderEvaluation Align(
+            Gen5ShaderEvaluation evaluation,
+            int[] indices)
+        {
+            var bindings = new Gen5GlobalMemoryBinding[merged.Count];
+            for (var index = 0; index < bindings.Length; index++)
+            {
+                bindings[index] = new Gen5GlobalMemoryBinding(
+                    ScalarAddress: 0,
+                    merged[index].BaseAddress,
+                    InstructionPcs: [],
+                    Data: [],
+                    DataLength: 0,
+                    DataPooled: false)
+                {
+                    Writable = false,
+                    WriteBackToGuest = false,
+                };
+            }
+
+            for (var sourceIndex = 0;
+                 sourceIndex < evaluation.GlobalMemoryBindings.Count;
+                 sourceIndex++)
+            {
+                bindings[indices[sourceIndex]] =
+                    evaluation.GlobalMemoryBindings[sourceIndex];
+            }
+
+            return evaluation with { GlobalMemoryBindings = bindings };
+        }
+
+        alignedPixelEvaluation = Align(pixelEvaluation, pixelIndices);
+        alignedVertexEvaluation = Align(vertexEvaluation, vertexIndices);
+        discardedBindings = discarded;
+        return merged.ToArray();
+    }
+
+    private static GraphicsGlobalBufferPackingPlan
+        CreateGraphicsGlobalBufferPackingPlan(
+            IReadOnlyList<Gen5GlobalMemoryBinding> bindings,
+            bool bakeScalars)
+    {
+        if (!bakeScalars ||
+            bindings.Count < 2 ||
+            bindings.Any(static binding => binding.Writable))
+        {
+            return new GraphicsGlobalBufferPackingPlan(
+                Packed: false,
+                DescriptorCount: bindings.Count,
+                DescriptorIndices: null,
+                DwordOffsets: null,
+                PackedByteLength: 0,
+                Fingerprint: 0);
+        }
+
+        var descriptorIndices = new int[bindings.Count];
+        var dwordOffsets = new uint[bindings.Count];
+        var alignment = VulkanVideoPresenter.GuestStorageBufferOffsetAlignment;
+        ulong cursor = 0;
+        const ulong prime = 1099511628211UL;
+        var fingerprint = 14695981039346656037UL;
+        for (var index = 0; index < bindings.Count; index++)
+        {
+            cursor = checked((cursor + alignment - 1) & ~(alignment - 1));
+            dwordOffsets[index] = checked((uint)(cursor / sizeof(uint)));
+            var byteBias = bindings[index].BaseAddress & (alignment - 1);
+            cursor = checked(
+                cursor +
+                byteBias +
+                (ulong)Math.Max(bindings[index].DataLength, sizeof(uint)));
+            cursor = checked((cursor + sizeof(uint) - 1) & ~(sizeof(uint) - 1UL));
+            fingerprint = (fingerprint ^ bindings[index].BaseAddress) * prime;
+            fingerprint = (fingerprint ^ dwordOffsets[index]) * prime;
+            fingerprint = (fingerprint ^ (uint)bindings[index].DataLength) * prime;
+        }
+
+        return new GraphicsGlobalBufferPackingPlan(
+            Packed: true,
+            DescriptorCount: 1,
+            descriptorIndices,
+            dwordOffsets,
+            checked((int)cursor),
+            fingerprint);
+    }
+
+    private static IReadOnlyList<Gen5GlobalMemoryBinding>
+        PackGraphicsGlobalMemoryBindings(
+            IReadOnlyList<Gen5GlobalMemoryBinding> bindings,
+            GraphicsGlobalBufferPackingPlan plan)
+    {
+        if (!plan.Packed ||
+            plan.DwordOffsets is null ||
+            plan.DwordOffsets.Count != bindings.Count)
+        {
+            throw new ArgumentException(
+                "graphics buffer packing requires one packed offset per binding",
+                nameof(plan));
+        }
+
+        var data = VulkanVideoPresenter.GuestDataPool.Rent(plan.PackedByteLength);
+        data.AsSpan(0, plan.PackedByteLength).Clear();
+        var alignment = VulkanVideoPresenter.GuestStorageBufferOffsetAlignment;
+        for (var index = 0; index < bindings.Count; index++)
+        {
+            var binding = bindings[index];
+            var byteBias = checked((int)(binding.BaseAddress & (alignment - 1)));
+            var destination = checked(
+                (int)plan.DwordOffsets[index] * sizeof(uint) + byteBias);
+            binding.Data.AsSpan(0, binding.DataLength).CopyTo(
+                data.AsSpan(destination, binding.DataLength));
+        }
+
+        return
+        [
+            new Gen5GlobalMemoryBinding(
+                ScalarAddress: 0,
+                BaseAddress: 0,
+                InstructionPcs: [],
+                data,
+                plan.PackedByteLength,
+                DataPooled: true)
+            {
+                Writable = false,
+                WriteBackToGuest = false,
+            },
+        ];
+    }
+
+    private static void ReturnEvaluationGlobalBindingArrays(
+        params Gen5ShaderEvaluation[] evaluations)
+    {
+        var returned = new HashSet<byte[]>(
+            System.Collections.Generic.ReferenceEqualityComparer.Instance);
+        foreach (var evaluation in evaluations)
+        {
+            foreach (var binding in evaluation.GlobalMemoryBindings)
+            {
+                if (binding.DataPooled && returned.Add(binding.Data))
+                {
+                    VulkanVideoPresenter.GuestDataPool.Return(binding.Data);
+                }
+            }
+        }
+    }
+
+    private static void ReturnDiscardedGlobalBindingArrays(
+        IReadOnlyList<Gen5GlobalMemoryBinding> bindings)
+    {
+        var returned = new HashSet<byte[]>(
+            System.Collections.Generic.ReferenceEqualityComparer.Instance);
+        foreach (var binding in bindings)
+        {
+            if (binding.DataPooled && returned.Add(binding.Data))
+            {
+                VulkanVideoPresenter.GuestDataPool.Return(binding.Data);
+            }
+        }
+    }
+
+    /// <summary>
     /// Returns pooled data arrays a translated draw owns but did not hand to
     /// a presenter consumer. The offscreen path hands globals, vertex and
     /// index buffers to the presenter (which returns them), so it passes all
@@ -8937,10 +9332,11 @@ public static partial class AgcExports
     /// one translated pipeline serves every matching shader/resource shape.
     /// </summary>
     private static IReadOnlyList<GuestMemoryBuffer> CreateTranslatedComputeGlobalBuffers(
-        Gen5ShaderEvaluation evaluation)
+        Gen5ShaderEvaluation evaluation,
+        bool bakeScalars)
     {
         var buffers = CreateGuestMemoryBuffers(evaluation.GlobalMemoryBindings);
-        if (_bakeScalars)
+        if (bakeScalars)
         {
             return buffers;
         }
@@ -8987,10 +9383,15 @@ public static partial class AgcExports
             ulong stateFingerprint,
             Gen5ShaderState state,
             Gen5ShaderEvaluation evaluation,
+            int globalBufferBase,
             int totalGlobalBufferCount,
+            int globalDescriptorBinding,
             int imageBindingBase,
             int scalarRegisterBufferIndex,
-            int requiredVertexOutputCount)
+            int requiredVertexOutputCount,
+            IReadOnlyList<int>? globalDescriptorIndices = null,
+            IReadOnlyList<uint>? globalDwordOffsets = null,
+            ulong bufferMappingFingerprint = 0)
     {
         if (evaluation.VertexInputs is not { Count: > 0 } vertexInputs ||
             !vertexInputs.Any(static input => input.DeferredDescriptorAddress != 0))
@@ -9032,10 +9433,13 @@ public static partial class AgcExports
                 shaderAddress,
                 stateFingerprint,
                 layout,
+                globalBufferBase,
                 totalGlobalBufferCount,
+                globalDescriptorBinding,
                 imageBindingBase,
                 scalarRegisterBufferIndex,
                 requiredVertexOutputCount,
+                bufferMappingFingerprint,
                 VulkanVideoPresenter.GuestStorageBufferOffsetAlignment);
             if (_deferredVertexShaderCache.TryGetValue(cacheKey, out var cached))
             {
@@ -9051,13 +9455,16 @@ public static partial class AgcExports
                     refreshedEvaluation,
                     out var shader,
                     out var error,
-                    globalBufferBase: 0,
+                    globalBufferBase: globalBufferBase,
                     totalGlobalBufferCount: totalGlobalBufferCount,
                     imageBindingBase: imageBindingBase,
                     scalarRegisterBufferIndex: scalarRegisterBufferIndex,
                     requiredVertexOutputCount: requiredVertexOutputCount,
                     storageBufferOffsetAlignment:
-                        VulkanVideoPresenter.GuestStorageBufferOffsetAlignment))
+                        VulkanVideoPresenter.GuestStorageBufferOffsetAlignment,
+                    globalDescriptorBinding: globalDescriptorBinding,
+                    globalDescriptorIndices: globalDescriptorIndices,
+                    globalDwordOffsets: globalDwordOffsets))
             {
                 Console.Error.WriteLine(
                     $"[LOADER][WARN] agc.deferred_vertex_compile_failed " +
@@ -9629,7 +10036,8 @@ public static partial class AgcExports
             $"prim=0x{draw.PrimitiveType:X} verts={draw.VertexCount} indexed={draw.IndexBuffer is not null} " +
             $"blend={(blend.Enable ? 1 : 0)}:{blend.ColorSrcFactor}/{blend.ColorDstFactor}/{blend.ColorFunc}" +
             $":a{blend.AlphaSrcFactor}/{blend.AlphaDstFactor}/{blend.AlphaFunc}/s{(blend.SeparateAlphaBlend ? 1 : 0)} " +
-            $"mask=0x{blend.WriteMask:X} viewport={viewport} textures={textureList} pos={positions} " +
+            $"mask=0x{blend.WriteMask:X} viewport={viewport} raster={draw.RenderState.Raster} " +
+            $"textures={textureList} pos={positions} " +
             $"ps_s0..3={string.Join(',', draw.PixelUserData.Take(4).Select(value => BitConverter.UInt32BitsToSingle(value).ToString("0.###")))} " +
             $"rawblend=0x{draw.RawBlendControl:X8} info=0x{draw.RawColorInfo:X8}");
     }
@@ -10325,18 +10733,20 @@ public static partial class AgcExports
         else if ((hasStorageBinding || writesGlobalMemory) &&
             (ulong)localSizeX * localSizeY * localSizeZ <= 1024)
         {
+            var guestGlobalBufferCount = evaluation.GlobalMemoryBindings.Count;
+            var bakeScalars = ShouldBakeScalars(guestGlobalBufferCount);
             var shaderKey = (
                 shaderAddress,
-                _bakeScalars
+                bakeScalars
                     ? ComputeShaderStateFingerprint(evaluation)
                     : ComputeShaderStructuralFingerprint(evaluation),
                 localSizeX,
                 localSizeY,
                 localSizeZ,
                 dispatch.WaveLaneCount,
-                _storageBufferOffsetAlignment);
-            var guestGlobalBufferCount = evaluation.GlobalMemoryBindings.Count;
-            var totalGlobalBufferCount = _bakeScalars
+                VulkanVideoPresenter.GuestStorageBufferOffsetAlignment,
+                bakeScalars);
+            var totalGlobalBufferCount = bakeScalars
                 ? guestGlobalBufferCount
                 : guestGlobalBufferCount + 1;
             _computeShaderCache.TryGetValue(shaderKey, out var computeShader);
@@ -10351,7 +10761,7 @@ public static partial class AgcExports
                     out computeShader,
                     out computeError,
                     totalGlobalBufferCount,
-                    initialScalarBufferIndex: _bakeScalars
+                    initialScalarBufferIndex: bakeScalars
                         ? -1
                         : guestGlobalBufferCount,
                     waveLaneCount: dispatch.WaveLaneCount,
@@ -10375,8 +10785,8 @@ public static partial class AgcExports
                     translatedBindings,
                     out _);
                 var globalMemoryBuffers =
-                    CreateTranslatedComputeGlobalBuffers(evaluation);
-                GuestGpu.Current.SubmitComputeDispatch(
+                    CreateTranslatedComputeGlobalBuffers(evaluation, bakeScalars);
+                var workSequence = GuestGpu.Current.SubmitComputeDispatch(
                     shaderAddress,
                     computeShader,
                     textures,

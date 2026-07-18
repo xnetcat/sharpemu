@@ -132,6 +132,29 @@ public sealed class Gen5ShaderAtomicDecodeTests
         Assert.Equal(new[] { Gen5Operand.Vector(9) }, halfExponential.Destinations);
         Assert.IsType<Gen5SdwaControl>(halfExponential.Control);
 
+        // V_RCP_F16 v21, v20 using the post-intro scene shader's SDWA selectors.
+        var halfReciprocal = DecodeSingle(0x7E2AA8F9, 0x00061514);
+        Assert.Equal("VRcpF16", halfReciprocal.Opcode);
+        Assert.Equal(new[] { Gen5Operand.Vector(20) }, halfReciprocal.Sources);
+        Assert.Equal(new[] { Gen5Operand.Vector(21) }, halfReciprocal.Destinations);
+        Assert.IsType<Gen5SdwaControl>(halfReciprocal.Control);
+
+        // V_MIN3_F16 v3, v0, v1, v2 from the first post-title scene shader.
+        var halfMinimum = DecodeSingle(0xD3510003, 0x040A0300);
+        Assert.Equal("VMin3F16", halfMinimum.Opcode);
+        Assert.Equal(
+            new[] { Gen5Operand.Vector(0), Gen5Operand.Vector(1), Gen5Operand.Vector(2) },
+            halfMinimum.Sources);
+        Assert.Equal(new[] { Gen5Operand.Vector(3) }, halfMinimum.Destinations);
+        Assert.IsType<Gen5Vop3Control>(halfMinimum.Control);
+
+        // V_XAD_U32 v3, v0, v1, v2: (src0 XOR src1) + src2.
+        var xorAdd = DecodeSingle(0xD3450003, 0x040A0300);
+        Assert.Equal("VXadU32", xorAdd.Opcode);
+        Assert.Equal(
+            new[] { Gen5Operand.Vector(0), Gen5Operand.Vector(1), Gen5Operand.Vector(2) },
+            xorAdd.Sources);
+
         // V_BFE_I32 v3, v0, v1, v2 and V_CVT_PK_U16_U32 v3, v0, v1.
         var signedBitfield = DecodeSingle(0xD5490003, 0x040A0300);
         Assert.Equal("VBfeI32", signedBitfield.Opcode);
@@ -177,6 +200,34 @@ public sealed class Gen5ShaderAtomicDecodeTests
         Assert.Equal("DsReadAddtidB32", addThreadIdRead.Opcode);
         Assert.Empty(addThreadIdRead.Sources);
         Assert.Equal(new[] { Gen5Operand.Vector(57) }, addThreadIdRead.Destinations);
+    }
+
+    [Fact]
+    public void SetPcTail_TerminatesBeforeShaderFooter()
+    {
+        var memory = new FakeCpuMemory(ShaderAddress, 0x1000);
+        var ctx = new CpuContext(memory, Generation.Gen5);
+        WriteProgram(
+            memory,
+            ShaderAddress,
+            [
+                0xBE802006, // S_SETPC_B64 s[6:7]
+                0x30306C73, // "sl00" shader-footer signature
+                0x0000023E,
+            ]);
+
+        Assert.True(
+            Gen5ShaderTranslator.TryCreateState(
+                ctx,
+                ShaderAddress,
+                0,
+                new Dictionary<uint, uint> { [ComputePgmRsrc2Register] = 0 },
+                ComputeUserDataRegister,
+                out var state,
+                out var error),
+            error);
+        var tail = Assert.Single(state.Program.Instructions);
+        Assert.Equal("SSetpcB64", tail.Opcode);
     }
 
     private static Gen5ShaderInstruction DecodeSingle(params uint[] words)

@@ -32,7 +32,10 @@ public static partial class Gen5SpirvTranslator
         uint pixelInputEnable = 0,
         uint pixelInputAddress = 0,
         IReadOnlyDictionary<uint, uint>? pixelInputLocations = null,
-        ulong storageBufferOffsetAlignment = 1) =>
+        ulong storageBufferOffsetAlignment = 1,
+        int globalDescriptorBinding = 0,
+        IReadOnlyList<int>? globalDescriptorIndices = null,
+        IReadOnlyList<uint>? globalDwordOffsets = null) =>
         TryCompilePixelShader(
             state,
             evaluation,
@@ -46,7 +49,10 @@ public static partial class Gen5SpirvTranslator
             pixelInputEnable,
             pixelInputAddress,
             pixelInputLocations,
-            storageBufferOffsetAlignment);
+            storageBufferOffsetAlignment,
+            globalDescriptorBinding,
+            globalDescriptorIndices,
+            globalDwordOffsets);
 
     public static bool TryCompilePixelShader(
         Gen5ShaderState state,
@@ -61,7 +67,10 @@ public static partial class Gen5SpirvTranslator
         uint pixelInputEnable = 0,
         uint pixelInputAddress = 0,
         IReadOnlyDictionary<uint, uint>? pixelInputLocations = null,
-        ulong storageBufferOffsetAlignment = 1)
+        ulong storageBufferOffsetAlignment = 1,
+        int globalDescriptorBinding = 0,
+        IReadOnlyList<int>? globalDescriptorIndices = null,
+        IReadOnlyList<uint>? globalDwordOffsets = null)
     {
         if (outputs.Count > 8 || outputs.Any(output => output.GuestSlot > 7))
         {
@@ -103,7 +112,10 @@ public static partial class Gen5SpirvTranslator
             pixelInputEnable: pixelInputEnable,
             pixelInputAddress: pixelInputAddress,
             pixelInputLocations: pixelInputLocations,
-            storageBufferOffsetAlignment: storageBufferOffsetAlignment);
+            storageBufferOffsetAlignment: storageBufferOffsetAlignment,
+            globalDescriptorBinding: globalDescriptorBinding,
+            globalDescriptorIndices: globalDescriptorIndices,
+            globalDwordOffsets: globalDwordOffsets);
         return context.TryCompile(out shader, out error);
     }
 
@@ -117,7 +129,10 @@ public static partial class Gen5SpirvTranslator
         int imageBindingBase = 0,
         int initialScalarBufferIndex = -1,
         int requiredVertexOutputCount = 0,
-        ulong storageBufferOffsetAlignment = 1)
+        ulong storageBufferOffsetAlignment = 1,
+        int globalDescriptorBinding = 0,
+        IReadOnlyList<int>? globalDescriptorIndices = null,
+        IReadOnlyList<uint>? globalDwordOffsets = null)
     {
         var context = new CompilationContext(
             Gen5SpirvStage.Vertex,
@@ -132,7 +147,10 @@ public static partial class Gen5SpirvTranslator
             imageBindingBase,
             initialScalarBufferIndex,
             requiredVertexOutputCount: requiredVertexOutputCount,
-            storageBufferOffsetAlignment: storageBufferOffsetAlignment);
+            storageBufferOffsetAlignment: storageBufferOffsetAlignment,
+            globalDescriptorBinding: globalDescriptorBinding,
+            globalDescriptorIndices: globalDescriptorIndices,
+            globalDwordOffsets: globalDwordOffsets);
         return context.TryCompile(out shader, out error);
     }
 
@@ -237,6 +255,9 @@ public static partial class Gen5SpirvTranslator
         private readonly uint _localSizeZ;
         private readonly int _globalBufferBase;
         private readonly int _totalGlobalBufferCount;
+        private readonly int _globalDescriptorBinding;
+        private readonly IReadOnlyList<int>? _globalDescriptorIndices;
+        private readonly IReadOnlyList<uint>? _globalDwordOffsets;
         private readonly int _imageBindingBase;
         private readonly int _initialScalarBufferIndex;
         private readonly uint _initialScalarWordOffset;
@@ -270,13 +291,11 @@ public static partial class Gen5SpirvTranslator
         private uint _uvec3Type;
         private uint _uvec4Type;
         private uint _privateUintPointer;
-        private uint _privateVec2Pointer;
         private uint _privateBoolPointer;
         private uint _runtimeBufferBiases;
         private uint _runtimeBufferLengths;
         private uint _scalarRegisters;
         private uint _vectorRegisters;
-        private uint _packedHalfRegisters;
         private uint _scc;
         private uint _vcc;
         private uint _exec;
@@ -361,7 +380,10 @@ public static partial class Gen5SpirvTranslator
             IReadOnlyDictionary<uint, uint>? pixelInputLocations = null,
             int requiredVertexOutputCount = 0,
             uint waveLaneCount = 32,
-            ulong storageBufferOffsetAlignment = 1)
+            ulong storageBufferOffsetAlignment = 1,
+            int globalDescriptorBinding = 0,
+            IReadOnlyList<int>? globalDescriptorIndices = null,
+            IReadOnlyList<uint>? globalDwordOffsets = null)
         {
             _stage = stage;
             _requiredVertexOutputCount = requiredVertexOutputCount;
@@ -380,6 +402,38 @@ public static partial class Gen5SpirvTranslator
             _totalGlobalBufferCount = totalGlobalBufferCount < 0
                 ? evaluation.GlobalMemoryBindings.Count
                 : totalGlobalBufferCount;
+            if (globalDescriptorBinding < 0)
+            {
+                throw new ArgumentOutOfRangeException(
+                    nameof(globalDescriptorBinding),
+                    globalDescriptorBinding,
+                    "descriptor bindings cannot be negative");
+            }
+            _globalDescriptorBinding = globalDescriptorBinding;
+            if (globalDescriptorIndices is not null &&
+                globalDescriptorIndices.Count != evaluation.GlobalMemoryBindings.Count)
+            {
+                throw new ArgumentException(
+                    "global descriptor-index mapping must match the logical binding count",
+                    nameof(globalDescriptorIndices));
+            }
+            if (globalDwordOffsets is not null &&
+                globalDwordOffsets.Count != evaluation.GlobalMemoryBindings.Count)
+            {
+                throw new ArgumentException(
+                    "global dword-offset mapping must match the logical binding count",
+                    nameof(globalDwordOffsets));
+            }
+            if (globalDescriptorIndices is not null &&
+                globalDescriptorIndices.Any(
+                    index => index < 0 || index >= _totalGlobalBufferCount))
+            {
+                throw new ArgumentOutOfRangeException(
+                    nameof(globalDescriptorIndices),
+                    "logical bindings must map inside the declared descriptor array");
+            }
+            _globalDescriptorIndices = globalDescriptorIndices;
+            _globalDwordOffsets = globalDwordOffsets;
             _imageBindingBase = imageBindingBase;
             _initialScalarBufferIndex = initialScalarBufferIndex;
             // Graphics keeps the pixel and vertex runtime state in one
@@ -755,20 +809,15 @@ public static partial class Gen5SpirvTranslator
             _uvec4Type = _module.TypeVector(_uintType, 4);
             _privateUintPointer =
                 _module.TypePointer(SpirvStorageClass.Private, _uintType);
-            _privateVec2Pointer =
-                _module.TypePointer(SpirvStorageClass.Private, _vec2Type);
             _privateBoolPointer =
                 _module.TypePointer(SpirvStorageClass.Private, _boolType);
 
             var scalarArrayType = _module.TypeArray(_uintType, ScalarRegisterCount);
             var vectorArrayType = _module.TypeArray(_uintType, VectorRegisterCount);
-            var packedHalfArrayType = _module.TypeArray(_vec2Type, VectorRegisterCount);
             var privateScalarArrayPointer =
                 _module.TypePointer(SpirvStorageClass.Private, scalarArrayType);
             var privateVectorArrayPointer =
                 _module.TypePointer(SpirvStorageClass.Private, vectorArrayType);
-            var privatePackedHalfArrayPointer =
-                _module.TypePointer(SpirvStorageClass.Private, packedHalfArrayType);
             _scalarRegisters = _module.AddGlobalVariable(
                 privateScalarArrayPointer,
                 SpirvStorageClass.Private,
@@ -777,10 +826,6 @@ public static partial class Gen5SpirvTranslator
                 privateVectorArrayPointer,
                 SpirvStorageClass.Private,
                 _module.ConstantNull(vectorArrayType));
-            _packedHalfRegisters = _module.AddGlobalVariable(
-                privatePackedHalfArrayPointer,
-                SpirvStorageClass.Private,
-                _module.ConstantNull(packedHalfArrayType));
             _scc = _module.AddGlobalVariable(
                 _privateBoolPointer,
                 SpirvStorageClass.Private,
@@ -817,7 +862,6 @@ public static partial class Gen5SpirvTranslator
 
             _interfaces.Add(_scalarRegisters);
             _interfaces.Add(_vectorRegisters);
-            _interfaces.Add(_packedHalfRegisters);
             _interfaces.Add(_scc);
             _interfaces.Add(_vcc);
             _interfaces.Add(_exec);
@@ -826,7 +870,6 @@ public static partial class Gen5SpirvTranslator
             _interfaces.Add(_programActive);
             _module.AddName(_scalarRegisters, "sgpr");
             _module.AddName(_vectorRegisters, "vgpr");
-            _module.AddName(_packedHalfRegisters, "vgprPackedHalf");
 
             var runtimeBufferBiasCount =
                 _globalBufferBase + _evaluation.GlobalMemoryBindings.Count;
@@ -1000,7 +1043,10 @@ public static partial class Gen5SpirvTranslator
                 SpirvStorageClass.StorageBuffer);
             _module.AddName(_globalBuffers, "guestBuffers");
             _module.AddDecoration(_globalBuffers, SpirvDecoration.DescriptorSet, 0);
-            _module.AddDecoration(_globalBuffers, SpirvDecoration.Binding, 0);
+            _module.AddDecoration(
+                _globalBuffers,
+                SpirvDecoration.Binding,
+                (uint)_globalDescriptorBinding);
             _interfaces.Add(_globalBuffers);
         }
 
@@ -1676,7 +1722,8 @@ public static partial class Gen5SpirvTranslator
             for (var index = block.StartIndex; index < block.EndIndex; index++)
             {
                 var instruction = _state.Program.Instructions[index];
-                if (IsBranch(instruction.Opcode) || instruction.Opcode == "SEndpgm")
+                if (IsBranch(instruction.Opcode) ||
+                    IsProgramTerminator(instruction.Opcode))
                 {
                     continue;
                 }
@@ -1694,7 +1741,7 @@ public static partial class Gen5SpirvTranslator
             }
 
             var terminator = _state.Program.Instructions[block.EndIndex - 1];
-            if (terminator.Opcode == "SEndpgm")
+            if (IsProgramTerminator(terminator.Opcode))
             {
                 Store(_programActive, _module.ConstantBool(false));
                 return true;
@@ -2475,6 +2522,11 @@ public static partial class Gen5SpirvTranslator
                 return TryEmitVertexInputFetch(control, vertexInput, out error);
             }
 
+            if (_evaluation.SyntheticZeroBufferPcs?.Contains(instruction.Pc) == true)
+            {
+                return TryEmitSyntheticZeroBufferMemory(instruction, control, out error);
+            }
+
             if (!TryResolveDominatingBufferBinding(
                     instruction.Pc,
                     control.ScalarResource,
@@ -2632,6 +2684,64 @@ public static partial class Gen5SpirvTranslator
                     LoadUnalignedBufferWord(bindingIndex, address));
             }
 
+            return true;
+        }
+
+        private bool TryEmitSyntheticZeroBufferMemory(
+            Gen5ShaderInstruction instruction,
+            Gen5BufferMemoryControl control,
+            out string error)
+        {
+            error = string.Empty;
+            if (instruction.Opcode.StartsWith("BufferAtomic", StringComparison.Ordinal))
+            {
+                if (!TryGetAtomicOp(instruction.Opcode["BufferAtomic".Length..], out _))
+                {
+                    error = $"unsupported buffer opcode {instruction.Opcode}";
+                    return false;
+                }
+
+                if (control.Glc)
+                {
+                    StoreV(control.VectorData, UInt(0));
+                }
+                return true;
+            }
+
+            if (instruction.Opcode.StartsWith("BufferStore", StringComparison.Ordinal) ||
+                instruction.Opcode.StartsWith("TBufferStore", StringComparison.Ordinal))
+            {
+                return true;
+            }
+
+            if (!instruction.Opcode.StartsWith("BufferLoad", StringComparison.Ordinal) &&
+                !instruction.Opcode.StartsWith("TBufferLoad", StringComparison.Ordinal))
+            {
+                error = $"unsupported buffer opcode {instruction.Opcode}";
+                return false;
+            }
+
+            if (TryGetSubdwordLoadInfo(
+                    instruction.Opcode,
+                    out _,
+                    out _,
+                    out var d16,
+                    out var d16High) &&
+                d16)
+            {
+                var previous = LoadV(control.VectorData);
+                StoreV(
+                    control.VectorData,
+                    d16High
+                        ? BitwiseAnd(previous, UInt(0x0000_FFFF))
+                        : BitwiseAnd(previous, UInt(0xFFFF_0000)));
+                return true;
+            }
+
+            for (uint index = 0; index < control.DwordCount; index++)
+            {
+                StoreV(control.VectorData + index, UInt(0));
+            }
             return true;
         }
 
@@ -4888,14 +4998,6 @@ public static partial class Gen5SpirvTranslator
             Gen5ShaderInstruction instruction,
             int component)
         {
-            if (TryLoadPackedHalfExportComponent(
-                    instruction,
-                    component,
-                    out var shadowValue))
-            {
-                return shadowValue;
-            }
-
             var packed = LoadV(instruction.Sources[component >> 1].Value);
             var unpacked = Ext(62, _vec2Type, packed);
             return _module.AddInstruction(
@@ -4903,132 +5005,6 @@ public static partial class Gen5SpirvTranslator
                 _floatType,
                 unpacked,
                 (uint)(component & 1));
-        }
-
-        private bool TryLoadPackedHalfExportComponent(
-            Gen5ShaderInstruction exportInstruction,
-            int component,
-            out uint value)
-        {
-            value = 0;
-            var packedSource = exportInstruction.Sources[component >> 1];
-            var tracePackedExport =
-                Environment.GetEnvironmentVariable(
-                    "SHARPEMU_TRACE_PACKED_EXPORT") == "1" &&
-                _state.Program.Address == 0x0000000500781200ul;
-            if (tracePackedExport)
-            {
-                Console.Error.WriteLine(
-                    $"[AGC][PACKED-EXPORT] exp_pc=0x{exportInstruction.Pc:X} " +
-                    $"component={component} source={packedSource.Kind}:" +
-                    $"{packedSource.Value}");
-                if (component == 0 && exportInstruction.Pc == 0x630)
-                {
-                    foreach (var decoded in _state.Program.Instructions.Where(
-                                 static decoded => decoded.Pc <= 0x640))
-                    {
-                        Console.Error.WriteLine(
-                            $"[AGC][TITLE-IR] 0x{decoded.Pc:X4} " +
-                            $"{decoded.Opcode} dst=[" +
-                            string.Join(',', decoded.Destinations) +
-                            "] src=[" +
-                            string.Join(',', decoded.Sources) + "] words=[" +
-                            string.Join(',', decoded.Words.Select(static word => $"{word:X8}")) +
-                            "] ctrl=" + decoded.Control);
-                    }
-                }
-            }
-            if (packedSource.Kind != Gen5OperandKind.VectorRegister)
-            {
-                if (tracePackedExport)
-                {
-                    Console.Error.WriteLine(
-                        "[AGC][PACKED-EXPORT] rejected: source is not a VGPR");
-                }
-                return false;
-            }
-
-            for (var index = _state.Program.Instructions.Count - 1; index >= 0; index--)
-            {
-                var candidate = _state.Program.Instructions[index];
-                if (candidate.Pc >= exportInstruction.Pc)
-                {
-                    continue;
-                }
-
-                if (exportInstruction.Pc - candidate.Pc > 128)
-                {
-                    break;
-                }
-
-                if (!candidate.Destinations.Any(destination =>
-                        destination.Kind == Gen5OperandKind.VectorRegister &&
-                        destination.Value == packedSource.Value))
-                {
-                    continue;
-                }
-
-                if (tracePackedExport)
-                {
-                    Console.Error.WriteLine(
-                        $"[AGC][PACKED-EXPORT] nearest_pc=0x{candidate.Pc:X} " +
-                        $"opcode={candidate.Opcode} distance=" +
-                        $"{exportInstruction.Pc - candidate.Pc}");
-                }
-
-                if (candidate.Opcode != "VCvtPkrtzF16F32" ||
-                    candidate.Sources.Count < 2)
-                {
-                    if (tracePackedExport)
-                    {
-                        Console.Error.WriteLine(
-                            "[AGC][PACKED-EXPORT] rejected: nearest writer is " +
-                            candidate.Opcode);
-                    }
-                    return false;
-                }
-
-                var packedPointer = PackedHalfPointer(packedSource.Value);
-                if (Environment.GetEnvironmentVariable(
-                        "SHARPEMU_FORCE_PACKED_EXPORT_STORE_ONE") == "1" &&
-                    _state.Program.Address == 0x0000000500781200ul)
-                {
-                    Store(
-                        packedPointer,
-                        _module.AddInstruction(
-                            SpirvOp.CompositeConstruct,
-                            _vec2Type,
-                            Float(1f),
-                            Float(1f)));
-                }
-
-                var packedPair = Load(
-                    _vec2Type,
-                    packedPointer);
-                value = _module.AddInstruction(
-                    SpirvOp.CompositeExtract,
-                    _floatType,
-                    packedPair,
-                    (uint)(component & 1));
-                if (Environment.GetEnvironmentVariable(
-                        "SHARPEMU_FORCE_PACKED_EXPORT_ONE") == "1")
-                {
-                    value = Float(1f);
-                }
-                if (tracePackedExport)
-                {
-                    Console.Error.WriteLine(
-                        "[AGC][PACKED-EXPORT] selected shadow pair");
-                }
-                return true;
-            }
-
-            if (tracePackedExport)
-            {
-                Console.Error.WriteLine(
-                    "[AGC][PACKED-EXPORT] rejected: no nearby writer");
-            }
-            return false;
         }
 
         private uint GetPixelOutputType(Gen5PixelOutputKind kind) =>
@@ -5170,14 +5146,30 @@ public static partial class Gen5SpirvTranslator
                 0);
         }
 
-        private uint BufferWordPointer(int binding, uint dwordAddress) =>
-            _module.AddInstruction(
+        private uint BufferWordPointer(int binding, uint dwordAddress)
+        {
+            var evaluationBinding = binding - _globalBufferBase;
+            var descriptorBinding =
+                _globalDescriptorIndices is not null &&
+                (uint)evaluationBinding < (uint)_globalDescriptorIndices.Count
+                    ? _globalDescriptorIndices[evaluationBinding]
+                    : binding;
+            var dwordOffset =
+                _globalDwordOffsets is not null &&
+                (uint)evaluationBinding < (uint)_globalDwordOffsets.Count
+                    ? _globalDwordOffsets[evaluationBinding]
+                    : 0;
+            var descriptorAddress = dwordOffset == 0
+                ? dwordAddress
+                : IAdd(dwordAddress, UInt(dwordOffset));
+            return _module.AddInstruction(
                 SpirvOp.AccessChain,
                 _storageUintPointer,
                 _globalBuffers,
-                UInt((uint)binding),
+                UInt((uint)descriptorBinding),
                 UInt(0),
-                dwordAddress);
+                descriptorAddress);
+        }
 
         private uint ScalarPointer(uint register) =>
             _module.AddInstruction(
@@ -5205,13 +5197,6 @@ public static partial class Gen5SpirvTranslator
                 SpirvOp.AccessChain,
                 _privateUintPointer,
                 _vectorRegisters,
-                UInt(register));
-
-        private uint PackedHalfPointer(uint register) =>
-            _module.AddInstruction(
-                SpirvOp.AccessChain,
-                _privateVec2Pointer,
-                _packedHalfRegisters,
                 UInt(register));
 
         private uint LoadS(uint register) => Load(_uintType, ScalarPointer(register));
@@ -5246,42 +5231,6 @@ public static partial class Gen5SpirvTranslator
             }
 
             Store(VectorPointer(register), value);
-        }
-
-        private void StorePackedHalf(uint register, uint value)
-        {
-            var active = Load(_boolType, _exec);
-            if (Environment.GetEnvironmentVariable(
-                    "SHARPEMU_FORCE_PACKED_STORE_EXEC_VALUES") == "1" &&
-                _state.Program.Address == 0x0000000500781200ul)
-            {
-                var activePair = _module.AddInstruction(
-                    SpirvOp.CompositeConstruct,
-                    _vec2Type,
-                    Float(1f),
-                    Float(1f));
-                var inactivePair = _module.AddInstruction(
-                    SpirvOp.CompositeConstruct,
-                    _vec2Type,
-                    Float(0.5f),
-                    Float(0.5f));
-                value = _module.AddInstruction(
-                    SpirvOp.Select,
-                    _vec2Type,
-                    active,
-                    activePair,
-                    inactivePair);
-                Store(PackedHalfPointer(register), value);
-                return;
-            }
-
-            value = _module.AddInstruction(
-                SpirvOp.Select,
-                _vec2Type,
-                active,
-                value,
-                Load(_vec2Type, PackedHalfPointer(register)));
-            Store(PackedHalfPointer(register), value);
         }
 
         private uint Load(uint type, uint pointer)
@@ -5643,6 +5592,9 @@ public static partial class Gen5SpirvTranslator
             opcode == "SBranch" ||
             opcode.StartsWith("SCbranch", StringComparison.Ordinal);
 
+        private static bool IsProgramTerminator(string opcode) =>
+            opcode is "SEndpgm" or "SSetpcB64";
+
         private static bool TryGetBranchTargetPc(
             Gen5ShaderInstruction instruction,
             out uint targetPc)
@@ -5685,7 +5637,8 @@ public static partial class Gen5SpirvTranslator
                     leaders.Add(targetPc);
                 }
 
-                if ((IsBranch(instruction.Opcode) || instruction.Opcode == "SEndpgm") &&
+                if ((IsBranch(instruction.Opcode) ||
+                     IsProgramTerminator(instruction.Opcode)) &&
                     index + 1 < instructions.Count)
                 {
                     leaders.Add(instructions[index + 1].Pc);
@@ -5736,7 +5689,7 @@ public static partial class Gen5SpirvTranslator
                 var block = blocks[blockIndex];
                 var terminator = instructions[block.EndIndex - 1];
                 var hasFallthrough = blockIndex + 1 < blocks.Count;
-                if (terminator.Opcode == "SEndpgm")
+                if (IsProgramTerminator(terminator.Opcode))
                 {
                     continue;
                 }

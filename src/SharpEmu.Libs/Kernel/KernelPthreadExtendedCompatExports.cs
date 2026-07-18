@@ -1324,6 +1324,7 @@ public static class KernelPthreadExtendedCompatExports
             currentThreadHandle,
             static _ => new ConcurrentDictionary<int, ulong>());
         values[key] = value;
+        MallocBinned3FreeListTracker.NoteTlsPoolCandidate(value);
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }

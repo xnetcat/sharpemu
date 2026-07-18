@@ -76,6 +76,9 @@ public sealed class Gen5SpirvAtomicTranslationTests
                 0x7E06A4F9, 0x00061500, // V_CVT_U16_F16 v3, v0 (SDWA)
                 0x7E0CAEF9, 0x00251501, // V_LOG_F16 v6, v1 (SDWA)
                 0x7E12B0F9, 0x0005150A, // V_EXP_F16 v9, v10 (SDWA)
+                0x7E2AA8F9, 0x00061514, // V_RCP_F16 v21, v20 (SDWA)
+                0xD3510003, 0x040A0300, // V_MIN3_F16 v3, v0, v1, v2
+                0xD3450003, 0x040A0300, // V_XAD_U32 v3, v0, v1, v2
                 0xD5490003, 0x040A0300, // V_BFE_I32 v3, v0, v1, v2
                 0xD76A0003, 0x040A0300, // V_CVT_PK_U16_U32 v3, v0, v1
                 0xD1780003, 0x040A0300, // V_XOR3_B32 v3, v0, v1, v2
@@ -83,6 +86,7 @@ public sealed class Gen5SpirvAtomicTranslationTests
                 0xD3000003, 0x00020300, // V_LSHRREV_B64 v[3:4], v0, v[1:2]
                 0xDAC00102, 0x00001700, // DS_WRITE_ADDTID_B32 v23 offset:0x102
                 0xDAC40100, 0x39000000, // DS_READ_ADDTID_B32 v57 offset:0x100
+                0xBE802006,             // S_SETPC_B64 s[6:7] shader tail
             ],
             new Dictionary<uint, uint>
             {
@@ -92,6 +96,7 @@ public sealed class Gen5SpirvAtomicTranslationTests
 
         Assert.Contains((ushort)SpirvOp.BitCount, opcodes);
         Assert.Contains((ushort)SpirvOp.ConvertFToU, opcodes);
+        Assert.Contains((ushort)SpirvOp.FDiv, opcodes);
         Assert.Contains((ushort)SpirvOp.BitFieldSExtract, opcodes);
         Assert.Contains((ushort)SpirvOp.ShiftLeftLogical, opcodes);
         Assert.Contains((ushort)SpirvOp.ShiftRightLogical, opcodes);
