@@ -220,6 +220,81 @@ public static class AudioOutExports
     }
 
     [SysAbiExport(
+        Nid = "GrQ9s4IrNaQ",
+        ExportName = "sceAudioOutGetPortState",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceAudioOut")]
+    public static int AudioOutGetPortState(CpuContext ctx)
+    {
+        var handle = unchecked((int)ctx[CpuRegister.Rdi]);
+        var stateAddress = ctx[CpuRegister.Rsi];
+        if (!Ports.TryGetValue(handle, out var port))
+        {
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        if (stateAddress == 0)
+        {
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        const ushort connectedPrimary = 0x01;
+        const ushort connectedTertiary = 0x04;
+        const ushort connectedHeadphone = 0x40;
+        const ushort connectedExternal = 0x80;
+
+        ushort output;
+        byte channels;
+        short volume;
+        switch (port.Type)
+        {
+            case 0:   // Main
+            case 1:   // BGM
+            case 126: // Audio3d
+                output = connectedPrimary;
+                channels = checked((byte)Math.Min(port.Channels, 2));
+                volume = -1;
+                break;
+            case 2: // Voice
+            case 3: // Personal
+                output = connectedHeadphone;
+                channels = 1;
+                volume = -1;
+                break;
+            case 4: // Controller speaker
+                output = connectedTertiary;
+                channels = 1;
+                volume = 127;
+                break;
+            case 127: // Auxiliary
+                output = connectedExternal;
+                channels = 0;
+                volume = -1;
+                break;
+            default:
+                output = 0;
+                channels = 0;
+                volume = -1;
+                break;
+        }
+
+        // OrbisAudioOutPortState is 32 bytes:
+        // u16 output, u8 channel, padding, s16 volume, u16 reroute counter,
+        // u64 flags and two reserved u64 values.
+        Span<byte> state = stackalloc byte[32];
+        state.Clear();
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(state, output);
+        state[2] = channels;
+        System.Buffers.Binary.BinaryPrimitives.WriteInt16LittleEndian(state[4..], volume);
+        if (!ctx.Memory.TryWrite(stateAddress, state))
+        {
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(
         Nid = "b+uAV89IlxE",
         ExportName = "sceAudioOutSetVolume",
         Target = Generation.Gen4 | Generation.Gen5,

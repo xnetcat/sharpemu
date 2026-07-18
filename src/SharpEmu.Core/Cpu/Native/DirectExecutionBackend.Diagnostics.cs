@@ -91,6 +91,56 @@ public sealed partial class DirectExecutionBackend
 		}
 	}
 
+	private static void RecordGuestThreadImportTrace(
+		GuestThreadState thread,
+		long dispatchIndex,
+		string nid,
+		ulong returnRip,
+		ulong arg0,
+		ulong arg1,
+		ulong arg2)
+	{
+		var trace = thread.RecentImports;
+		trace[thread.RecentImportWriteIndex] = new RecentImportTraceEntry(
+			dispatchIndex,
+			nid,
+			returnRip,
+			arg0,
+			arg1,
+			arg2,
+			thread.ThreadHandle,
+			Environment.CurrentManagedThreadId);
+		thread.RecentImportWriteIndex = (thread.RecentImportWriteIndex + 1) % trace.Length;
+		if (thread.RecentImportCount < trace.Length)
+		{
+			thread.RecentImportCount++;
+		}
+	}
+
+	private static void DumpGuestThreadImportTrace(GuestThreadState thread)
+	{
+		var trace = thread.RecentImports;
+		if (thread.RecentImportCount == 0)
+		{
+			return;
+		}
+
+		Console.Error.WriteLine(
+			$"[LOADER][INFO]   Recent imports for guest=0x{thread.ThreadHandle:X16} ({thread.RecentImportCount}):");
+		var index = (thread.RecentImportWriteIndex - thread.RecentImportCount + trace.Length) % trace.Length;
+		for (var i = 0; i < thread.RecentImportCount; i++)
+		{
+			var entry = trace[(index + i) % trace.Length];
+			if (!string.IsNullOrEmpty(entry.Nid))
+			{
+				Console.Error.WriteLine(
+					$"[LOADER][INFO]     #{entry.DispatchIndex} nid={entry.Nid} " +
+					$"ret=0x{entry.ReturnRip:X16} rdi=0x{entry.Arg0:X16} " +
+					$"rsi=0x{entry.Arg1:X16} rdx=0x{entry.Arg2:X16}");
+			}
+		}
+	}
+
 	private void DumpRecentImportTrace()
 	{
 		var trace = _recentImportTrace;

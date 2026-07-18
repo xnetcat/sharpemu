@@ -97,6 +97,23 @@ public sealed class VirtualMemory : IVirtualMemory
         }
     }
 
+    public bool IsRangeReadable(ulong virtualAddress, int length)
+    {
+        if (length < 0)
+        {
+            return false;
+        }
+
+        lock (_gate)
+        {
+            return TryValidateRange(
+                virtualAddress,
+                length,
+                ProgramHeaderFlags.Read,
+                out _);
+        }
+    }
+
     private bool TryValidateRange(
         ulong virtualAddress,
         int length,

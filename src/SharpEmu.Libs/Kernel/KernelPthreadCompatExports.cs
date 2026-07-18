@@ -139,7 +139,9 @@ public static class KernelPthreadCompatExports
         LibraryName = "libKernel")]
     public static int PthreadYield(CpuContext ctx)
     {
-        _ = ctx;
+        // A title may wait for AvPlayer's StateReady callback by yielding,
+        // without polling AvPlayer or submitting another frame.
+        AvPlayer.AvPlayerExports.PumpPendingEvents(ctx);
         Thread.Yield();
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }

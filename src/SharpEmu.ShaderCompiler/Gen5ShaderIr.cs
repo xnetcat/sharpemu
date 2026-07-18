@@ -297,8 +297,8 @@ public sealed record Gen5ImageBinding(
 }
 
 // Data arrays may be rented from ArrayPool (oversized): always slice with
-// DataLength, never Data.Length. Ownership transfers to the presenter, which
-// returns pooled arrays after uploading them into host-visible buffers.
+// DataLength, never Data.Length. Read-only guest-backed bindings can instead
+// carry no array and be resolved by guest VA immediately before GPU execution.
 public sealed record Gen5GlobalMemoryBinding(
     uint ScalarAddress,
     ulong BaseAddress,
@@ -316,6 +316,26 @@ public sealed record Gen5GlobalMemoryBinding(
     // storage must remain shader-writable, but must never be copied to the
     // descriptor's unmapped guest address.
     public bool WriteBackToGuest { get; set; } = true;
+
+    /// <summary>
+    /// Guest address of a late-written four-dword buffer descriptor. When
+    /// nonzero, the render thread resolves the descriptor and snapshots its
+    /// target at queue-execution time rather than command-parse time.
+    /// </summary>
+    public ulong DeferredDescriptorAddress { get; init; }
+
+    /// <summary>
+    /// Multi-hop source for a late-written buffer descriptor whose containing
+    /// table pointer is itself loaded indirectly.
+    /// </summary>
+    public Gen5DescriptorChain? DeferredChain { get; init; }
+
+    /// <summary>
+    /// The full binding is readable through <c>CpuContext.Memory</c> and
+    /// should be consumed from guest VA at presenter execution time. This
+    /// avoids copying immutable multi-megabyte resources once per draw.
+    /// </summary>
+    public bool ReadFromGuestAtExecution { get; init; }
 }
 
 public sealed record Gen5VertexInputBinding(
@@ -329,7 +349,14 @@ public sealed record Gen5VertexInputBinding(
     uint OffsetBytes,
     byte[] Data,
     int DataLength,
-    bool DataPooled);
+    bool DataPooled)
+{
+    /// <summary>
+    /// The vertex range is readable through <c>CpuContext.Memory</c> and
+    /// is intentionally not snapshotted while parsing the command list.
+    /// </summary>
+    public bool ReadFromGuestAtExecution { get; init; }
+}
 
 public sealed record Gen5ShaderEvaluation(
     IReadOnlyList<uint> InitialScalarRegisters,
@@ -338,7 +365,11 @@ public sealed record Gen5ShaderEvaluation(
     IReadOnlyList<Gen5GlobalMemoryBinding> GlobalMemoryBindings,
     Gen5ComputeSystemRegisters? ComputeSystemRegisters = null,
     IReadOnlySet<uint>? RuntimeScalarRegisters = null,
-    IReadOnlyList<Gen5VertexInputBinding>? VertexInputs = null);
+    IReadOnlyList<Gen5VertexInputBinding>? VertexInputs = null,
+    // Execution-time refresh map for the packed runtime scalar block. Each
+    // entry patches one shader-entry SGPR that arrived through an indirect
+    // user-data table which the guest may rewrite after command parsing.
+    IReadOnlyList<(int Offset, ulong Source)>? RuntimeScalarRefreshes = null);
 
 public sealed record Gen5ShaderInstruction(
     uint Pc,

@@ -126,11 +126,9 @@ internal sealed unsafe class PosixHostMemory : IHostMemory
 
     public void FlushInstructionCache(ulong address, ulong size)
     {
-        _ = address;
-        _ = size;
-        // The supported POSIX process is x86-64 (including Rosetta 2), whose
-        // instruction cache is coherent. A future arm64 backend must call the
-        // platform instruction-cache invalidation API here.
+        global::SharpEmu.HLE.HostMemory.FlushInstructionCache(
+            (void*)address,
+            checked((nuint)size));
     }
 
     private static uint ToNativeProtection(HostPageProtection protection) => protection switch

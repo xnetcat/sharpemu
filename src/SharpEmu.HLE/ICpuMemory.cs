@@ -10,4 +10,10 @@ public interface ICpuMemory
     bool TryWrite(ulong virtualAddress, ReadOnlySpan<byte> source);
 
     bool TryCompare(ulong virtualAddress, ReadOnlySpan<byte> expected) => false;
+
+    /// <summary>
+    /// Reports whether a complete range can be read without copying it. Memory
+    /// implementations that cannot validate ranges cheaply may return false.
+    /// </summary>
+    bool IsRangeReadable(ulong virtualAddress, int length) => false;
 }

@@ -12,6 +12,7 @@ namespace SharpEmu.Libs.SaveData;
 public static class SaveDataExports
 {
     private const int OrbisSaveDataErrorParameter = unchecked((int)0x809F0000);
+    private const int OrbisSaveDataErrorNotMounted = unchecked((int)0x809F0004);
     private const int OrbisSaveDataErrorExists = unchecked((int)0x809F0007);
     private const int OrbisSaveDataErrorNotFound = unchecked((int)0x809F0008);
     private const int OrbisSaveDataErrorInternal = unchecked((int)0x809F000B);
@@ -36,6 +37,8 @@ public static class SaveDataExports
     private static readonly object _stateGate = new();
     private static readonly object _memoryGate = new();
     private static readonly HashSet<int> _preparedTransactionResources = [];
+    private static readonly Dictionary<string, string> _mountedSavePaths =
+        new(StringComparer.Ordinal);
     private static string? _titleId;
 
     public static void ConfigureApplicationInfo(string? titleId)
@@ -44,6 +47,7 @@ public static class SaveDataExports
         {
             _titleId = string.IsNullOrWhiteSpace(titleId) ? null : SanitizePathSegment(titleId.Trim());
             _preparedTransactionResources.Clear();
+            _mountedSavePaths.Clear();
         }
     }
 
@@ -221,6 +225,10 @@ public static class SaveDataExports
 
             const string mountPoint = "/savedata0";
             KernelMemoryCompatExports.RegisterGuestPathMount(mountPoint, savePath);
+            lock (_stateGate)
+            {
+                _mountedSavePaths[mountPoint] = savePath;
+            }
 
             Span<byte> result = stackalloc byte[MountResultSize];
             result.Clear();
@@ -251,6 +259,102 @@ public static class SaveDataExports
         }
     }
 
+    [SysAbiExport(
+        Nid = "85zul--eGXs",
+        ExportName = "sceSaveDataSetParam",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceSaveData")]
+    public static int SaveDataSetParam(CpuContext ctx)
+    {
+        var mountPointAddress = ctx[CpuRegister.Rdi];
+        var paramType = unchecked((uint)ctx[CpuRegister.Rsi]);
+        var paramBufferAddress = ctx[CpuRegister.Rdx];
+        var paramBufferSize = ctx[CpuRegister.Rcx];
+        if (mountPointAddress == 0 || paramBufferAddress == 0 || paramType > 4 ||
+            !TryReadFixedAscii(ctx, mountPointAddress, 16, out var mountPoint) ||
+            string.IsNullOrWhiteSpace(mountPoint))
+        {
+            return SetReturn(ctx, OrbisSaveDataErrorParameter);
+        }
+
+        string savePath;
+        lock (_stateGate)
+        {
+            if (!_mountedSavePaths.TryGetValue(mountPoint, out savePath!))
+            {
+                return SetReturn(ctx, OrbisSaveDataErrorNotMounted);
+            }
+        }
+
+        try
+        {
+            var metadataPath = GetParamMetadataPath(savePath);
+            var param = File.Exists(metadataPath)
+                ? File.ReadAllBytes(metadataPath)
+                : new byte[SaveDataParamSize];
+            if (param.Length != SaveDataParamSize)
+            {
+                Array.Resize(ref param, SaveDataParamSize);
+            }
+
+            switch (paramType)
+            {
+                case 0: // All fields.
+                    if (paramBufferSize != SaveDataParamSize ||
+                        !ctx.Memory.TryRead(paramBufferAddress, param))
+                    {
+                        return SetReturn(
+                            ctx,
+                            paramBufferSize == SaveDataParamSize
+                                ? (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT
+                                : OrbisSaveDataErrorParameter);
+                    }
+                    break;
+                case 1: // Title.
+                    if (!TryReplaceParamBytes(ctx, paramBufferAddress, paramBufferSize, param, 0x000, 128))
+                    {
+                        return SetReturn(ctx, OrbisSaveDataErrorParameter);
+                    }
+                    break;
+                case 2: // Subtitle.
+                    if (!TryReplaceParamBytes(ctx, paramBufferAddress, paramBufferSize, param, 0x080, 128))
+                    {
+                        return SetReturn(ctx, OrbisSaveDataErrorParameter);
+                    }
+                    break;
+                case 3: // Detail.
+                    if (!TryReplaceParamBytes(ctx, paramBufferAddress, paramBufferSize, param, 0x100, 1024))
+                    {
+                        return SetReturn(ctx, OrbisSaveDataErrorParameter);
+                    }
+                    break;
+                case 4: // User parameter.
+                    if (paramBufferSize != sizeof(uint) ||
+                        !ctx.Memory.TryRead(paramBufferAddress, param.AsSpan(0x500, sizeof(uint))))
+                    {
+                        return SetReturn(
+                            ctx,
+                            paramBufferSize == sizeof(uint)
+                                ? (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT
+                                : OrbisSaveDataErrorParameter);
+                    }
+                    break;
+            }
+
+            var temporaryPath = metadataPath + $".{Environment.ProcessId}.tmp";
+            File.WriteAllBytes(temporaryPath, param);
+            File.Move(temporaryPath, metadataPath, overwrite: true);
+            TraceSaveData(
+                $"set_param mount_point={mountPoint} type={paramType} size=0x{paramBufferSize:X} " +
+                $"path='{metadataPath}'");
+            return SetReturn(ctx, 0);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return SetReturn(ctx, OrbisSaveDataErrorInternal);
+        }
+    }
+
     private static int _nextTransactionResource;
     [SysAbiExport(
         Nid = "gjRZNnw0JPE",
@@ -259,39 +363,15 @@ public static class SaveDataExports
         LibraryName = "libSceSaveData")]
     public static int SaveDataCreateTransactionResource(CpuContext ctx)
     {
-        var userId = unchecked((int)ctx[CpuRegister.Rdi]);
-        var reserved = ctx[CpuRegister.Rsi];
+        var memorySize = ctx[CpuRegister.Rdi];
+        var resource = Interlocked.Increment(ref _nextTransactionResource);
 
-        var id = (uint)Interlocked.Increment(ref _nextTransactionResource);
-
-        // The resource-out pointer's argument slot varies by SDK revision: some
-        // callers pass it in rdx, others in rcx (a 4-arg form where rdx holds a
-        // count/flag). Void Terrarium passes rdx=0x1 (not a pointer) and the
-        // real out-pointer in rcx. Probe the plausible candidates and write the
-        // handle to the first writable one instead of faulting on a bad rdx.
-        // This is a stub-level create (matches shadPS4's return-OK semantics);
-        // never return MEMORY_FAULT for it, or the guest treats savedata init as
-        // failed and never advances.
-        var resourceAddress = 0UL;
-        foreach (var candidate in new[]
-                 {
-                     ctx[CpuRegister.Rdx],
-                     ctx[CpuRegister.Rcx],
-                     ctx[CpuRegister.R8],
-                     ctx[CpuRegister.R9],
-                 })
-        {
-            if (candidate != 0 && TryWriteUInt32(ctx, candidate, id))
-            {
-                resourceAddress = candidate;
-                break;
-            }
-        }
-
+        // The ABI returns the transaction-resource id directly. There is no
+        // output pointer: the remaining volatile registers belong to the
+        // caller and must never be treated as candidate guest addresses.
         TraceSaveData(
-            $"create_transaction_resource user={userId} reserved=0x{reserved:X} resource_addr=0x{resourceAddress:X} id={id}");
-
-        return SetReturn(ctx, 0);
+            $"create_transaction_resource memory_size=0x{memorySize:X} resource={resource}");
+        return SetReturn(ctx, resource);
     }
 
     [SysAbiExport(
@@ -405,13 +485,46 @@ public static class SaveDataExports
 
     private static bool TryWriteParam(CpuContext ctx, ulong address, SaveEntry entry)
     {
-        var param = new byte[SaveDataParamSize];
-        WriteAscii(param.AsSpan(0x00, 128), "Saved Data");
-        WriteAscii(param.AsSpan(0x100, 1024), entry.Name);
-        BinaryPrimitives.WriteInt64LittleEndian(
-            param.AsSpan(0x508, sizeof(long)),
-            new DateTimeOffset(entry.LastWriteUtc).ToUnixTimeSeconds());
+        var metadataPath = GetParamMetadataPath(entry.Path);
+        var param = File.Exists(metadataPath)
+            ? File.ReadAllBytes(metadataPath)
+            : new byte[SaveDataParamSize];
+        if (param.Length != SaveDataParamSize)
+        {
+            Array.Resize(ref param, SaveDataParamSize);
+        }
+        if (!File.Exists(metadataPath))
+        {
+            WriteAscii(param.AsSpan(0x00, 128), "Saved Data");
+            WriteAscii(param.AsSpan(0x100, 1024), entry.Name);
+            BinaryPrimitives.WriteInt64LittleEndian(
+                param.AsSpan(0x508, sizeof(long)),
+                new DateTimeOffset(entry.LastWriteUtc).ToUnixTimeSeconds());
+        }
         return ctx.Memory.TryWrite(address, param);
+    }
+
+    private static string GetParamMetadataPath(string savePath) =>
+        savePath + ".sharpemu-param";
+
+    private static bool TryReplaceParamBytes(
+        CpuContext ctx,
+        ulong sourceAddress,
+        ulong sourceSize,
+        byte[] destination,
+        int destinationOffset,
+        int destinationSize)
+    {
+        if (sourceSize == 0 || sourceSize > (ulong)destinationSize)
+        {
+            return false;
+        }
+
+        var target = destination.AsSpan(destinationOffset, destinationSize);
+        target.Clear();
+        return ctx.Memory.TryRead(
+            sourceAddress,
+            target[..checked((int)sourceSize)]);
     }
 
     private static bool TryWriteSearchInfo(CpuContext ctx, ulong address, SaveEntry entry)

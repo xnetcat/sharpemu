@@ -871,8 +871,48 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         }
     }
 
+    public bool IsRangeReadable(ulong virtualAddress, int length)
+    {
+        if (length < 0)
+        {
+            return false;
+        }
+
+        _gate.EnterReadLock();
+        try
+        {
+            var region = FindRegion(virtualAddress, (ulong)length);
+            if (region is null ||
+                !TryResolveRegionOffset(
+                    virtualAddress,
+                    (ulong)length,
+                    region,
+                    out var offset))
+            {
+                return false;
+            }
+
+            if (length == 0)
+            {
+                return true;
+            }
+
+            var source = region.VirtualAddress + offset;
+            return !region.IsReservedOnly ||
+                EnsureRangeCommitted(source, (ulong)length, region);
+        }
+        finally
+        {
+            _gate.ExitReadLock();
+        }
+    }
+
     public bool TryWrite(ulong virtualAddress, ReadOnlySpan<byte> source)
     {
+        using var guestImageWrite =
+            SharpEmu.HLE.GuestImageWriteTracker.BeginManagedWrite(
+                virtualAddress,
+                (ulong)source.Length);
         var requiresExclusiveAccess = false;
         _gate.EnterReadLock();
         try
@@ -908,6 +948,12 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                     fixed (byte* srcPtr = source)
                     {
                         Buffer.MemoryCopy(srcPtr, destPtr, (nuint)source.Length, (nuint)source.Length);
+                    }
+                    if (region.IsExecutable)
+                    {
+                        _hostMemory.FlushInstructionCache(
+                            (ulong)destPtr,
+                            (ulong)source.Length);
                     }
 
                     return true;
@@ -1006,6 +1052,12 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                 {
                     Buffer.MemoryCopy(srcPtr, destPtr, (nuint)source.Length, (nuint)source.Length);
                 }
+                if (region.IsExecutable)
+                {
+                    _hostMemory.FlushInstructionCache(
+                        (ulong)destPtr,
+                        (ulong)source.Length);
+                }
 
                 return true;
             }
@@ -1025,7 +1077,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
             finally
             {
                 _hostMemory.ProtectRaw((ulong)destPtr, (ulong)source.Length, oldProtect, out _);
-                if (IsExecutableProtection(oldProtect))
+                if (region.IsExecutable || IsExecutableProtection(oldProtect))
                 {
                     _hostMemory.FlushInstructionCache((ulong)destPtr, (ulong)source.Length);
                 }

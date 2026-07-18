@@ -31,19 +31,44 @@ public sealed partial class DirectExecutionBackend
 	private static readonly bool NativeGuestWorkersDisabled =
 		string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_NATIVE_GUEST_WORKERS"), "1", StringComparison.Ordinal);
 
+	private interface INativeGuestExecutor : IDisposable
+	{
+		int Run(
+			CpuContext context,
+			GuestThreadState? state,
+			ulong guestThreadHandle,
+			ulong sentinelRip,
+			ulong returnSlotAddress,
+			nint hostRspSlot,
+			nint entryStub,
+			ulong affinityMask,
+			out bool yieldRequested,
+			out string? yieldReason,
+			out bool forcedExit);
+	}
+
 	private readonly object _nativeWorkerGate = new();
-	private readonly List<NativeGuestExecutor> _allNativeWorkers = new();
-	private readonly Stack<NativeGuestExecutor> _idleNativeWorkers = new();
+	private readonly List<INativeGuestExecutor> _allNativeWorkers = new();
+	private readonly Dictionary<Thread, Stack<INativeGuestExecutor>> _idleNativeWorkersByOwner =
+		new(ReferenceEqualityComparer.Instance);
 	private bool _nativeWorkersDisposed;
 	private int _nativeWorkerCreationFailedLogged;
 
-	// Runs an emitted guest entry stub. Preferred path is a pooled native worker
-	// thread; falls back to the historical inline calli (guest frames above this
-	// thread's managed frames) when workers are disabled or unavailable.
+	// Runs an emitted guest entry stub. Preferred path is a raw native worker
+	// paired with the current managed scheduling lane; falls back to the
+	// historical inline calli (guest frames above this thread's managed frames)
+	// when workers are disabled or unavailable.
 	//
 	// Callers set the Active* thread-statics before emitting the stub and read the
 	// yield/forced-exit flags right after this returns, so the worker outcome is
 	// copied back into this thread's statics before returning.
+	//
+	// Guest pthread continuations are scheduled through a persistent managed
+	// GuestExecutionRunner. Keep that lane paired with the same raw OS thread
+	// across every blocked slice as well: libc/CLR TSD and native thread identity
+	// are process state, not part of the emulated register/TLS snapshot. A global
+	// idle stack migrated one guest continuation between arbitrary raw threads and
+	// eventually resumed Unity with a mismatched native-thread context.
 	private unsafe int RunGuestEntryStub(void* entryStub, ulong hostRspSlot)
 	{
 		var worker = RentNativeGuestExecutor();
@@ -78,24 +103,28 @@ public sealed partial class DirectExecutionBackend
 		}
 	}
 
-	private NativeGuestExecutor? RentNativeGuestExecutor()
+	private INativeGuestExecutor? RentNativeGuestExecutor()
 	{
 		if (NativeGuestWorkersDisabled)
 		{
 			return null;
 		}
+		var owner = Thread.CurrentThread;
 		lock (_nativeWorkerGate)
 		{
 			if (_nativeWorkersDisposed)
 			{
 				return null;
 			}
-			if (_idleNativeWorkers.Count > 0)
+			if (_idleNativeWorkersByOwner.TryGetValue(owner, out var idleWorkers) &&
+				idleWorkers.Count > 0)
 			{
-				return _idleNativeWorkers.Pop();
+				return idleWorkers.Pop();
 			}
 		}
-		var worker = NativeGuestExecutor.TryCreate(this);
+		INativeGuestExecutor? worker = OperatingSystem.IsWindows()
+			? NativeGuestExecutor.TryCreate(this)
+			: PosixNativeGuestExecutor.TryCreate(this);
 		if (worker is null)
 		{
 			if (Interlocked.Exchange(ref _nativeWorkerCreationFailedLogged, 1) == 0)
@@ -117,13 +146,19 @@ public sealed partial class DirectExecutionBackend
 		return worker;
 	}
 
-	private void ReturnNativeGuestExecutor(NativeGuestExecutor worker)
+	private void ReturnNativeGuestExecutor(INativeGuestExecutor worker)
 	{
+		var owner = Thread.CurrentThread;
 		lock (_nativeWorkerGate)
 		{
 			if (!_nativeWorkersDisposed)
 			{
-				_idleNativeWorkers.Push(worker);
+				if (!_idleNativeWorkersByOwner.TryGetValue(owner, out var idleWorkers))
+				{
+					idleWorkers = new Stack<INativeGuestExecutor>();
+					_idleNativeWorkersByOwner.Add(owner, idleWorkers);
+				}
+				idleWorkers.Push(worker);
 				return;
 			}
 		}
@@ -132,7 +167,7 @@ public sealed partial class DirectExecutionBackend
 
 	private void DisposeNativeGuestExecutors()
 	{
-		NativeGuestExecutor[] workers;
+		INativeGuestExecutor[] workers;
 		lock (_nativeWorkerGate)
 		{
 			if (_nativeWorkersDisposed)
@@ -142,7 +177,7 @@ public sealed partial class DirectExecutionBackend
 			_nativeWorkersDisposed = true;
 			workers = _allNativeWorkers.ToArray();
 			_allNativeWorkers.Clear();
-			_idleNativeWorkers.Clear();
+			_idleNativeWorkersByOwner.Clear();
 		}
 		foreach (var worker in workers)
 		{
@@ -150,7 +185,7 @@ public sealed partial class DirectExecutionBackend
 		}
 	}
 
-	// A pooled raw OS thread that executes guest entry stubs. The run loop is emitted
+	// A scheduling-lane-affine raw OS thread that executes guest entry stubs. The run loop is emitted
 	// native code (no CLR unwind info required — nothing ever unwinds through it):
 	//
 	//   loop: WaitForSingleObject(work);
@@ -160,10 +195,10 @@ public sealed partial class DirectExecutionBackend
 	//         RunEpilogue(self, eax);       // managed: captures outcome, restores ambient
 	//         SetEvent(done); goto loop;
 	//
-	// Workers carry no per-guest identity of their own: the prologue rebinds guest TLS,
-	// the host-RSP slot, the Active* thread-statics and the GuestThreadExecution ambient
-	// on every run, so a worker can be reused for any guest thread.
-	private sealed unsafe class NativeGuestExecutor : IDisposable
+	// The prologue still rebinds guest TLS, the host-RSP slot, Active* thread-statics
+	// and the GuestThreadExecution ambient on every run. The executor is only reused
+	// by its owning scheduling lane so host-side thread identity remains stable.
+	private sealed unsafe class NativeGuestExecutor : INativeGuestExecutor
 	{
 		private const uint LoopStubSize = 512u;
 		private const uint WorkerStackReservation = 4u * 1024u * 1024u;

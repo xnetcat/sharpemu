@@ -2764,12 +2764,25 @@ public static partial class KernelMemoryCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_OK;
         }
 
+        bool released;
+        int remainingAllocations;
         lock (_memoryGate)
         {
-            if (!TryReleaseDirectMemoryRangeLocked(start, length))
-            {
-                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
-            }
+            released = TryReleaseDirectMemoryRangeLocked(start, length);
+            remainingAllocations = _directAllocations.Count;
+        }
+
+        if (ShouldTraceDirectMemory())
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] checked_release_direct: start=0x{start:X16} " +
+                $"len=0x{length:X16} released={(released ? 1 : 0)} " +
+                $"allocations={remainingAllocations}");
+        }
+
+        if (!released)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
         }
 
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;

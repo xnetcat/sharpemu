@@ -300,7 +300,12 @@ public static partial class Gen5SpirvTranslator
             uint ComponentType,
             uint VectorType,
             ImageComponentKind ComponentKind,
-            bool IsStorage);
+            bool IsStorage,
+            bool IsTexelBuffer,
+            SpirvImageDim Dimension,
+            int CoordinateComponents,
+            int SizeComponents,
+            int GradientComponents);
 
         private readonly record struct SpirvVertexInput(
             uint Variable,
@@ -963,6 +968,15 @@ public static partial class Gen5SpirvTranslator
                 _imageBindingByPc.TryAdd(binding.Pc, index);
                 var isStorage =
                     Gen5ShaderTranslator.IsStorageImageOperation(binding.Opcode);
+                var isBufferResource =
+                    IsBufferImageResource(binding.ResourceDescriptor);
+                // RDNA permits filtered SAMPLE operations over TYPE=BUF.
+                // SPIR-V/Vulkan texel buffers are intentionally unfiltered,
+                // so preserve SAMPLE semantics through a one-dimensional
+                // sampled image. Direct LOAD/STORE/ATOMIC access uses the
+                // native texel-buffer representation.
+                var isTexelBuffer =
+                    isBufferResource && !UsesSampler(binding.Opcode);
                 var (format, componentKind) =
                     DecodeImageFormat(binding.ResourceDescriptor);
                 var componentType = componentKind switch
@@ -983,16 +997,29 @@ public static partial class Gen5SpirvTranslator
                     _module.AddCapability(
                         SpirvCapability.StorageImageExtendedFormats);
                 }
+                if (isTexelBuffer)
+                {
+                    _module.AddCapability(SpirvCapability.SampledBuffer);
+                    if (isStorage)
+                    {
+                        _module.AddCapability(SpirvCapability.ImageBuffer);
+                    }
+                }
 
+                var imageShape = isTexelBuffer
+                    ? new ImageShape(SpirvImageDim.Buffer, false, false, 1, 1, 1)
+                    : isBufferResource
+                        ? new ImageShape(SpirvImageDim.Dim1D, false, false, 1, 1, 1)
+                        : GetImageShape(binding.Control.Dimension);
                 var imageType = _module.TypeImage(
                     componentType,
-                    SpirvImageDim.Dim2D,
+                    imageShape.Dimension,
                     depth: false,
-                    arrayed: false,
-                    multisampled: false,
+                    arrayed: imageShape.Arrayed,
+                    multisampled: imageShape.Multisampled,
                     sampled: isStorage ? 2u : 1u,
                     isStorage ? format : SpirvImageFormat.Unknown);
-                var objectType = isStorage
+                var objectType = isStorage || isTexelBuffer
                     ? imageType
                     : _module.TypeSampledImage(imageType);
                 var pointer = _module.TypePointer(
@@ -1015,10 +1042,47 @@ public static partial class Gen5SpirvTranslator
                         componentType,
                         _module.TypeVector(componentType, 4),
                         componentKind,
-                        isStorage));
+                        isStorage,
+                        isTexelBuffer,
+                        imageShape.Dimension,
+                        imageShape.CoordinateComponents,
+                        imageShape.SizeComponents,
+                        imageShape.GradientComponents));
                 _interfaces.Add(variable);
             }
         }
+
+        private readonly record struct ImageShape(
+            SpirvImageDim Dimension,
+            bool Arrayed,
+            bool Multisampled,
+            int CoordinateComponents,
+            int SizeComponents,
+            int GradientComponents);
+
+        private static ImageShape GetImageShape(uint dimension) =>
+            dimension switch
+            {
+                0 => new(SpirvImageDim.Dim1D, false, false, 1, 1, 1),
+                1 => new(SpirvImageDim.Dim2D, false, false, 2, 2, 2),
+                2 => new(SpirvImageDim.Dim3D, false, false, 3, 3, 3),
+                3 => new(SpirvImageDim.Cube, false, false, 3, 2, 3),
+                4 => new(SpirvImageDim.Dim1D, true, false, 2, 2, 1),
+                5 => new(SpirvImageDim.Dim2D, true, false, 3, 3, 2),
+                6 => new(SpirvImageDim.Dim2D, false, true, 2, 2, 2),
+                7 => new(SpirvImageDim.Dim2D, true, true, 3, 3, 2),
+                _ => new(SpirvImageDim.Dim2D, false, false, 2, 2, 2),
+            };
+
+        private uint ImageCoordinateType(SpirvImageResource resource, uint componentType) =>
+            resource.CoordinateComponents == 1
+                ? componentType
+                : _module.TypeVector(componentType, (uint)resource.CoordinateComponents);
+
+        private uint ImageSizeType(SpirvImageResource resource) =>
+            resource.SizeComponents == 1
+                ? _intType
+                : _module.TypeVector(_intType, (uint)resource.SizeComponents);
 
         private static bool RequiresExtendedStorageImageFormat(
             SpirvImageFormat format) =>
@@ -1027,15 +1091,22 @@ public static partial class Gen5SpirvTranslator
                 not SpirvImageFormat.Rgba32i and
                 not SpirvImageFormat.Rgba32ui;
 
+        private static bool IsBufferImageResource(
+            IReadOnlyList<uint> descriptor) =>
+            descriptor.Count >= 4 &&
+            ((descriptor[3] >> 28) & 0xFu) == 0;
+
         private static (SpirvImageFormat Format, ImageComponentKind Kind)
             DecodeImageFormat(IReadOnlyList<uint> descriptor)
         {
-            if (descriptor.Count < 2)
+            if (descriptor.Count < 4)
             {
                 return (SpirvImageFormat.Unknown, ImageComponentKind.Float);
             }
 
-            var unifiedFormat = (descriptor[1] >> 20) & 0x1FFu;
+            var unifiedFormat = IsBufferImageResource(descriptor)
+                ? (descriptor[3] >> 12) & 0x7Fu
+                : (descriptor[1] >> 20) & 0x1FFu;
             if (!Gfx10UnifiedFormat.TryDecode(
                     unifiedFormat,
                     out var dataFormat,
@@ -3210,18 +3281,18 @@ public static partial class Gen5SpirvTranslator
             var imageObject = Load(resource.ObjectType, resource.Variable);
             if (instruction.Opcode == "ImageGetResinfo")
             {
-                var queryImage = resource.IsStorage
+                var queryImage = resource.IsStorage || resource.IsTexelBuffer
                     ? imageObject
                     : _module.AddInstruction(
                         SpirvOp.Image,
                         resource.ImageType,
                         imageObject);
                 var size = _module.AddInstruction(
-                    resource.IsStorage
+                    resource.IsStorage || resource.IsTexelBuffer
                         ? SpirvOp.ImageQuerySize
                         : SpirvOp.ImageQuerySizeLod,
-                    _module.TypeVector(_intType, 2),
-                    resource.IsStorage
+                    ImageSizeType(resource),
+                    resource.IsStorage || resource.IsTexelBuffer
                         ? [queryImage]
                         : [queryImage, UInt(0)]);
                 uint outputIndex = 0;
@@ -3233,13 +3304,15 @@ public static partial class Gen5SpirvTranslator
                     }
 
                     uint value;
-                    if (component < 2)
+                    if (component < resource.SizeComponents)
                     {
-                        var signedValue = _module.AddInstruction(
-                            SpirvOp.CompositeExtract,
-                            _intType,
-                            size,
-                            component);
+                        var signedValue = resource.SizeComponents == 1
+                            ? size
+                            : _module.AddInstruction(
+                                SpirvOp.CompositeExtract,
+                                _intType,
+                                size,
+                                component);
                         value = Bitcast(_uintType, signedValue);
                     }
                     else
@@ -3261,7 +3334,10 @@ public static partial class Gen5SpirvTranslator
                     return false;
                 }
 
-                var coordinates = BuildIntegerCoordinates(image, 0);
+                var coordinates = BuildIntegerCoordinates(
+                    image,
+                    0,
+                    resource.CoordinateComponents);
                 var components = new uint[4];
                 uint sourceIndex = 0;
                 for (var component = 0; component < components.Length; component++)
@@ -3297,13 +3373,14 @@ public static partial class Gen5SpirvTranslator
                     components);
                 var imageSize = _module.AddInstruction(
                     SpirvOp.ImageQuerySize,
-                    _module.TypeVector(_intType, 2),
+                    ImageSizeType(resource),
                     imageObject);
                 EmitBoundsCheckedImageWrite(
                     coordinates,
                     imageSize,
                     imageObject,
-                    texel);
+                    texel,
+                    resource.CoordinateComponents);
 
                 return true;
             }
@@ -3326,12 +3403,13 @@ public static partial class Gen5SpirvTranslator
                 var signed = resource.ComponentKind == ImageComponentKind.Sint;
                 var atomicImageSize = _module.AddInstruction(
                     SpirvOp.ImageQuerySize,
-                    _module.TypeVector(_intType, 2),
+                    ImageSizeType(resource),
                     imageObject);
                 var coordinates = BuildClampedIntegerCoordinates(
                     image,
                     0,
-                    atomicImageSize);
+                    atomicImageSize,
+                    resource.CoordinateComponents);
                 EmitExecConditional(() =>
                 {
                     var pointer = _module.AddInstruction(
@@ -3377,12 +3455,13 @@ public static partial class Gen5SpirvTranslator
                 {
                     var imageSize = _module.AddInstruction(
                         SpirvOp.ImageQuerySize,
-                        _module.TypeVector(_intType, 2),
+                        ImageSizeType(resource),
                         imageObject);
                     var coordinates = BuildClampedIntegerCoordinates(
                         image,
                         0,
-                        imageSize);
+                        imageSize,
+                        resource.CoordinateComponents);
                     sampled = _module.AddInstruction(
                         SpirvOp.ImageRead,
                         resource.VectorType,
@@ -3398,13 +3477,14 @@ public static partial class Gen5SpirvTranslator
                         imageObject);
                     var imageSize = _module.AddInstruction(
                         SpirvOp.ImageQuerySizeLod,
-                        _module.TypeVector(_intType, 2),
+                        ImageSizeType(resource),
                         fetchedImage,
                         UInt(mipLevel));
                     var coordinates = BuildClampedIntegerCoordinates(
                         image,
                         0,
-                        imageSize);
+                        imageSize,
+                        resource.CoordinateComponents);
                     sampled = _module.AddInstruction(
                         SpirvOp.ImageFetch,
                         resource.VectorType,
@@ -3441,7 +3521,10 @@ public static partial class Gen5SpirvTranslator
                 if (hasOffset)
                 {
                     addressCursor = AlignFullImageAddress(image, addressCursor);
-                    offset = BuildImageOffset(image, addressCursor);
+                    offset = BuildImageOffset(
+                        image,
+                        addressCursor,
+                        resource.GradientComponents);
                     addressCursor += ImageFullAddressSlots(image);
                 }
 
@@ -3465,22 +3548,33 @@ public static partial class Gen5SpirvTranslator
                 }
 
                 var gradientX = hasGradients
-                    ? BuildFloatCoordinates(image, addressCursor)
+                    ? BuildFloatCoordinates(
+                        image,
+                        addressCursor,
+                        resource.GradientComponents)
                     : 0u;
                 var gradientY = hasGradients
-                    ? BuildFloatCoordinates(image, addressCursor + 2)
+                    ? BuildFloatCoordinates(
+                        image,
+                        addressCursor + resource.GradientComponents,
+                        resource.GradientComponents)
                     : 0u;
                 if (hasGradients)
                 {
-                    addressCursor += 4;
+                    addressCursor += resource.GradientComponents * 2;
                 }
 
-                var coordinates = BuildFloatCoordinates(image, addressCursor);
+                var coordinates = BuildFloatCoordinates(
+                    image,
+                    addressCursor,
+                    resource.CoordinateComponents);
                 var explicitLod = hasGradients || hasZeroLod || hasLod;
                 var lod = hasZeroLod
                     ? Float(0)
                     : hasLod
-                        ? LoadImageFloatAddress(image, addressCursor + 2)
+                        ? LoadImageFloatAddress(
+                            image,
+                            addressCursor + resource.CoordinateComponents)
                         : lodOrBias;
                 if (hasOffset)
                 {
@@ -3550,7 +3644,10 @@ public static partial class Gen5SpirvTranslator
                 var offset = 0u;
                 if (hasOffset)
                 {
-                    offset = BuildImageOffset(image, addressCursor);
+                    offset = BuildImageOffset(
+                        image,
+                        addressCursor,
+                        resource.GradientComponents);
                     addressCursor += ImageFullAddressSlots(image);
                 }
 
@@ -3565,7 +3662,10 @@ public static partial class Gen5SpirvTranslator
                     addressCursor += ImageFullAddressSlots(image);
                 }
 
-                var coordinates = BuildFloatCoordinates(image, addressCursor);
+                var coordinates = BuildFloatCoordinates(
+                    image,
+                    addressCursor,
+                    resource.CoordinateComponents);
                 var operands = new List<uint>
                 {
                     imageObject,
@@ -3622,6 +3722,14 @@ public static partial class Gen5SpirvTranslator
             {
                 error = $"unsupported image opcode {instruction.Opcode}";
                 return false;
+            }
+
+            if (resource.IsTexelBuffer)
+            {
+                sampled = ApplyTexelBufferDstSelect(
+                    resource,
+                    _evaluation.ImageBindings[bindingIndex].ResourceDescriptor,
+                    sampled);
             }
 
             var outputValues = new List<uint>(4);
@@ -3697,6 +3805,48 @@ public static partial class Gen5SpirvTranslator
             return true;
         }
 
+        private uint ApplyTexelBufferDstSelect(
+            SpirvImageResource resource,
+            IReadOnlyList<uint> descriptor,
+            uint texel)
+        {
+            if (descriptor.Count < 4)
+            {
+                return texel;
+            }
+
+            uint TypedConstant(bool one) => resource.ComponentKind switch
+            {
+                ImageComponentKind.Uint => UInt(one ? 1u : 0u),
+                ImageComponentKind.Sint =>
+                    _module.Constant(_intType, one ? 1u : 0u),
+                _ => Float(one ? 1f : 0f),
+            };
+
+            var dstSelect = descriptor[3] & 0xFFFu;
+            var components = new uint[4];
+            for (var component = 0; component < components.Length; component++)
+            {
+                var selector = (dstSelect >> (component * 3)) & 0x7u;
+                components[component] = selector switch
+                {
+                    0 => TypedConstant(false),
+                    1 => TypedConstant(true),
+                    >= 4 and <= 7 => _module.AddInstruction(
+                        SpirvOp.CompositeExtract,
+                        resource.ComponentType,
+                        texel,
+                        selector - 4),
+                    _ => TypedConstant(false),
+                };
+            }
+
+            return _module.AddInstruction(
+                SpirvOp.CompositeConstruct,
+                resource.VectorType,
+                components);
+        }
+
         private uint EmitDepthCompareScalar(
             SpirvImageResource resource,
             uint texel,
@@ -3758,15 +3908,26 @@ public static partial class Gen5SpirvTranslator
                 });
         }
 
-        private uint BuildFloatCoordinates(Gen5ImageControl image, int start)
+        private uint BuildFloatCoordinates(
+            Gen5ImageControl image,
+            int start,
+            int componentCount)
         {
-            var x = LoadImageFloatAddress(image, start);
-            var y = LoadImageFloatAddress(image, start + 1);
+            if (componentCount == 1)
+            {
+                return LoadImageFloatAddress(image, start);
+            }
+
+            var components = new uint[componentCount];
+            for (var component = 0; component < componentCount; component++)
+            {
+                components[component] = LoadImageFloatAddress(image, start + component);
+            }
+
             return _module.AddInstruction(
                 SpirvOp.CompositeConstruct,
-                _vec2Type,
-                x,
-                y);
+                _module.TypeVector(_floatType, (uint)componentCount),
+                components);
         }
 
         private static int ImageAddressRegister(
@@ -3871,47 +4032,62 @@ public static partial class Gen5SpirvTranslator
                 ShiftLeftLogical(BitwiseAnd(high, UInt(0xFFFF)), UInt(16)));
         }
 
-        private uint BuildIntegerCoordinates(Gen5ImageControl image, int start)
+        private uint BuildIntegerCoordinates(
+            Gen5ImageControl image,
+            int start,
+            int componentCount)
         {
-            var ivec2 = _module.TypeVector(_intType, 2);
-            var x = Bitcast(_intType, LoadImageIntegerAddress(image, start));
-            var y = Bitcast(_intType, LoadImageIntegerAddress(image, start + 1));
+            if (componentCount == 1)
+            {
+                return Bitcast(_intType, LoadImageIntegerAddress(image, start));
+            }
+
+            var components = new uint[componentCount];
+            for (var component = 0; component < componentCount; component++)
+            {
+                components[component] = Bitcast(
+                    _intType,
+                    LoadImageIntegerAddress(image, start + component));
+            }
+
             return _module.AddInstruction(
                 SpirvOp.CompositeConstruct,
-                ivec2,
-                x,
-                y);
+                _module.TypeVector(_intType, (uint)componentCount),
+                components);
         }
 
         private uint BuildClampedIntegerCoordinates(
             Gen5ImageControl image,
             int start,
-            uint imageSize)
+            uint imageSize,
+            int componentCount)
         {
-            var ivec2 = _module.TypeVector(_intType, 2);
-            var x = ClampSignedCoordinate(
-                Bitcast(
-                    _intType,
-                    LoadImageIntegerAddress(image, start)),
-                _module.AddInstruction(
+            if (componentCount == 1)
+            {
+                return ClampSignedCoordinate(
+                    Bitcast(_intType, LoadImageIntegerAddress(image, start)),
+                    imageSize);
+            }
+
+            var components = new uint[componentCount];
+            for (var component = 0; component < componentCount; component++)
+            {
+                var extent = _module.AddInstruction(
                     SpirvOp.CompositeExtract,
                     _intType,
                     imageSize,
-                    0));
-            var y = ClampSignedCoordinate(
-                Bitcast(
-                    _intType,
-                    LoadImageIntegerAddress(image, start + 1)),
-                _module.AddInstruction(
-                    SpirvOp.CompositeExtract,
-                    _intType,
-                    imageSize,
-                    1));
+                    (uint)component);
+                components[component] = ClampSignedCoordinate(
+                    Bitcast(
+                        _intType,
+                        LoadImageIntegerAddress(image, start + component)),
+                    extent);
+            }
+
             return _module.AddInstruction(
                 SpirvOp.CompositeConstruct,
-                ivec2,
-                x,
-                y);
+                _module.TypeVector(_intType, (uint)componentCount),
+                components);
         }
 
         private uint ClampSignedCoordinate(uint value, uint extent)
@@ -3950,64 +4126,49 @@ public static partial class Gen5SpirvTranslator
             uint coordinates,
             uint imageSize,
             uint imageObject,
-            uint texel)
+            uint texel,
+            int componentCount)
         {
-            var x = _module.AddInstruction(
-                SpirvOp.CompositeExtract,
-                _intType,
-                coordinates,
-                0);
-            var y = _module.AddInstruction(
-                SpirvOp.CompositeExtract,
-                _intType,
-                coordinates,
-                1);
-            var width = _module.AddInstruction(
-                SpirvOp.CompositeExtract,
-                _intType,
-                imageSize,
-                0);
-            var height = _module.AddInstruction(
-                SpirvOp.CompositeExtract,
-                _intType,
-                imageSize,
-                1);
             var zero = _module.Constant(_intType, 0);
-            var xNonNegative = _module.AddInstruction(
-                SpirvOp.SGreaterThanEqual,
-                _boolType,
-                x,
-                zero);
-            var yNonNegative = _module.AddInstruction(
-                SpirvOp.SGreaterThanEqual,
-                _boolType,
-                y,
-                zero);
-            var xInRange = _module.AddInstruction(
-                SpirvOp.SLessThan,
-                _boolType,
-                x,
-                width);
-            var yInRange = _module.AddInstruction(
-                SpirvOp.SLessThan,
-                _boolType,
-                y,
-                height);
-            var lowerInRange = _module.AddInstruction(
-                SpirvOp.LogicalAnd,
-                _boolType,
-                xNonNegative,
-                yNonNegative);
-            var upperInRange = _module.AddInstruction(
-                SpirvOp.LogicalAnd,
-                _boolType,
-                xInRange,
-                yInRange);
-            var inRange = _module.AddInstruction(
-                SpirvOp.LogicalAnd,
-                _boolType,
-                lowerInRange,
-                upperInRange);
+            var inRange = _module.ConstantBool(true);
+            for (var component = 0; component < componentCount; component++)
+            {
+                var coordinate = componentCount == 1
+                    ? coordinates
+                    : _module.AddInstruction(
+                        SpirvOp.CompositeExtract,
+                        _intType,
+                        coordinates,
+                        (uint)component);
+                var extent = componentCount == 1
+                    ? imageSize
+                    : _module.AddInstruction(
+                        SpirvOp.CompositeExtract,
+                        _intType,
+                        imageSize,
+                        (uint)component);
+                var nonNegative = _module.AddInstruction(
+                    SpirvOp.SGreaterThanEqual,
+                    _boolType,
+                    coordinate,
+                    zero);
+                var belowExtent = _module.AddInstruction(
+                    SpirvOp.SLessThan,
+                    _boolType,
+                    coordinate,
+                    extent);
+                var componentInRange = _module.AddInstruction(
+                    SpirvOp.LogicalAnd,
+                    _boolType,
+                    nonNegative,
+                    belowExtent);
+                inRange = _module.AddInstruction(
+                    SpirvOp.LogicalAnd,
+                    _boolType,
+                    inRange,
+                    componentInRange);
+            }
+
             inRange = _module.AddInstruction(
                 SpirvOp.LogicalAnd,
                 _boolType,
@@ -4031,30 +4192,40 @@ public static partial class Gen5SpirvTranslator
             _module.AddLabel(mergeLabel);
         }
 
-        private uint BuildImageOffset(Gen5ImageControl image, int component)
+        private uint BuildImageOffset(
+            Gen5ImageControl image,
+            int component,
+            int componentCount)
         {
-            var ivec2 = _module.TypeVector(_intType, 2);
             var packed = Bitcast(
                 _intType,
                 LoadV(image.GetAddressRegister(
                     ImageAddressRegister(image, component))));
-            var x = _module.AddInstruction(
-                SpirvOp.BitFieldSExtract,
-                _intType,
-                packed,
-                UInt(0),
-                UInt(6));
-            var y = _module.AddInstruction(
-                SpirvOp.BitFieldSExtract,
-                _intType,
-                packed,
-                UInt(8),
-                UInt(6));
+            if (componentCount == 1)
+            {
+                return _module.AddInstruction(
+                    SpirvOp.BitFieldSExtract,
+                    _intType,
+                    packed,
+                    UInt(0),
+                    UInt(6));
+            }
+
+            var components = new uint[componentCount];
+            for (var index = 0; index < componentCount; index++)
+            {
+                components[index] = _module.AddInstruction(
+                    SpirvOp.BitFieldSExtract,
+                    _intType,
+                    packed,
+                    UInt((uint)(index * 8)),
+                    UInt(6));
+            }
+
             return _module.AddInstruction(
                 SpirvOp.CompositeConstruct,
-                ivec2,
-                x,
-                y);
+                _module.TypeVector(_intType, (uint)componentCount),
+                components);
         }
 
         private uint ApplyDynamicSampleOffset(
@@ -4064,7 +4235,13 @@ public static partial class Gen5SpirvTranslator
             uint texelOffset,
             uint lod)
         {
-            var ivec2 = _module.TypeVector(_intType, 2);
+            if (resource.CoordinateComponents != resource.SizeComponents)
+            {
+                return coordinates;
+            }
+
+            var coordinateType = ImageCoordinateType(resource, _floatType);
+            var sizeType = ImageSizeType(resource);
             var image = _module.AddInstruction(
                 SpirvOp.Image,
                 resource.ImageType,
@@ -4086,25 +4263,25 @@ public static partial class Gen5SpirvTranslator
                 signedLod);
             var size = _module.AddInstruction(
                 SpirvOp.ImageQuerySizeLod,
-                ivec2,
+                sizeType,
                 image,
                 clampedLod);
             var sizeFloat = _module.AddInstruction(
                 SpirvOp.ConvertSToF,
-                _vec2Type,
+                coordinateType,
                 size);
             var offsetFloat = _module.AddInstruction(
                 SpirvOp.ConvertSToF,
-                _vec2Type,
+                coordinateType,
                 texelOffset);
             var normalizedOffset = _module.AddInstruction(
                 SpirvOp.FDiv,
-                _vec2Type,
+                coordinateType,
                 offsetFloat,
                 sizeFloat);
             return _module.AddInstruction(
                 SpirvOp.FAdd,
-                _vec2Type,
+                coordinateType,
                 coordinates,
                 normalizedOffset);
         }

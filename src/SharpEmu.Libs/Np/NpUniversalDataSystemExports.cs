@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using SharpEmu.HLE;
+using SharpEmu.Libs.Kernel;
 using System.Buffers.Binary;
 
 namespace SharpEmu.Libs.Np;
@@ -120,21 +121,72 @@ public static class NpUniversalDataSystemExports
     }
 
     [SysAbiExport(
+        Nid = "s6W4Zl4Slgk",
+        ExportName = "sceNpUniversalDataSystemCreateEventPropertyObject",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNpUniversalDataSystem")]
+    public static int NpUniversalDataSystemCreateEventPropertyObject(CpuContext ctx)
+    {
+        var objectAddressPointer = ctx[CpuRegister.Rdi];
+        if (objectAddressPointer == 0)
+        {
+            return ctx.SetReturn(
+                NpUniversalDataSystemErrorInvalidArgument,
+                typeof(long));
+        }
+
+        if (!KernelMemoryCompatExports.TryAllocateHleData(
+                ctx,
+                length: 0x20,
+                alignment: 16,
+                out var objectAddress))
+        {
+            return ctx.SetReturn(
+                (int)OrbisGen2Result.ORBIS_GEN2_ERROR_TRY_AGAIN,
+                typeof(long));
+        }
+
+        Span<byte> objectStorage = stackalloc byte[0x20];
+        objectStorage.Clear();
+        if (!ctx.Memory.TryWrite(objectAddress, objectStorage) ||
+            !ctx.TryWriteUInt64(objectAddressPointer, objectAddress))
+        {
+            return ctx.SetReturn(
+                (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT,
+                typeof(long));
+        }
+
+        return ctx.SetReturn(0, typeof(long));
+    }
+
+    [SysAbiExport(
+        Nid = "kKUH0Viib3c",
+        ExportName = "sceNpUniversalDataSystemDestroyEventPropertyObject",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNpUniversalDataSystem")]
+    public static int NpUniversalDataSystemDestroyEventPropertyObject(CpuContext ctx)
+    {
+        return ctx.SetReturn(0, typeof(long));
+    }
+
+    [SysAbiExport(
         Nid = "MfDb+4Nln64",
         ExportName = "sceNpUniversalDataSystemEventPropertyObjectSetString",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libSceNpUniversalDataSystem")]
     public static int NpUniversalDataSystemEventPropertyObjectSetString(CpuContext ctx)
     {
-        var propertyObjectAddress = ctx[CpuRegister.Rsi];
+        var propertyObjectAddress = ctx[CpuRegister.Rdi];
+        var keyAddress = ctx[CpuRegister.Rsi];
         var valueAddress = ctx[CpuRegister.Rdx];
-        if (propertyObjectAddress == 0 || valueAddress == 0)
+        if (propertyObjectAddress == 0 || keyAddress == 0 || valueAddress == 0)
         {
             return ctx.SetReturn(NpUniversalDataSystemErrorInvalidArgument, typeof(long));
         }
 
         Span<byte> probe = stackalloc byte[1];
         return ctx.Memory.TryRead(propertyObjectAddress, probe) &&
+               ctx.Memory.TryRead(keyAddress, probe) &&
                ctx.Memory.TryRead(valueAddress, probe)
             ? ctx.SetReturn(0, typeof(long))
             : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT, typeof(long));
@@ -147,15 +199,17 @@ public static class NpUniversalDataSystemExports
         LibraryName = "libSceNpUniversalDataSystem")]
     public static int NpUniversalDataSystemEventPropertyObjectSetArray(CpuContext ctx)
     {
-        var propertyObjectAddress = ctx[CpuRegister.Rsi];
+        var propertyObjectAddress = ctx[CpuRegister.Rdi];
+        var keyAddress = ctx[CpuRegister.Rsi];
         var valueAddress = ctx[CpuRegister.Rdx];
-        if (propertyObjectAddress == 0)
+        if (propertyObjectAddress == 0 || keyAddress == 0)
         {
             return ctx.SetReturn(NpUniversalDataSystemErrorInvalidArgument, typeof(long));
         }
 
         Span<byte> probe = stackalloc byte[1];
-        if (!ctx.Memory.TryRead(propertyObjectAddress, probe))
+        if (!ctx.Memory.TryRead(propertyObjectAddress, probe) ||
+            !ctx.Memory.TryRead(keyAddress, probe))
         {
             return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT, typeof(long));
         }

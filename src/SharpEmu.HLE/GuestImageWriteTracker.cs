@@ -32,6 +32,7 @@ public static unsafe class GuestImageWriteTracker
         public int Armed;
         public int FirstCpuWriteSeen;
         public int PendingFirstCpuWrite;
+        public long WriteGeneration;
         public bool TraceLifetime;
         public long SourceSequence;
         public long FirstCpuWriteTraceSequence;
@@ -132,9 +133,19 @@ public static unsafe class GuestImageWriteTracker
                 // Never resize an object that is still reachable from the
                 // signal handler's lock-free snapshot. Retire it and publish
                 // a fresh immutable range.
+                var writeGeneration = Volatile.Read(ref range.WriteGeneration);
                 DisarmLocked(range, "replace-range");
                 _rangesByAddress.Remove(address);
-                range = null;
+                range = new TrackedRange
+                {
+                    Address = address,
+                    ByteCount = byteCount,
+                    Start = start,
+                    End = start + length,
+                    WriteGeneration = writeGeneration,
+                };
+                _rangesByAddress[address] = range;
+                RebuildSnapshotLocked();
             }
 
             if (range is null)
@@ -249,6 +260,31 @@ public static unsafe class GuestImageWriteTracker
     }
 
     /// <summary>
+    /// Returns the monotonic first-write generation for a tracked allocation.
+    /// Unlike the consuming dirty flag, this remains changed after another
+    /// cache owner consumes and re-arms the range.
+    /// </summary>
+    public static bool TryGetWriteGeneration(ulong address, out long generation)
+    {
+        generation = 0;
+        if (!_enabled)
+        {
+            return false;
+        }
+
+        lock (_gate)
+        {
+            if (!_rangesByAddress.TryGetValue(address, out var range))
+            {
+                return false;
+            }
+
+            generation = Volatile.Read(ref range.WriteGeneration);
+            return true;
+        }
+    }
+
+    /// <summary>
     /// Prepares pages touched by a managed HLE memory write. Native guest
     /// stores fault and enter <see cref="TryHandleWriteFault"/> through the
     /// POSIX signal bridge, but a managed Buffer.MemoryCopy into a protected
@@ -258,11 +294,44 @@ public static unsafe class GuestImageWriteTracker
     /// </summary>
     public static void NotifyManagedWrite(ulong address, ulong byteCount)
     {
-        if (!_enabled || address == 0 || byteCount == 0)
+        using var scope = BeginManagedWrite(address, byteCount);
+    }
+
+    public readonly struct ManagedWriteScope : IDisposable
+    {
+        private readonly bool _entered;
+
+        internal ManagedWriteScope(bool entered)
         {
-            return;
+            _entered = entered;
         }
 
+        public void Dispose()
+        {
+            if (_entered)
+            {
+                Monitor.Exit(_gate);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Dirties and unprotects a managed write range while excluding Track and
+    /// Rearm until the caller disposes the scope. Without this scope another
+    /// GPU submit thread can re-protect the page between notification and the
+    /// managed copy, turning a resumable guest write fault into a fatal CLR
+    /// AccessViolation.
+    /// </summary>
+    public static ManagedWriteScope BeginManagedWrite(
+        ulong address,
+        ulong byteCount)
+    {
+        if (!_enabled || address == 0 || byteCount == 0)
+        {
+            return default;
+        }
+
+        Monitor.Enter(_gate);
         var end = address > ulong.MaxValue - byteCount
             ? ulong.MaxValue
             : address + byteCount;
@@ -277,6 +346,8 @@ public static unsafe class GuestImageWriteTracker
             }
             candidate = nextPage;
         }
+
+        return new ManagedWriteScope(entered: true);
     }
 
     /// <summary>
@@ -390,6 +461,10 @@ public static unsafe class GuestImageWriteTracker
             }
 
             var wasArmed = Interlocked.Exchange(ref range.Armed, 0) != 0;
+            if (wasArmed)
+            {
+                Interlocked.Increment(ref range.WriteGeneration);
+            }
             if (wasArmed &&
                 range.TraceLifetime &&
                 Interlocked.CompareExchange(ref range.FirstCpuWriteSeen, 1, 0) == 0)

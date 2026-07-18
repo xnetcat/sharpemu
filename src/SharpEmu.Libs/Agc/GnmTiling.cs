@@ -143,6 +143,203 @@ internal static class GnmTiling
     /// </summary>
     public static bool NeedsDetile(uint swizzleMode) => ShouldDetile(swizzleMode);
 
+    internal readonly record struct MipLevelLayout(
+        ulong ByteOffset,
+        int TailX,
+        int TailY,
+        int TailBlockBytes,
+        bool InTail);
+
+    /// <summary>
+    /// Resolves one mip's byte location in a thin GFX10 allocation. Tiled
+    /// resources place a shared mip-tail block first, followed by the remaining
+    /// levels from smallest to largest. Consequently mip zero is not generally
+    /// at the descriptor base when MAX_MIP is non-zero.
+    /// </summary>
+    public static bool TryGetMipLevelLayout(
+        uint swizzleMode,
+        int elementsWide,
+        int elementsHigh,
+        int bytesPerElement,
+        uint maximumMip,
+        uint mipLevel,
+        out MipLevelLayout layout)
+    {
+        layout = default;
+        if (!ShouldDetile(swizzleMode) ||
+            elementsWide <= 0 ||
+            elementsHigh <= 0 ||
+            bytesPerElement <= 0 ||
+            maximumMip >= 16 ||
+            mipLevel > maximumMip ||
+            !TryGetSwizzleKind(swizzleMode, out _, out var blockBytes))
+        {
+            return false;
+        }
+
+        var bytesPerElementLog2 = BitLog2((uint)bytesPerElement);
+        if (bytesPerElementLog2 < 0)
+        {
+            return false;
+        }
+
+        var blockElements = blockBytes >> bytesPerElementLog2;
+        var (blockWidth, blockHeight) = SquareBlockDimensions(blockElements);
+        var blockLog2 = BitLog2((uint)blockBytes);
+        if (blockWidth == 0 || blockHeight == 0 || blockLog2 < 9)
+        {
+            return false;
+        }
+
+        if (maximumMip == 0)
+        {
+            layout = new MipLevelLayout(0, 0, 0, 0, false);
+            return true;
+        }
+
+        var levelCount = maximumMip + 1;
+        var tailWidth = blockWidth >> 1;
+        var tailHeight = blockHeight;
+        var maximumTailLevels = blockLog2 <= 11
+            ? 1u + (1u << (blockLog2 - 9))
+            : (uint)blockLog2 - 4u;
+        var firstTail = levelCount;
+        for (var level = 0u; level < levelCount; level++)
+        {
+            var width = Math.Max(elementsWide >> checked((int)level), 1);
+            var height = Math.Max(elementsHigh >> checked((int)level), 1);
+            if (width <= tailWidth &&
+                height <= tailHeight &&
+                levelCount - level <= maximumTailLevels)
+            {
+                firstTail = level;
+                break;
+            }
+        }
+
+        if (mipLevel >= firstTail)
+        {
+            // AddrLib exposes an addressable byte origin inside the shared
+            // tail block. Convert it to the equivalent element coordinate so
+            // the ordinary within-block equation can read that level later.
+            var tailIndex = maximumTailLevels - 1u - (mipLevel - firstTail);
+            var mipOffset = tailIndex > 6u
+                ? 16u << checked((int)tailIndex)
+                : tailIndex << 8;
+            var mipX =
+                ((mipOffset >> 9) & 1u) |
+                ((mipOffset >> 10) & 2u) |
+                ((mipOffset >> 11) & 4u) |
+                ((mipOffset >> 12) & 8u) |
+                ((mipOffset >> 13) & 16u) |
+                ((mipOffset >> 14) & 32u);
+            var mipY =
+                ((mipOffset >> 8) & 1u) |
+                ((mipOffset >> 9) & 2u) |
+                ((mipOffset >> 10) & 4u) |
+                ((mipOffset >> 11) & 8u) |
+                ((mipOffset >> 12) & 16u) |
+                ((mipOffset >> 13) & 32u);
+            if ((blockLog2 & 1) != 0)
+            {
+                (mipX, mipY) = (mipY, mipX);
+                if ((bytesPerElementLog2 & 1) != 0)
+                {
+                    mipY = (mipY << 1) | (mipX & 1u);
+                    mipX >>= 1;
+                }
+            }
+
+            layout = new MipLevelLayout(
+                mipOffset,
+                checked((int)(mipX * (uint)(blockWidth >> 4))),
+                checked((int)(mipY * (uint)(blockHeight >> 4))),
+                blockBytes,
+                true);
+            return true;
+        }
+
+        ulong byteOffset = firstTail == levelCount ? 0UL : (uint)blockBytes;
+        for (var level = checked((int)firstTail) - 1; level >= 0; level--)
+        {
+            if ((uint)level == mipLevel)
+            {
+                layout = new MipLevelLayout(byteOffset, 0, 0, 0, false);
+                return true;
+            }
+
+            var width = Math.Max(elementsWide >> level, 1);
+            var height = Math.Max(elementsHigh >> level, 1);
+            if (!TryGetTiledByteCount(
+                    swizzleMode,
+                    width,
+                    height,
+                    bytesPerElement,
+                    out var levelBytes))
+            {
+                return false;
+            }
+
+            byteOffset = checked(byteOffset + levelBytes);
+        }
+
+        return false;
+    }
+
+    /// <summary>Returns the physical span occupied by a complete mip chain.</summary>
+    public static bool TryGetMipChainByteCount(
+        uint swizzleMode,
+        int elementsWide,
+        int elementsHigh,
+        int bytesPerElement,
+        uint maximumMip,
+        out ulong byteCount)
+    {
+        byteCount = 0;
+        for (var level = 0u; level <= maximumMip; level++)
+        {
+            if (!TryGetMipLevelLayout(
+                    swizzleMode,
+                    elementsWide,
+                    elementsHigh,
+                    bytesPerElement,
+                    maximumMip,
+                    level,
+                    out var layout))
+            {
+                byteCount = 0;
+                return false;
+            }
+
+            ulong end;
+            if (layout.InTail)
+            {
+                end = (uint)layout.TailBlockBytes;
+            }
+            else
+            {
+                var levelWidth = Math.Max(elementsWide >> checked((int)level), 1);
+                var levelHeight = Math.Max(elementsHigh >> checked((int)level), 1);
+                if (!TryGetTiledByteCount(
+                        swizzleMode,
+                        levelWidth,
+                        levelHeight,
+                        bytesPerElement,
+                        out var levelBytes))
+                {
+                    byteCount = 0;
+                    return false;
+                }
+
+                end = checked(layout.ByteOffset + levelBytes);
+            }
+
+            byteCount = Math.Max(byteCount, end);
+        }
+
+        return true;
+    }
+
     /// <summary>
     /// Gets the physical byte span occupied by a tiled mip. GNM allocates whole
     /// swizzle blocks even when the logical image is much smaller than a block;
