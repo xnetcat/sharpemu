@@ -5094,6 +5094,11 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			ptr2[offset++] = 186;
 			*(ulong*)(ptr2 + offset) = hostRspSlot;
 			offset += 8;
+			// A callback that returns without blocking comes back through this
+			// generated entry thunk, not CreateGuestReturnStub. Preserve its
+			// live RAX in the same second host-RSP slot used by the shared
+			// return stub before restoring the host stack.
+			EmitDirectGuestReturnCapture(ptr2, ref offset);
 			ptr2[offset++] = 73;
 			ptr2[offset++] = 139;
 			ptr2[offset++] = 34;
@@ -5392,6 +5397,14 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	{
 		*(uint*)(code + offset) = value;
 		offset += sizeof(uint);
+	}
+
+	internal static unsafe void EmitDirectGuestReturnCapture(byte* code, ref int offset)
+	{
+		EmitByte(code, ref offset, 0x49); // mov [r10+8], rax
+		EmitByte(code, ref offset, 0x89);
+		EmitByte(code, ref offset, 0x42);
+		EmitByte(code, ref offset, 0x08);
 	}
 
 	private static unsafe void EmitHostNonvolatileXmmSave(byte* code, ref int offset)
