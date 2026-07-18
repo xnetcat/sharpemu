@@ -4485,9 +4485,14 @@ internal static unsafe class VulkanVideoPresenter
         // Per-frame constants can be populated after command parsing and even
         // after draw resources are built. Refreshing at batch flush gives the
         // host shader the execution-time bytes a real GPU would fetch.
-        private static readonly bool _refreshAllSnapshotBuffers = !string.Equals(
+        // Default-on was tried (run 111): at ~1 FPS the guest recycles the
+        // transient constant ring between submission and batch flush, so a
+        // late refresh replaces correct submission-time bytes with next-frame
+        // garbage and blacks the whole frame. Keep the refresh opt-in until
+        // refresh timing is tied to the guest's own submission order.
+        private static readonly bool _refreshAllSnapshotBuffers = string.Equals(
             Environment.GetEnvironmentVariable("SHARPEMU_REFRESH_ALL_CB_SNAPSHOTS"),
-            "0",
+            "1",
             StringComparison.Ordinal);
         private long _runtimeScalarRefreshCount;
         private long _snapshotBufferRefreshCount;
