@@ -44,7 +44,8 @@ internal static partial class MetalVideoPresenter
         texture.TileMode,
         texture.Pitch,
         texture.Sampler,
-        texture.Depth);
+        texture.Depth,
+        texture.Type);
 
     /// <summary>Caching requires the write tracker: without page protection a
     /// guest CPU write would never evict the entry and draws would sample

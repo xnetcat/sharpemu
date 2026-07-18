@@ -314,7 +314,14 @@ public static partial class Gen5SpirvTranslator
             uint VectorType,
             ImageComponentKind ComponentKind,
             bool IsStorage,
-            bool Is3D = false);
+            bool Is3D = false,
+            bool IsLayered = false,
+            bool IsCube = false)
+        {
+            public uint CoordinateComponents => Is3D || IsLayered ? 3u : 2u;
+            public uint GradientComponents => Is3D ? 3u : 2u;
+            public uint SizeComponents => CoordinateComponents;
+        }
 
         private readonly record struct SpirvVertexInput(
             uint Variable,
@@ -980,10 +987,14 @@ public static partial class Gen5SpirvTranslator
                 var isStorage = Gen5ShaderTranslator.RequiresStorageImage(
                     binding,
                     _evaluation.ImageBindings);
-                // GFX10 MIMG DIM 2 is a true 3D volume. Keep the SPIR-V image
-                // declaration and every coordinate/size operation consistent
-                // with that dimensionality.
+                // RDNA2 DIM is part of the shader ABI, independent of the
+                // descriptor's late-written TYPE. GFX10 MIMG DIM 2 is a true
+                // 3D volume; cubes are exposed as 2D arrays because AMD
+                // supplies (x, y, face_id), not a Vulkan cube direction
+                // vector. This also preserves cube arrays.
                 var is3D = binding.Control.Dimension == 2;
+                var isCube = binding.Control.Dimension == 3;
+                var isLayered = isCube || binding.Control.Dimension == 5;
                 var (format, componentKind) =
                     DecodeImageFormat(binding.ResourceDescriptor);
                 var componentType = componentKind switch
@@ -1009,7 +1020,7 @@ public static partial class Gen5SpirvTranslator
                     componentType,
                     is3D ? SpirvImageDim.Dim3D : SpirvImageDim.Dim2D,
                     depth: false,
-                    arrayed: false,
+                    arrayed: isLayered,
                     multisampled: false,
                     sampled: isStorage ? 2u : 1u,
                     isStorage ? format : SpirvImageFormat.Unknown);
@@ -1037,7 +1048,9 @@ public static partial class Gen5SpirvTranslator
                         _module.TypeVector(componentType, 4),
                         componentKind,
                         isStorage,
-                        is3D));
+                        is3D,
+                        isLayered,
+                        isCube));
                 _interfaces.Add(variable);
             }
         }
@@ -3276,7 +3289,7 @@ public static partial class Gen5SpirvTranslator
                         SpirvOp.Image,
                         resource.ImageType,
                         imageObject);
-                var sizeComponents = resource.Is3D ? 3u : 2u;
+                var sizeComponents = resource.SizeComponents;
                 var size = _module.AddInstruction(
                     resource.IsStorage
                         ? SpirvOp.ImageQuerySize
@@ -3322,7 +3335,10 @@ public static partial class Gen5SpirvTranslator
                     return false;
                 }
 
-                var coordinates = BuildIntegerCoordinates(image, 0, resource.Is3D);
+                var coordinates = BuildIntegerCoordinates(
+                    image,
+                    0,
+                    resource.CoordinateComponents == 3);
                 var components = new uint[4];
                 uint sourceIndex = 0;
                 for (var component = 0; component < components.Length; component++)
@@ -3358,14 +3374,14 @@ public static partial class Gen5SpirvTranslator
                     components);
                 var imageSize = _module.AddInstruction(
                     SpirvOp.ImageQuerySize,
-                    _module.TypeVector(_intType, resource.Is3D ? 3u : 2u),
+                    _module.TypeVector(_intType, resource.SizeComponents),
                     imageObject);
                 EmitBoundsCheckedImageWrite(
                     coordinates,
                     imageSize,
                     imageObject,
                     texel,
-                    resource.Is3D);
+                    resource.CoordinateComponents == 3);
 
                 return true;
             }
@@ -3388,13 +3404,13 @@ public static partial class Gen5SpirvTranslator
                 var signed = resource.ComponentKind == ImageComponentKind.Sint;
                 var atomicImageSize = _module.AddInstruction(
                     SpirvOp.ImageQuerySize,
-                    _module.TypeVector(_intType, resource.Is3D ? 3u : 2u),
+                    _module.TypeVector(_intType, resource.SizeComponents),
                     imageObject);
                 var coordinates = BuildClampedIntegerCoordinates(
                     image,
                     0,
                     atomicImageSize,
-                    resource.Is3D);
+                    resource.CoordinateComponents == 3);
                 EmitExecConditional(() =>
                 {
                     var pointer = _module.AddInstruction(
@@ -3440,13 +3456,13 @@ public static partial class Gen5SpirvTranslator
                 {
                     var imageSize = _module.AddInstruction(
                         SpirvOp.ImageQuerySize,
-                        _module.TypeVector(_intType, resource.Is3D ? 3u : 2u),
+                        _module.TypeVector(_intType, resource.SizeComponents),
                         imageObject);
                     var coordinates = BuildClampedIntegerCoordinates(
                         image,
                         0,
                         imageSize,
-                        resource.Is3D);
+                        resource.CoordinateComponents == 3);
                     sampled = _module.AddInstruction(
                         SpirvOp.ImageRead,
                         resource.VectorType,
@@ -3462,14 +3478,14 @@ public static partial class Gen5SpirvTranslator
                         imageObject);
                     var imageSize = _module.AddInstruction(
                         SpirvOp.ImageQuerySizeLod,
-                        _module.TypeVector(_intType, resource.Is3D ? 3u : 2u),
+                        _module.TypeVector(_intType, resource.SizeComponents),
                         fetchedImage,
                         UInt(mipLevel));
                     var coordinates = BuildClampedIntegerCoordinates(
                         image,
                         0,
                         imageSize,
-                        resource.Is3D);
+                        resource.CoordinateComponents == 3);
                     sampled = _module.AddInstruction(
                         SpirvOp.ImageFetch,
                         resource.VectorType,
@@ -3529,32 +3545,38 @@ public static partial class Gen5SpirvTranslator
                     addressCursor += ImageFullAddressSlots(image);
                 }
 
-                var coordinateComponents = resource.Is3D ? 3 : 2;
+                var gradientComponents = (int)resource.GradientComponents;
                 var gradientX = hasGradients
-                    ? BuildFloatCoordinates(image, addressCursor, resource.Is3D)
+                    ? BuildFloatCoordinates(
+                        image,
+                        addressCursor,
+                        resource,
+                        gradient: true)
                     : 0u;
                 var gradientY = hasGradients
                     ? BuildFloatCoordinates(
                         image,
-                        addressCursor + coordinateComponents,
-                        resource.Is3D)
+                        addressCursor + gradientComponents,
+                        resource,
+                        gradient: true)
                     : 0u;
                 if (hasGradients)
                 {
-                    addressCursor += coordinateComponents * 2;
+                    addressCursor += gradientComponents * 2;
                 }
 
                 var coordinates =
-                    BuildFloatCoordinates(image, addressCursor, resource.Is3D);
+                    BuildFloatCoordinates(image, addressCursor, resource);
+                var bodyComponents = (int)resource.CoordinateComponents;
                 var explicitLod = hasGradients || hasZeroLod || hasLod;
                 var lod = hasZeroLod
                     ? Float(0)
                     : hasLod
                         ? LoadImageFloatAddress(
                             image,
-                            addressCursor + coordinateComponents)
+                            addressCursor + bodyComponents)
                         : lodOrBias;
-                if (hasOffset && !resource.Is3D)
+                if (hasOffset && !resource.Is3D && !resource.IsLayered)
                 {
                     // Vulkan before maintenance8 forbids the dynamic Offset
                     // image operand on non-gather sampling operations. RDNA
@@ -3638,7 +3660,7 @@ public static partial class Gen5SpirvTranslator
                 }
 
                 var coordinates =
-                    BuildFloatCoordinates(image, addressCursor, resource.Is3D);
+                    BuildFloatCoordinates(image, addressCursor, resource);
                 var operands = new List<uint>
                 {
                     imageObject,
@@ -3834,13 +3856,69 @@ public static partial class Gen5SpirvTranslator
         private uint BuildFloatCoordinates(
             Gen5ImageControl image,
             int start,
-            bool is3D = false)
+            SpirvImageResource resource,
+            bool gradient = false)
         {
             var x = LoadImageFloatAddress(image, start);
             var y = LoadImageFloatAddress(image, start + 1);
-            if (is3D)
+            if (gradient)
+            {
+                if (!resource.Is3D)
+                {
+                    return _module.AddInstruction(
+                        SpirvOp.CompositeConstruct,
+                        _vec2Type,
+                        x,
+                        y);
+                }
+
+                var zGradient = LoadImageFloatAddress(image, start + 2);
+                return _module.AddInstruction(
+                    SpirvOp.CompositeConstruct,
+                    _vec3Type,
+                    x,
+                    y,
+                    zGradient);
+            }
+
+            if (resource.CoordinateComponents == 3)
             {
                 var z = LoadImageFloatAddress(image, start + 2);
+                if (resource.IsCube)
+                {
+                    // AMD cube helper math yields normalized face X/Y in
+                    // [1, 2]. A sampled cube face is encoded as
+                    // slice * 8 + face, while a Vulkan 2D-array layer is
+                    // slice * 6 + face.
+                    x = _module.AddInstruction(
+                        SpirvOp.FSub,
+                        _floatType,
+                        x,
+                        Float(1));
+                    y = _module.AddInstruction(
+                        SpirvOp.FSub,
+                        _floatType,
+                        y,
+                        Float(1));
+                    var faceId = _module.AddInstruction(
+                        SpirvOp.ConvertFToU,
+                        _uintType,
+                        z);
+                    var cubeIndex = ShiftRightLogical(faceId, UInt(3));
+                    var face = BitwiseAnd(faceId, UInt(7));
+                    var layer = IAdd(
+                        _module.AddInstruction(
+                            SpirvOp.IMul,
+                            _uintType,
+                            cubeIndex,
+                            UInt(6)),
+                        face);
+                    z = _module.AddInstruction(
+                        SpirvOp.ConvertUToF,
+                        _floatType,
+                        layer);
+                }
+
                 return _module.AddInstruction(
                     SpirvOp.CompositeConstruct,
                     _vec3Type,

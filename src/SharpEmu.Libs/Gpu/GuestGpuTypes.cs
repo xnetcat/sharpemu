@@ -28,7 +28,10 @@ internal sealed record GuestDrawTexture(
     uint TileMode = 0,
     uint DstSelect = 0xFAC,
     GuestSampler Sampler = default,
-    uint Depth = 1);
+    uint Depth = 1,
+    // Raw RDNA2 T# type (8=1D, 9=2D, 10=3D, 11=cube,
+    // 12=1D array, 13=2D array, 14=2D MSAA, 15=2D MSAA array).
+    uint Type = 9);
 
 /// <summary>Raw guest sampler descriptor dwords, copied verbatim from guest memory.</summary>
 internal readonly record struct GuestSampler(
@@ -50,7 +53,8 @@ internal readonly record struct TextureContentIdentity(
     uint TileMode,
     uint Pitch,
     GuestSampler Sampler,
-    uint Depth = 1);
+    uint Depth = 1,
+    uint Type = 9);
 
 internal sealed record GuestMemoryBuffer(
     ulong BaseAddress,

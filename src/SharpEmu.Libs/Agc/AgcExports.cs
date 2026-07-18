@@ -148,6 +148,7 @@ public static partial class AgcExports
     private const uint Gen5TextureType1D = 8;
     private const uint Gen5TextureType2D = 9;
     private const uint Gen5TextureType3D = 10;
+    private const uint Gen5TextureTypeCube = 11;
     private const uint Gen5TextureType2DArray = 13;
     private const uint MaxVolumeTextureDepth = 2048;
     private const ulong MaxPresentedTextureBytes = 128UL * 1024UL * 1024UL;
@@ -7838,8 +7839,12 @@ public static partial class AgcExports
     }
 
     private static bool IsBindableTextureType(in TextureDescriptor descriptor) =>
-        descriptor.Type is Gen5TextureType1D or Gen5TextureType2D or Gen5TextureType3D ||
-        descriptor.Type == Gen5TextureType2DArray && descriptor.BaseArray == 0;
+        descriptor.Type is
+            Gen5TextureType1D or
+            Gen5TextureType2D or
+            Gen5TextureType3D ||
+        descriptor.Type is Gen5TextureTypeCube or Gen5TextureType2DArray &&
+            descriptor.BaseArray == 0;
 
     private static bool TryCreateGuestDrawTexture(
         CpuContext ctx,
@@ -7935,7 +7940,8 @@ public static partial class AgcExports
                 TileMode: descriptor.TileMode,
                 DstSelect: descriptor.DstSelect,
                 Sampler: ToGuestSampler(samplerDescriptor),
-                Depth: descriptor.Depth);
+                Depth: descriptor.Depth,
+                Type: descriptor.Type);
             return true;
         }
 
@@ -8009,7 +8015,8 @@ public static partial class AgcExports
                 TileMode: descriptor.TileMode,
                 DstSelect: descriptor.DstSelect,
                 Sampler: ToGuestSampler(samplerDescriptor),
-                Depth: descriptor.Depth);
+                Depth: descriptor.Depth,
+                Type: descriptor.Type);
             return true;
         }
 
@@ -8036,7 +8043,8 @@ public static partial class AgcExports
                     descriptor.TileMode,
                     sourceWidth,
                     sampler,
-                    descriptor.Depth)))
+                    descriptor.Depth,
+                    descriptor.Type)))
         {
             texture = new GuestDrawTexture(
                 descriptor.Address,
@@ -8055,7 +8063,8 @@ public static partial class AgcExports
                 TileMode: descriptor.TileMode,
                 DstSelect: descriptor.DstSelect,
                 Sampler: sampler,
-                Depth: descriptor.Depth);
+                Depth: descriptor.Depth,
+                Type: descriptor.Type);
             return true;
         }
 
@@ -8116,7 +8125,8 @@ public static partial class AgcExports
             TileMode: descriptor.TileMode,
             DstSelect: descriptor.DstSelect,
             Sampler: ToGuestSampler(samplerDescriptor),
-            Depth: descriptor.Depth);
+            Depth: descriptor.Depth,
+            Type: descriptor.Type);
         return true;
     }
 
