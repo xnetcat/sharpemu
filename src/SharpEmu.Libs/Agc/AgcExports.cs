@@ -7203,9 +7203,9 @@ public static partial class AgcExports
                 texture.Height == 0;
             textures.Add(new TranslatedImageBinding(
                 texture,
-                Gen5ShaderTranslator.RequiresStorageImage(
-                    binding,
-                    exportEvaluation.ImageBindings),
+                Gen5ShaderTranslator.UsesStorageImageDescriptor(
+                    binding.Opcode,
+                    binding.ResourceDescriptor),
                 binding.MipLevel ?? 0,
                 binding.SamplerDescriptor,
                 binding.DescriptorSourceAddress,
@@ -7791,7 +7791,9 @@ public static partial class AgcExports
                 texture.Width == 0 ||
                 texture.Height == 0;
             var isStorage =
-                Gen5ShaderTranslator.IsStorageImageOperation(binding.Opcode);
+                Gen5ShaderTranslator.UsesStorageImageDescriptor(
+                    binding.Opcode,
+                    binding.ResourceDescriptor);
             if (_traceAgcShader || _tracePixelShaderAddress == pixelShaderAddress)
             {
                 Console.Error.WriteLine(
@@ -10747,8 +10749,9 @@ public static partial class AgcExports
         var hasStorageBinding = false;
         foreach (var binding in bindings)
         {
-            var isStorage = Gen5ShaderTranslator.RequiresStorageImage(binding, bindings);
-            var writesStorage = Gen5ShaderTranslator.IsStorageImageOperation(binding.Opcode);
+            var isStorage = Gen5ShaderTranslator.UsesStorageImageDescriptor(
+                binding.Opcode,
+                binding.ResourceDescriptor);
             var descriptorValid = TryDecodeTextureDescriptor(binding.ResourceDescriptor, out var texture);
             if (!descriptorValid)
             {

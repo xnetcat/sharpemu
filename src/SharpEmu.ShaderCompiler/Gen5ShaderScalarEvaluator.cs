@@ -527,6 +527,39 @@ public static class Gen5ShaderScalarEvaluator
                     continue;
                 }
 
+                // SharpEmu host-maps guest allocations in the lower canonical
+                // address range. A stale descriptor can still pass the V#
+                // type checks while assembling a non-canonical address from
+                // unrelated scalar data. Binding a large zero-filled Vulkan
+                // buffer for that impossible address leaves the translated
+                // instruction live and has caused Metal to hang in post-movie
+                // compute passes. Preserve the architectural unbound-resource
+                // behavior directly in SPIR-V instead.
+                if (!IsLowerCanonicalGuestAddress(bufferDescriptor.BaseAddress))
+                {
+                    if (_strictBufferLoad)
+                    {
+                        error =
+                            $"buffer-address-noncanonical pc=0x{instruction.Pc:X} " +
+                            $"address=0x{bufferDescriptor.BaseAddress:X16} " +
+                            $"s{bufferMemory.ScalarResource}";
+                        return false;
+                    }
+
+                    AddSyntheticBufferBinding(
+                        globalMemoryBindings,
+                        globalMemoryByAddress,
+                        bufferMemory.ScalarResource,
+                        instruction.Pc,
+                        writable);
+                    TraceBufferDescriptorFallback(
+                        state,
+                        instruction,
+                        bufferMemory.ScalarResource,
+                        scalarRegisters);
+                    continue;
+                }
+
                 if (resolveVertexInputs &&
                     vertexInputBindings.Count < MaxNativeVertexInputCount &&
                     IsVertexFetchCandidate(instruction, bufferMemory, bufferDescriptor))
@@ -858,6 +891,9 @@ public static class Gen5ShaderScalarEvaluator
         opcode.StartsWith("TBufferStore", StringComparison.Ordinal) ||
         opcode.StartsWith("BufferAtomic", StringComparison.Ordinal) ||
         opcode.StartsWith("TBufferAtomic", StringComparison.Ordinal);
+
+    private static bool IsLowerCanonicalGuestAddress(ulong address) =>
+        address < 0x0000_8000_0000_0000UL;
 
     private static bool HasGlobalMemoryBindingForPc(
         IReadOnlyList<Gen5GlobalMemoryBinding> bindings,
