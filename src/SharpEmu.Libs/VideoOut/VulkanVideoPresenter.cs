@@ -7050,6 +7050,7 @@ internal static unsafe class VulkanVideoPresenter
         private int _flipWriteTraceCount;
         private int _blitSourceReadbacks;
         private int _smallLutReadbacks;
+        private int _prefilterCbDumpCount;
         private readonly HashSet<ulong> _tracedSmallLutAddresses = new();
         private static readonly bool _forceDrawSync = string.Equals(
             Environment.GetEnvironmentVariable("SHARPEMU_FORCE_DRAW_SYNC"),
@@ -11837,6 +11838,76 @@ internal static unsafe class VulkanVideoPresenter
                     _pixelSpirvWriteCounts[_tracePixelSpirvBytes] = pixelWriteCount;
                     tracePixelSpirv =
                         pixelWriteCount == _tracePixelSpirvOccurrence;
+                }
+                if (_tracePixelSpirvBytes > 0 &&
+                    _tracePixelSpirvBytes == work.Draw.PixelSpirv.Length &&
+                    _prefilterCbDumpCount < 12)
+                {
+                    _prefilterCbDumpCount++;
+                    var cbBuffers = work.Draw.GlobalMemoryBuffers;
+                    Span<byte> cbWord = stackalloc byte[4];
+                    for (var cbIndex = 0; cbIndex < cbBuffers.Count; cbIndex++)
+                    {
+                        var cbBuffer = cbBuffers[cbIndex];
+                        var cbLine = new System.Text.StringBuilder();
+                        cbLine.Append(
+                            $"[CBDUMP] ps_bytes={work.Draw.PixelSpirv.Length} " +
+                            $"buf={cbIndex}/{cbBuffers.Count} " +
+                            $"base=0x{cbBuffer.BaseAddress:X16} len={cbBuffer.Length} " +
+                            $"data_len={cbBuffer.Data.Length} " +
+                            $"reread={(cbBuffer.ReadFromGuestAtExecution ? 1 : 0)} " +
+                            $"writable={(cbBuffer.Writable ? 1 : 0)}");
+                        foreach (var cbOffset in
+                            new[] { 0, 128, 160, 184, 188, 192, 196, 208, 212, 216, 220 })
+                        {
+                            var snapshot = float.NaN;
+                            if (cbOffset + 4 <= cbBuffer.Data.Length)
+                            {
+                                snapshot = BitConverter.ToSingle(
+                                    cbBuffer.Data, cbOffset);
+                            }
+
+                            var live = float.NaN;
+                            if (cbBuffer.BaseAddress != 0 &&
+                                _guestMemory?.TryRead(
+                                    cbBuffer.BaseAddress + (ulong)cbOffset,
+                                    cbWord) == true)
+                            {
+                                live = BitConverter.ToSingle(cbWord);
+                            }
+
+                            cbLine.Append(
+                                $" [{cbOffset}]s={snapshot:0.####}/l={live:0.####}");
+                        }
+
+                        Console.Error.WriteLine(cbLine.ToString());
+                    }
+
+                    // Read back this draw's INPUT textures: distinguishes a
+                    // bright-scene-in (cbuffer/shader zeroing) from an
+                    // already-zero input (upstream alias-miss / dropped write).
+                    _commandBuffer = _presentationCommandBuffer;
+                    FlushBatchedGuestCommands();
+                    Check(
+                        _vk.QueueWaitIdle(_queue),
+                        "vkQueueWaitIdle(prefilter input trace)");
+                    foreach (var inputTexture in resources.Textures)
+                    {
+                        if (inputTexture.GuestImage is { } inputImage &&
+                            inputImage.Address != 0 &&
+                            (ulong)inputImage.Width * inputImage.Height <=
+                                1920UL * 1080UL)
+                        {
+                            Console.Error.WriteLine(
+                                $"[CBINPUT] ps_bytes={work.Draw.PixelSpirv.Length} " +
+                                $"addr=0x{inputImage.Address:X16} " +
+                                $"{inputImage.Width}x{inputImage.Height} " +
+                                $"fmt={inputImage.Format} " +
+                                $"init={inputImage.Initialized} " +
+                                $"cpu={inputImage.IsCpuBacked}");
+                            TraceGuestImageContents(inputImage);
+                        }
+                    }
                 }
                 var traceTitleDraw =
                     !_tracedTitleDraw &&
