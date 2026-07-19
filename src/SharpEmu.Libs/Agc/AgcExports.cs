@@ -5616,7 +5616,6 @@ public static partial class AgcExports
             // this stream (including flips) stays deferred behind it.
             ReleaseDeferredWaitProducersAcrossQueues(
                 gpuState,
-                state,
                 waitAddress,
                 is64Bit ? (ulong)sizeof(ulong) : sizeof(uint));
         }
@@ -5791,37 +5790,36 @@ public static partial class AgcExports
         return true;
     }
 
-    private static void ReleaseDeferredWaitProducersAcrossQueues(
+    // Searching Graphics plus every compute queue covers the waiting stream too
+    // (it is always one of those live queues), so no per-stream skip is needed.
+    // Returns true when at least one deferred producer flowed.
+    private static bool ReleaseDeferredWaitProducersAcrossQueues(
         SubmittedGpuState gpuState,
-        SubmittedDcbState waitingState,
         ulong waitAddress,
         ulong waitLength)
     {
-        ReleaseDeferredWaitProducers(waitingState, waitAddress, waitLength);
-        if (!ReferenceEquals(gpuState.Graphics, waitingState))
-        {
-            ReleaseDeferredWaitProducers(gpuState.Graphics, waitAddress, waitLength);
-        }
-
+        var released = ReleaseDeferredWaitProducers(
+            gpuState.Graphics, waitAddress, waitLength);
         foreach (var computeState in gpuState.ComputeQueues.Values)
         {
-            if (!ReferenceEquals(computeState, waitingState))
-            {
-                ReleaseDeferredWaitProducers(computeState, waitAddress, waitLength);
-            }
+            released |= ReleaseDeferredWaitProducers(
+                computeState, waitAddress, waitLength);
         }
+
+        return released;
     }
 
-    private static void ReleaseDeferredWaitProducers(
+    private static bool ReleaseDeferredWaitProducers(
         SubmittedDcbState state,
         ulong waitAddress,
         ulong waitLength)
     {
         if (state.DeferredGpuSideEffects.Count == 0)
         {
-            return;
+            return false;
         }
 
+        var released = false;
         var retained = new Queue<SubmittedDcbState.DeferredGpuSideEffect>(
             state.DeferredGpuSideEffects.Count);
         while (state.DeferredGpuSideEffects.TryDequeue(out var deferred))
@@ -5839,6 +5837,7 @@ public static partial class AgcExports
                     $"submission={state.ActiveSubmissionId} " +
                     $"label=0x{waitAddress:X16} action='{deferred.DebugName}'");
                 deferred.Effect();
+                released = true;
             }
             else
             {
@@ -5850,6 +5849,67 @@ public static partial class AgcExports
         {
             state.DeferredGpuSideEffects.Enqueue(deferred);
         }
+
+        return released;
+    }
+
+    /// <summary>
+    /// Re-runs the cross-queue producer release for every wait still registered
+    /// against this guest memory. The registration-time sweep
+    /// (<see cref="ReleaseDeferredWaitProducersAcrossQueues"/>) fires exactly
+    /// once, so a producer that lands on some queue's deferred pile afterwards —
+    /// while that queue's own <c>DeferredWaitCount</c> stays above zero because
+    /// of this very wait — would otherwise never flow: the pile only drains when
+    /// the count reaches zero, which the deferred producer itself must unblock.
+    /// The monitor calls this whenever a poll makes no progress, guaranteeing a
+    /// deferred producer always eventually flows and breaking producer/consumer
+    /// deferral cycles. It runs only the guest's own already-queued writes with
+    /// the values the guest programmed; it never fabricates a label value.
+    /// Returns true when at least one deferred producer flowed.
+    /// </summary>
+    private static bool ReleaseDeferredWaitProducersForAllWaits(
+        CpuContext ctx,
+        SubmittedGpuState gpuState)
+    {
+        var memoryStateKey = GetCpuMemoryStateKey(ctx.Memory);
+        var ranges = GpuWaitRegistry.SnapshotWaitRanges(memoryStateKey);
+        if (ranges is null)
+        {
+            return false;
+        }
+
+        var released = false;
+        foreach (var (address, length) in ranges)
+        {
+            released |= ReleaseDeferredWaitProducersAcrossQueues(
+                gpuState, address, length);
+        }
+
+        return released;
+    }
+
+    /// <summary>
+    /// Test seam for the deferral liveness invariant: a producer trapped on a
+    /// queue's deferred pile must flow to an overlapping wait, while a producer
+    /// that does not overlap the wait must be retained (never spuriously run).
+    /// </summary>
+    internal static (bool Ran, bool Retained) ReleaseDeferredProducerForTest(
+        ulong producerAddress,
+        ulong producerLength,
+        ulong waitAddress,
+        ulong waitLength)
+    {
+        var gpuState = new SubmittedGpuState();
+        var ran = false;
+        gpuState.Graphics.DeferredGpuSideEffects.Enqueue(
+            new SubmittedDcbState.DeferredGpuSideEffect(
+                () => ran = true,
+                producerAddress,
+                producerLength,
+                "test_producer"));
+        ReleaseDeferredWaitProducersAcrossQueues(gpuState, waitAddress, waitLength);
+        var retained = gpuState.Graphics.DeferredGpuSideEffects.Count != 0;
+        return (ran, retained);
     }
 
     private static SubmittedGpuState GetSubmittedGpuState(ICpuMemory memory) =>
@@ -5891,10 +5951,25 @@ public static partial class AgcExports
         var monitorContext = new CpuContext(
             submitContext.Memory,
             submitContext.TargetGeneration);
-        ThreadPool.UnsafeQueueUserWorkItem(
-            static state => MonitorGpuWaits(state.Context, state.GpuState),
-            (Context: monitorContext, GpuState: gpuState),
-            preferLocal: false);
+
+        // A dedicated background thread, not a ThreadPool work item. The monitor
+        // is the only off-submit trigger that keeps deferred GPU effects flowing
+        // while a wait is registered, and it is the liveness backstop when the
+        // guest stops submitting new DCBs. ThreadPool.UnsafeQueueUserWorkItem has
+        // unbounded scheduling latency and can sit queued indefinitely when guest
+        // worker items saturate the pool, which would strand every deferred flip
+        // behind the wait. A dedicated thread cannot be starved that way.
+        var monitorThread = new Thread(
+            static state =>
+            {
+                var (context, gpu) = ((CpuContext, SubmittedGpuState))state!;
+                MonitorGpuWaits(context, gpu);
+            })
+        {
+            IsBackground = true,
+            Name = "SharpEmu-GpuWaitMonitor",
+        };
+        monitorThread.Start((monitorContext, gpuState));
     }
 
     private static void MonitorGpuWaits(
@@ -5928,6 +6003,17 @@ public static partial class AgcExports
                 {
                     Volatile.Write(ref gpuState.WaitMonitorRunning, 0);
                     return;
+                }
+
+                if (!madeProgress &&
+                    ReleaseDeferredWaitProducersForAllWaits(ctx, gpuState))
+                {
+                    // A producer for one of the still-registered labels was
+                    // trapped on a queue's deferred pile behind its own wait.
+                    // Releasing it flows the guest's programmed write; re-poll
+                    // promptly so the next drain can satisfy the wait instead of
+                    // backing off toward the wedge.
+                    madeProgress = true;
                 }
             }
 

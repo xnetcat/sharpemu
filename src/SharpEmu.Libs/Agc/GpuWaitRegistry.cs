@@ -190,6 +190,45 @@ internal static class GpuWaitRegistry
     }
 
     /// <summary>
+    /// Returns the distinct watched (address, byte-length) ranges for every
+    /// waiter still registered against <paramref name="memory"/>. The length is
+    /// 8 when any waiter at that address is 64-bit, otherwise 4. Used by the
+    /// wait monitor to periodically re-run the cross-queue producer release for
+    /// all outstanding waits so a producer that was deferred onto a queue's
+    /// pile after that wait's one-shot registration-time sweep still flows.
+    /// </summary>
+    public static List<(ulong Address, ulong Length)>? SnapshotWaitRanges(object memory)
+    {
+        List<(ulong Address, ulong Length)>? ranges = null;
+        lock (_gate)
+        {
+            foreach (var (address, list) in _waiters)
+            {
+                var matched = false;
+                var any64Bit = false;
+                foreach (var waiter in list)
+                {
+                    if (!ReferenceEquals(waiter.Memory, memory))
+                    {
+                        continue;
+                    }
+
+                    matched = true;
+                    any64Bit |= waiter.Is64Bit;
+                }
+
+                if (matched)
+                {
+                    ranges ??= new List<(ulong, ulong)>();
+                    ranges.Add((address, any64Bit ? (ulong)sizeof(ulong) : sizeof(uint)));
+                }
+            }
+        }
+
+        return ranges;
+    }
+
+    /// <summary>
     /// Returns watched labels overlapped by a newly discovered producer. Used
     /// only for diagnostics; producer completion still wakes through the
     /// normal CollectSatisfied path after the ordered memory write executes.
