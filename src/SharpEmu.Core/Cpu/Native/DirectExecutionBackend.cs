@@ -235,6 +235,13 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private CpuContext? _cpuContext;
 
+	// Per-thread free-list of reusable guest continuation stubs (executable
+	// trampoline + host-RSP storage). Reused across continuations on the same
+	// thread so the hot resume path stops taking HostMemory's global lock for a
+	// VirtualAlloc/VirtualFree each time — the worker-storm live-lock hotspot.
+	[ThreadStatic]
+	private static Stack<(nint Stub, nint Rsp)>? _continuationStubPool;
+
 	[ThreadStatic]
 	private static DirectExecutionBackend? _activeExecutionBackend;
 
@@ -5182,18 +5189,39 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			return GuestNativeCallExitReason.Exception;
 		}
 		const uint stubSize = 512u;
-		void* ptr = VirtualAlloc(null, stubSize, 12288u, 4u);
-		if (ptr == null)
+		// The stub is rebuilt from scratch on every continuation resume, so a
+		// prior stub's memory can be reused verbatim. VirtualAlloc/VirtualFree
+		// each take HostMemory's global lock; doing that per continuation makes
+		// the guest job system's worker-creation storm convoy on that lock (a
+		// CPU-spun live-lock). Reuse per-thread stubs from a free-list instead:
+		// entry pops a free stub (or allocates one), exit returns it. Nesting is
+		// safe because an in-use stub is popped off the list, so a nested call
+		// takes a different one. Bounded guest-thread count bounds the pool.
+		var stubPool = _continuationStubPool ??= new Stack<(nint Stub, nint Rsp)>();
+		void* ptr;
+		void* hostRspStorage;
+		if (stubPool.Count > 0)
 		{
-			reason = "failed to allocate executable memory for guest thread stub";
-			return GuestNativeCallExitReason.Exception;
+			var reused = stubPool.Pop();
+			ptr = (void*)reused.Stub;
+			hostRspStorage = (void*)reused.Rsp;
+			NativeMemory.Clear(hostRspStorage, (nuint)(2 * sizeof(ulong)));
 		}
-		void* hostRspStorage = NativeMemory.AllocZeroed((nuint)(2 * sizeof(ulong)));
-		if (hostRspStorage == null)
+		else
 		{
-			VirtualFree(ptr, 0u, 32768u);
-			reason = "failed to allocate writable host-RSP storage for guest continuation stub";
-			return GuestNativeCallExitReason.Exception;
+			ptr = VirtualAlloc(null, stubSize, 12288u, 4u);
+			if (ptr == null)
+			{
+				reason = "failed to allocate executable memory for guest thread stub";
+				return GuestNativeCallExitReason.Exception;
+			}
+			hostRspStorage = NativeMemory.AllocZeroed((nuint)(2 * sizeof(ulong)));
+			if (hostRspStorage == null)
+			{
+				VirtualFree(ptr, 0u, 32768u);
+				reason = "failed to allocate writable host-RSP storage for guest continuation stub";
+				return GuestNativeCallExitReason.Exception;
+			}
 		}
 		var previousActiveBackend = _activeExecutionBackend;
 		var previousActiveContext = _activeCpuContext;
@@ -5320,8 +5348,11 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				previousForcedExit,
 				previousYieldRequested,
 				previousYieldReason);
-			NativeMemory.Free(hostRspStorage);
-			VirtualFree(ptr, 0u, 32768u);
+			// Return the stub to this thread's free-list for reuse rather than
+			// freeing it (which would take HostMemory's global lock again). The
+			// pool is this same thread's, so the push is lock-free.
+			(_continuationStubPool ??= new Stack<(nint Stub, nint Rsp)>())
+				.Push(((nint)ptr, (nint)hostRspStorage));
 		}
 	}
 
