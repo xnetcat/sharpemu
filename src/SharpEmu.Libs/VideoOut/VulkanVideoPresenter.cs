@@ -7781,15 +7781,8 @@ internal static unsafe class VulkanVideoPresenter
             out TextureResource resource)
         {
             resource = default!;
-            // A non-empty RgbaPixels means the parse thread deliberately read
-            // fresh guest bytes for this draw: either the image is CPU-backed,
-            // or the write tracker reported the backing memory dirty (a guest
-            // CPU store landed since the last upload). Both cases must re-upload
-            // so the sample reflects unified-memory content. An empty snapshot
-            // is the pure GPU-feedback case and keeps the live image untouched.
-            // The fingerprint compare below still skips redundant uploads, so
-            // dropping the IsCpuBacked gate never re-uploads unchanged content.
-            if (guestImage.Width != texture.Width ||
+            if (!guestImage.IsCpuBacked ||
+                guestImage.Width != texture.Width ||
                 guestImage.Height != texture.Height ||
                 guestImage.Depth != Math.Max(texture.Depth, 1u) ||
                 guestImage.MipLevels != 1 ||
@@ -8620,23 +8613,6 @@ internal static unsafe class VulkanVideoPresenter
 
                     _guestImageExtents[texture.Address] =
                         (width, height, expectedSize);
-                }
-
-                // Promoting a plain sampled texture into an address-keyed guest
-                // image means the parse thread stops re-reading its guest
-                // memory (the IsGuestImageAvailable fast path). Arm CPU-write
-                // tracking over its backing extent so a later guest store
-                // (atlas rasterization, memset) dirties the range and the
-                // sample re-reads it. This resource sets OwnsStorage=false, so
-                // the texture-cache Track site never fires for it; without this
-                // the surface froze at its first upload forever.
-                if (!is3D)
-                {
-                    SharpEmu.HLE.GuestImageWriteTracker.Track(
-                        texture.Address,
-                        expectedSize,
-                        CurrentGuestWorkSequenceForDiagnostics,
-                        "vulkan.cpu-backed-image");
                 }
             }
 
@@ -12381,19 +12357,11 @@ internal static unsafe class VulkanVideoPresenter
                             depth));
                 }
 
-                // Track the full backing extent regardless of size. The former
-                // 1920x1080 cap left oversized surfaces (4K UI sheets, super-
-                // sampled buffers) permanently un-invalidated: a guest CPU
-                // rewrite never dirtied them and the sample served whatever
-                // stale bytes last sat there. GPU renders write the Vulkan
-                // image, not guest memory, so tracking only faults on genuine
-                // CPU stores — cost stays one fault per surface per write burst.
-                if (!is3D)
+                if (!is3D && target.Width <= 1920 && target.Height <= 1080)
                 {
                     SharpEmu.HLE.GuestImageWriteTracker.Track(
                         target.Address,
-                        GetTextureVolumeByteCount(
-                            target.Format, target.Width, target.Height, depth),
+                        (ulong)target.Width * target.Height * GetTextureBytesPerPixel(target.Format),
                         CurrentGuestWorkSequenceForDiagnostics,
                         "vulkan.render-target");
                 }
@@ -12544,16 +12512,11 @@ internal static unsafe class VulkanVideoPresenter
                         depth));
             }
 
-            // See the retained-variant path above: track the full backing
-            // extent with no size cap so oversized render targets that the
-            // guest later rewrites with the CPU are re-uploaded on the next
-            // sample instead of serving stale bytes.
-            if (!is3D)
+            if (!is3D && target.Width <= 1920 && target.Height <= 1080)
             {
                 SharpEmu.HLE.GuestImageWriteTracker.Track(
                     target.Address,
-                    GetTextureVolumeByteCount(
-                        target.Format, target.Width, target.Height, depth),
+                    (ulong)target.Width * target.Height * GetTextureBytesPerPixel(target.Format),
                     CurrentGuestWorkSequenceForDiagnostics,
                     "vulkan.render-target");
             }
