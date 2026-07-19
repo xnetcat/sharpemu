@@ -4530,6 +4530,40 @@ public static partial class AgcExports
         return false;
     }
 
+    // True when a not-yet-executed label write for this address was registered
+    // by the SAME queue and SAME submission (i.e. a ReleaseMem/WriteData earlier
+    // in this command stream). Such a producer is FIFO-ordered ahead of every
+    // packet parsed after the wait, so the wait needs no suspend.
+    private static bool HasPendingSameSubmissionLabelProducer(
+        object memory,
+        string queueName,
+        ulong submissionId,
+        ulong address,
+        ulong length)
+    {
+        lock (_labelProducerGate)
+        {
+            for (var index = _labelProducers.Count - 1; index >= 0; index--)
+            {
+                var producer = _labelProducers[index];
+                if (!producer.Completed &&
+                    producer.SubmissionId == submissionId &&
+                    ReferenceEquals(producer.Memory, memory) &&
+                    string.Equals(producer.QueueName, queueName, StringComparison.Ordinal) &&
+                    RangesOverlap(
+                        producer.Address,
+                        producer.Length,
+                        address,
+                        length))
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
     private static void TraceWaitProducerState(
         object memory,
         in GpuWaitRegistry.WaitingDcb waiter,
@@ -5462,6 +5496,27 @@ public static partial class AgcExports
         if (!hasCurrent)
         {
             return false; // cannot evaluate the label — do not stall the DCB
+        }
+
+        // In-stream fence: the awaited label is written by a ReleaseMem/WriteData
+        // packet earlier in THIS SAME submission's command stream, whose write was
+        // deferred as an ordered action on this queue. The presenter executes a
+        // logical queue's work — draws, dispatches, and those deferred label
+        // writes — in FIFO order, so everything parsed after this wait is already
+        // ordered behind the producer. Suspending here is therefore unnecessary
+        // and dangerous: if the deferred write is slow to drain, the submission
+        // never completes, its submit-completion equeue event (ident 0, graphics)
+        // never fires, and a title gating its next frame on that event hangs.
+        // Only cross-queue / externally produced labels still suspend, preserving
+        // the ordering the suspend mechanism exists for.
+        if (HasPendingSameSubmissionLabelProducer(
+                ctx.Memory,
+                state.QueueName,
+                state.ActiveSubmissionId,
+                waitAddress,
+                is64Bit ? (ulong)sizeof(ulong) : sizeof(uint)))
+        {
+            return false;
         }
 
         GpuWaitRegistry.Register(waitAddress, waiter);
