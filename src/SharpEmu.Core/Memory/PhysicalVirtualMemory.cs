@@ -1306,15 +1306,34 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
     {
         var startPage = AlignDown(address, PageSize);
         var endPage = AlignUp(address + size, PageSize);
+        // HostMemory.Query returns a run of pages sharing one protection, and
+        // each call takes HostMemory's global lock. Querying every page instead
+        // of advancing by the returned run size is the hotspot behind the
+        // guest-worker-creation-storm live-lock: dozens of guest threads all
+        // acquire that global lock per page of every write. Re-query only when
+        // crossing out of the last validated host run so a multi-page write
+        // takes the lock once per protection run, not once per page.
+        ulong hostRunEnd = 0;
         for (var pageAddress = startPage; pageAddress < endPage; pageAddress += PageSize)
         {
-            if (!_hostMemory.Query(pageAddress, out var hostRegion) ||
-                hostRegion.State != HostRegionState.Committed ||
-                (write
-                    ? !IsWritableHostProtection(hostRegion.Protection)
-                    : !IsReadableHostProtection(hostRegion.Protection)))
+            if (pageAddress >= hostRunEnd)
             {
-                return false;
+                if (!_hostMemory.Query(pageAddress, out var hostRegion) ||
+                    hostRegion.State != HostRegionState.Committed ||
+                    (write
+                        ? !IsWritableHostProtection(hostRegion.Protection)
+                        : !IsReadableHostProtection(hostRegion.Protection)))
+                {
+                    return false;
+                }
+
+                hostRunEnd = hostRegion.BaseAddress + hostRegion.RegionSize;
+                // Guard against a non-advancing run so the loop always makes
+                // progress even if a backend reports a zero-length region.
+                if (hostRunEnd <= pageAddress)
+                {
+                    hostRunEnd = pageAddress + PageSize;
+                }
             }
 
             if (_pageProtections.TryGetValue(pageAddress, out var flags))
