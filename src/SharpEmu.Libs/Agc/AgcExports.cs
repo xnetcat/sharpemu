@@ -5812,16 +5812,44 @@ public static partial class AgcExports
         }
     }
 
-    private static void ReleaseDeferredWaitProducers(
+    /// <summary>
+    /// Releases deferred producers feeding a label from every queue's deferred
+    /// pile. Used by the wait monitor, which has no single "waiting" queue to
+    /// skip — a registered wait's producer may sit in any stream.
+    /// </summary>
+    private static bool ReleaseDeferredWaitProducersFromAllQueues(
+        SubmittedGpuState gpuState,
+        ulong waitAddress,
+        ulong waitLength)
+    {
+        var releasedAny = false;
+        if (ReleaseDeferredWaitProducers(gpuState.Graphics, waitAddress, waitLength))
+        {
+            releasedAny = true;
+        }
+
+        foreach (var computeState in gpuState.ComputeQueues.Values)
+        {
+            if (ReleaseDeferredWaitProducers(computeState, waitAddress, waitLength))
+            {
+                releasedAny = true;
+            }
+        }
+
+        return releasedAny;
+    }
+
+    private static bool ReleaseDeferredWaitProducers(
         SubmittedDcbState state,
         ulong waitAddress,
         ulong waitLength)
     {
         if (state.DeferredGpuSideEffects.Count == 0)
         {
-            return;
+            return false;
         }
 
+        var releasedAny = false;
         var retained = new Queue<SubmittedDcbState.DeferredGpuSideEffect>(
             state.DeferredGpuSideEffects.Count);
         while (state.DeferredGpuSideEffects.TryDequeue(out var deferred))
@@ -5839,6 +5867,7 @@ public static partial class AgcExports
                     $"submission={state.ActiveSubmissionId} " +
                     $"label=0x{waitAddress:X16} action='{deferred.DebugName}'");
                 deferred.Effect();
+                releasedAny = true;
             }
             else
             {
@@ -5850,6 +5879,8 @@ public static partial class AgcExports
         {
             state.DeferredGpuSideEffects.Enqueue(deferred);
         }
+
+        return releasedAny;
     }
 
     private static SubmittedGpuState GetSubmittedGpuState(ICpuMemory memory) =>
@@ -5913,6 +5944,26 @@ public static partial class AgcExports
                 {
                     Volatile.Write(ref gpuState.WaitMonitorRunning, 0);
                     return;
+                }
+
+                // A registered wait's producing RELEASE_MEM/DMA can be parked in
+                // some queue's deferred-effects pile — deferred behind an earlier
+                // wait in its own submission. That pile is otherwise drained only
+                // when a NEW wait registers (registration-time cross-queue
+                // release) or the wait satisfies. If the guest issues no further
+                // submissions (a screen-transition boundary), nothing drains it,
+                // the label never gets written, and presentation wedges forever.
+                // Re-attempt the release here so the monitor is liveness-safe:
+                // this runs the guest's real deferred writes, never fabricates a
+                // value. Running before the satisfaction check lets the released
+                // write be observed on this same pass.
+                if (_gpuWaitDeferEffectsEnabled)
+                {
+                    foreach (var (address, width) in
+                        GpuWaitRegistry.SnapshotAddressesForMemory(memoryStateKey))
+                    {
+                        ReleaseDeferredWaitProducersFromAllQueues(gpuState, address, width);
+                    }
                 }
 
                 DrainResumableDcbs(ctx, gpuState, tracePackets: _traceAgc);

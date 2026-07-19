@@ -81,6 +81,42 @@ internal static class GpuWaitRegistry
         }
     }
 
+    /// <summary>
+    /// Snapshots every registered waiter's address and byte width for a memory,
+    /// so the wait monitor can re-attempt releasing the deferred producers that
+    /// feed those labels. Deduplicated by address, taking the widest width so a
+    /// 64-bit waiter is never re-checked as 32-bit.
+    /// </summary>
+    public static List<(ulong Address, ulong Width)> SnapshotAddressesForMemory(object memory)
+    {
+        var matches = new List<(ulong Address, ulong Width)>();
+        lock (_gate)
+        {
+            foreach (var (address, list) in _waiters)
+            {
+                var any = false;
+                var any64Bit = false;
+                foreach (var waiter in list)
+                {
+                    if (!ReferenceEquals(waiter.Memory, memory))
+                    {
+                        continue;
+                    }
+
+                    any = true;
+                    any64Bit |= waiter.Is64Bit;
+                }
+
+                if (any)
+                {
+                    matches.Add((address, any64Bit ? (ulong)sizeof(ulong) : sizeof(uint)));
+                }
+            }
+        }
+
+        return matches;
+    }
+
     public static void Register(ulong address, WaitingDcb waiter)
     {
         waiter.WaitAddress = address;
