@@ -32,6 +32,24 @@ public static class Gen5ShaderScalarEvaluator
     private static readonly object _scalarLoadFailureTraceGate = new();
     private static readonly HashSet<(ulong Shader, uint Pc)> _tracedScalarLoadFailures = [];
 
+    // Diagnostic: trace the provenance of constant-buffer V# descriptors that
+    // are suspicious — resolved near the shader's own preamble (base ~= program
+    // address), oversized/clamped (a huge num_records is usually a mis-decoded
+    // or unpopulated EUD/SRT descriptor), or any load inside a getpc-carrying
+    // shader (the tonemap/post pass). Prints the decoded descriptor, its
+    // provenance (whether the base dword itself came from a guest-memory table,
+    // and whether that live source differs), and the live payload for small
+    // buffers so a partially-populated constant buffer is visible. This is how
+    // the "black scene = zero exposure constant" hypothesis is checked against
+    // real data. Gated; one line per (shader, pc), zero cost when off.
+    private static readonly bool _traceConstantBufferProvenance =
+        string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_TRACE_CB_PROVENANCE"),
+            "1",
+            StringComparison.Ordinal);
+    private static readonly object _constantBufferProvenanceGate = new();
+    private static readonly HashSet<(ulong Shader, uint Pc)> _tracedConstantBufferProvenance = [];
+
     // A stale buffer descriptor should not discard an otherwise valid shader
     // pass.  Treat it as an all-zero buffer by default; callers that need
     // strict diagnostics can restore the old failure behaviour explicitly.
@@ -2156,6 +2174,103 @@ public static class Gen5ShaderScalarEvaluator
         var address = unchecked(
             baseAddress +
             byteOffset) & ~3UL;
+        if (_traceConstantBufferProvenance &&
+            isBufferLoad &&
+            hasBufferDescriptor &&
+            bufferDescriptor.BaseAddress != 0)
+        {
+            var programAddress = state.Program.Address;
+            var delta = (long)bufferDescriptor.BaseAddress - (long)programAddress;
+            var nearPreamble = delta > -0x4000 && delta < 0x4000;
+            var clamped = bufferDescriptor.SizeBytes >= 0x10000;
+            var isGetpcProgram = false;
+            for (var i = 0; i < state.Program.Instructions.Count; i++)
+            {
+                if (state.Program.Instructions[i].Opcode == "SGetpcB64")
+                {
+                    isGetpcProgram = true;
+                    break;
+                }
+            }
+
+            if (nearPreamble || clamped || isGetpcProgram)
+            {
+                var shouldTrace = false;
+                lock (_constantBufferProvenanceGate)
+                {
+                    shouldTrace = _tracedConstantBufferProvenance.Add(
+                        (programAddress, instruction.Pc));
+                }
+
+                if (shouldTrace)
+                {
+                    var srcLo = 0UL;
+                    var srcHi = 0UL;
+                    scalarLoadSources?.TryGetValue(scalarBase.Value, out srcLo);
+                    scalarLoadSources?.TryGetValue(scalarBase.Value + 1, out srcHi);
+                    var hasChain =
+                        scalarLoadChains?.ContainsKey(scalarBase.Value) == true;
+                    // If the V# base dword itself came from guest memory (an
+                    // EUD/SRT indirection), re-read that source now to see
+                    // whether the live pointer differs from what we captured.
+                    var liveBaseLo = 0u;
+                    var liveBaseHi = 0u;
+                    if (srcLo != 0)
+                    {
+                        TryReadUInt32(ctx, srcLo, out liveBaseLo);
+                    }
+                    if (srcHi != 0)
+                    {
+                        TryReadUInt32(ctx, srcHi, out liveBaseHi);
+                    }
+                    // Live content at the resolved base (first 2 dwords).
+                    var liveWord0 = 0u;
+                    var liveWord1 = 0u;
+                    TryReadUInt32(ctx, bufferDescriptor.BaseAddress, out liveWord0);
+                    TryReadUInt32(ctx, bufferDescriptor.BaseAddress + 4, out liveWord1);
+                    // For small buffers, dump the full live payload so a
+                    // partially-populated constant buffer (record 0 written,
+                    // exposure record still zero) is visible.
+                    var liveDump = string.Empty;
+                    if (bufferDescriptor.SizeBytes is > 0 and <= 256)
+                    {
+                        var sb = new System.Text.StringBuilder(" livefull=[");
+                        var dwords = (int)(bufferDescriptor.SizeBytes / 4);
+                        for (var w = 0; w < dwords; w++)
+                        {
+                            TryReadUInt32(
+                                ctx,
+                                bufferDescriptor.BaseAddress + (ulong)(w * 4),
+                                out var wv);
+                            if (w != 0)
+                            {
+                                sb.Append(',');
+                            }
+                            sb.Append(wv.ToString("X8"));
+                        }
+                        sb.Append(']');
+                        liveDump = sb.ToString();
+                    }
+                    Console.Error.WriteLine(
+                        $"[CBPROV] prog=0x{programAddress:X16} pc=0x{instruction.Pc:X} " +
+                        $"op={instruction.Opcode} s{scalarBase.Value} " +
+                        $"base=0x{bufferDescriptor.BaseAddress:X16} delta={delta:+#;-#;0} " +
+                        $"stride={bufferDescriptor.Stride} records={bufferDescriptor.NumRecords} " +
+                        $"size={bufferDescriptor.SizeBytes} imm={control.ImmediateOffsetBytes} " +
+                        $"clamped={(clamped ? 1 : 0)} " +
+                        $"v#=[{scalarRegisters[scalarBase.Value]:X8}:" +
+                        $"{scalarRegisters[scalarBase.Value + 1]:X8}:" +
+                        $"{scalarRegisters[scalarBase.Value + 2]:X8}:" +
+                        $"{scalarRegisters[scalarBase.Value + 3]:X8}] " +
+                        $"src_lo=0x{srcLo:X16} src_hi=0x{srcHi:X16} chain={(hasChain ? 1 : 0)} " +
+                        $"liveBase=0x{liveBaseHi:X8}{liveBaseLo:X8} " +
+                        $"live@base=[{liveWord0:X8}:{liveWord1:X8}]{liveDump} " +
+                        $"ud_base=s{state.UserDataScalarRegisterBase} " +
+                        $"ud_count={state.UserData.Count}");
+                }
+            }
+        }
+
         var deferredDescriptorAddress = 0UL;
         Gen5DescriptorChain? deferredDescriptorChain = null;
         if (isBufferLoad)
