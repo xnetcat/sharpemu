@@ -2920,7 +2920,7 @@ public static partial class AgcExports
         {
             state.HasActiveSubmission = true;
             state.ActiveSubmissionId = submission.SubmissionId;
-            state.IsSuspended = ParseSubmittedDcb(
+            state.IsSuspended = ParseSubmittedDcbResilient(
                 ctx,
                 gpuState,
                 state,
@@ -2934,6 +2934,58 @@ public static partial class AgcExports
 
             state.HasActiveSubmission = false;
             NotifySubmittedDcbCompleted(gpuState, state, submission.SubmissionId);
+        }
+    }
+
+    private static readonly HashSet<string> _tracedDcbParseExceptions = new();
+
+    // ParseSubmittedDcb walks guest-authored PM4 and may throw on a shader-
+    // translation or guest-memory edge case. If that exception unwinds out of
+    // PumpSubmittedQueue / ResumeSuspendedDcb, the submission is left with
+    // HasActiveSubmission = true forever: the queue never advances, its
+    // submit-completion equeue event (ident 0, filter graphics) never fires,
+    // and a title that gates its next frame on that event (Unity's submitDone)
+    // busy-waits indefinitely. Fail closed the same way a detected malformed
+    // packet is dropped-as-completed: swallow the parse fault, report it once,
+    // and let the caller finish + notify the submission so the pipeline drains.
+    private static bool ParseSubmittedDcbResilient(
+        CpuContext ctx,
+        SubmittedGpuState gpuState,
+        SubmittedDcbState state,
+        ulong commandAddress,
+        uint dwordCount,
+        bool tracePackets)
+    {
+        try
+        {
+            return ParseSubmittedDcb(
+                ctx, gpuState, state, commandAddress, dwordCount, tracePackets);
+        }
+        catch (Exception ex)
+        {
+            var key = $"{state.QueueName}:{ex.GetType().FullName}:{ex.Message}";
+            bool firstForKey;
+            lock (_submitTraceGate)
+            {
+                if (_tracedDcbParseExceptions.Count >= 256)
+                {
+                    _tracedDcbParseExceptions.Clear();
+                }
+
+                firstForKey = _tracedDcbParseExceptions.Add(key);
+            }
+
+            if (firstForKey)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][WARN] agc.dcb_parse_exception queue={state.QueueName} " +
+                    $"submission={state.ActiveSubmissionId} addr=0x{commandAddress:X16} " +
+                    $"dwords={dwordCount}: {ex.GetType().Name}: {ex.Message}");
+            }
+
+            // Not suspended: the caller resets HasActiveSubmission, publishes the
+            // completion event, and pumps the remaining queued submissions.
+            return false;
         }
     }
 
@@ -5089,7 +5141,7 @@ public static partial class AgcExports
         state.QueueName = waiter.QueueName ?? state.QueueName;
         state.ActiveSubmissionId = waiter.SubmissionId;
         state.IsSuspended = false;
-        if (ParseSubmittedDcb(
+        if (ParseSubmittedDcbResilient(
                 ctx,
                 gpuState,
                 state,
