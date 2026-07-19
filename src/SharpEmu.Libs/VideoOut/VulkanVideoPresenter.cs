@@ -12027,6 +12027,8 @@ internal static unsafe class VulkanVideoPresenter
                     _prefilterCbDumpCount++;
                     var cbBuffers = work.Draw.GlobalMemoryBuffers;
                     Span<byte> cbWord = stackalloc byte[4];
+                    Span<byte> probeBytes = stackalloc byte[32];
+                    Span<byte> probeRow = stackalloc byte[64];
                     for (var cbIndex = 0; cbIndex < cbBuffers.Count; cbIndex++)
                     {
                         var cbBuffer = cbBuffers[cbIndex];
@@ -12062,6 +12064,70 @@ internal static unsafe class VulkanVideoPresenter
                         }
 
                         Console.Error.WriteLine(cbLine.ToString());
+
+                        // TEMP PROBE (tonemap 256KB zero-buffer root cause):
+                        // determine whether the large constant range is ever
+                        // written (CPU fault or managed WRITE_DATA path) and
+                        // whether a live GPU buffer allocation covers it.
+                        if (cbBuffer.BaseAddress != 0 && cbBuffer.Length >= 65536)
+                        {
+                            SharpEmu.HLE.GuestImageWriteTracker.Track(
+                                cbBuffer.BaseAddress, 4096, source: "tonemap-probe");
+                            SharpEmu.HLE.GuestImageWriteTracker.TryGetWriteGeneration(
+                                cbBuffer.BaseAddress, out var probeGen);
+                            var covering = "none";
+                            foreach (var alloc in _guestBufferAllocations)
+                            {
+                                if (alloc.BaseAddress <= cbBuffer.BaseAddress &&
+                                    alloc.BaseAddress + alloc.Size >=
+                                        cbBuffer.BaseAddress + 16)
+                                {
+                                    covering =
+                                        $"0x{alloc.BaseAddress:X16}+0x{alloc.Size:X}" +
+                                        $"@{alloc.QueueName}";
+                                    break;
+                                }
+                            }
+
+                            var liveHex = "read-fail";
+                            if (_guestMemory?.TryRead(
+                                    cbBuffer.BaseAddress, probeBytes) == true)
+                            {
+                                liveHex = Convert.ToHexString(probeBytes);
+                            }
+
+                            // Wide window: dump the pipeline neighbourhood to
+                            // distinguish missing embedded-constant data from a
+                            // mis-relocated pointer. Scan base-0x400..base+0x400
+                            // in 64-byte rows, printing only nonzero rows.
+                            var wide = new System.Text.StringBuilder();
+                            for (long rel = -0x400; rel < 0x400; rel += 64)
+                            {
+                                var addr = (ulong)((long)cbBuffer.BaseAddress + rel);
+                                if (_guestMemory?.TryRead(addr, probeRow) != true)
+                                {
+                                    continue;
+                                }
+
+                                var nonZero = false;
+                                foreach (var b in probeRow)
+                                {
+                                    if (b != 0) { nonZero = true; break; }
+                                }
+                                if (nonZero)
+                                {
+                                    wide.Append(
+                                        $" [{(rel >= 0 ? "+" : "")}{rel:X}]" +
+                                        Convert.ToHexString(probeRow));
+                                }
+                            }
+
+                            Console.Error.WriteLine(
+                                $"[CBPROBE] base=0x{cbBuffer.BaseAddress:X16} " +
+                                $"len={cbBuffer.Length} writegen={probeGen} " +
+                                $"covering={covering} live32={liveHex}" +
+                                $" wide=>{wide}");
+                        }
                     }
 
                     // Read back this draw's INPUT textures: distinguishes a
