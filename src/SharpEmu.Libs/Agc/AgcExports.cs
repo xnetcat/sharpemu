@@ -9676,8 +9676,20 @@ public static partial class AgcExports
             return true;
         }
 
+        // Aliased guest images live in host GPU memory, so this fast path
+        // normally returns empty texels and lets the presenter sample the live
+        // Vulkan image (correct for the render-into-then-sample feedback case).
+        // On PS5 that same address is unified memory: once the guest CPU writes
+        // it (font-atlas rasterization, Chowdren fog memset, a movie placeholder
+        // rewrite), the next sample must observe those bytes. The write tracker
+        // dirties the range only on a real CPU store, so a set dirty flag means
+        // the GPU image is stale — fall through to the cold path below and ship
+        // fresh texels with this draw, exactly as the cached-sampled fast path
+        // does. Without this the promoted image froze at its first upload and
+        // every later CPU rewrite was invisible.
         if (!isStorage &&
             descriptor.Address != 0 &&
+            !SharpEmu.HLE.GuestImageWriteTracker.PeekDirty(descriptor.Address) &&
             VulkanVideoPresenter.IsGuestImageAvailable(
                 descriptor.Address,
                 descriptor.Format,
