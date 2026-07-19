@@ -137,7 +137,30 @@ public static unsafe class HostMemory
 
         private static readonly nint MAP_FAILED = -1;
 
-        private static readonly object Gate = new();
+        // Reader/writer lock over the region table. Query is read-only and, on
+        // the guest job system's worker-creation storm, runs from dozens of
+        // guest threads at once; a single mutual-exclusion lock serialized them
+        // into a CPU-spun live-lock. Reads now run concurrently; Alloc/Free/
+        // Protect keep exclusive access.
+        private static readonly System.Threading.ReaderWriterLockSlim Gate = new();
+        private static ReadScope EnterRead()
+        {
+            Gate.EnterReadLock();
+            return default;
+        }
+        private static WriteScope EnterWrite()
+        {
+            Gate.EnterWriteLock();
+            return default;
+        }
+        private readonly struct ReadScope : System.IDisposable
+        {
+            public void Dispose() => Gate.ExitReadLock();
+        }
+        private readonly struct WriteScope : System.IDisposable
+        {
+            public void Dispose() => Gate.ExitWriteLock();
+        }
         private static readonly SortedList<ulong, Region> Regions = new();
 
         private sealed class Region
@@ -169,7 +192,7 @@ public static unsafe class HostMemory
 
             var alignedSize = AlignUp((ulong)size, PageSize);
 
-            lock (Gate)
+            using (EnterWrite())
             {
                 if (allocationType == MEM_COMMIT && address != null &&
                     TryFindRegionLocked((ulong)address, out var existing))
@@ -269,7 +292,7 @@ public static unsafe class HostMemory
             _ = size;
             _ = freeType;
 
-            lock (Gate)
+            using (EnterWrite())
             {
                 if (!Regions.TryGetValue((ulong)address, out var region))
                 {
@@ -292,7 +315,7 @@ public static unsafe class HostMemory
             var start = AlignDown((ulong)address, PageSize);
             var end = AlignUp((ulong)address + size, PageSize);
 
-            lock (Gate)
+            using (EnterWrite())
             {
                 if (!TryFindRegionLocked(start, out var region) || end > region.End)
                 {
@@ -315,7 +338,7 @@ public static unsafe class HostMemory
             info = default;
             var pageAddress = AlignDown((ulong)address, PageSize);
 
-            lock (Gate)
+            using (EnterRead())
             {
                 if (TryFindRegionLocked(pageAddress, out var region))
                 {
