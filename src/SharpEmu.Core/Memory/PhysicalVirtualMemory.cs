@@ -434,13 +434,21 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                     break;
                 }
             }
+
+            // Decommit inside the write lock. A concurrent reader (TryWrite
+            // holds only the read lock through its OS-protection query AND the
+            // memcpy) can otherwise observe the page as committed+writable, then
+            // fault when this frees the backing mid-copy — the render thread's
+            // deferred-DMA apply hit exactly this and crashed the process with an
+            // uncatchable AccessViolation. Freeing under the write lock makes the
+            // reader's memcpy and this decommit mutually exclusive; Clear() frees
+            // under the write lock for the same reason.
+            _hostMemory.Free(address);
         }
         finally
         {
             _gate.ExitWriteLock();
         }
-
-        _hostMemory.Free(address);
     }
 
     public bool TryAllocateGuestMemory(ulong size, ulong alignment, out ulong address)
