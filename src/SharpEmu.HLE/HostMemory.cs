@@ -93,10 +93,16 @@ public static unsafe class HostMemory
             return;
         }
 
-        // The emulator only executes x86-64 guest code, so a non-Windows host
-        // is either x86-64 (including Rosetta 2 translation) with a coherent
-        // instruction cache, or would need sys_icache_invalidate for a future
-        // arm64 recompiler. Nothing to do today.
+        if (OperatingSystem.IsMacOS() && address != null && size != 0)
+        {
+            // This process is x86-64 under Rosetta on Apple silicon, but the
+            // translated instructions ultimately execute from the host's
+            // non-coherent instruction cache. Apple requires generated or
+            // modified machine code to be invalidated before execution.
+            // Besides the physical cache, this also gives Rosetta a supported
+            // coherency boundary for an existing translation of the range.
+            SysIcacheInvalidate(address, size);
+        }
     }
 
     [DllImport("kernel32.dll", EntryPoint = "VirtualAlloc", SetLastError = true)]
@@ -119,6 +125,9 @@ public static unsafe class HostMemory
     [DllImport("kernel32.dll", EntryPoint = "FlushInstructionCache")]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool Win32FlushInstructionCache(void* hProcess, void* lpBaseAddress, nuint dwSize);
+
+    [DllImport("/usr/lib/libSystem.B.dylib", EntryPoint = "sys_icache_invalidate")]
+    private static extern void SysIcacheInvalidate(void* start, nuint length);
 
     private static class Posix
     {

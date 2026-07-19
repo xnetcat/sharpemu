@@ -188,6 +188,8 @@ public enum SpirvCapability : uint
     Int64 = 11,
     Int16 = 22,
     ImageGatherExtended = 25,
+    SampledBuffer = 46,
+    ImageBuffer = 47,
     StorageImageExtendedFormats = 49,
     ImageQuery = 50,
     StorageImageReadWithoutFormat = 55,

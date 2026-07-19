@@ -24,6 +24,68 @@ public sealed class KernelMemoryCompatExportsTests
     private const ulong SpanSizeOutAddress = GuestMemoryBase + 0x110;
 
     [Fact]
+    public void DirectMemoryQuery_FindNextReturnsFollowingAllocation()
+    {
+        const ulong memoryBase = 0x1_0000_0000;
+        const ulong allocationOutAddress = memoryBase + 0x100;
+        const ulong queryInfoAddress = memoryBase + 0x200;
+        const ulong searchStart = 0x3FFF_0000_0;
+        const ulong searchEnd = 0x4_0000_0000;
+        const ulong allocationLength = 0x4000;
+        const int memoryType = 0x12;
+        var memory = new FakeCpuMemory(memoryBase, 0x1000);
+        var context = new CpuContext(memory, Generation.Gen5);
+
+        context[CpuRegister.Rdi] = searchStart;
+        context[CpuRegister.Rsi] = searchEnd;
+        context[CpuRegister.Rdx] = allocationLength;
+        context[CpuRegister.Rcx] = allocationLength;
+        context[CpuRegister.R8] = memoryType;
+        context[CpuRegister.R9] = allocationOutAddress;
+        Assert.Equal(0, KernelMemoryCompatExports.KernelAllocateDirectMemory(context));
+        Assert.True(context.TryReadUInt64(allocationOutAddress, out var allocationStart));
+
+        try
+        {
+            context[CpuRegister.Rdi] = allocationStart - allocationLength;
+            context[CpuRegister.Rsi] = 1;
+            context[CpuRegister.Rdx] = queryInfoAddress;
+            context[CpuRegister.Rcx] = 24;
+
+            var result = KernelMemoryCompatExports.KernelDirectMemoryQuery(context);
+
+            Assert.Equal(0, result);
+            Assert.True(context.TryReadUInt64(queryInfoAddress, out var queriedStart));
+            Assert.True(context.TryReadUInt64(queryInfoAddress + 8, out var queriedEnd));
+            Assert.Equal(allocationStart, queriedStart);
+            Assert.Equal(allocationStart + allocationLength, queriedEnd);
+        }
+        finally
+        {
+            context[CpuRegister.Rdi] = allocationStart;
+            context[CpuRegister.Rsi] = allocationLength;
+            Assert.Equal(0, KernelMemoryCompatExports.KernelCheckedReleaseDirectMemory(context));
+        }
+    }
+
+    [Fact]
+    public void VirtualQuery_FindNextPastAddressSpaceReturnsAccessDenied()
+    {
+        const ulong memoryBase = 0x1_0000_0000;
+        const ulong queryInfoAddress = memoryBase + 0x100;
+        var memory = new FakeCpuMemory(memoryBase, 0x1000);
+        var context = new CpuContext(memory, Generation.Gen5);
+        context[CpuRegister.Rdi] = ulong.MaxValue;
+        context[CpuRegister.Rsi] = 1;
+        context[CpuRegister.Rdx] = queryInfoAddress;
+        context[CpuRegister.Rcx] = 72;
+
+        var result = KernelMemoryCompatExports.KernelVirtualQuery(context);
+
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_ERROR_ACCESS_DENIED, result);
+    }
+
+    [Fact]
     public void PosixStat_MissingFileReturnsMinusOne()
     {
         const ulong memoryBase = 0x1_0000_0000;

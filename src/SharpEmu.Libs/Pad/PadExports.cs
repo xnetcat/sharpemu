@@ -22,6 +22,7 @@ public static class PadExports
     private const int StandardPortType = 0;
     private const int PrimaryPadHandle = 1;
     private const int ControllerInformationSize = 0x1C;
+    private const int DeviceClassExtendedInformationSize = 0x14;
     private const int PadDataSize = 0x78;
 
     // Real firmware hands out small non-negative handles; 0 is valid. Some titles
@@ -157,6 +158,34 @@ public static class PadExports
     }
 
     [SysAbiExport(
+        Nid = "AcslpN1jHR8",
+        ExportName = "scePadDeviceClassGetExtendedInformation",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libScePad")]
+    public static int PadDeviceClassGetExtendedInformation(CpuContext ctx)
+    {
+        var handle = unchecked((int)ctx[CpuRegister.Rdi]);
+        var informationAddress = ctx[CpuRegister.Rsi];
+        if (!IsPrimaryPadHandle(handle))
+        {
+            return ctx.SetReturn(OrbisPadErrorInvalidHandle);
+        }
+
+        if (informationAddress == 0)
+        {
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        // Standard pads have device class 0 and no class-specific capability
+        // payload. Unity still requires the complete structure to be cleared.
+        Span<byte> information = stackalloc byte[DeviceClassExtendedInformationSize];
+        information.Clear();
+        return ctx.Memory.TryWrite(informationAddress, information)
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    [SysAbiExport(
         Nid = "vDLMoJLde8I",
         ExportName = "scePadSetTiltCorrectionState",
         Target = Generation.Gen4 | Generation.Gen5,
@@ -239,38 +268,6 @@ public static class PadExports
         information[0x1C] = 0;   // deviceClass: 0 = standard controller / DualSense
         information[0x1D] = 1;   // connected (ext)
         information[0x1E] = 0;   // connectionType: local
-
-        return ctx.Memory.TryWrite(informationAddress, information)
-            ? ctx.SetReturn(0)
-            : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
-    }
-
-    [SysAbiExport(
-        Nid = "AcslpN1jHR8",
-        ExportName = "scePadDeviceClassGetExtendedInformation",
-        Target = Generation.Gen4 | Generation.Gen5,
-        LibraryName = "libScePad")]
-    public static int PadDeviceClassGetExtendedInformation(CpuContext ctx)
-    {
-        var handle = unchecked((int)ctx[CpuRegister.Rdi]);
-        var informationAddress = ctx[CpuRegister.Rsi];
-        if (!IsPrimaryPadHandle(handle))
-        {
-            return ctx.SetReturn(OrbisPadErrorInvalidHandle);
-        }
-
-        if (informationAddress == 0)
-        {
-            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
-        }
-
-        // ScePadDeviceClassExtendedInformation: deviceClass 0 = standard pad
-        // (DualSense). We emulate no special peripheral (guitar/drums/wheel), so
-        // the class-data union stays zeroed — the guest treats it as a plain
-        // controller with no extended capabilities.
-        Span<byte> information = stackalloc byte[0x20];
-        information.Clear();
-        BinaryPrimitives.WriteInt32LittleEndian(information[0x00..], 0);
 
         return ctx.Memory.TryWrite(informationAddress, information)
             ? ctx.SetReturn(0)
@@ -411,6 +408,19 @@ public static class PadExports
     }
 
     [SysAbiExport(
+        Nid = "rIZnR6eSpvk",
+        ExportName = "scePadResetOrientation",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libScePad")]
+    public static int PadResetOrientation(CpuContext ctx)
+    {
+        var handle = unchecked((int)ctx[CpuRegister.Rdi]);
+        return IsPrimaryPadHandle(handle)
+            ? ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_OK)
+            : ctx.SetReturn(OrbisPadErrorInvalidHandle);
+    }
+
+    [SysAbiExport(
         Nid = "RR4novUEENY",
         ExportName = "scePadSetLightBar",
         Target = Generation.Gen4 | Generation.Gen5,
@@ -545,6 +555,15 @@ public static class PadExports
 
     private static readonly long PadStartTimestamp = Stopwatch.GetTimestamp();
     private static readonly double[] AutoCrossTimes = ParseAutoCrossTimes();
+    private static readonly bool AutoCrossCatchUp = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_AUTO_CROSS_CATCH_UP"),
+        "1",
+        StringComparison.Ordinal);
+    private static readonly object AutoCrossGate = new();
+    private static long _autoCrossLoggedMask;
+    private static int _autoCrossNextIndex;
+    private static double _autoCrossActiveUntil;
+    private static double _autoCrossReleaseUntil;
 
     private static double[] ParseAutoCrossTimes()
     {
@@ -577,15 +596,81 @@ public static class PadExports
         }
 
         var elapsed = (Stopwatch.GetTimestamp() - PadStartTimestamp) / (double)Stopwatch.Frequency;
-        foreach (var time in times)
+        if (AutoCrossCatchUp)
         {
+            lock (AutoCrossGate)
+            {
+                var active = TryAdvanceAutoCrossSequence(
+                    elapsed,
+                    times,
+                    ref _autoCrossNextIndex,
+                    ref _autoCrossActiveUntil,
+                    ref _autoCrossReleaseUntil,
+                    out var activatedIndex);
+                if (activatedIndex >= 0)
+                {
+                    LogAutoCross(activatedIndex, times[activatedIndex], elapsed, catchUp: true);
+                }
+
+                return active;
+            }
+        }
+
+        for (var index = 0; index < times.Length; index++)
+        {
+            var time = times[index];
             if (elapsed >= time && elapsed < time + 0.4)
             {
+                LogAutoCross(index, time, elapsed, catchUp: false);
                 return true;
             }
         }
 
         return false;
+    }
+
+    internal static bool TryAdvanceAutoCrossSequence(
+        double elapsed,
+        IReadOnlyList<double> times,
+        ref int nextIndex,
+        ref double activeUntil,
+        ref double releaseUntil,
+        out int activatedIndex)
+    {
+        activatedIndex = -1;
+        if (elapsed < activeUntil)
+        {
+            return true;
+        }
+
+        if (elapsed < releaseUntil ||
+            nextIndex >= times.Count ||
+            elapsed < times[nextIndex])
+        {
+            return false;
+        }
+
+        activatedIndex = nextIndex++;
+        activeUntil = elapsed + 0.4;
+        releaseUntil = activeUntil + 0.5;
+        return true;
+    }
+
+    private static void LogAutoCross(int index, double scheduled, double elapsed, bool catchUp)
+    {
+        if (index >= 64)
+        {
+            return;
+        }
+
+        var bit = 1L << index;
+        var previous = Interlocked.Or(ref _autoCrossLoggedMask, bit);
+        if ((previous & bit) == 0)
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] pad.auto_cross index={index} " +
+                $"scheduled={scheduled:F3}s elapsed={elapsed:F3}s catch_up={catchUp}");
+        }
     }
 
     /// <summary>Maps the host seam's neutral button flags onto SCE_PAD_BUTTON bits.</summary>

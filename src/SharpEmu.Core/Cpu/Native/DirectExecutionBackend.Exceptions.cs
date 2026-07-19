@@ -187,7 +187,9 @@ public sealed partial class DirectExecutionBackend
 					$"[LOADER][INFO]   Guest thread: handle=0x{activeGuestThread.ThreadHandle:X16} " +
 					$"name='{activeGuestThread.Name}' state={activeGuestThread.State} " +
 					$"last_import={activeGuestThread.LastImportNid ?? "<none>"} " +
-					$"last_ret=0x{activeGuestThread.LastReturnRip:X16}");
+					$"last_ret=0x{activeGuestThread.LastReturnRip:X16} " +
+					$"last_rsp=0x{activeGuestThread.LastImportRsp:X16} " +
+					$"last_rbp=0x{activeGuestThread.LastImportRbp:X16}");
 				Console.Error.WriteLine(
 					$"[LOADER][INFO]   Last import registers: " +
 					$"rax=0x{Volatile.Read(ref activeGuestThread.LastImportRax):X16} " +
@@ -206,6 +208,9 @@ public sealed partial class DirectExecutionBackend
 					$"3=0x{activeGuestThread.LastImportStack3:X16} " +
 					$"4=0x{activeGuestThread.LastImportStack4:X16} " +
 					$"5=0x{activeGuestThread.LastImportStack5:X16}");
+				DumpPointerWindow("last-import-stack", activeGuestThread.LastImportRsp, 0x80);
+				DumpPointerWindow("last-import-frame", activeGuestThread.LastImportRbp, 0x200);
+				DumpGuestThreadImportTrace(activeGuestThread);
 			}
 			if (TryFormatNearestRuntimeSymbol(rip, out string symbol))
 			{
@@ -393,6 +398,7 @@ public sealed partial class DirectExecutionBackend
 						r8, r9, r10, r11, r12, r13, r14, r15);
 					DumpGuestReferenceDiagnostics();
 					DumpGuestPointerWindowDiagnostics();
+					DumpRecentVcallProbeTrace();
 					break;
 				case 2147483651u:
 					Console.Error.WriteLine("[LOADER][WARNING]   Type: Breakpoint (int3)");
@@ -1257,11 +1263,20 @@ public sealed partial class DirectExecutionBackend
 
 		if (mbi.State == 4096 && IsAccessCompatible(accessType, mbi.Protect))
 		{
+			uint oldProtection = 0;
+			bool repaired = VirtualProtect(
+				(void*)pageBase,
+				4096u,
+				commitProtect,
+				&oldProtection);
 			if (traceLazyCommit)
 			{
-				Console.Error.WriteLine($"[LOADER][TRACE] lazy-commit-race#{traceIndex}: fault=0x{faultAddress:X16} protect=0x{mbi.Protect:X08}");
+				Console.Error.WriteLine(
+					$"[LOADER][TRACE] lazy-commit-race#{traceIndex}: " +
+					$"fault=0x{faultAddress:X16} protect=0x{mbi.Protect:X08} " +
+					$"repaired={repaired}");
 			}
-			return true;
+			return repaired;
 		}
 
 		bool committed = false;

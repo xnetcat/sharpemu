@@ -1003,6 +1003,21 @@ public static class KernelRuntimeCompatExports
 
         if (!KernelModuleRegistry.TryGetModuleByAddress(queriedAddress, out var module))
         {
+            // Unwinding through an HLE import can expose the host-side return
+            // boundary below the guest executable VA range. Report a
+            // synthetic module with no unwind tables so libc terminates the
+            // walk normally instead of treating the boundary as a missing
+            // guest module. Kyty applies the same boundary rule.
+            if (queriedAddress < 0x8_0000_0000UL)
+            {
+                return TryWriteHostUnwindBoundaryInfo(
+                    ctx,
+                    outInfoAddress,
+                    queriedAddress)
+                    ? (int)OrbisGen2Result.ORBIS_GEN2_OK
+                    : (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+            }
+
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
         }
 
@@ -1013,6 +1028,19 @@ public static class KernelRuntimeCompatExports
 
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "crb5j7mkk1c",
+        ExportName = "_is_signal_return",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int IsSignalReturn(CpuContext ctx)
+    {
+        // SharpEmu does not materialize the kernel signal-return trampoline
+        // frames that libunwind is probing for.
+        ctx[CpuRegister.Rax] = 0;
+        return 0;
     }
 
     [SysAbiExport(
@@ -1285,6 +1313,17 @@ public static class KernelRuntimeCompatExports
         ctx[CpuRegister.Rax] = unchecked((uint)handle);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
+
+    [SysAbiExport(
+        Nid = "4fU5yvOkVG4",
+        ExportName = "sceSysmoduleGetModuleInfoForUnwind",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceSysmodule")]
+    public static int SysmoduleGetModuleInfoForUnwind(CpuContext ctx) =>
+        // Same (VAddr, s32 flags, info*) ABI as sceKernelGetModuleInfoForUnwind.
+        // Delegate to the real implementation so C++ exception unwinding resolves
+        // the owning module instead of following an unresolved-import path.
+        KernelGetModuleInfoForUnwind(ctx);
 
     [SysAbiExport(
         Nid = "g8cM39EUZ6o",
@@ -1700,6 +1739,25 @@ public static class KernelRuntimeCompatExports
         BinaryPrimitives.WriteUInt64LittleEndian(
             payload.AsSpan(0x128),
             module.EndAddress - module.BaseAddress);
+        return ctx.Memory.TryWrite(outInfoAddress, payload);
+    }
+
+    private static bool TryWriteHostUnwindBoundaryInfo(
+        CpuContext ctx,
+        ulong outInfoAddress,
+        ulong queriedAddress)
+    {
+        const int unwindInfoSize = 0x130;
+        const ulong boundarySize = 0x10_0000;
+        var payload = new byte[unwindInfoSize];
+        BinaryPrimitives.WriteUInt64LittleEndian(payload, unwindInfoSize);
+        WriteModuleName(payload, "SharpEmuHostBoundary");
+        BinaryPrimitives.WriteUInt64LittleEndian(
+            payload.AsSpan(0x120),
+            queriedAddress & ~(boundarySize - 1));
+        BinaryPrimitives.WriteUInt64LittleEndian(
+            payload.AsSpan(0x128),
+            boundarySize);
         return ctx.Memory.TryWrite(outInfoAddress, payload);
     }
 

@@ -286,6 +286,28 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		static () => (nint)NativeMemory.AllocZeroed(GuestContextTransferFrameQwords, sizeof(ulong)),
 		trackAllValues: true);
 
+	private sealed class GuestContinuationExecutionResource
+	{
+		public nint FrameAddress;
+		public nint HostRspStorage;
+		public nint EntryStub;
+	}
+
+	private sealed class GuestContinuationExecutionPool
+	{
+		public readonly List<GuestContinuationExecutionResource> Resources = new();
+		public int Depth;
+	}
+
+	// Rosetta translates x86 pages by virtual address and does not provide a
+	// useful invalidation primitive to an x86 process. Continuation entry code
+	// must therefore remain byte-for-byte immutable for its entire lifetime.
+	// Mutable registers live in writable frames; a small per-lane pool preserves
+	// independent frames when an HLE callback starts nested guest execution.
+	private readonly ThreadLocal<GuestContinuationExecutionPool> _guestContinuationExecutionPools = new(
+		static () => new GuestContinuationExecutionPool(),
+		trackAllValues: true);
+
 	private nint _guestContextTransferStub;
 
 	private long _importDispatchCount;
@@ -334,6 +356,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private bool _logAllImports;
 
+	private bool _logPeriodicImports;
+
 	private bool _logImportFrames;
 
 	private bool _logImportRecent;
@@ -345,6 +369,49 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	private ulong _probeImportReturnAddress;
 
 	private long _probeImportReturnAddressCount;
+
+	// SHARPEMU_VCALL_PROBE: comma-separated guest instruction addresses. Each
+	// site is replaced with UD2 before entry execution; the POSIX signal bridge
+	// records the live stack and emulates the original instruction. This is an
+	// opt-in diagnostic for locating stack corruption across native guest calls.
+	private const int VcallProbeMaxSites = 8;
+
+	private static readonly ulong[] _vcallProbeAddresses = new ulong[VcallProbeMaxSites];
+
+	private static readonly byte[][] _vcallProbeOriginalBytesBySite =
+		Enumerable.Range(0, VcallProbeMaxSites).Select(static _ => new byte[6]).ToArray();
+
+	private static int _vcallProbeSiteCount;
+
+	private static long _vcallProbeHitCount;
+
+	private static bool _vcallProbeRestored;
+
+	private const long VcallProbeLogLimit = 4096;
+
+	private const long VcallProbeRestoreThreshold = long.MaxValue;
+
+	private const int VcallProbeTraceLength = 1024;
+
+	private struct VcallProbeTraceEntry
+	{
+		public long Sequence;
+		public int Site;
+		public ulong Rip;
+		public ulong Rsp;
+		public ulong Rbp;
+		public ulong Rax;
+		public ulong R8;
+		public ulong Target;
+		public ulong TargetCode;
+		public ulong Stack0;
+		public ulong Stack1;
+		public ulong Stack2;
+		public ulong Stack3;
+	}
+
+	private static readonly VcallProbeTraceEntry[] _vcallProbeTrace =
+		new VcallProbeTraceEntry[VcallProbeTraceLength];
 
 	private string? _importFilter;
 
@@ -456,6 +523,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		public string? LastImportNid;
 
 		public ulong LastReturnRip;
+		public ulong LastImportRsp;
+		public ulong LastImportRbp;
 
 		// Busy guest workers overwrite the global recent-import ring. Preserve
 		// the most recent complete SysV call frame per guest thread so native
@@ -474,6 +543,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		public ulong LastImportStack5;
 		public ulong LastImportRax;
 		public int LastImportResultValid;
+
+		public readonly RecentImportTraceEntry[] RecentImports = new RecentImportTraceEntry[32];
+		public int RecentImportWriteIndex;
+		public int RecentImportCount;
 
 		public Thread? HostThread { get; set; }
 
@@ -754,8 +827,11 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	private static readonly RawExceptionHandlerDelegate RawVectoredHandlerDelegateInstance = RawVectoredHandlerManaged;
 	private static readonly RawExceptionHandlerDelegate RawUnhandledFilterDelegateInstance = RawUnhandledFilterManaged;
 
+	private static readonly nint ImportGatewaySysVPtr =
+		Marshal.GetFunctionPointerForDelegate(ImportGatewayDelegateInstance);
+
 	private static readonly nint ImportGatewayPtr = ResolveWin64CallbackPtr(
-		Marshal.GetFunctionPointerForDelegate(ImportGatewayDelegateInstance));
+		ImportGatewaySysVPtr);
 
 	// Emitted trampolines call managed callbacks with the Win64 ABI. On
 	// Windows the runtime already compiles them that way; on POSIX .NET they
@@ -1125,6 +1201,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		_logFiber = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_FIBER"), "1", StringComparison.Ordinal);
 		_logBootstrap = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_BOOTSTRAP"), "1", StringComparison.Ordinal);
 		_logAllImports = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_ALL_IMPORTS"), "1", StringComparison.Ordinal);
+		_logPeriodicImports = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_PERIODIC_IMPORTS"), "1", StringComparison.Ordinal);
 		_logImportFrames = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_IMPORT_FRAMES"), "1", StringComparison.Ordinal);
 		_logImportRecent = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_IMPORT_RECENT"), "1", StringComparison.Ordinal);
 		_logStackCheck = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_STACK_CHK"), "1", StringComparison.Ordinal);
@@ -1148,6 +1225,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		lock (_importResultLogSampleGate)
 		{
 			_importResultLogSamples.Clear();
+		}
+		lock (_dlsymMissLogSampleGate)
+		{
+			_dlsymMissLogSamples.Clear();
 		}
 		lock (_lazyCommitRangeGate)
 		{
@@ -1176,6 +1257,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			}
 			CreateTlsHandler();
 			PatchTlsPatterns();
+			TryArmVcallProbe();
 			return ExecuteEntry(context, entryPoint, out result);
 		}
 		catch (Exception ex)
@@ -1883,15 +1965,6 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			error = "guest context transfer without an active CPU context";
 			return false;
 		}
-		if (!TryValidateGuestContextTransferTarget(activeContext.Memory, target, out error))
-		{
-			return false;
-		}
-		if (!activeContext.TryWriteUInt64(target.Rsp - sizeof(ulong), target.Rip))
-		{
-			error = $"guest context transfer slot is not writable at 0x{target.Rsp - sizeof(ulong):X16}";
-			return false;
-		}
 
 		transferStub = GetOrCreateGuestContextTransferStub();
 		if (transferStub == 0)
@@ -1904,6 +1977,30 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		if (frameAddress == 0)
 		{
 			error = "failed to allocate guest context transfer frame";
+			return false;
+		}
+
+		return TryPopulateGuestContextTransferFrame(activeContext, target, frameAddress, out error);
+	}
+
+	private unsafe static bool TryPopulateGuestContextTransferFrame(
+		CpuContext context,
+		in GuestCpuContinuation target,
+		nint frameAddress,
+		out string? error)
+	{
+		if (!TryValidateGuestContextTransferTarget(context.Memory, target, out error))
+		{
+			return false;
+		}
+		if (!context.TryWriteUInt64(target.Rsp - sizeof(ulong), target.Rip))
+		{
+			error = $"guest context transfer slot is not writable at 0x{target.Rsp - sizeof(ulong):X16}";
+			return false;
+		}
+		if (frameAddress == 0)
+		{
+			error = "guest context transfer frame is not allocated";
 			return false;
 		}
 
@@ -1928,6 +2025,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		frame[17] = target.Mxcsr == 0 ? 0x1F80u : target.Mxcsr;
 		frame[18] = target.FpuControlWord == 0 ? 0x037Fu : target.FpuControlWord;
 		frame[19] = target.RestoreFullFpuState ? 1u : 0u;
+		error = null;
 		return true;
 	}
 
@@ -2151,32 +2249,60 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			ptr2[num++] = 73;
 			ptr2[num++] = 139;
 			ptr2[num++] = 35;
-			ptr2[num++] = 72;
-			ptr2[num++] = 131;
-			ptr2[num++] = 236;
-			ptr2[num++] = 56;
-			ptr2[num++] = 0x4C; ptr2[num++] = 0x89; ptr2[num++] = 0x64; ptr2[num++] = 0x24; ptr2[num++] = 0x28; // mov [rsp+0x28],r12
-			ptr2[num++] = 72;
-			ptr2[num++] = 185;
-			*(long*)(ptr2 + num) = _selfHandlePtr;
-			num += 8;
-			ptr2[num++] = 186;
-			*(int*)(ptr2 + num) = importIndex;
-			num += 4;
-			ptr2[num++] = 77;
-			ptr2[num++] = 137;
-			ptr2[num++] = 224;
-			ptr2[num++] = 72;
-			ptr2[num++] = 184;
-			*(long*)(ptr2 + num) = ImportGatewayPtr;
-			num += 8;
-			ptr2[num++] = byte.MaxValue;
-			ptr2[num++] = 208;
-			ptr2[num++] = 0x4C; ptr2[num++] = 0x8B; ptr2[num++] = 0x64; ptr2[num++] = 0x24; ptr2[num++] = 0x28; // mov r12,[rsp+0x28]
-			ptr2[num++] = 72;
-			ptr2[num++] = 131;
-			ptr2[num++] = 196;
-			ptr2[num++] = 56;
+			if (OperatingSystem.IsWindows())
+			{
+				ptr2[num++] = 72;
+				ptr2[num++] = 131;
+				ptr2[num++] = 236;
+				ptr2[num++] = 56;
+				ptr2[num++] = 0x4C; ptr2[num++] = 0x89; ptr2[num++] = 0x64; ptr2[num++] = 0x24; ptr2[num++] = 0x28; // mov [rsp+0x28],r12
+				ptr2[num++] = 72;
+				ptr2[num++] = 185;
+				*(long*)(ptr2 + num) = _selfHandlePtr;
+				num += 8;
+				ptr2[num++] = 186;
+				*(int*)(ptr2 + num) = importIndex;
+				num += 4;
+				ptr2[num++] = 77;
+				ptr2[num++] = 137;
+				ptr2[num++] = 224;
+				ptr2[num++] = 72;
+				ptr2[num++] = 184;
+				*(long*)(ptr2 + num) = ImportGatewayPtr;
+				num += 8;
+				ptr2[num++] = byte.MaxValue;
+				ptr2[num++] = 208;
+				ptr2[num++] = 0x4C; ptr2[num++] = 0x8B; ptr2[num++] = 0x64; ptr2[num++] = 0x24; ptr2[num++] = 0x28; // mov r12,[rsp+0x28]
+				ptr2[num++] = 72;
+				ptr2[num++] = 131;
+				ptr2[num++] = 196;
+				ptr2[num++] = 56;
+			}
+			else
+			{
+				// The raw POSIX guest worker and CLR reverse P/Invoke both use
+				// System V. Keep this transition in that ABI instead of layering
+				// a Win64 shadow-space frame and register-shuffling thunk over
+				// the worker's host stack. The guest argument-pack pointer is
+				// spilled above the call boundary, outside the SysV red zone, so
+				// an asynchronous CLR suspension cannot strand the restore path
+				// with a transient value in R12.
+				ptr2[num++] = 0x48; ptr2[num++] = 0x83; ptr2[num++] = 0xEC; ptr2[num++] = 0x18; // sub rsp,0x18
+				ptr2[num++] = 0x4C; ptr2[num++] = 0x89; ptr2[num++] = 0x64; ptr2[num++] = 0x24; ptr2[num++] = 0x08; // mov [rsp+8],r12
+				ptr2[num++] = 0x48; ptr2[num++] = 0xBF; // mov rdi,selfHandle
+				*(long*)(ptr2 + num) = _selfHandlePtr;
+				num += 8;
+				ptr2[num++] = 0xBE; // mov esi,importIndex
+				*(int*)(ptr2 + num) = importIndex;
+				num += 4;
+				ptr2[num++] = 0x4C; ptr2[num++] = 0x89; ptr2[num++] = 0xE2; // mov rdx,r12
+				ptr2[num++] = 0x48; ptr2[num++] = 0xB8; // mov rax,SysV gateway
+				*(long*)(ptr2 + num) = ImportGatewaySysVPtr;
+				num += 8;
+				ptr2[num++] = 0xFF; ptr2[num++] = 0xD0; // call rax
+				ptr2[num++] = 0x4C; ptr2[num++] = 0x8B; ptr2[num++] = 0x64; ptr2[num++] = 0x24; ptr2[num++] = 0x08; // mov r12,[rsp+8]
+				ptr2[num++] = 0x48; ptr2[num++] = 0x83; ptr2[num++] = 0xC4; ptr2[num++] = 0x18; // add rsp,0x18
+			}
 			// Materialize SysV vector return registers written by the managed HLE
 			// gateway before restoring the guest stack.
 			for (var xmm = 0; xmm < 2; xmm++)
@@ -2362,6 +2488,13 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 		byte* code = (byte*)ptr;
 		int offset = 0;
+		// TlsGetValue clobbers RAX, which still contains the guest callback's
+		// full-width return value here. Preserve it in a host callee-saved
+		// register and publish it beside the saved host stack pointer before
+		// restoring the host execution frame.
+		EmitByte(code, ref offset, 0x49); // mov r12, rax
+		EmitByte(code, ref offset, 0x89);
+		EmitByte(code, ref offset, 0xC4);
 		EmitByte(code, ref offset, 0x48); // sub rsp, 0x20
 		EmitByte(code, ref offset, 0x83);
 		EmitByte(code, ref offset, 0xEC);
@@ -2378,6 +2511,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		EmitByte(code, ref offset, 0x83);
 		EmitByte(code, ref offset, 0xC4);
 		EmitByte(code, ref offset, 0x20);
+		EmitByte(code, ref offset, 0x4C); // mov [rax+8], r12
+		EmitByte(code, ref offset, 0x89);
+		EmitByte(code, ref offset, 0x60);
+		EmitByte(code, ref offset, 0x08);
 		EmitByte(code, ref offset, 0x48); // mov rsp, [rax]
 		EmitByte(code, ref offset, 0x8B);
 		EmitByte(code, ref offset, 0x20);
@@ -3597,9 +3734,11 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	/// outer guest entry is still executing managed HLE code, so returning a
 	/// successful callback result here would abandon the callback continuation
 	/// and let a noreturn operation such as pthread_exit unwind through live
-	/// libc cleanup state. Temporarily expose the owning guest thread as blocked,
-	/// let the normal scheduler wake it, and resume the callback continuation on
-	/// this executor until it either returns or fails.
+	/// libc cleanup state. The nested continuation must remain local to this
+	/// executor: publishing it as the owning thread's normal blocked
+	/// continuation lets a signal handler overwrite the interrupted thread's
+	/// scheduler state and permits the global ready queue to claim an executor
+	/// which is still running the callback.
 	/// </summary>
 	private bool ResumeBlockedNestedGuestCallback(
 		CpuContext callbackContext,
@@ -3800,8 +3939,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				LastError = null;
 				exitReason = ExecuteGuestContinuationEntry(
 					context,
-					continuation.Rip,
-					continuation.ReturnSlotAddress,
+					continuation,
 					reason,
 					out callbackReason);
 				callbackLastError = LastError;
@@ -4278,6 +4416,16 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				return;
 			}
 
+			// TryRaiseGuestException queues a signal raised while this thread's
+			// current handler is executing. Imports made by the handler are safe
+			// points too, but recursively consuming that follow-up here would run
+			// both handlers on the same fixed exception stack and overwrite the
+			// active handler's frames. Keep it queued until this delivery unwinds.
+			if (_activeGuestExceptionDeliveries.Contains(threadHandle))
+			{
+				return;
+			}
+
 			if (!_pendingGuestExceptions.Remove(threadHandle, out pending))
 			{
 				return;
@@ -4315,20 +4463,31 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					$"rip=0x{interruptedContinuation.Rip:X16}");
 			}
 
-			if (!TryCallGuestFunction(
-					currentContext,
-					pending.Handler,
-					unchecked((ulong)pending.ExceptionType),
-					exceptionContextAddress,
-					pending.ExceptionStackBase + callbackStackOffset,
-					callbackStackSize,
-					$"kernel exception 0x{pending.ExceptionType:X2} safe point",
-					out var callbackError))
+			// The outer HLE import may already have staged a thread block. Run the
+			// exception handler with clean staging slots so its nested imports
+			// cannot consume that block and bind it to a different return frame.
+			var interruptedStagedState = GuestThreadExecution.SaveAndResetStagedState();
+			try
 			{
-				Console.Error.WriteLine(
-					$"[LOADER][ERROR] Guest exception safe-point delivery failed: " +
-					$"target=0x{threadHandle:X16} type=0x{pending.ExceptionType:X2} " +
-					$"error={callbackError ?? "unknown"}");
+				if (!TryCallGuestFunction(
+						currentContext,
+						pending.Handler,
+						unchecked((ulong)pending.ExceptionType),
+						exceptionContextAddress,
+						pending.ExceptionStackBase + callbackStackOffset,
+						callbackStackSize,
+						$"kernel exception 0x{pending.ExceptionType:X2} safe point",
+						out var callbackError))
+				{
+					Console.Error.WriteLine(
+						$"[LOADER][ERROR] Guest exception safe-point delivery failed: " +
+						$"target=0x{threadHandle:X16} type=0x{pending.ExceptionType:X2} " +
+						$"error={callbackError ?? "unknown"}");
+				}
+			}
+			finally
+			{
+				GuestThreadExecution.RestoreStagedState(interruptedStagedState);
 			}
 		}
 		finally
@@ -4346,15 +4505,25 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		GuestCpuContinuation continuation,
 		ulong size)
 	{
+		var bytes = BuildGuestExceptionContext(context, continuation, size);
+		return context.Memory.TryWrite(address, bytes);
+	}
+
+	internal static byte[] BuildGuestExceptionContext(
+		CpuContext context,
+		GuestCpuContinuation continuation,
+		ulong size)
+	{
 		var bytes = new byte[checked((int)size)];
 		void Write64(int offset, ulong value) =>
 			BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(offset, sizeof(ulong)), value);
 
 		var hasContinuation = continuation.Rip >= 65536 && continuation.Rsp != 0;
-		// Orbis ucontext_t has a 0x10-byte signal mask and 0x30 bytes of
-		// private fields before its amd64 mcontext. These offsets match the
-		// platform ABI used by libScePs5Util and Unity's Boehm GC. Supplying a
-		// bare mcontext here makes the collector miss live register roots.
+		// The kernel handler receives an Orbis ucontext_t: a 0x10-byte signal
+		// mask and 0x30 bytes of private fields precede amd64 mcontext_t.
+		// libScePs5Util reads RSP at ucontext+0xF8, while Unity copies
+		// ucontext[0..0xD8) and scans its GPR roots at +0x48..+0xB8. Keeping the
+		// prefix on both generations is therefore part of the observable ABI.
 		const int mcontext = 0x40;
 		Write64(mcontext + 0x08, hasContinuation ? continuation.Rdi : context[CpuRegister.Rdi]);
 		Write64(mcontext + 0x10, hasContinuation ? continuation.Rsi : context[CpuRegister.Rsi]);
@@ -4374,12 +4543,12 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		var rip = hasContinuation ? continuation.Rip : context.Rip;
 		var rsp = hasContinuation ? continuation.Rsp : context[CpuRegister.Rsp];
 		Write64(mcontext + 0xA0, rip);
-		Write64(mcontext + 0xB0, hasContinuation ? continuation.Rflags : 0);
+		Write64(mcontext + 0xB0, hasContinuation ? continuation.Rflags : context.Rflags);
 		Write64(mcontext + 0xB8, rsp);
 		Write64(mcontext + 0xC8, 0x480); // sizeof(Orbis mcontext_t)
 		Write64(mcontext + 0x440, hasContinuation ? continuation.FsBase : context.FsBase);
 		Write64(mcontext + 0x448, hasContinuation ? continuation.GsBase : context.GsBase);
-		return context.Memory.TryWrite(address, bytes);
+		return bytes;
 	}
 
 	private void TraceGuestContext(string message)
@@ -4893,8 +5062,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		ApplyGuestContinuation(context, continuation);
 		return ExecuteGuestContinuationEntry(
 			context,
-			continuation.Rip,
-			continuation.ReturnSlotAddress,
+			continuation,
 			name,
 			out reason);
 	}
@@ -4908,9 +5076,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		if (!string.Equals(
 				Environment.GetEnvironmentVariable("SHARPEMU_TRACE_FOCUSED_CONTINUATION"),
 				"1",
-				StringComparison.Ordinal) ||
-			continuation.Rsp < 0x00006FFFAC000000UL ||
-			continuation.Rsp >= 0x00006FFFAC200000UL)
+				StringComparison.Ordinal))
 		{
 			return;
 		}
@@ -4973,7 +5139,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			reason = "failed to allocate executable memory for guest thread stub";
 			return GuestNativeCallExitReason.Exception;
 		}
-		void* hostRspStorage = NativeMemory.Alloc((nuint)sizeof(ulong));
+		void* hostRspStorage = NativeMemory.AllocZeroed((nuint)(2 * sizeof(ulong)));
 		if (hostRspStorage == null)
 		{
 			VirtualFree(ptr, 0u, 32768u);
@@ -5083,6 +5249,13 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			ptr2[offset++] = 186;
 			*(ulong*)(ptr2 + offset) = hostRspSlot;
 			offset += 8;
+			// Publish the full guest return value before restoring RSP. The
+			// continuation return stub already writes this slot, but the normal
+			// call/ret path lands here directly and previously left it zero.
+			ptr2[offset++] = 73; // mov [r10+8], rax
+			ptr2[offset++] = 137;
+			ptr2[offset++] = 66;
+			ptr2[offset++] = 8;
 			ptr2[offset++] = 73;
 			ptr2[offset++] = 139;
 			ptr2[offset++] = 34;
@@ -5124,7 +5297,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			ActiveGuestThreadYieldReason = null;
 			try
 			{
-				var nativeReturn = CallNativeEntry(ptr);
+				RunGuestEntryStub(ptr, hostRspSlot);
 				if (ActiveGuestThreadYieldRequested)
 				{
 					reason = ActiveGuestThreadYieldReason ?? "guest thread blocked";
@@ -5135,7 +5308,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					reason = LastError ?? "guest thread forced exit";
 					return GuestNativeCallExitReason.ForcedExit;
 				}
-				reason = $"returned 0x{nativeReturn:X8}";
+				var guestRax = *((ulong*)hostRspStorage + 1);
+				context[CpuRegister.Rax] = guestRax;
+				reason = $"returned 0x{guestRax:X8}";
 				return GuestNativeCallExitReason.Returned;
 			}
 			catch (AccessViolationException ex)
@@ -5167,8 +5342,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private unsafe GuestNativeCallExitReason ExecuteGuestContinuationEntry(
 		CpuContext context,
-		ulong entryPoint,
-		ulong returnSlotAddress,
+		GuestCpuContinuation continuation,
 		string name,
 		out string? reason)
 	{
@@ -5178,20 +5352,13 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			reason = "guest thread stack pointer is zero";
 			return GuestNativeCallExitReason.Exception;
 		}
-		const uint stubSize = 512u;
-		void* ptr = VirtualAlloc(null, stubSize, 12288u, 4u);
-		if (ptr == null)
+		var pool = _guestContinuationExecutionPools.Value;
+		if (pool is null)
 		{
-			reason = "failed to allocate executable memory for guest thread stub";
+			reason = "failed to allocate guest continuation execution pool";
 			return GuestNativeCallExitReason.Exception;
 		}
-		void* hostRspStorage = NativeMemory.Alloc((nuint)sizeof(ulong));
-		if (hostRspStorage == null)
-		{
-			VirtualFree(ptr, 0u, 32768u);
-			reason = "failed to allocate writable host-RSP storage for guest continuation stub";
-			return GuestNativeCallExitReason.Exception;
-		}
+		var resourceIndex = pool.Depth++;
 		var previousActiveBackend = _activeExecutionBackend;
 		var previousActiveContext = _activeCpuContext;
 		var previousSentinel = _activeEntryReturnSentinelRip;
@@ -5202,75 +5369,48 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		nint previousHostRspSlotValue = TlsGetValue(_hostRspSlotTlsIndex);
 		try
 		{
+			GuestContinuationExecutionResource resource;
+			if (resourceIndex < pool.Resources.Count)
+			{
+				resource = pool.Resources[resourceIndex];
+			}
+			else
+			{
+				resource = CreateGuestContinuationExecutionResource(out reason)!;
+				if (resource is null)
+				{
+					return GuestNativeCallExitReason.Exception;
+				}
+				pool.Resources.Add(resource);
+			}
+
 			_activeExecutionBackend = this;
 			_activeCpuContext = context;
 			_activeEntryReturnSentinelRip = 0;
-			_activeGuestReturnSlotAddress = returnSlotAddress;
+			_activeGuestReturnSlotAddress = continuation.ReturnSlotAddress;
 			_activeForcedGuestExit = false;
 			_activeGuestThreadYieldRequested = false;
 			_activeGuestThreadYieldReason = null;
 			BindTlsBase(context);
-			byte* ptr2 = (byte*)ptr;
-			ulong hostRspSlot = (ulong)hostRspStorage;
-			var emitter = new NativeCodeEmitter(ptr2);
-
-			emitter.Emit(0x53); // push rbx
-			emitter.Emit(0x55); // push rbp
-			emitter.Emit(0x57); // push rdi
-			emitter.Emit(0x56); // push rsi
-			emitter.Emit(0x41); emitter.Emit(0x54); // push r12
-			emitter.Emit(0x41); emitter.Emit(0x55); // push r13
-			emitter.Emit(0x41); emitter.Emit(0x56); // push r14
-			emitter.Emit(0x41); emitter.Emit(0x57); // push r15
-			EmitHostNonvolatileXmmSave(ptr2, ref emitter.Offset);
-			// Restore the fiber's floating-point control environment before
-			// abandoning the host stack. This path is used when a blocked guest
-			// continuation migrates to another managed worker.
-			emitter.Emit(0x48); emitter.Emit(0x83); emitter.Emit(0xEC); emitter.Emit(0x08); // sub rsp,8
-			emitter.Emit(0xC7); emitter.Emit(0x04); emitter.Emit(0x24); // mov dword [rsp],imm32
-			emitter.Emit(context.Mxcsr);
-			emitter.Emit(0x0F); emitter.Emit(0xAE); emitter.Emit(0x14); emitter.Emit(0x24); // ldmxcsr [rsp]
-			emitter.Emit(0x66); emitter.Emit(0xC7); emitter.Emit(0x04); emitter.Emit(0x24); // mov word [rsp],imm16
-			emitter.Emit(context.FpuControlWord);
-			emitter.Emit(0xD9); emitter.Emit(0x2C); emitter.Emit(0x24); // fldcw [rsp]
-			emitter.Emit(0x48); emitter.Emit(0x83); emitter.Emit(0xC4); emitter.Emit(0x08); // add rsp,8
-			emitter.EmitMovR64Immediate(0x49, 0xBA, hostRspSlot); // mov r10, hostRspSlot
-			emitter.Emit(0x49); emitter.Emit(0x89); emitter.Emit(0x22); // mov [r10], rsp
-			emitter.EmitMovR64Immediate(0x48, 0xB8, context[CpuRegister.Rsp]); // mov rax, guest rsp
-			emitter.Emit(0x48); emitter.Emit(0x89); emitter.Emit(0xC4); // mov rsp, rax
-			emitter.Emit(0x48); emitter.Emit(0x83); emitter.Emit(0xEC); emitter.Emit(0x08); // reserve transfer slot
-			emitter.EmitMovR64Immediate(0x48, 0xB8, entryPoint); // mov rax, entryPoint
-			emitter.Emit(0x48); emitter.Emit(0x89); emitter.Emit(0x04); emitter.Emit(0x24); // mov [rsp],rax
-			emitter.EmitMovR64Immediate(0x48, 0xBB, context[CpuRegister.Rbx]); // mov rbx, imm64
-			emitter.EmitMovR64Immediate(0x48, 0xBD, context[CpuRegister.Rbp]); // mov rbp, imm64
-			emitter.EmitMovR64Immediate(0x48, 0xBF, context[CpuRegister.Rdi]); // mov rdi, imm64
-			emitter.EmitMovR64Immediate(0x48, 0xBE, context[CpuRegister.Rsi]); // mov rsi, imm64
-			emitter.EmitMovR64Immediate(0x48, 0xBA, context[CpuRegister.Rdx]); // mov rdx, imm64
-			emitter.EmitMovR64Immediate(0x48, 0xB9, context[CpuRegister.Rcx]); // mov rcx, imm64
-			emitter.EmitMovR64Immediate(0x49, 0xB8, context[CpuRegister.R8]); // mov r8, imm64
-			emitter.EmitMovR64Immediate(0x49, 0xB9, context[CpuRegister.R9]); // mov r9, imm64
-			emitter.EmitMovR64Immediate(0x49, 0xBA, context[CpuRegister.R10]); // mov r10, imm64
-			emitter.EmitMovR64Immediate(0x49, 0xBC, context[CpuRegister.R12]); // mov r12, imm64
-			emitter.EmitMovR64Immediate(0x49, 0xBD, context[CpuRegister.R13]); // mov r13, imm64
-			emitter.EmitMovR64Immediate(0x49, 0xBE, context[CpuRegister.R14]); // mov r14, imm64
-			emitter.EmitMovR64Immediate(0x49, 0xBF, context[CpuRegister.R15]); // mov r15, imm64
-			emitter.EmitMovR64Immediate(0x49, 0xBB, context[CpuRegister.R11]); // mov r11, imm64
-			emitter.EmitMovR64Immediate(0x48, 0xB8, context[CpuRegister.Rax]); // mov rax, imm64
-			emitter.Emit(0xC3); // ret through the synthetic transfer slot
+			var hostRspStorage = (ulong*)resource.HostRspStorage;
+			hostRspStorage[0] = 0;
+			hostRspStorage[1] = 0;
+			if (!TryPopulateGuestContextTransferFrame(
+				context,
+				continuation,
+				resource.FrameAddress,
+				out reason))
+			{
+				return GuestNativeCallExitReason.Exception;
+			}
 			ActiveEntryReturnSentinelRip = (ulong)_guestReturnStub;
-			if (returnSlotAddress == 0 || !context.TryWriteUInt64(returnSlotAddress, (ulong)_guestReturnStub))
+			if (continuation.ReturnSlotAddress == 0 ||
+				!context.TryWriteUInt64(continuation.ReturnSlotAddress, (ulong)_guestReturnStub))
 			{
-				reason = $"failed to patch guest continuation return slot at 0x{returnSlotAddress:X16}";
+				reason = $"failed to patch guest continuation return slot at 0x{continuation.ReturnSlotAddress:X16}";
 				return GuestNativeCallExitReason.Exception;
 			}
-			uint oldProtect = default(uint);
-			if (!VirtualProtect(ptr, stubSize, 32u, &oldProtect))
-			{
-				reason = "failed to seal guest continuation stub execute-read";
-				return GuestNativeCallExitReason.Exception;
-			}
-			FlushInstructionCache(GetCurrentProcess(), ptr, stubSize);
-			if (!TlsSetValue(_hostRspSlotTlsIndex, (nint)hostRspSlot))
+			if (!TlsSetValue(_hostRspSlotTlsIndex, resource.HostRspStorage))
 			{
 				reason = "failed to bind host-RSP storage for guest continuation stub";
 				return GuestNativeCallExitReason.Exception;
@@ -5279,7 +5419,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			ActiveGuestThreadYieldReason = null;
 			try
 			{
-				var nativeReturn = CallNativeEntry(ptr);
+				RunGuestEntryStub((void*)resource.EntryStub, (ulong)resource.HostRspStorage);
 				if (ActiveGuestThreadYieldRequested)
 				{
 					reason = ActiveGuestThreadYieldReason ?? "guest thread blocked";
@@ -5290,7 +5430,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					reason = LastError ?? "guest thread forced exit";
 					return GuestNativeCallExitReason.ForcedExit;
 				}
-				reason = $"returned 0x{nativeReturn:X8}";
+				var guestRax = hostRspStorage[1];
+				context[CpuRegister.Rax] = guestRax;
+				reason = $"returned 0x{guestRax:X8}";
 				return GuestNativeCallExitReason.Returned;
 			}
 			catch (AccessViolationException ex)
@@ -5315,14 +5457,98 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				previousForcedExit,
 				previousYieldRequested,
 				previousYieldReason);
-			NativeMemory.Free(hostRspStorage);
-			VirtualFree(ptr, 0u, 32768u);
+			pool.Depth--;
 		}
 	}
 
-	// The continuation trampoline is rebuilt on every blocked-thread resume.
-	// Keep its tiny writer on the stack: capturing local emit functions create a
-	// managed display-class allocation on this extremely hot path.
+	private unsafe GuestContinuationExecutionResource? CreateGuestContinuationExecutionResource(
+		out string? error)
+	{
+		error = null;
+		var resource = new GuestContinuationExecutionResource
+		{
+			FrameAddress = (nint)NativeMemory.AllocZeroed(
+				GuestContextTransferFrameQwords,
+				sizeof(ulong)),
+			HostRspStorage = (nint)NativeMemory.AllocZeroed(2, sizeof(ulong)),
+		};
+		if (resource.FrameAddress == 0 || resource.HostRspStorage == 0)
+		{
+			FreeGuestContinuationExecutionResource(resource);
+			error = "failed to allocate writable guest continuation state";
+			return null;
+		}
+
+		var transferStub = GetOrCreateGuestContextTransferStub();
+		if (transferStub == 0)
+		{
+			FreeGuestContinuationExecutionResource(resource);
+			error = "failed to allocate guest context transfer stub";
+			return null;
+		}
+
+		const uint stubSize = 256;
+		var code = (byte*)VirtualAlloc(null, stubSize, 12288u, 4u);
+		if (code == null)
+		{
+			FreeGuestContinuationExecutionResource(resource);
+			error = "failed to allocate immutable guest continuation entry stub";
+			return null;
+		}
+
+		var emitter = new NativeCodeEmitter(code);
+		emitter.Emit(0x53); // push rbx
+		emitter.Emit(0x55); // push rbp
+		emitter.Emit(0x57); // push rdi
+		emitter.Emit(0x56); // push rsi
+		emitter.Emit(0x41); emitter.Emit(0x54); // push r12
+		emitter.Emit(0x41); emitter.Emit(0x55); // push r13
+		emitter.Emit(0x41); emitter.Emit(0x56); // push r14
+		emitter.Emit(0x41); emitter.Emit(0x57); // push r15
+		EmitHostNonvolatileXmmSave(code, ref emitter.Offset);
+		emitter.EmitMovR64Immediate(0x49, 0xBA, (ulong)resource.HostRspStorage); // mov r10,hostRspStorage
+		emitter.Emit(0x49); emitter.Emit(0x89); emitter.Emit(0x22); // mov [r10],rsp
+		emitter.EmitMovR64Immediate(0x48, 0xB8, (ulong)resource.FrameAddress); // mov rax,frame
+		emitter.EmitMovR64Immediate(0x49, 0xBA, (ulong)transferStub); // mov r10,transferStub
+		emitter.Emit(0x41); emitter.Emit(0xFF); emitter.Emit(0xE2); // jmp r10
+		Debug.Assert(emitter.Offset <= stubSize, "Guest continuation entry stub exceeded its allocation.");
+
+		uint oldProtect = 0;
+		if (!VirtualProtect(code, stubSize, 32u, &oldProtect))
+		{
+			VirtualFree(code, 0u, 32768u);
+			FreeGuestContinuationExecutionResource(resource);
+			error = "failed to seal immutable guest continuation entry stub";
+			return null;
+		}
+
+		FlushInstructionCache(GetCurrentProcess(), code, stubSize);
+		resource.EntryStub = (nint)code;
+		return resource;
+	}
+
+	private unsafe static void FreeGuestContinuationExecutionResource(
+		GuestContinuationExecutionResource resource)
+	{
+		if (resource.EntryStub != 0)
+		{
+			VirtualFree((void*)resource.EntryStub, 0u, 32768u);
+			resource.EntryStub = 0;
+		}
+		if (resource.HostRspStorage != 0)
+		{
+			NativeMemory.Free((void*)resource.HostRspStorage);
+			resource.HostRspStorage = 0;
+		}
+		if (resource.FrameAddress != 0)
+		{
+			NativeMemory.Free((void*)resource.FrameAddress);
+			resource.FrameAddress = 0;
+		}
+	}
+
+	// Keep tiny generated-code writers on the stack: capturing local emit
+	// functions create a managed display-class allocation on hot transition paths.
 	private unsafe ref struct NativeCodeEmitter(byte* code)
 	{
 		private readonly byte* _code = code;
@@ -5446,7 +5672,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			result = OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
 			return false;
 		}
-		void* hostRspStorage = NativeMemory.Alloc((nuint)sizeof(ulong));
+		void* hostRspStorage = NativeMemory.AllocZeroed((nuint)(2 * sizeof(ulong)));
 		if (hostRspStorage == null)
 		{
 			VirtualFree(ptr, 0u, 32768u);
@@ -5553,6 +5779,12 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			ptr2[num3++] = 186;
 			*(ulong*)(ptr2 + num3) = num2;
 			num3 += 8;
+			// Preserve the guest entry result for the managed caller before
+			// switching back to the saved host stack.
+			ptr2[num3++] = 73; // mov [r10+8], rax
+			ptr2[num3++] = 137;
+			ptr2[num3++] = 66;
+			ptr2[num3++] = 8;
 			ptr2[num3++] = 73;
 			ptr2[num3++] = 139;
 			ptr2[num3++] = 34;
@@ -5609,7 +5841,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			int num6 = -1;
 			try
 			{
-				num6 = CallNativeEntry(ptr);
+				num6 = RunGuestEntryStub(ptr, num2);
 				Console.Error.WriteLine($"[LOADER][INFO] Guest returned: {num6}");
 				// A host stop has already invalidated the session. Draining guest
 				// continuations here can re-enter a blocked HLE call after its owner
@@ -6432,6 +6664,16 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			VirtualFree((void*)_guestReturnStub, 0u, 32768u);
 			_guestReturnStub = 0;
 		}
+		foreach (var pool in _guestContinuationExecutionPools.Values)
+		{
+			foreach (var resource in pool.Resources)
+			{
+				FreeGuestContinuationExecutionResource(resource);
+			}
+			pool.Resources.Clear();
+			pool.Depth = 0;
+		}
+		_guestContinuationExecutionPools.Dispose();
 		if (_guestContextTransferStub != 0)
 		{
 			VirtualFree((void*)_guestContextTransferStub, 0u, 32768u);

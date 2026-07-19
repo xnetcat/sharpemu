@@ -12,6 +12,7 @@ namespace SharpEmu.Libs.SaveData;
 public static class SaveDataExports
 {
     private const int OrbisSaveDataErrorParameter = unchecked((int)0x809F0000);
+    private const int OrbisSaveDataErrorNotMounted = unchecked((int)0x809F0004);
     private const int OrbisSaveDataErrorExists = unchecked((int)0x809F0007);
     private const int OrbisSaveDataErrorNotFound = unchecked((int)0x809F0008);
     private const int OrbisSaveDataErrorInternal = unchecked((int)0x809F000B);

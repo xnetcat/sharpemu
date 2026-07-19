@@ -37,6 +37,11 @@ public static class KernelPthreadCompatExports
         string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_PTHREAD_CONDS"), "1", StringComparison.Ordinal);
     private static readonly HashSet<ulong>? _tracePthreadMutexFilter = ParseTraceAddressFilter(
         Environment.GetEnvironmentVariable("SHARPEMU_LOG_PTHREAD_MUTEX_FILTER"));
+    private static readonly bool _tracePthreadStaleWaiters =
+        string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_LOG_PTHREAD_STALE_WAITERS"),
+            "1",
+            StringComparison.Ordinal);
     private static long _nextSynchronizationWaiterId;
 
     private sealed class PthreadMutexState
@@ -134,7 +139,9 @@ public static class KernelPthreadCompatExports
         LibraryName = "libKernel")]
     public static int PthreadYield(CpuContext ctx)
     {
-        _ = ctx;
+        // A title may wait for AvPlayer's StateReady callback by yielding,
+        // without polling AvPlayer or submitting another frame.
+        AvPlayer.AvPlayerExports.PumpPendingEvents(ctx);
         Thread.Yield();
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
@@ -1493,6 +1500,29 @@ public static class KernelPthreadCompatExports
             return true;
         }
 
+        var removedStaleWaiters = 0;
+        // A running thread cannot legitimately be queued behind an older
+        // waiter belonging to itself. That state can only come from an
+        // abandoned condition-variable mutex reacquisition. Leaving the old
+        // entry at the FIFO head prevents this thread, and every thread behind
+        // it, from ever acquiring an otherwise-unowned mutex.
+        while (state.Waiters.First is { } head &&
+            !ReferenceEquals(head, waiter.Node) &&
+            head.Value.ThreadId == waiter.ThreadId)
+        {
+            state.Waiters.RemoveFirst();
+            head.Value.Node = null;
+            removedStaleWaiters++;
+        }
+
+        if (_tracePthreadStaleWaiters && removedStaleWaiters != 0)
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] pthread_mutex_drop_stale_waiters " +
+                $"thread=0x{waiter.ThreadId:X16} removed={removedStaleWaiters} " +
+                $"remaining={state.Waiters.Count}");
+        }
+
         if (state.OwnerThreadId != 0 ||
             waiter.Node is null ||
             !ReferenceEquals(state.Waiters.First, waiter.Node))
@@ -1836,7 +1866,10 @@ public static class KernelPthreadCompatExports
             $"[LOADER][TRACE] pthread_{operation}: mutex=0x{mutexAddress:X16} resolved=0x{resolvedAddress:X16} " +
             $"guest[0]=0x{guestWord0:X16} guest[8]=0x{guestWord1:X16} " +
             $"current=0x{currentThreadId:X16} owner=0x{(state?.OwnerThreadId ?? 0):X16} " +
-            $"recursion={(state?.RecursionCount ?? 0)} type={(state?.Type ?? 0)} result=0x{unchecked((uint)result):X8}");
+            $"recursion={(state?.RecursionCount ?? 0)} type={(state?.Type ?? 0)} " +
+            $"fifo={(state is null ? -1 : state.Waiters.Count)} " +
+            $"fifo_head=0x{(state?.Waiters.First?.Value.ThreadId ?? 0):X16} " +
+            $"result=0x{unchecked((uint)result):X8}");
     }
 
     private static void TracePthreadCond(string operation, ulong condAddress, ulong mutexAddress, PthreadCondState? state, bool timed, int result)

@@ -40,6 +40,12 @@ public sealed class TrackedCpuMemory : ICpuMemory, ITrackedCpuMemory, IGuestMemo
         return result;
     }
 
+    public bool TryCompare(ulong virtualAddress, ReadOnlySpan<byte> expected) =>
+        _inner.TryCompare(virtualAddress, expected);
+
+    public bool IsRangeReadable(ulong virtualAddress, int length) =>
+        _inner.IsRangeReadable(virtualAddress, length);
+
     public bool TryAllocateGuestMemory(ulong size, ulong alignment, out ulong address)
     {
         if (_inner is IGuestMemoryAllocator allocator)

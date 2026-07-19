@@ -30,4 +30,70 @@ public sealed class PadExportsTests
         _ctx[CpuRegister.Rdi] = unchecked((ulong)handle);
         Assert.Equal(expected, PadExports.PadSetTiltCorrectionState(_ctx));
     }
+
+    [Fact]
+    public void AutoCrossCatchUp_ReplaysMissedPressesWithReleaseGaps()
+    {
+        double[] times = [28, 36, 44];
+        var nextIndex = 0;
+        var activeUntil = 0.0;
+        var releaseUntil = 0.0;
+
+        Assert.True(PadExports.TryAdvanceAutoCrossSequence(
+            100.0,
+            times,
+            ref nextIndex,
+            ref activeUntil,
+            ref releaseUntil,
+            out var activatedIndex));
+        Assert.Equal(0, activatedIndex);
+        Assert.Equal(1, nextIndex);
+
+        Assert.True(PadExports.TryAdvanceAutoCrossSequence(
+            100.2,
+            times,
+            ref nextIndex,
+            ref activeUntil,
+            ref releaseUntil,
+            out activatedIndex));
+        Assert.Equal(-1, activatedIndex);
+
+        Assert.False(PadExports.TryAdvanceAutoCrossSequence(
+            100.6,
+            times,
+            ref nextIndex,
+            ref activeUntil,
+            ref releaseUntil,
+            out activatedIndex));
+        Assert.Equal(-1, activatedIndex);
+
+        Assert.True(PadExports.TryAdvanceAutoCrossSequence(
+            101.0,
+            times,
+            ref nextIndex,
+            ref activeUntil,
+            ref releaseUntil,
+            out activatedIndex));
+        Assert.Equal(1, activatedIndex);
+        Assert.Equal(2, nextIndex);
+    }
+
+    [Fact]
+    public void AutoCrossCatchUp_WaitsForNextScheduledPress()
+    {
+        double[] times = [28];
+        var nextIndex = 0;
+        var activeUntil = 0.0;
+        var releaseUntil = 0.0;
+
+        Assert.False(PadExports.TryAdvanceAutoCrossSequence(
+            27.9,
+            times,
+            ref nextIndex,
+            ref activeUntil,
+            ref releaseUntil,
+            out var activatedIndex));
+        Assert.Equal(-1, activatedIndex);
+        Assert.Equal(0, nextIndex);
+    }
 }

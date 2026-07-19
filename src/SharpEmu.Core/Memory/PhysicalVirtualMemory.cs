@@ -871,16 +871,56 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         }
     }
 
+    public bool IsRangeReadable(ulong virtualAddress, int length)
+    {
+        if (length < 0)
+        {
+            return false;
+        }
+
+        _gate.EnterReadLock();
+        try
+        {
+            var region = FindRegion(virtualAddress, (ulong)length);
+            if (region is null ||
+                !TryResolveRegionOffset(
+                    virtualAddress,
+                    (ulong)length,
+                    region,
+                    out var offset))
+            {
+                return false;
+            }
+
+            if (length == 0)
+            {
+                return true;
+            }
+
+            var source = region.VirtualAddress + offset;
+            return !region.IsReservedOnly ||
+                EnsureRangeCommitted(source, (ulong)length, region);
+        }
+        finally
+        {
+            _gate.ExitReadLock();
+        }
+    }
+
     public bool TryWrite(ulong virtualAddress, ReadOnlySpan<byte> source)
     {
         // A managed write into a page the guest-image write tracker has
         // protected surfaces as a fatal AccessViolation — the runtime turns
         // SIGSEGV in managed code into an exception before the resumable
         // signal bridge can restore access (native guest stores recover
-        // there). Pre-visit the span so tracked pages are unprotected and
-        // their owners dirtied before the copy; guest addresses are
-        // host-identical, matching the tracker's fault addresses.
-        GuestImageWriteTracker.NotifyManagedWrite(virtualAddress, (ulong)source.Length);
+        // there). Hold a managed-write scope across the copy so tracked pages
+        // are unprotected and their owners dirtied, and stay writable until the
+        // copy completes; guest addresses are host-identical, matching the
+        // tracker's fault addresses.
+        using var guestImageWrite =
+            GuestImageWriteTracker.BeginManagedWrite(
+                virtualAddress,
+                (ulong)source.Length);
 
         var requiresExclusiveAccess = false;
         _gate.EnterReadLock();
@@ -917,6 +957,12 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                     fixed (byte* srcPtr = source)
                     {
                         Buffer.MemoryCopy(srcPtr, destPtr, (nuint)source.Length, (nuint)source.Length);
+                    }
+                    if (region.IsExecutable)
+                    {
+                        _hostMemory.FlushInstructionCache(
+                            (ulong)destPtr,
+                            (ulong)source.Length);
                     }
 
                     NotifyGuestWriteWatch(virtualAddress, source);
@@ -1024,6 +1070,12 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                 {
                     Buffer.MemoryCopy(srcPtr, destPtr, (nuint)source.Length, (nuint)source.Length);
                 }
+                if (region.IsExecutable)
+                {
+                    _hostMemory.FlushInstructionCache(
+                        (ulong)destPtr,
+                        (ulong)source.Length);
+                }
 
                 NotifyGuestWriteWatch(virtualAddress, source);
                 return true;
@@ -1044,7 +1096,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
             finally
             {
                 _hostMemory.ProtectRaw((ulong)destPtr, (ulong)source.Length, oldProtect, out _);
-                if (IsExecutableProtection(oldProtect))
+                if (region.IsExecutable || IsExecutableProtection(oldProtect))
                 {
                     _hostMemory.FlushInstructionCache((ulong)destPtr, (ulong)source.Length);
                 }

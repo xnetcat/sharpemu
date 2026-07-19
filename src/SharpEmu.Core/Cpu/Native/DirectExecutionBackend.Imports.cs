@@ -31,11 +31,11 @@ public sealed partial class DirectExecutionBackend
 	private const int ImportSavedFpuControlOffset = -148;
 	private const int ImportSavedXmmOffset = -128;
 	private const int ImportVectorRegisterCount = 8;
-	private const ulong StackCheckGuardValue = 0xC0DEC0DECAFEBA00UL;
-	private static long _canaryReturnRecoveries;
 
 	private readonly object _importResultLogSampleGate = new();
 	private readonly Dictionary<string, int> _importResultLogSamples = new(StringComparer.Ordinal);
+	private readonly object _dlsymMissLogSampleGate = new();
+	private readonly Dictionary<string, int> _dlsymMissLogSamples = new(StringComparer.Ordinal);
 	private int _il2CppExceptionDiagnosticCount;
 
 	private static ulong ImportDispatchGatewayManaged(nint backendHandle, int importIndex, nint argPackPtr)
@@ -87,10 +87,6 @@ public sealed partial class DirectExecutionBackend
 		void* contextRecord = ((EXCEPTION_POINTERS*)exceptionInfo)->ContextRecord;
 		ulong value = ReadCtxU64(contextRecord, 248);
 		ulong value2 = (ulong)exceptionRecord->ExceptionAddress;
-		if (value == StackCheckGuardValue && TryRecoverCanaryReturn(contextRecord))
-		{
-			return -1;
-		}
 		if (!IsUnresolvedSentinel(value) && !IsUnresolvedSentinel(value2))
 		{
 			return 0;
@@ -105,41 +101,6 @@ public sealed partial class DirectExecutionBackend
 			return -1;
 		}
 		return 0;
-	}
-
-	private unsafe static bool TryRecoverCanaryReturn(void* contextRecord)
-	{
-		var rsp = ReadCtxU64(contextRecord, CTX_RSP);
-		var interruptedReturn = ReadCtxU64(contextRecord, CTX_RBP);
-		var interruptedFrame = rsp + 0x18;
-		if (!IsLikelyReturnAddress(interruptedReturn) ||
-			rsp < sizeof(ulong) ||
-			!TryReadStackU64(interruptedFrame, out var callerRbp) ||
-			!TryReadStackU64(rsp + 0x20, out var callerReturn) ||
-			callerRbp <= rsp || callerRbp - rsp > 0x10000 ||
-			!IsLikelyReturnAddress(callerReturn))
-		{
-			return false;
-		}
-
-		// The guest unwind reached this callback return one stack slot late: the
-		// final pop loaded the interrupted return into rbp and ret consumed the
-		// stack guard. Resume at that return with the outer frame pointer rebuilt
-		// from the still-intact caller frame on the stack.
-		WriteCtxU64(contextRecord, CTX_RBP, interruptedFrame);
-		WriteCtxU64(contextRecord, CTX_RSP, rsp - sizeof(ulong));
-		WriteCtxU64(contextRecord, CTX_RIP, interruptedReturn);
-		var recoveryCount = Interlocked.Increment(ref _canaryReturnRecoveries);
-		if (recoveryCount <= 4 || recoveryCount % 1000 == 0)
-		{
-			Console.Error.WriteLine(
-				$"[LOADER][WARN] Recovered malformed canary return #{recoveryCount}: " +
-				$"resume=0x{interruptedReturn:X16} rsp=0x{rsp - sizeof(ulong):X16} " +
-				$"rbp=0x{interruptedFrame:X16} caller_rbp=0x{callerRbp:X16} " +
-				$"caller=0x{callerReturn:X16}");
-			Console.Error.Flush();
-		}
-		return true;
 	}
 
 	private unsafe ulong DispatchImport(int importIndex, nint argPackPtr)
@@ -225,48 +186,6 @@ public sealed partial class DirectExecutionBackend
 				$"saved_rbp=0x{frameValue:X16} saved_ret=0x{frameReturn:X16}");
 		}
 		var isGuestWorker = GuestThreadExecution.IsGuestThread;
-		if (!IsLikelyReturnAddress(num7))
-		{
-			for (int i = 1; i <= 4; i++)
-			{
-				ulong num8 = *(ulong*)(argPackPtr + 96 + i * 8);
-				if (IsLikelyReturnAddress(num8))
-				{
-					*(ulong*)(argPackPtr + 96) = num8;
-					num7 = num8;
-					Console.Error.WriteLine($"[LOADER][WARNING] Import#{num}: corrected suspicious return RIP using stack slot +0x{i * 8:X} -> 0x{num7:X16}");
-					break;
-				}
-			}
-		}
-		// Diagnostic compatibility escape hatch for a guest stack-protector
-		// failure whose noreturn call is immediately followed by UD2.  Returning
-		// normally from the HLE export would execute that UD2; redirect this one
-		// well-known compiler epilogue back through its register/stack unwind.
-		// Keep the byte-pattern check strict so the opt-in cannot guess at an
-		// unrelated function layout.
-		if (string.Equals(importStubEntry.Nid, "Ou3iL1abvng", StringComparison.Ordinal) &&
-			string.Equals(
-				Environment.GetEnvironmentVariable("SHARPEMU_IGNORE_STACK_CHK"),
-				"1",
-				StringComparison.Ordinal) &&
-			num7 >= 0x20)
-		{
-			var returnCode = (byte*)num7;
-			if (returnCode[0] == 0x0F && returnCode[1] == 0x0B &&
-				returnCode[-22] == 0x75 && returnCode[-21] == 0x0F &&
-				returnCode[-20] == 0x48 && returnCode[-19] == 0x83 &&
-				returnCode[-18] == 0xC4)
-			{
-				var recoveredReturn = num7 - 20;
-				*(ulong*)(argPackPtr + 96) = recoveredReturn;
-				cpuContext[CpuRegister.Rax] = 0;
-				Console.Error.WriteLine(
-					$"[LOADER][WARN] Recovered guest stack-check epilogue " +
-					$"ret=0x{num7:X16} -> 0x{recoveredReturn:X16}");
-				return 0;
-			}
-		}
 		if (_activeGuestThreadState is { } activeGuestThreadState)
 		{
 			Interlocked.Increment(ref activeGuestThreadState.ImportCount);
@@ -284,6 +203,16 @@ public sealed partial class DirectExecutionBackend
 			activeGuestThreadState.LastImportStack5 = ReadImportStackArgument(argPackPtr, 5);
 			Volatile.Write(ref activeGuestThreadState.LastImportResultValid, 0);
 			Volatile.Write(ref activeGuestThreadState.LastReturnRip, num7);
+			Volatile.Write(ref activeGuestThreadState.LastImportRsp, importStackPointer);
+			Volatile.Write(ref activeGuestThreadState.LastImportRbp, value4);
+			RecordGuestThreadImportTrace(
+				activeGuestThreadState,
+				num,
+				importStubEntry.Nid,
+				num7,
+				value,
+				value2,
+				num3);
 			// Publish the NID last so readers cannot pair a new import name with
 			// the preceding import's argument snapshot.
 			Volatile.Write(ref activeGuestThreadState.LastImportNid, importStubEntry.Nid);
@@ -334,15 +263,16 @@ public sealed partial class DirectExecutionBackend
 		bool flag4 = !string.IsNullOrWhiteSpace(_importFilter);
 		bool flag5 = false;
 		ExportedFunction? matchedExport = importStubEntry.Export;
-		bool periodicTrace = num <= 128 ||
-			(num >= 240 && num <= 400) ||
-			(num >= 900 && num <= 1300) ||
-			num % 100000 == 0L ||
-			(importStubEntry.Nid == "tsvEmnenz48" && (num <= 256 || num % 1000 == 0L)) ||
-			(importStubEntry.Nid == "rTXw65xmLIA" && (num <= 256 || num % 128 == 0)) ||
-			flag ||
-			flag2 ||
-			flag3;
+		bool periodicTrace = _logPeriodicImports &&
+			(num <= 128 ||
+			 (num >= 240 && num <= 400) ||
+			 (num >= 900 && num <= 1300) ||
+			 num % 100000 == 0L ||
+			 (importStubEntry.Nid == "tsvEmnenz48" && (num <= 256 || num % 1000 == 0L)) ||
+			 (importStubEntry.Nid == "rTXw65xmLIA" && (num <= 256 || num % 128 == 0)) ||
+			 flag ||
+			 flag2 ||
+			 flag3);
 		if (matchedExport is not null)
 		{
 			if (flag4)
@@ -1241,16 +1171,26 @@ public sealed partial class DirectExecutionBackend
 		var arg0 = *(ulong*)argPackPtr;
 		var returnRip = *(ulong*)(argPackPtr + 96);
 		var leafStackPointer = (ulong)argPackPtr + 96UL;
-		var probeLeafReturn = _logAllImports &&
-			string.Equals(importStubEntry.Nid, "2Z+PpY6CaJg", StringComparison.Ordinal) &&
-			leafStackPointer >= 0x00006FFFAC1FF000UL &&
-			leafStackPointer < 0x00006FFFAC200000UL;
+		var probeLeafReturn =
+			(_probeImportReturnAddress != 0 && returnRip == _probeImportReturnAddress) ||
+			(_logAllImports &&
+			 string.Equals(importStubEntry.Nid, "2Z+PpY6CaJg", StringComparison.Ordinal) &&
+			 leafStackPointer >= 0x00006FFFAC1FF000UL &&
+			 leafStackPointer < 0x00006FFFAC200000UL);
 		if (probeLeafReturn)
 		{
+			var framePointer = *(ulong*)(argPackPtr + 56);
+			var savedFramePointer =
+				TryReadStackU64(framePointer, out var savedRbp) ? savedRbp : 0;
+			var savedReturn =
+				TryReadStackU64(framePointer + sizeof(ulong), out var frameReturn)
+					? frameReturn
+					: 0;
 			Console.Error.WriteLine(
 				$"[LOADER][TRACE] leaf-return-probe-enter nid={importStubEntry.Nid} " +
 				$"ret=0x{returnRip:X16} rsp=0x{leafStackPointer:X16} " +
-				$"active_slot=0x{ActiveGuestReturnSlotAddress:X16}");
+				$"rbp=0x{framePointer:X16} saved_rbp=0x{savedFramePointer:X16} " +
+				$"saved_ret=0x{savedReturn:X16} active_slot=0x{ActiveGuestReturnSlotAddress:X16}");
 		}
 		cpuContext.Rip = importStubEntry.Address;
 		LoadImportVolatileArguments(cpuContext, argPackPtr);
@@ -1285,9 +1225,21 @@ public sealed partial class DirectExecutionBackend
 			activeGuestThreadState.LastImportStack5 = ReadImportStackArgument(argPackPtr, 5);
 			Volatile.Write(ref activeGuestThreadState.LastImportResultValid, 0);
 			Volatile.Write(ref activeGuestThreadState.LastReturnRip, returnRip);
+			Volatile.Write(ref activeGuestThreadState.LastImportRsp, leafStackPointer);
+			Volatile.Write(
+				ref activeGuestThreadState.LastImportRbp,
+				cpuContext[CpuRegister.Rbp]);
+			RecordGuestThreadImportTrace(
+				activeGuestThreadState,
+				dispatchIndex,
+				importStubEntry.Nid,
+				returnRip,
+				arg0,
+				cpuContext[CpuRegister.Rsi],
+				cpuContext[CpuRegister.Rdx]);
 			Volatile.Write(ref activeGuestThreadState.LastImportNid, importStubEntry.Nid);
 		}
-		if (dispatchIndex % 100000 == 0)
+		if (_logPeriodicImports && dispatchIndex % 100000 == 0)
 		{
 			Console.Error.WriteLine(
 				$"[LOADER][TRACE] Import#{dispatchIndex}: {export.LibraryName}:{export.Name} ({importStubEntry.Nid}) " +
@@ -1345,6 +1297,9 @@ public sealed partial class DirectExecutionBackend
 			}
 		}
 
+		// Preserve the waiter object on the leaf-import path. RunGuestThread
+		// resumes BlockWaiter directly; registering only its delegate pair lets
+		// a condition wait continue without running the mutex-reacquire step.
 		var consumedThreadBlock = GuestThreadExecution.TryConsumeCurrentThreadBlock(
 				out var blockReason,
 				out var blockContinuation,
@@ -1429,14 +1384,18 @@ public sealed partial class DirectExecutionBackend
 		var expectedFileProbeMiss =
 			result == OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND &&
 			IsExpectedFileProbeNotFoundNid(nid);
+		var expectedDirectMemoryReleaseMiss =
+			string.Equals(nid, "hwVSPCmp5tM", StringComparison.Ordinal) &&
+			result == OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
 		var expectedTimedWaitTimeout =
-			string.Equals(nid, "27bAgiJmOh0", StringComparison.Ordinal) &&
-			unchecked((int)result) == 60;
+			(nid is "BmMjYxmew1w" or "27bAgiJmOh0") &&
+			(unchecked((int)result) == 60 ||
+				result == OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT);
 		var expectedEqueueTimeout =
 			string.Equals(nid, "fzyMKs9kim0", StringComparison.Ordinal) &&
 			result == OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT;
 		var expectedMutexTrylockBusy =
-			string.Equals(nid, "K-jXhbt2gn4", StringComparison.Ordinal) &&
+			(nid is "K-jXhbt2gn4" or "upoVrzMHFeE") &&
 			result == OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY;
 		var expectedSemaphoreTrywaitAgain =
 			string.Equals(nid, "H2a+IN9TP0E", StringComparison.Ordinal) &&
@@ -1451,6 +1410,7 @@ public sealed partial class DirectExecutionBackend
 			string.Equals(nid, "D-CzAxQL0XI", StringComparison.Ordinal) &&
 			resultValue == unchecked((int)0x80960009);
 		if (!expectedFileProbeMiss &&
+			!expectedDirectMemoryReleaseMiss &&
 			!expectedTimedWaitTimeout &&
 			!expectedEqueueTimeout &&
 			!expectedMutexTrylockBusy &&
@@ -1774,7 +1734,12 @@ public sealed partial class DirectExecutionBackend
 			"WKAXJ4XBPQ4" or // scePthreadCondWait
 			"BmMjYxmew1w" or // scePthreadCondTimedwait
 			"Op8TBGY5KHg" or // pthread_cond_wait
-			"27bAgiJmOh0";   // pthread_cond_timedwait
+			"27bAgiJmOh0" or // pthread_cond_timedwait
+			"9UK1vLZQft4" or // scePthreadMutexLock
+			"7H0iTOciTLo" or // pthread_mutex_lock
+			"tn3VlD0hG60" or // scePthreadMutexUnlock
+			"2Z+PpY6CaJg" or // pthread_mutex_unlock
+			"K-jXhbt2gn4";   // pthread_mutex_trylock
 
 	private void ResetImportLoopPattern()
 	{
@@ -2027,8 +1992,25 @@ public sealed partial class DirectExecutionBackend
 			!TryResolveRuntimeSymbolAddress(ComputePsNid(symbolName), out resolvedAddress) &&
 			!TryResolveRuntimeSymbolAlias(symbolName, out resolvedAddress))
 		{
-			Console.Error.WriteLine(
-				$"[LOADER][WARN] sceKernelDlsym failed: handle=0x{cpuContext[CpuRegister.Rdi]:X} symbol='{symbolName}'");
+			var missKey = $"{moduleHandle}\0{symbolName}";
+			int missCount;
+			lock (_dlsymMissLogSampleGate)
+			{
+				_dlsymMissLogSamples.TryGetValue(missKey, out missCount);
+				missCount++;
+				_dlsymMissLogSamples[missKey] = missCount;
+			}
+			if (missCount == 1 ||
+				(string.Equals(
+					Environment.GetEnvironmentVariable("SHARPEMU_LOG_DLSYM"),
+					"1",
+					StringComparison.Ordinal) &&
+				 missCount % 1000 == 0))
+			{
+				Console.Error.WriteLine(
+					$"[LOADER][WARN] sceKernelDlsym failed: handle=0x{cpuContext[CpuRegister.Rdi]:X} " +
+					$"symbol='{symbolName}' count={missCount}");
+			}
 			cpuContext[CpuRegister.Rax] = 18446744073709551615uL;
 			return OrbisGen2Result.ORBIS_GEN2_OK;
 		}

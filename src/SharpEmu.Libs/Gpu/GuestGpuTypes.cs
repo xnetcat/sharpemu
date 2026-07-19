@@ -27,7 +27,22 @@ internal sealed record GuestDrawTexture(
     uint Pitch = 0,
     uint TileMode = 0,
     uint DstSelect = 0xFAC,
-    GuestSampler Sampler = default);
+    GuestSampler Sampler = default,
+    ulong DeferredDescriptorAddress = 0,
+    SharpEmu.ShaderCompiler.Gen5DescriptorChain? DeferredChain = null,
+    uint Type = 9,
+    uint Depth = 1,
+    uint Layers = 1,
+    uint BaseArrayLayer = 0,
+    uint BufferStride = 0,
+    bool IsFilteredBuffer = false,
+    // Raw MIMG DIM selected by the shader instruction. This is deliberately
+    // independent of Type: a guest may legally use an array view (including a
+    // one-layer array view) over an image whose allocation descriptor is 2D.
+    uint ViewDimension = 1,
+    // Guest CPU write-tracker generation of the memory RgbaPixels was read
+    // from; -1 when the range is untracked or the pixels were not read here.
+    long WriteGeneration = -1);
 
 /// <summary>Raw guest sampler descriptor dwords, copied verbatim from guest memory.</summary>
 internal readonly record struct GuestSampler(
@@ -48,7 +63,13 @@ internal readonly record struct TextureContentIdentity(
     uint DstSelect,
     uint TileMode,
     uint Pitch,
-    GuestSampler Sampler);
+    GuestSampler Sampler,
+    uint Type = 9,
+    uint Depth = 1,
+    uint Layers = 1,
+    uint BaseArrayLayer = 0,
+    uint BufferStride = 0,
+    uint ViewDimension = 1);
 
 internal sealed record GuestMemoryBuffer(
     ulong BaseAddress,
@@ -56,7 +77,15 @@ internal sealed record GuestMemoryBuffer(
     int Length,
     bool Pooled,
     bool Writable = false,
-    bool WriteBackToGuest = true);
+    bool WriteBackToGuest = true,
+    ulong DeferredDescriptorAddress = 0,
+    SharpEmu.ShaderCompiler.Gen5DescriptorChain? DeferredChain = null,
+    bool IsRuntimeScalarState = false,
+    bool ReadFromGuestAtExecution = false,
+    // Late-written shader-entry SGPRs to re-read immediately before upload.
+    // This is only populated for the self-contained BaseAddress==0 packed
+    // runtime-scalar buffers.
+    IReadOnlyList<(int Offset, ulong Source)>? RuntimeScalarRefreshes = null);
 
 /// <summary>DataFormat/NumberFormat are raw guest vertex-attribute codes.</summary>
 internal sealed record GuestVertexBuffer(
@@ -69,13 +98,16 @@ internal sealed record GuestVertexBuffer(
     uint OffsetBytes,
     byte[] Data,
     int Length,
-    bool Pooled);
+    bool Pooled,
+    bool ReadFromGuestAtExecution = false);
 
 internal sealed record GuestIndexBuffer(
     byte[] Data,
     int Length,
     bool Is32Bit,
-    bool Pooled);
+    bool Pooled,
+    ulong BaseAddress = 0,
+    bool ReadFromGuestAtExecution = false);
 
 internal readonly record struct GuestRect(
     int X,
@@ -171,7 +203,10 @@ internal sealed record GuestRenderTarget(
     uint Height,
     uint Format,
     uint NumberType,
-    uint MipLevels = 1);
+    uint MipLevels = 1,
+    uint Type = 9,
+    uint Depth = 1,
+    uint Layers = 1);
 
 /// <summary>Guest DB surface bound alongside a color render target.</summary>
 internal sealed record GuestDepthTarget(
@@ -182,7 +217,11 @@ internal sealed record GuestDepthTarget(
     uint GuestFormat,
     uint SwizzleMode,
     float ClearDepth,
-    bool ReadOnly)
+    bool ReadOnly,
+    // DB_HTILE_DATA_BASE: PS5 titles fast-clear depth by rewriting HTILE
+    // metadata from compute; the depth backend watches this range to know
+    // when the guest cleared the surface without a DB_RENDER_CONTROL clear.
+    ulong HtileAddress = 0)
 {
     public ulong Address => WriteAddress != 0 ? WriteAddress : ReadAddress;
 }

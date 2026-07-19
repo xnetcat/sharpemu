@@ -3,6 +3,7 @@
 
 using SharpEmu.HLE;
 using SharpEmu.HLE.Host;
+using SharpEmu.Libs.Agc;
 using SharpEmu.Libs.Gpu;
 using SharpEmu.Libs.Audio;
 using SharpEmu.Libs.Kernel;
@@ -45,6 +46,7 @@ public static class VideoOutExports
     private const ulong SceVideoOutPixelFormatA2R10G10B10 = 0x88060000;
     private const ulong SceVideoOutPixelFormatA2R10G10B10Srgb = 0x88000000;
     private const ulong SceVideoOutPixelFormatA2R10G10B10Bt2020Pq = 0x88740000;
+    private const ulong SceVideoOutPixelFormatA16R16G16B16Float = 0xC1060000;
     // Prospero/PS5 format2 values are 64-bit encodings. The 0x22000000 field
     // selects R-first component order; notably, the 0x81000000... family is
     // packed 10:10:10:2 and must not be mistaken for an 8-bit RGBA format.
@@ -56,6 +58,8 @@ public static class VideoOutExports
     private const ulong SceVideoOutPixelFormat2B10G10R10A2Srgb = 0x8100000000000000;
     private const ulong SceVideoOutPixelFormat2R10G10B10A2Bt2100Pq = 0x8100070422000000;
     private const ulong SceVideoOutPixelFormat2B10G10R10A2Bt2100Pq = 0x8100070400000000;
+    private const ulong SceVideoOutPixelFormat2R16G16B16A16Float = 0xC001000622000000;
+    private const ulong SceVideoOutPixelFormat2B16G16R16A16Float = 0xC001000600000000;
     private const ulong SceVideoOutInternalEventFlip = 0x6;
     // Distinct internal ident for vblank events. Games interpret events through
     // sceVideoOutGetEventId (mapped below), so the exact value is internal; only
@@ -686,6 +690,9 @@ public static class VideoOutExports
         var bufferIndex = unchecked((int)ctx[CpuRegister.Rsi]);
         var flipMode = unchecked((int)ctx[CpuRegister.Rdx]);
         var flipArg = unchecked((long)ctx[CpuRegister.Rcx]);
+        // A flip is another safe guest boundary at which AvPlayer service
+        // notifications can be delivered without re-entering AddSource.
+        AvPlayer.AvPlayerExports.PumpPendingEvents(ctx);
         return SubmitFlip(ctx, handle, bufferIndex, flipMode, flipArg, submitGpuImage: true);
     }
 
@@ -1276,10 +1283,24 @@ public static class VideoOutExports
         var submitted = Interlocked.Exchange(ref _submittedFrameCount, 0);
         var presentedCount = Interlocked.Exchange(ref _presentedFrameCount, 0);
         var (draws, drawMs, pipelines, spirvCompiles) = GuestGpu.Current.ReadAndResetPerfCounters();
+        var vertexReads = Interlocked.Exchange(
+            ref SharpEmu.ShaderCompiler.Gen5ShaderScalarEvaluator.GlobalMemoryReadCount,
+            0);
+        var vertexReadBytes = Interlocked.Exchange(
+            ref SharpEmu.ShaderCompiler.Gen5ShaderScalarEvaluator.GlobalMemoryReadBytes,
+            0);
+        var vertexCacheHits = Interlocked.Exchange(
+            ref SharpEmu.ShaderCompiler.Gen5ShaderScalarEvaluator.GlobalMemoryReadCacheHits,
+            0);
+        var vertexReuses = Interlocked.Exchange(
+            ref SharpEmu.ShaderCompiler.Gen5ShaderScalarEvaluator.GlobalMemoryReadReuses,
+            0);
         Console.Error.WriteLine(
             $"[LOADER][PERF] videoout submitted_fps={submitted / elapsedSeconds:F1} " +
             $"presented_fps={presentedCount / elapsedSeconds:F1} " +
-            $"draws={draws} draw_ms={drawMs:F0} pipelines={pipelines} spirv={spirvCompiles}");
+            $"draws={draws} draw_ms={drawMs:F0} pipelines={pipelines} spirv={spirvCompiles} " +
+            $"guest_reads={vertexReads} guest_read_mb={vertexReadBytes / (1024 * 1024)} " +
+            $"snapshot_hits={vertexCacheHits} snapshot_reuses={vertexReuses}");
     }
 
     private static readonly bool _flipPacingDisabled = string.Equals(
@@ -1696,6 +1717,11 @@ public static class VideoOutExports
             SceVideoOutPixelFormat2R10G10B10A2Bt2100Pq or
             SceVideoOutPixelFormat2B10G10R10A2Bt2100Pq
             ? 4u
+            : pixelFormat is
+                SceVideoOutPixelFormatA16R16G16B16Float or
+                SceVideoOutPixelFormat2R16G16B16A16Float or
+                SceVideoOutPixelFormat2B16G16R16A16Float
+                ? 8u
             : 0u;
 
     internal static bool IsPacked10BitPixelFormat(ulong pixelFormat) =>
@@ -1736,6 +1762,9 @@ public static class VideoOutExports
             SceVideoOutPixelFormat2B10G10R10A2Srgb or
             SceVideoOutPixelFormat2R10G10B10A2Bt2100Pq or
             SceVideoOutPixelFormat2B10G10R10A2Bt2100Pq => 9u,
+            SceVideoOutPixelFormatA16R16G16B16Float or
+            SceVideoOutPixelFormat2R16G16B16A16Float or
+            SceVideoOutPixelFormat2B16G16R16A16Float => 71u,
             _ => 0u,
         };
 
@@ -1860,7 +1889,9 @@ public static class VideoOutExports
         var dst = 0;
         Span<byte> rgba = stackalloc byte[4];
         var packed10 = IsPacked10BitPixelFormatNormalized(pixelFormat);
-        for (var src = 0; src + 3 < source.Length; src += 4)
+        var float16 = IsFloat16PixelFormatNormalized(pixelFormat);
+        var sourceStride = float16 ? 8 : 4;
+        for (var src = 0; src + sourceStride - 1 < source.Length; src += sourceStride)
         {
             if (packed10)
             {
@@ -1869,6 +1900,18 @@ public static class VideoOutExports
                 destination[dst++] = rgba[0];
                 destination[dst++] = rgba[1];
                 destination[dst++] = rgba[2];
+            }
+            else if (float16)
+            {
+                var redFirst = pixelFormat is
+                    SceVideoOutPixelFormatA16R16G16B16Float or
+                    SceVideoOutPixelFormat2R16G16B16A16Float;
+                var least = HalfToByte(BinaryPrimitives.ReadUInt16LittleEndian(source[src..]));
+                var green = HalfToByte(BinaryPrimitives.ReadUInt16LittleEndian(source[(src + 2)..]));
+                var most = HalfToByte(BinaryPrimitives.ReadUInt16LittleEndian(source[(src + 4)..]));
+                destination[dst++] = redFirst ? least : most;
+                destination[dst++] = green;
+                destination[dst++] = redFirst ? most : least;
             }
             else if (pixelFormat is
                      SceVideoOutPixelFormatA8B8G8R8Srgb or
@@ -1885,6 +1928,57 @@ public static class VideoOutExports
                 destination[dst++] = source[src + 0];
             }
         }
+    }
+
+    private static bool IsFloat16PixelFormatNormalized(ulong pixelFormat) =>
+        pixelFormat is
+            SceVideoOutPixelFormatA16R16G16B16Float or
+            SceVideoOutPixelFormat2R16G16B16A16Float or
+            SceVideoOutPixelFormat2B16G16R16A16Float;
+
+    private static byte HalfToByte(ushort bits)
+    {
+        var value = (float)BitConverter.UInt16BitsToHalf(bits);
+        if (!float.IsFinite(value))
+        {
+            return value > 0 ? byte.MaxValue : (byte)0;
+        }
+
+        return (byte)Math.Clamp((int)MathF.Round(value * 255f), 0, 255);
+    }
+
+    internal static bool TryPackRgba16FloatPixel(
+        ulong pixelFormat,
+        byte red,
+        byte green,
+        byte blue,
+        byte alpha,
+        Span<byte> destination)
+    {
+        pixelFormat = NormalizePixelFormat(pixelFormat);
+        if (!IsFloat16PixelFormatNormalized(pixelFormat) || destination.Length < 8)
+        {
+            return false;
+        }
+
+        var redFirst = pixelFormat is
+            SceVideoOutPixelFormatA16R16G16B16Float or
+            SceVideoOutPixelFormat2R16G16B16A16Float;
+        var first = redFirst ? red : blue;
+        var third = redFirst ? blue : red;
+        BinaryPrimitives.WriteUInt16LittleEndian(
+            destination,
+            BitConverter.HalfToUInt16Bits((Half)(first / 255f)));
+        BinaryPrimitives.WriteUInt16LittleEndian(
+            destination[2..],
+            BitConverter.HalfToUInt16Bits((Half)(green / 255f)));
+        BinaryPrimitives.WriteUInt16LittleEndian(
+            destination[4..],
+            BitConverter.HalfToUInt16Bits((Half)(third / 255f)));
+        BinaryPrimitives.WriteUInt16LittleEndian(
+            destination[6..],
+            BitConverter.HalfToUInt16Bits((Half)(alpha / 255f)));
+        return true;
     }
 
     [Conditional("DEBUG")]
