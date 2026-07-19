@@ -1170,6 +1170,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			}
 			CreateTlsHandler();
 			PatchTlsPatterns();
+			TryArmVcallProbe();
 			return ExecuteEntry(context, entryPoint, out result);
 		}
 		catch (Exception ex)
