@@ -36,7 +36,10 @@ internal sealed class MetalGuestGpuBackend : IGuestGpuBackend
         int imageBindingBase = 0,
         int scalarRegisterBufferIndex = -1,
         int requiredVertexOutputCount = 0,
-        ulong storageBufferOffsetAlignment = 1)
+        ulong storageBufferOffsetAlignment = 1,
+        int globalDescriptorBinding = 0,
+        IReadOnlyList<int>? globalDescriptorIndices = null,
+        IReadOnlyList<uint>? globalDwordOffsets = null)
     {
         shader = null;
         if (!Gen5MslTranslator.TryCompileVertexShader(
@@ -70,7 +73,11 @@ internal sealed class MetalGuestGpuBackend : IGuestGpuBackend
         int scalarRegisterBufferIndex = -1,
         uint pixelInputEnable = 0,
         uint pixelInputAddress = 0,
-        ulong storageBufferOffsetAlignment = 1)
+        IReadOnlyDictionary<uint, uint>? pixelInputLocations = null,
+        ulong storageBufferOffsetAlignment = 1,
+        int globalDescriptorBinding = 0,
+        IReadOnlyList<int>? globalDescriptorIndices = null,
+        IReadOnlyList<uint>? globalDwordOffsets = null)
     {
         shader = null;
         if (!Gen5MslTranslator.TryCompilePixelShader(
@@ -222,7 +229,10 @@ internal sealed class MetalGuestGpuBackend : IGuestGpuBackend
         uint primitiveType = 4,
         GuestIndexBuffer? indexBuffer = null,
         IReadOnlyList<GuestVertexBuffer>? vertexBuffers = null,
-        GuestRenderState? renderState = null) =>
+        GuestRenderState? renderState = null,
+        Func<IReadOnlyList<GuestVertexBuffer>, IGuestCompiledShader?>?
+            deferredVertexCompiler = null,
+        int pixelGlobalBufferCount = -1) =>
         MetalVideoPresenter.SubmitTranslatedDraw(
             Msl(pixelShader),
             textures,
@@ -251,7 +261,10 @@ internal sealed class MetalGuestGpuBackend : IGuestGpuBackend
         GuestIndexBuffer? indexBuffer = null,
         IReadOnlyList<GuestVertexBuffer>? vertexBuffers = null,
         GuestRenderState? renderState = null,
-        ulong shaderAddress = 0) =>
+        ulong shaderAddress = 0,
+        Func<IReadOnlyList<GuestVertexBuffer>, IGuestCompiledShader?>?
+            deferredVertexCompiler = null,
+        int pixelGlobalBufferCount = -1) =>
         MetalVideoPresenter.SubmitDepthOnlyTranslatedDraw(
             Msl(pixelShader),
             textures,
@@ -281,7 +294,10 @@ internal sealed class MetalGuestGpuBackend : IGuestGpuBackend
         IReadOnlyList<GuestVertexBuffer>? vertexBuffers = null,
         GuestRenderState? renderState = null,
         GuestDepthTarget? depthTarget = null,
-        ulong shaderAddress = 0) =>
+        ulong shaderAddress = 0,
+        Func<IReadOnlyList<GuestVertexBuffer>, IGuestCompiledShader?>?
+            deferredVertexCompiler = null,
+        int pixelGlobalBufferCount = -1) =>
         MetalVideoPresenter.SubmitOffscreenTranslatedDraw(
             Msl(pixelShader),
             textures,

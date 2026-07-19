@@ -915,7 +915,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         // there). Pre-visit the span so tracked pages are unprotected and
         // their owners dirtied before the copy; guest addresses are
         // host-identical, matching the tracker's fault addresses.
-        GuestImageWriteTracker.NotifyManagedWrite(virtualAddress, (ulong)source.Length);
+        GuestImageWriteTracker.PrepareWrite(virtualAddress, (ulong)source.Length);
 
         var requiresExclusiveAccess = false;
         _gate.EnterReadLock();

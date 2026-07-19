@@ -1353,6 +1353,41 @@ public static class AvPlayerExports
         return null;
     }
 
+    internal static string NormalizeGuestMediaPath(string guestPath)
+    {
+        var normalized = guestPath.Replace('\\', '/');
+        var anchorAtApp0 = false;
+        if (normalized.StartsWith("file://", StringComparison.OrdinalIgnoreCase))
+        {
+            normalized = normalized["file://".Length..];
+        }
+        else if (normalized.StartsWith("file:", StringComparison.OrdinalIgnoreCase))
+        {
+            normalized = normalized["file:".Length..];
+        }
+
+        foreach (var prefix in new[] { "app0:/", "/app0/", "app0:", "/app0" })
+        {
+            if (normalized.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            {
+                normalized = normalized[prefix.Length..];
+                anchorAtApp0 = true;
+                break;
+            }
+        }
+
+        // Unreal emits media URLs relative to app0/shpc/Binaries/Prospero.
+        // Anchor those ../../../ paths at app0 instead of allowing host-path
+        // traversal outside the mounted title root.
+        while (normalized.StartsWith("../", StringComparison.Ordinal))
+        {
+            normalized = normalized[3..];
+            anchorAtApp0 = true;
+        }
+
+        return anchorAtApp0 ? normalized.TrimStart('/') : normalized;
+    }
+
     internal static string? ResolveGuestPath(string guestPath)
     {
         if (string.IsNullOrWhiteSpace(guestPath))

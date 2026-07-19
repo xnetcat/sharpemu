@@ -1077,6 +1077,59 @@ internal static unsafe class VulkanVideoPresenter
     private static readonly HashSet<(ulong Address, uint Width, uint Height)>
         _tracedGuestImageSubmissions = [];
     private static Thread? _thread;
+    private static VulkanHostSurface? _hostSurface;
+
+    // Same-process native surface embedding (GUI host). The Silent Hill fork
+    // renders through its own present path and does not yet drive frames into
+    // an embedded surface; these members exist so the upstream host-surface
+    // façade (VulkanHostSurface) compiles and standalone GLFW/CLI sessions,
+    // which never attach a surface, behave exactly as before.
+    internal static event Action<VulkanHostSurface>? FirstHostFramePresented;
+
+    /// <summary>
+    /// Selects a same-process native surface for the next VideoOut session.
+    /// Rejected once the presenter thread has started: Vulkan surface
+    /// ownership cannot change under an active swapchain.
+    /// </summary>
+    public static bool TryAttachHostSurface(VulkanHostSurface surface)
+    {
+        ArgumentNullException.ThrowIfNull(surface);
+        lock (_gate)
+        {
+            if (_thread is not null)
+            {
+                return false;
+            }
+
+            _hostSurface = surface;
+            return true;
+        }
+    }
+
+    /// <summary>Releases the host surface after the guest session has stopped.</summary>
+    public static void DetachHostSurface(VulkanHostSurface surface)
+    {
+        ArgumentNullException.ThrowIfNull(surface);
+        lock (_gate)
+        {
+            if (ReferenceEquals(_hostSurface, surface))
+            {
+                _hostSurface = null;
+            }
+        }
+    }
+
+    internal static bool UsesHostSurface
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _hostSurface is not null;
+            }
+        }
+    }
+
     private static Presentation? _latestPresentation;
     private static byte[]? _copyFragmentSpirv;
     private static uint _windowWidth;
@@ -1085,6 +1138,77 @@ internal static unsafe class VulkanVideoPresenter
     private static bool _presenterCloseRequested;
     private const string DebugUtilsExtensionName = "VK_EXT_debug_utils";
     private const uint NvidiaVendorId = 0x10DE;
+    private const uint AmdVendorId = 0x1002;
+    private const int LastResortPenalty = 1000;
+
+    internal static int ScorePhysicalDevice(
+        PhysicalDeviceProperties properties,
+        string name,
+        string? deviceOverride)
+    {
+        if (!string.IsNullOrWhiteSpace(deviceOverride))
+        {
+            return name.Contains(deviceOverride, StringComparison.OrdinalIgnoreCase) ? 1000 : -1000;
+        }
+
+        var score = properties.DeviceType switch
+        {
+            PhysicalDeviceType.DiscreteGpu => 300,
+            PhysicalDeviceType.VirtualGpu => 100,
+            PhysicalDeviceType.IntegratedGpu => 50,
+            PhysicalDeviceType.Cpu => 20,
+            _ => 10,
+        };
+
+        if (properties.VendorID == NvidiaVendorId)
+        {
+            score += 500;
+        }
+
+        score -= ComputeDevicePenalty(properties, OperatingSystem.IsWindows());
+
+        return score;
+    }
+
+    internal static int ComputeDevicePenalty(PhysicalDeviceProperties properties, bool isWindows)
+    {
+        var penalty = 0;
+
+        if (isWindows &&
+            properties.DeviceType == PhysicalDeviceType.IntegratedGpu &&
+            properties.VendorID == AmdVendorId)
+        {
+            penalty += LastResortPenalty;
+        }
+
+        return penalty;
+    }
+
+    internal static ulong GetGuestImageByteCount(uint format, uint width, uint height)
+    {
+        var blockBytes = format switch
+        {
+            169 or 170 or 175 or 176 => 8UL,
+            171 or 172 or 173 or 174 or
+            177 or 178 or 179 or 180 or 181 or 182 => 16UL,
+            _ => 0UL,
+        };
+        if (blockBytes != 0)
+        {
+            return checked(((ulong)width + 3) / 4 * (((ulong)height + 3) / 4) * blockBytes);
+        }
+
+        var bytesPerPixel = format switch
+        {
+            1 => 1UL,
+            2 or 3 or 16 or 17 or 19 => 2UL,
+            11 or 12 => 8UL,
+            13 => 12UL,
+            14 => 16UL,
+            _ => 4UL,
+        };
+        return checked((ulong)width * height * bytesPerPixel);
+    }
     private const string PortabilityEnumerationExtensionName = "VK_KHR_portability_enumeration";
     private const string PortabilitySubsetExtensionName = "VK_KHR_portability_subset";
     private const int GlfwPlatformHint = 0x00050003;
@@ -4225,33 +4349,6 @@ internal static unsafe class VulkanVideoPresenter
                 $"[LOADER][INFO] Vulkan device: {selectedName} ({selected.DeviceType})");
             VideoOutExports.SetSelectedGpuName(selectedName);
             _window.Title = VideoOutExports.GetWindowTitle();
-        }
-
-        private static int ScorePhysicalDevice(
-            PhysicalDeviceProperties properties,
-            string name,
-            string? deviceOverride)
-        {
-            if (!string.IsNullOrWhiteSpace(deviceOverride))
-            {
-                return name.Contains(deviceOverride, StringComparison.OrdinalIgnoreCase) ? 1000 : -1000;
-            }
-
-            var score = properties.DeviceType switch
-            {
-                PhysicalDeviceType.DiscreteGpu => 300,
-                PhysicalDeviceType.VirtualGpu => 100,
-                PhysicalDeviceType.Cpu => 50,
-                PhysicalDeviceType.IntegratedGpu => -100,
-                _ => 10,
-            };
-
-            if (properties.VendorID == NvidiaVendorId)
-            {
-                score += 500;
-            }
-
-            return score;
         }
 
         private void LoadComputeDeviceLimits()

@@ -705,6 +705,19 @@ public static class PlayGoExports
         var hasMetadata = File.Exists(playGoDat) || File.Exists(scenarioJson) || File.Exists(chunkDefsXml);
         if (!hasMetadata)
         {
+            if (assumeInstalled)
+            {
+                // Unpacked, fully-installed dumps omit the package chunk table
+                // even though every chunk is locally present. Accept the guest's
+                // queried ids as LOCAL_FAST (Unknown knowledge) instead of
+                // reporting "not downloaded".
+                TracePlayGo("metadata_missing; assume all queried chunks installed");
+                return new PlayGoMetadata(
+                    true,
+                    [(ushort)0],
+                    PlayGoChunkIdKnowledge.Unknown);
+            }
+
             // No PlayGo sidecar: derive the installed chunk set from the pak files
             // actually present on disk. A locally dumped title has all of its data
             // installed, and a package that splits content across chunks names them

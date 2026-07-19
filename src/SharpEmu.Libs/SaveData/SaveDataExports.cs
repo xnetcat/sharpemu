@@ -277,8 +277,6 @@ public static class SaveDataExports
     [SysAbiExport(Nid = "XgvSuIdnMlw", ExportName = "sceSaveDataGetParam", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
     public static int SaveDataGetParam(CpuContext ctx) => TransferParam(ctx, write: false);
 
-    [SysAbiExport(Nid = "85zul--eGXs", ExportName = "sceSaveDataSetParam", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
-    public static int SaveDataSetParam(CpuContext ctx) => TransferParam(ctx, write: true);
 
     private static int TransferParam(CpuContext ctx, bool write)
     {
@@ -344,8 +342,6 @@ public static class SaveDataExports
     }
 
     // ---- icons ----
-    [SysAbiExport(Nid = "c88Yy54Mx0w", ExportName = "sceSaveDataSaveIcon", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
-    public static int SaveDataSaveIcon(CpuContext ctx) => TransferIconForMount(ctx, write: true);
 
     [SysAbiExport(Nid = "cGjO3wM3V28", ExportName = "sceSaveDataLoadIcon", Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSaveData")]
     public static int SaveDataLoadIcon(CpuContext ctx) => TransferIconForMount(ctx, write: false);
@@ -1115,10 +1111,10 @@ public static class SaveDataExports
     // ~/SharpEmu/Saves/<titleId>/; userId is accepted for API fidelity but not
     // part of the host path.
     private static string ResolveTitleSaveRoot(int userId, string titleId) =>
-        SaveDataStorage.TitleRoot(ResolveSaveDataRoot(), titleId);
+        Path.Combine(ResolveSaveDataRoot(), userId.ToString(), SanitizePathSegment(titleId));
 
     private static string ResolveSaveDataMemoryPath(int userId) =>
-        SaveDataStorage.MemoryPath(ResolveTitleSaveRoot(userId, ResolveConfiguredTitleId()));
+        Path.Combine(ResolveTitleSaveRoot(userId, ResolveConfiguredTitleId()), "sce_sdmemory", "memory.dat");
 
     private static bool TryReadMemoryData(
         CpuContext ctx, ulong address, out ulong buffer, out ulong size, out ulong offset)
@@ -1130,7 +1126,14 @@ public static class SaveDataExports
             ctx.TryReadUInt64(address + 0x10, out offset);
     }
 
-    private static string ResolveSaveDataRoot() => SaveDataStorage.Root();
+    private static string ResolveSaveDataRoot()
+    {
+        var configured = Environment.GetEnvironmentVariable("SHARPEMU_SAVEDATA_DIR");
+        var root = string.IsNullOrWhiteSpace(configured)
+            ? Path.Combine(AppContext.BaseDirectory, "user", "savedata")
+            : configured;
+        return Path.GetFullPath(root);
+    }
 
     private static string ResolveConfiguredTitleId()
     {

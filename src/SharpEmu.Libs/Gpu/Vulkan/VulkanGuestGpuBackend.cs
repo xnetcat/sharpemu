@@ -411,7 +411,17 @@ internal sealed class VulkanGuestGpuBackend : IGuestGpuBackend
         VulkanVideoPresenter.GetGuestImageExtents();
 
     public bool IsTextureContentCached(in TextureContentIdentity identity) =>
-        VulkanVideoPresenter.IsTextureContentCached(identity);
+        VulkanVideoPresenter.IsTextureContentCached(
+            new VulkanVideoPresenter.TextureContentIdentity(
+                identity.Address,
+                identity.Width,
+                identity.Height,
+                identity.Format,
+                identity.NumberType,
+                identity.DstSelect,
+                identity.TileMode,
+                identity.Pitch,
+                identity.Sampler));
 
     public void AttachGuestMemory(SharpEmu.HLE.ICpuMemory memory) =>
         VulkanVideoPresenter.AttachGuestMemory(memory);

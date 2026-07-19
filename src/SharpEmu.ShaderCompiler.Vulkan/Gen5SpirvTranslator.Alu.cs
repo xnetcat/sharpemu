@@ -1488,17 +1488,6 @@ public static partial class Gen5SpirvTranslator
                         vector);
                     break;
                 }
-                case "VPkAddF16":
-                case "VPkMulF16":
-                case "VPkMinF16":
-                case "VPkMaxF16":
-                case "VPkFmaF16":
-                    if (!TryEmitPackedF16(instruction, out result, out error))
-                    {
-                        return false;
-                    }
-
-                    break;
                 case "VCvtPkU16U32":
                 {
                     var low = Ext(
