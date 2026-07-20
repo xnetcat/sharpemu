@@ -582,7 +582,17 @@ public static class Gen5ShaderTranslator
                 // scalar S_BUFFER_LOADs mints bogus buffer descriptors from
                 // register garbage and drops the real packed-math result.
                 encoding = Gen5ShaderEncoding.Vop3p;
-                return DecodeVop3p(word, out name, out sizeDwords, out error);
+                // The 9-bit src0/src1/src2 fields live in the second dword; a
+                // field of 255 selects a 32-bit literal constant that trails the
+                // instruction (3 dwords). Read the second dword so the size and
+                // the literal are decoded, exactly as VOP3 does.
+                if (!TryReadUInt32(ctx, baseAddress + pc + sizeof(uint), out var vop3pExtra))
+                {
+                    error = $"vop3p-extra-read-failed pc=0x{pc:X}";
+                    return false;
+                }
+
+                return DecodeVop3p(word, vop3pExtra, out name, out sizeDwords, out error);
             case 0x32:
                 encoding = Gen5ShaderEncoding.Vintrp;
                 return DecodeVintrp(word, out name, out sizeDwords, out error);
@@ -1427,10 +1437,20 @@ public static class Gen5ShaderTranslator
         return FinishDecode(name, $"unknown-smem op=0x{opcode:X2}", out error);
     }
 
-    private static bool DecodeVop3p(uint word, out string name, out uint sizeDwords, out string error)
+    private static bool DecodeVop3p(
+        uint word,
+        uint extra,
+        out string name,
+        out uint sizeDwords,
+        out string error)
     {
         var opcode = (word >> 16) & 0x7F;
-        sizeDwords = 2;
+        var src0 = extra & 0x1FF;
+        var src1 = (extra >> 9) & 0x1FF;
+        var src2 = (extra >> 18) & 0x1FF;
+        // A source field of 255 selects a trailing 32-bit literal constant,
+        // making the instruction 3 dwords instead of 2 (matches VOP3).
+        sizeDwords = src0 == 0xFF || src1 == 0xFF || src2 == 0xFF ? 3u : 2u;
         error = string.Empty;
         name = opcode switch
         {
