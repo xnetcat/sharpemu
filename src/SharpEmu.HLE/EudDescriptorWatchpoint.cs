@@ -383,18 +383,22 @@ public static unsafe class EudDescriptorWatchpoint
 
         lock (_gate)
         {
-            var threadId = PosixHostStubs.GetCurrentThreadId();
-            if (_pageCount != 0 || Volatile.Read(ref _eventSequence) != Volatile.Read(ref _flushedSequence))
+            if (_pageCount == 0)
             {
-                Log($"[EUD-WATCH][SUBMIT] label={label} host_tid={threadId} " +
-                    $"pages={_pageCount} events={Volatile.Read(ref _eventSequence)}");
+                return;
             }
+
+            var threadId = PosixHostStubs.GetCurrentThreadId();
+            Log($"[EUD-WATCH][SUBMIT] label={label} host_tid={threadId} " +
+                $"pages={_pageCount} events={Volatile.Read(ref _eventSequence)}");
 
             DrainEventsLocked();
 
             if (Volatile.Read(ref _saturated) != 0)
             {
                 DisarmAllLocked("saturated");
+                _pageCount = 0;
+                RebuildSnapshotLocked();
                 return;
             }
 
