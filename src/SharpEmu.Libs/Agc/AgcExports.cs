@@ -4355,6 +4355,20 @@ public static partial class AgcExports
                         cachedDisplayBuffer.Height,
                         cachedDisplayBuffer.PitchInPixel))
                 {
+                    if (VulkanVideoPresenter.TraceRenderGraphEnabled)
+                    {
+                        // The authoritative present source for this title: the
+                        // AGC flip presents the guest render target at this
+                        // display-buffer address ("gpu-cache" path). Rooting the
+                        // buffer lineage here lets the readback compare the
+                        // presented buffer's mean against the post-chain outputs.
+                        Console.Error.WriteLine(
+                            $"[RGFLIP] handle={handle} index={displayBufferIndex} " +
+                            $"present_src=0x{cachedDisplayBuffer.Address:X16} " +
+                            $"{cachedDisplayBuffer.Width}x{cachedDisplayBuffer.Height} " +
+                            $"path=gpu-cache");
+                    }
+
                     TraceDisplayBuffer(
                         handle,
                         displayBufferIndex,

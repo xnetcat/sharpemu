@@ -5816,6 +5816,7 @@ internal static unsafe class VulkanVideoPresenter
                 !_traceGuestImageShaderFilterEnabled &&
                 !_traceGuestImageShaderSuffixFilterEnabled &&
                 !_traceExposure &&
+                !TraceRenderGraphEnabled &&
                 GuestImageTraceInterval() is null)
             {
                 return Array.Empty<GuestImageTraceRequest>();
@@ -15626,16 +15627,25 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             // Render-graph mode: read back every distinct color/float target and
-            // sampled texture once so the buffer lineage has a mean-luminance for
-            // each node. Deduped per address and capped so the heavy per-target
-            // queue-idle readback does not run unboundedly.
+            // sampled texture so the buffer lineage has a mean-luminance for each
+            // node. Re-traced at most once per _renderGraphRetraceInterval submit
+            // ticks per address (not a permanent dedupe) so a buffer's content is
+            // sampled at a stable menu frame, not just its first boot appearance;
+            // the interval and a global cap bound the heavy queue-idle readback.
             if (TraceRenderGraphEnabled &&
                 GetReadbackBytesPerPixel(image.Format) != 0 &&
-                Interlocked.Read(ref _renderGraphMeanLogCount) < 20000 &&
-                _tracedGuestImageContents.Add(image.Address))
+                Interlocked.Read(ref _renderGraphMeanLogCount) < 200000)
             {
-                Interlocked.Increment(ref _renderGraphMeanLogCount);
-                return true;
+                var hasLast = _renderGraphLastTrace.TryGetValue(image.Address, out var last);
+                if (!hasLast ||
+                    _submitTimeline >= last + _renderGraphRetraceInterval)
+                {
+                    _renderGraphLastTrace[image.Address] = _submitTimeline;
+                    Interlocked.Increment(ref _renderGraphMeanLogCount);
+                    return true;
+                }
+
+                return false;
             }
 
             if (_traceGuestImageShaderFilterEnabled &&
@@ -15720,6 +15730,11 @@ internal static unsafe class VulkanVideoPresenter
         }
 
         private readonly Dictionary<ulong, long> _guestImageTraceCounts = new();
+        // SHARPEMU_TRACE_RENDERGRAPH: per-address submit-timeline of the last
+        // mean-luminance readback, so a buffer is re-sampled periodically (see
+        // ShouldTraceGuestImageContents) rather than only on first appearance.
+        private readonly Dictionary<ulong, ulong> _renderGraphLastTrace = new();
+        private const ulong _renderGraphRetraceInterval = 400;
         private long _globalGuestImageDrawCount;
         private long _intervalReadbackCount;
 
