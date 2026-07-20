@@ -5810,6 +5810,7 @@ internal static unsafe class VulkanVideoPresenter
                 !_traceGuestImageAddressFilterEnabled &&
                 !_traceGuestImageShaderFilterEnabled &&
                 !_traceGuestImageShaderSuffixFilterEnabled &&
+                !_traceExposure &&
                 GuestImageTraceInterval() is null)
             {
                 return Array.Empty<GuestImageTraceRequest>();
@@ -5823,7 +5824,12 @@ internal static unsafe class VulkanVideoPresenter
 
             foreach (var texture in resources.Textures)
             {
-                if ((texture.IsStorage || _traceGuestImageAddressFilterEnabled) &&
+                // Exposure tracing also wants sampled (non-storage) tiny images:
+                // the tonemap/uber consumer reads the 1x1 exposure texture as a
+                // sampled input, not a storage image.
+                if ((texture.IsStorage ||
+                     _traceGuestImageAddressFilterEnabled ||
+                     _traceExposure) &&
                     texture.GuestImage is { } image)
                 {
                     candidates.Add(image);
@@ -14333,6 +14339,12 @@ internal static unsafe class VulkanVideoPresenter
                 try
                 {
                     var bytes = new ReadOnlySpan<byte>(mapped, checked((int)byteCount));
+                    if (_traceExposure && image.Width <= 4 && image.Height <= 4)
+                    {
+                        LogExposureTexel(image, bytes, bytesPerPixel, shaderAddress);
+                        return;
+                    }
+
                     if (GuestImageTraceInterval() is not null && bytesPerPixel == 4)
                     {
                         long r = 0, g = 0, b = 0, a = 0, samples = 0;
@@ -14400,6 +14412,77 @@ internal static unsafe class VulkanVideoPresenter
             {
                 _vk.DestroyBuffer(_device, buffer, null);
                 _vk.FreeMemory(_device, memory, null);
+            }
+        }
+
+        // Log a tiny image's texels interpreted as float(s). Used by
+        // SHARPEMU_TRACE_EXPOSURE to read back the 1x1 auto-exposure texture as
+        // both producer output (adaptation compute) and consumer input
+        // (tonemap/uber pass); the shader address in the line names which.
+        private static void LogExposureTexel(
+            GuestImageResource image,
+            ReadOnlySpan<byte> bytes,
+            uint bytesPerPixel,
+            ulong shaderAddress)
+        {
+            var texelCount = checked((int)(image.Width * image.Height));
+            var stride = (int)bytesPerPixel;
+            var builder = new StringBuilder();
+            for (var texel = 0; texel < texelCount; texel++)
+            {
+                var offset = texel * stride;
+                if (stride == 0 || offset + stride > bytes.Length)
+                {
+                    break;
+                }
+
+                if (texel > 0)
+                {
+                    builder.Append(' ');
+                }
+
+                builder.Append(DecodeExposureTexel(bytes.Slice(offset, stride), image.Format));
+            }
+
+            var hexLength = Math.Min(bytes.Length, 32);
+            Console.Error.WriteLine(
+                $"[EXPTRACE] shader=0x{shaderAddress:X16} addr=0x{image.Address:X16} " +
+                $"{image.Width}x{image.Height} fmt={image.Format} " +
+                $"texel={builder} raw=0x{Convert.ToHexString(bytes[..hexLength])}");
+        }
+
+        private static string DecodeExposureTexel(
+            ReadOnlySpan<byte> texel,
+            Format format)
+        {
+            switch (format)
+            {
+                case Format.R32Sfloat:
+                    return $"{BitConverter.ToSingle(texel):G6}";
+                case Format.R32G32Sfloat:
+                    return $"({BitConverter.ToSingle(texel):G6}," +
+                           $"{BitConverter.ToSingle(texel[4..]):G6})";
+                case Format.R32G32B32A32Sfloat:
+                    return $"({BitConverter.ToSingle(texel):G6}," +
+                           $"{BitConverter.ToSingle(texel[4..]):G6}," +
+                           $"{BitConverter.ToSingle(texel[8..]):G6}," +
+                           $"{BitConverter.ToSingle(texel[12..]):G6})";
+                case Format.R16Sfloat:
+                    return $"{(float)BitConverter.ToHalf(texel):G6}";
+                case Format.R16G16Sfloat:
+                    return $"({(float)BitConverter.ToHalf(texel):G6}," +
+                           $"{(float)BitConverter.ToHalf(texel[2..]):G6})";
+                case Format.R16G16B16A16Sfloat:
+                    return $"({(float)BitConverter.ToHalf(texel):G6}," +
+                           $"{(float)BitConverter.ToHalf(texel[2..]):G6}," +
+                           $"{(float)BitConverter.ToHalf(texel[4..]):G6}," +
+                           $"{(float)BitConverter.ToHalf(texel[6..]):G6})";
+                case Format.R32Uint:
+                    return BitConverter.ToUInt32(texel).ToString();
+                case Format.R32Sint:
+                    return BitConverter.ToInt32(texel).ToString();
+                default:
+                    return $"0x{Convert.ToHexString(texel)}";
             }
         }
 
@@ -15252,6 +15335,14 @@ internal static unsafe class VulkanVideoPresenter
                 return false;
             }
 
+            // Exposure mode: trace every tiny image on every draw so the 1x1
+            // exposure texture's value can be watched as temporal adaptation
+            // evolves. Bypasses the once-per-address dedupe below on purpose.
+            if (_traceExposure && image.Width <= 4 && image.Height <= 4)
+            {
+                return true;
+            }
+
             if (_traceGuestImageShaderFilterEnabled &&
                 !AddressListContains(
                     "SHARPEMU_TRACE_GUEST_IMAGE_SHADER_ADDRS",
@@ -15417,6 +15508,18 @@ internal static unsafe class VulkanVideoPresenter
         private static readonly bool _traceDepthInitialization =
             string.Equals(
                 Environment.GetEnvironmentVariable("SHARPEMU_TRACE_DEPTH_INIT"),
+                "1",
+                StringComparison.Ordinal);
+        // SHARPEMU_TRACE_EXPOSURE=1 reads back tiny (<=4x4) guest images every
+        // frame, interpreting their texels as floats. The auto-exposure chain
+        // ends in a 1x1 exposure texture written by an adaptation compute and
+        // sampled by the tonemap/uber pass; this trace prints the producer's
+        // output and the consumer's input so a wrong exposure value (bad chain
+        // math / uninitialized ping-pong seed) can be told apart from a
+        // compute->graphics image handoff gap.
+        private static readonly bool _traceExposure =
+            string.Equals(
+                Environment.GetEnvironmentVariable("SHARPEMU_TRACE_EXPOSURE"),
                 "1",
                 StringComparison.Ordinal);
         private static readonly long _traceGuestImageOccurrence =
