@@ -6055,6 +6055,7 @@ public static partial class AgcExports
             IndirectRegisterSpace.Sh => state.ShRegisters,
             _ => state.UcRegisters,
         };
+        TraceShIndirectPatchTable(ctx, registerSpace, packetAddress, registersAddress, registerCount);
         for (uint index = 0; index < registerCount; index++)
         {
             var entryAddress = registersAddress + ((ulong)index * 8);
@@ -6074,6 +6075,75 @@ public static partial class AgcExports
                 state.ShRegisterSources[registerOffset] =
                     entryAddress + sizeof(uint);
             }
+        }
+    }
+
+    private static readonly bool _traceShIndirect =
+        string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_TRACE_SHINDIRECT"),
+            "1",
+            StringComparison.Ordinal);
+    private static int _shIndirectTraceCount;
+
+    // Diagnostic (SHARPEMU_TRACE_SHINDIRECT=1): dump the raw indirect patch
+    // table and several candidate interpretations so the true entry layout is
+    // determinable. RE (fn 0x44710) says each 8-byte entry is a 64-bit SOURCE
+    // ADDRESS that SetShRegIndirect dereferences to obtain the register value,
+    // whereas SharpEmu currently reads {u32 offset, u32 value}. Dumps both.
+    private static void TraceShIndirectPatchTable(
+        CpuContext ctx,
+        IndirectRegisterSpace registerSpace,
+        ulong packetAddress,
+        ulong registersAddress,
+        uint registerCount)
+    {
+        if (!_traceShIndirect || registerSpace != IndirectRegisterSpace.Sh)
+        {
+            return;
+        }
+
+        if (Interlocked.Increment(ref _shIndirectTraceCount) > 512)
+        {
+            return;
+        }
+
+        Console.Error.WriteLine(
+            $"[SHIND] packet=0x{packetAddress:X16} table=0x{registersAddress:X16} count={registerCount}");
+        var dump = Math.Min(registerCount, 40u);
+        var values = new uint[dump];
+        var offsets = new uint[dump];
+        for (uint index = 0; index < dump; index++)
+        {
+            var entryAddress = registersAddress + ((ulong)index * 8);
+            TryReadUInt32(ctx, entryAddress, out offsets[index]);
+            TryReadUInt32(ctx, entryAddress + 4, out values[index]);
+        }
+
+        for (uint index = 0; index < dump; index++)
+        {
+            var offset = offsets[index];
+            var value = values[index];
+            // If this value + the next entry's value form a plausible guest VA
+            // (consecutive user-data dwords = a 64-bit pointer), dereference it
+            // and dump the 4 dwords there — that reveals whether the pointer the
+            // shader will treat as an EUD/descriptor base holds a real V# or
+            // (per RE) points into the DCB chunk / patch region.
+            var ptrDump = string.Empty;
+            if (index + 1 < dump && offsets[index + 1] == offset + 1)
+            {
+                var candidate = (ulong)value | ((ulong)values[index + 1] << 32);
+                if (candidate >= 0x1_0000_0000UL && candidate < 0x1000_0000_0000UL &&
+                    TryReadUInt32(ctx, candidate, out var p0))
+                {
+                    TryReadUInt32(ctx, candidate + 4, out var p1);
+                    TryReadUInt32(ctx, candidate + 8, out var p2);
+                    TryReadUInt32(ctx, candidate + 12, out var p3);
+                    ptrDump = $" PTR=0x{candidate:X10}->[{p0:X8}:{p1:X8}:{p2:X8}:{p3:X8}]";
+                }
+            }
+
+            Console.Error.WriteLine(
+                $"[SHIND]   k={index} off=0x{offset:X}(s{offset}) value=0x{value:X8}{ptrDump}");
         }
     }
 
