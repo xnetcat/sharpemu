@@ -2966,14 +2966,23 @@ public static partial class AgcExports
         }
 
         // A DCB is complete only after its translated Vulkan work and ordered
-        // guest-memory writes have finished. Put the notification on that same
-        // logical graphics queue instead of approximating completion with a
-        // timer, which can wake Unity while its upload data is still stale.
-        if (GuestGpu.Current.SubmitOrderedGuestAction(
-                TriggerCompletionEvents,
-                $"agc submit completion {submissionId}") == 0)
+        // guest-memory writes have finished. Enqueue the notification onto that
+        // submission's own logical graphics queue (FIFO) so it fires strictly
+        // after the submission's draws have executed on the render thread. The
+        // in-stream side effects (ReleaseMem/WriteData/EVENT_WRITE) already
+        // order onto this queue during ParseSubmittedDcb, but that scope has
+        // closed by the time completion is published here; without re-entering
+        // the queue the action lands on the round-robin default queue and can
+        // fire before the draws execute — waking the guest (e.g. Unity) to
+        // recycle per-draw descriptor rings ahead of GPU consumption.
+        using (GuestGpu.Current.EnterGuestQueue(state.QueueName, submissionId))
         {
-            TriggerCompletionEvents();
+            if (GuestGpu.Current.SubmitOrderedGuestAction(
+                    TriggerCompletionEvents,
+                    $"agc submit completion {submissionId}") == 0)
+            {
+                TriggerCompletionEvents();
+            }
         }
     }
 
