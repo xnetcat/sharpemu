@@ -2335,11 +2335,28 @@ public static class Gen5ShaderScalarEvaluator
                 eudWord3);
         }
 
+        // An EUD/SRT-spilled V# that decodes as garbage at parse (a tiny,
+        // pointer-shaped base or one carrying high-bit garbage) is an
+        // unpopulated descriptor slot, not a real buffer: the guest worker
+        // thread that fills it can still be running when the submit thread
+        // parses this draw. Baking a zero/garbage buffer here loses the
+        // constant data permanently. Route it to the same deferred path as the
+        // all-zero slot so the render thread re-reads the 4-dword slot
+        // immediately before the queued draw executes — by which point (with
+        // completion signalling throttling the guest to render pace) the slot
+        // holds the real V#. Only slots loaded from a known descriptor source
+        // qualify, and only when malformed, so healthy descriptors keep the
+        // parse-time path unchanged.
+        var malformedEudDescriptor =
+            isBufferLoad &&
+            (deferredDescriptorAddress != 0 ||
+             deferredDescriptorChain is not null) &&
+            IsMalformedEudDescriptor(hasBufferDescriptor, bufferDescriptor);
         var deferredBufferLoad =
             isBufferLoad &&
-            address == 0 &&
             (deferredDescriptorAddress != 0 ||
-             deferredDescriptorChain is not null);
+             deferredDescriptorChain is not null) &&
+            (address == 0 || malformedEudDescriptor);
         var bufferUnbound =
             isBufferLoad &&
             (!hasBufferDescriptor ||
