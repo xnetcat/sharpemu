@@ -2267,6 +2267,28 @@ public static class Gen5ShaderScalarEvaluator
                         $"live@base=[{liveWord0:X8}:{liveWord1:X8}]{liveDump} " +
                         $"ud_base=s{state.UserDataScalarRegisterBase} " +
                         $"ud_count={state.UserData.Count}");
+
+                    // A base that is a tiny integer paired with a pointer-shaped
+                    // record count, or that carries high garbage bits, is not a
+                    // resource the shader was compiled against — it is an
+                    // EUD/SRT table slot that has not been populated with a V#
+                    // yet. Dump the scalar chain that built the descriptor and
+                    // the guest memory window it was read from so the table's
+                    // real layout and population state are visible end to end.
+                    var recordsLookLikePointer =
+                        bufferDescriptor.NumRecords > 0x0100_0000u &&
+                        bufferDescriptor.BaseAddress < 0x0001_0000UL;
+                    var baseHasGarbageHighBits =
+                        bufferDescriptor.BaseAddress >= 0x0000_0010_0000_0000UL;
+                    if (recordsLookLikePointer || baseHasGarbageHighBits)
+                    {
+                        DumpMalformedDescriptorProvenance(
+                            ctx,
+                            state,
+                            instruction,
+                            scalarBase.Value,
+                            srcLo);
+                    }
                 }
             }
         }
@@ -2645,6 +2667,67 @@ public static class Gen5ShaderScalarEvaluator
                 $"dst=[{string.Join(',', candidate.Destinations)}] " +
                 $"src=[{string.Join(',', candidate.Sources)}] " +
                 $"control={candidate.Control}");
+        }
+    }
+
+    // Diagnostic (gated by SHARPEMU_TRACE_CB_PROVENANCE): dump the scalar
+    // instruction stream that produced a malformed buffer descriptor, the
+    // guest source each V# dword was read from, and a window of the descriptor
+    // table it was read out of. This is what pinpoints an EUD/SRT table slot
+    // that has not been populated with a real V# at translation time (the
+    // buffer-V# slots read back as zero or command-stream bytes while sampler
+    // slots in the same table already hold valid descriptors).
+    private static void DumpMalformedDescriptorProvenance(
+        CpuContext ctx,
+        Gen5ShaderState state,
+        Gen5ShaderInstruction instruction,
+        uint scalarBase,
+        ulong descriptorSource)
+    {
+        var sources = string.Join(
+            ',',
+            Enumerable.Range(0, 4).Select(offset =>
+                $"s{scalarBase + (uint)offset}"));
+        Console.Error.WriteLine(
+            $"[CBPROV][PROG] shader=0x{state.Program.Address:X16} " +
+            $"pc=0x{instruction.Pc:X} base=[{sources}] src=0x{descriptorSource:X16}");
+        if (descriptorSource != 0)
+        {
+            var windowStart = (descriptorSource & ~0xFUL) >= 0x180UL
+                ? (descriptorSource & ~0xFUL) - 0x180UL
+                : 0UL;
+            var sb = new System.Text.StringBuilder();
+            for (var offset = 0; offset < 0x200; offset += 4)
+            {
+                var probe = windowStart + (ulong)offset;
+                TryReadUInt32(ctx, probe, out var word);
+                if (offset % 16 == 0)
+                {
+                    sb.Append($" 0x{probe:X12}:");
+                }
+
+                sb.Append($" {word:X8}");
+            }
+
+            Console.Error.WriteLine(
+                $"[CBPROV][MEM] shader=0x{state.Program.Address:X16} " +
+                $"pc=0x{instruction.Pc:X} src=0x{descriptorSource:X16}{sb}");
+        }
+
+        foreach (var candidate in state.Program.Instructions)
+        {
+            if (candidate.Pc > instruction.Pc)
+            {
+                break;
+            }
+
+            Console.Error.WriteLine(
+                $"[CBPROV][PROG] shader=0x{state.Program.Address:X16} " +
+                $"pc=0x{candidate.Pc:X} op={candidate.Opcode} " +
+                $"words=[{string.Join(',', candidate.Words.Select(word => $"{word:X8}"))}] " +
+                $"dst=[{string.Join(',', candidate.Destinations)}] " +
+                $"src=[{string.Join(',', candidate.Sources)}] " +
+                $"ctrl={candidate.Control}");
         }
     }
 
