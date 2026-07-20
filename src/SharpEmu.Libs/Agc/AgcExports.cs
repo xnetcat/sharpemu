@@ -313,6 +313,60 @@ public static partial class AgcExports
         "1",
         StringComparison.Ordinal);
     private static int _shaderRelocTraceCount;
+    // Gated wait-evaluation forensics: log how each graphics WAIT_REG_MEM was
+    // resolved (satisfied-at-parse / same-submission-skip / suspend / fail-open)
+    // together with the label address, value seen, and required value. Deduped
+    // by (label,disposition) so 276 waits/frame stay bounded. Used to decide
+    // whether the failing per-draw descriptor reads are gated by a CPU-label
+    // wait we prematurely satisfy (hypothesis a) or an unordered worker race.
+    private static readonly bool _traceWaitEval = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_TRACE_WAIT_EVAL"),
+        "1",
+        StringComparison.Ordinal);
+    private static readonly HashSet<(ulong Label, string Disposition)> _tracedWaitEvals = new();
+    private static readonly object _waitEvalGate = new();
+
+    private static void TraceWaitEval(
+        SubmittedDcbState state,
+        ulong waitAddress,
+        ulong currentValue,
+        ulong reference,
+        ulong mask,
+        uint compareFunction,
+        bool is64Bit,
+        string disposition)
+    {
+        if (!_traceWaitEval)
+        {
+            return;
+        }
+
+        bool firstForKey;
+        lock (_waitEvalGate)
+        {
+            if (_tracedWaitEvals.Count >= 4096)
+            {
+                _tracedWaitEvals.Clear();
+            }
+
+            firstForKey = _tracedWaitEvals.Add((waitAddress & ~0xFFFUL, disposition));
+        }
+
+        if (!firstForKey)
+        {
+            return;
+        }
+
+        // Flag labels that live in the per-draw SRT/descriptor heap (0x2xxxx
+        // region) — a wait on such a label is a descriptor-population gate.
+        var labelInSrtHeap = waitAddress >= 0x0000_0002_0000_0000UL &&
+                             waitAddress < 0x0000_0003_0000_0000UL;
+        Console.Error.WriteLine(
+            $"[WAITEVAL] queue={state.QueueName} submission={state.ActiveSubmissionId} " +
+            $"label=0x{waitAddress:X16} cur=0x{currentValue:X16} ref=0x{reference:X16} " +
+            $"mask=0x{mask:X16} cmp={compareFunction} bits={(is64Bit ? 64 : 32)} " +
+            $"srt_heap_label={(labelInSrtHeap ? 1 : 0)} disposition={disposition}");
+    }
     private static readonly bool _traceVertexRanges = string.Equals(
         Environment.GetEnvironmentVariable("SHARPEMU_TRACE_VERTEX_RANGES"),
         "1",
@@ -4716,6 +4770,18 @@ public static partial class AgcExports
                         address,
                         length))
                 {
+                    if (_traceWaitEval)
+                    {
+                        var exact = producer.Address == address ||
+                            (producer.Length <= 32 &&
+                             address >= producer.Address &&
+                             address < producer.Address + producer.Length);
+                        Console.Error.WriteLine(
+                            $"[WAITMATCH] label=0x{address:X16} matched_producer_addr=0x{producer.Address:X16} " +
+                            $"producer_len={producer.Length} exact={(exact ? 1 : 0)} " +
+                            $"action='{producer.DebugName}'");
+                    }
+
                     return true;
                 }
             }
@@ -5574,6 +5640,8 @@ public static partial class AgcExports
         // become permanent entries keyed by address zero.
         if (compareFunction is 0 or 7)
         {
+            TraceWaitEval(state, waitAddress, 0, reference, mask,
+                compareFunction, is64Bit, "fail-open-cmp");
             TraceSubmittedWait(
                 waitAddress,
                 0,
@@ -5640,11 +5708,15 @@ public static partial class AgcExports
 
         if (hasCurrent && GpuWaitRegistry.Compare(waiter, currentValue))
         {
+            TraceWaitEval(state, waitAddress, currentValue, reference, mask,
+                compareFunction, is64Bit, "satisfied-at-parse");
             return false; // already satisfied — keep parsing
         }
 
         if (!_gpuWaitSuspendEnabled)
         {
+            TraceWaitEval(state, waitAddress, currentValue, reference, mask,
+                compareFunction, is64Bit, hasCurrent ? "force-satisfied" : "force-nocurrent");
             if (hasCurrent)
             {
                 ForceSatisfyGpuWait(ctx, waiter, currentValue);
@@ -5655,6 +5727,8 @@ public static partial class AgcExports
 
         if (!hasCurrent)
         {
+            TraceWaitEval(state, waitAddress, currentValue, reference, mask,
+                compareFunction, is64Bit, "no-current-keep-parsing");
             return false; // cannot evaluate the label — do not stall the DCB
         }
 
@@ -5676,9 +5750,13 @@ public static partial class AgcExports
                 waitAddress,
                 is64Bit ? (ulong)sizeof(ulong) : sizeof(uint)))
         {
+            TraceWaitEval(state, waitAddress, currentValue, reference, mask,
+                compareFunction, is64Bit, "same-submission-skip");
             return false;
         }
 
+        TraceWaitEval(state, waitAddress, currentValue, reference, mask,
+            compareFunction, is64Bit, "SUSPEND");
         GpuWaitRegistry.Register(waitAddress, waiter);
         var gpuState = GetSubmittedGpuState(ctx.Memory);
         EnsureGpuWaitMonitor(ctx, gpuState);
