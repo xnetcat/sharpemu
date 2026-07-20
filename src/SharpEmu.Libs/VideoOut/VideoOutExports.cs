@@ -1156,7 +1156,19 @@ public static class VideoOutExports
 
         if (submitGpuImage)
         {
-            TriggerFlipEvents();
+            // Honest flip completion: deliver the flip events only after the
+            // graphics work that produced this frame has actually executed on
+            // the render thread, in submission (FIFO) order. Firing them here
+            // at submit time signalled "flip done" before the renderer had run
+            // the frame, letting the guest advance ~frames ahead and recycle
+            // the per-draw descriptor rings the GPU had not yet consumed.
+            if (VulkanVideoPresenter.SubmitOrderedGuestFlipCompletion(
+                    TriggerFlipEvents,
+                    $"videoout flip complete handle={handle} index={bufferIndex}") == 0)
+            {
+                // No render thread to order against (headless/startup).
+                TriggerFlipEvents();
+            }
         }
         else if (VulkanVideoPresenter.SubmitOrderedGuestAction(
                      TriggerFlipEvents,

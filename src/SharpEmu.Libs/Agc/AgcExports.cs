@@ -3536,7 +3536,7 @@ public static partial class AgcExports
         var gpuState = GetSubmittedGpuState(ctx.Memory);
         lock (gpuState.Gate)
         {
-            gpuState.Graphics.QueueName = "dcb.graphics";
+            gpuState.Graphics.QueueName = VulkanVideoPresenter.GraphicsGuestQueueName;
             EnqueueSubmittedDcb(
                 ctx,
                 gpuState,
@@ -3861,10 +3861,17 @@ public static partial class AgcExports
         }
 
         // A DCB is complete only after its translated Vulkan work and ordered
-        // guest-memory writes have finished. Put the notification on that same
-        // logical graphics queue instead of approximating completion with a
-        // timer, which can wake Unity while its upload data is still stale.
-        if (VulkanVideoPresenter.SubmitOrderedGuestAction(
+        // guest-memory writes have finished. Publish the notification strictly
+        // behind that submission's draws by enqueuing it onto the SAME logical
+        // graphics queue (FIFO), not the default queue. The in-stream side
+        // effects (ReleaseMem/WriteData/EVENT_WRITE) already order onto this
+        // queue during parse; this completion event runs after the parse scope
+        // closes, so without the explicit queue it landed on the round-robin
+        // default queue and fired before the draws executed — letting Unity
+        // recycle descriptor rings ~frames ahead of GPU consumption.
+        if (VulkanVideoPresenter.SubmitOrderedGuestActionOnQueue(
+                state.QueueName,
+                submissionId,
                 TriggerCompletionEvents,
                 $"agc submit completion {submissionId}") == 0)
         {
@@ -13989,7 +13996,7 @@ public static partial class AgcExports
         var gpuState = GetSubmittedGpuState(ctx.Memory);
         lock (gpuState.Gate)
         {
-            gpuState.Graphics.QueueName = "dcb.graphics";
+            gpuState.Graphics.QueueName = VulkanVideoPresenter.GraphicsGuestQueueName;
             Gen5ShaderScalarEvaluator.BeginGlobalMemoryReadScope();
             try
             {

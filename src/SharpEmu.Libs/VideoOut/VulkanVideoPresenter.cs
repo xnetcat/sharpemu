@@ -125,6 +125,10 @@ internal static unsafe class VulkanVideoPresenter
     // pin per-draw snapshots. The independent byte cap below still bounds
     // queued texture, writable-buffer, and index payloads.
     private const int MaxPendingGuestWork = 256;
+    // Name of the logical guest queue the graphics DCB parses onto. Kept here
+    // (and referenced from AgcExports) so completion signals can be ordered
+    // onto the same FIFO as the draws they belong to.
+    internal const string GraphicsGuestQueueName = "dcb.graphics";
     private const ulong MaximumCachedHostBufferBytes = 128UL * 1024 * 1024;
     // A captured 4K flip can consume tens of MiB of device-local memory.
     // Retain only a short presentation queue while always preserving the
@@ -295,6 +299,11 @@ internal static unsafe class VulkanVideoPresenter
     private const int GlfwPlatformNull = 0x00060005;
     private static bool _splashHidden;
     private static long _enqueuedGuestWorkSequence;
+    // Submission id most recently seen enqueuing work onto the graphics queue.
+    // Flip-completion actions reuse it so they share the graphics draws' queue
+    // identity (avoiding a spurious host command-buffer flush) while still
+    // ordering strictly behind them.
+    private static ulong _lastGraphicsGuestSubmissionId;
     // Largest contiguous completed sequence, retained for compact diagnostics.
     // Per-queue scheduling can complete a later global id first, so correctness
     // checks use IsGuestWorkCompletedLocked rather than numeric <= comparisons.
@@ -1033,6 +1042,60 @@ internal static unsafe class VulkanVideoPresenter
             return _closed || _thread is null
                 ? 0
                 : EnqueueGuestWorkLocked(new VulkanOrderedGuestAction(action, debugName));
+        }
+    }
+
+    /// <summary>
+    /// Enqueues an ordered guest action onto a specific logical guest queue so
+    /// it runs in FIFO order after that queue's already-submitted work has
+    /// executed on the render thread. Used to publish a submission's completion
+    /// signal (its graphics equeue event) only once the translated Vulkan work
+    /// it produced has actually run, rather than at parse/submit time — which
+    /// let the guest recycle per-draw descriptor rings ahead of GPU
+    /// consumption. Returns 0 when there is no render thread so the caller can
+    /// run the action inline (headless/startup).
+    /// </summary>
+    public static long SubmitOrderedGuestActionOnQueue(
+        string queueName,
+        ulong submissionId,
+        Action action,
+        string debugName)
+    {
+        ArgumentNullException.ThrowIfNull(action);
+        lock (_gate)
+        {
+            return _closed || _thread is null
+                ? 0
+                : EnqueueGuestWorkLocked(
+                    new VulkanOrderedGuestAction(action, debugName),
+                    new VulkanGuestQueueIdentity(
+                        string.IsNullOrWhiteSpace(queueName)
+                            ? "guest.unknown"
+                            : queueName,
+                        submissionId));
+        }
+    }
+
+    /// <summary>
+    /// Publishes a video-out flip's completion events in submission (FIFO)
+    /// order on the graphics queue, so they fire only after the graphics work
+    /// that produced the flipped frame has executed. Firing flip completion at
+    /// submit time let the guest outrun the renderer, recycling per-draw
+    /// descriptor rings before the GPU consumed them. Returns 0 when there is
+    /// no render thread so the caller can run the events inline.
+    /// </summary>
+    public static long SubmitOrderedGuestFlipCompletion(Action action, string debugName)
+    {
+        ArgumentNullException.ThrowIfNull(action);
+        lock (_gate)
+        {
+            return _closed || _thread is null
+                ? 0
+                : EnqueueGuestWorkLocked(
+                    new VulkanOrderedGuestAction(action, debugName),
+                    new VulkanGuestQueueIdentity(
+                        GraphicsGuestQueueName,
+                        _lastGraphicsGuestSubmissionId));
         }
     }
 
@@ -1998,7 +2061,9 @@ internal static unsafe class VulkanVideoPresenter
 		}
 	}
 
-    private static long EnqueueGuestWorkLocked(object work)
+    private static long EnqueueGuestWorkLocked(
+        object work,
+        VulkanGuestQueueIdentity? queueOverride = null)
     {
         var payloadArrays = GetGuestWorkPayloadArrays(work);
         var payloadBytes = GetIncrementalGuestWorkPayloadBytesLocked(payloadArrays);
@@ -2062,7 +2127,12 @@ internal static unsafe class VulkanVideoPresenter
             return 0;
         }
 
-        var queue = _submittingGuestQueue ?? VulkanGuestQueueIdentity.Default;
+        var queue = queueOverride ?? _submittingGuestQueue ?? VulkanGuestQueueIdentity.Default;
+        if (string.Equals(queue.Name, GraphicsGuestQueueName, StringComparison.Ordinal))
+        {
+            _lastGraphicsGuestSubmissionId = queue.SubmissionId;
+        }
+
         var sequence = ++_enqueuedGuestWorkSequence;
         _lastEnqueuedGuestWorkByQueue[queue.Name] = sequence;
         var requiredSequence = GetGuestWorkDependencyLocked(work);
