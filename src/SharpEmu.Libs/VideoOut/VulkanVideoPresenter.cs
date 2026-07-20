@@ -14345,6 +14345,15 @@ internal static unsafe class VulkanVideoPresenter
                         return;
                     }
 
+                    if (_traceExposure &&
+                        IsFloatReadbackFormat(image.Format) &&
+                        image.Width <= 1024 && image.Height <= 1024 &&
+                        Interlocked.Increment(ref _exposureMeanLogCount) <= 6000)
+                    {
+                        LogExposureImageMean(image, bytes, bytesPerPixel, shaderAddress);
+                        return;
+                    }
+
                     if (GuestImageTraceInterval() is not null && bytesPerPixel == 4)
                     {
                         long r = 0, g = 0, b = 0, a = 0, samples = 0;
@@ -14450,6 +14459,70 @@ internal static unsafe class VulkanVideoPresenter
                 $"{image.Width}x{image.Height} fmt={image.Format} " +
                 $"texel={builder} raw=0x{Convert.ToHexString(bytes[..hexLength])}");
         }
+
+        private static long _exposureMeanLogCount;
+
+        private static bool IsFloatReadbackFormat(Format format) =>
+            format switch
+            {
+                Format.R16Sfloat or
+                Format.R16G16Sfloat or
+                Format.R16G16B16A16Sfloat or
+                Format.R32Sfloat or
+                Format.R32G32Sfloat or
+                Format.R32G32B32A32Sfloat => true,
+                _ => false,
+            };
+
+        // Under SHARPEMU_TRACE_EXPOSURE, log mean/min/max luminance of a small
+        // float image so the auto-exposure INPUT (512^2 scene mip) and the
+        // luminance pyramid it produces can be told apart from a converged
+        // exposure: a dim input with a low exposure output means the chain math
+        // is wrong; a bright input means the exposure is correctly low and the
+        // wrong-brightness is upstream of the luminance sample.
+        private static void LogExposureImageMean(
+            GuestImageResource image,
+            ReadOnlySpan<byte> bytes,
+            uint bytesPerPixel,
+            ulong shaderAddress)
+        {
+            var stride = (int)bytesPerPixel;
+            if (stride == 0)
+            {
+                return;
+            }
+
+            var texelCount = bytes.Length / stride;
+            double sum = 0;
+            var min = double.PositiveInfinity;
+            var max = double.NegativeInfinity;
+            var samples = 0;
+            // Sample at a coprime-ish stride so we cover the image cheaply.
+            var step = Math.Max(1, texelCount / 4096);
+            for (var texel = 0; texel < texelCount; texel += step)
+            {
+                var value = ReadChannel0(bytes.Slice(texel * stride, stride), image.Format);
+                sum += value;
+                min = Math.Min(min, value);
+                max = Math.Max(max, value);
+                samples++;
+            }
+
+            var mean = samples > 0 ? sum / samples : 0;
+            Console.Error.WriteLine(
+                $"[EXPMEAN] shader=0x{shaderAddress:X16} addr=0x{image.Address:X16} " +
+                $"{image.Width}x{image.Height} fmt={image.Format} " +
+                $"mean={mean:G6} min={min:G6} max={max:G6} samples={samples}");
+        }
+
+        private static double ReadChannel0(ReadOnlySpan<byte> texel, Format format) =>
+            format switch
+            {
+                Format.R16Sfloat or
+                Format.R16G16Sfloat or
+                Format.R16G16B16A16Sfloat => (double)BitConverter.ToHalf(texel),
+                _ => BitConverter.ToSingle(texel),
+            };
 
         private static string DecodeExposureTexel(
             ReadOnlySpan<byte> texel,
@@ -15338,7 +15411,13 @@ internal static unsafe class VulkanVideoPresenter
             // Exposure mode: trace every tiny image on every draw so the 1x1
             // exposure texture's value can be watched as temporal adaptation
             // evolves. Bypasses the once-per-address dedupe below on purpose.
-            if (_traceExposure && image.Width <= 4 && image.Height <= 4)
+            // Small float images (the 512^2 luminance-sample scene mip and the
+            // 256^2 luminance pyramid) are traced too so the auto-exposure
+            // input brightness can be measured.
+            if (_traceExposure &&
+                ((image.Width <= 4 && image.Height <= 4) ||
+                 (image.Width <= 1024 && image.Height <= 1024 &&
+                  IsFloatReadbackFormat(image.Format))))
             {
                 return true;
             }
