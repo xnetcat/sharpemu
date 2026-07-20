@@ -1121,6 +1121,18 @@ public static class VideoOutExports
                 displayBuffer.Width,
                 displayBuffer.Height,
                 displayBuffer.PitchInPixel);
+
+            if (VulkanVideoPresenter.TraceRenderGraphEnabled)
+            {
+                // Names the exact buffer the flip presents so the lineage can be
+                // rooted at the true present source (compared against the black
+                // uber output vs the correctly-exposed mid-grey buffer).
+                Console.Error.WriteLine(
+                    $"[RGFLIP] handle={handle} index={bufferIndex} " +
+                    $"addr=0x{displayBuffer.Address:X16} " +
+                    $"{displayBuffer.Width}x{displayBuffer.Height} " +
+                    $"pitch={displayBuffer.PitchInPixel} submitted={guestImageSubmitted}");
+            }
         }
 
         if (_dumpVideoOut)

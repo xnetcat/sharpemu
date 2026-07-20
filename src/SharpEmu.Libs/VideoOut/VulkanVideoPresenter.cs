@@ -1175,6 +1175,11 @@ internal static unsafe class VulkanVideoPresenter
         }
     }
 
+    // Top-level accessor for the render-graph trace gate (defined on Presenter)
+    // so exports outside this class (e.g. VideoOutExports.SubmitFlip) can log
+    // the flip present source under SHARPEMU_TRACE_RENDERGRAPH.
+    internal static bool TraceRenderGraphEnabled => Presenter.TraceRenderGraphEnabled;
+
     public static bool TrySubmitGuestImage(
         ulong address,
         uint width,
@@ -5829,7 +5834,8 @@ internal static unsafe class VulkanVideoPresenter
                 // sampled input, not a storage image.
                 if ((texture.IsStorage ||
                      _traceGuestImageAddressFilterEnabled ||
-                     _traceExposure) &&
+                     _traceExposure ||
+                     TraceRenderGraphEnabled) &&
                     texture.GuestImage is { } image)
                 {
                     candidates.Add(image);
@@ -10456,6 +10462,12 @@ internal static unsafe class VulkanVideoPresenter
                         $"batch={batchIndex}/{batchCount} z={zStart}..{zStart + zCount}");
                     if (isLastBatch)
                     {
+                        if (TraceRenderGraphEnabled)
+                        {
+                            LogRenderGraphEdge(
+                                "dispatch", work.ShaderAddress, null, null, resources);
+                        }
+
                         SubmitGuestCommandBuffer(
                             commandBuffer,
                             [resources],
@@ -11936,6 +11948,11 @@ internal static unsafe class VulkanVideoPresenter
                 }
 
                 EndDebugLabel(_commandBuffer);
+
+                if (TraceRenderGraphEnabled)
+                {
+                    LogRenderGraphEdge("draw", work.ShaderAddress, targets, depth, resources);
+                }
 
                 var traceImages = GetTraceImages(resources, targets, work.ShaderAddress);
                 _batchTraceImages.AddRange(traceImages);
@@ -14354,6 +14371,12 @@ internal static unsafe class VulkanVideoPresenter
                         return;
                     }
 
+                    if (TraceRenderGraphEnabled)
+                    {
+                        LogRenderGraphMean(image, bytes, bytesPerPixel, shaderAddress);
+                        return;
+                    }
+
                     if (GuestImageTraceInterval() is not null && bytesPerPixel == 4)
                     {
                         long r = 0, g = 0, b = 0, a = 0, samples = 0;
@@ -14523,6 +14546,186 @@ internal static unsafe class VulkanVideoPresenter
                 Format.R16G16B16A16Sfloat => (double)BitConverter.ToHalf(texel),
                 _ => BitConverter.ToSingle(texel),
             };
+
+        private static long _renderGraphDrawSeq;
+
+        // SHARPEMU_TRACE_RENDERGRAPH: emit one dataflow edge per draw/dispatch.
+        // targets = the color render targets this pass writes; samples = the
+        // sampled input textures it reads. Storage images are tagged (S). This
+        // is the DAG the buffer-lineage forensic reconstructs; readback of each
+        // target's mean luminance is emitted separately as [RGMEAN].
+        private void LogRenderGraphEdge(
+            string kind,
+            ulong shaderAddress,
+            IReadOnlyList<GuestImageResource>? targets,
+            GuestDepthResource? depth,
+            TranslatedDrawResources resources)
+        {
+            var seq = Interlocked.Increment(ref _renderGraphDrawSeq);
+            var targetText = new StringBuilder();
+            if (targets is not null)
+            {
+                foreach (var target in targets)
+                {
+                    if (targetText.Length != 0)
+                    {
+                        targetText.Append(',');
+                    }
+
+                    targetText.Append(
+                        $"0x{target.Address:X}:{target.Width}x{target.Height}:{target.Format}");
+                }
+            }
+
+            // For compute, the written targets are the storage images.
+            var storageText = new StringBuilder();
+            var sampleText = new StringBuilder();
+            foreach (var texture in resources.Textures)
+            {
+                var target = texture.IsStorage ? storageText : sampleText;
+                if (target.Length != 0)
+                {
+                    target.Append(',');
+                }
+
+                target.Append(
+                    $"0x{texture.Address:X}:{texture.Width}x{texture.Height}");
+            }
+
+            Console.Error.WriteLine(
+                $"[RGRAPH] seq={seq} kind={kind} shader=0x{shaderAddress:X16} " +
+                $"targets=[{targetText}] storage=[{storageText}] " +
+                $"samples=[{sampleText}]" +
+                (depth is not null ? $" depth=0x{depth.Address:X}" : string.Empty));
+        }
+
+        // Mean luminance (average of R,G,B normalised to 0..1) of a readback of
+        // a color/float render target. Matches the 0..1 convention the exposure
+        // means use so lineage numbers are directly comparable. Sparse-sampled
+        // for cost. Returns (mean, min, max, nonzeroFrac).
+        private static (double Mean, double Min, double Max, double NonzeroFrac)
+            ComputeRenderGraphLuma(
+                ReadOnlySpan<byte> bytes,
+                Format format,
+                uint bytesPerPixel)
+        {
+            if (bytesPerPixel == 0)
+            {
+                return (0, 0, 0, 0);
+            }
+
+            var texelCount = bytes.Length / (int)bytesPerPixel;
+            if (texelCount == 0)
+            {
+                return (0, 0, 0, 0);
+            }
+
+            var step = Math.Max(1, texelCount / 65536);
+            double sum = 0;
+            var min = double.PositiveInfinity;
+            var max = double.NegativeInfinity;
+            long nonzero = 0;
+            var samples = 0;
+            for (var texel = 0; texel < texelCount; texel += step)
+            {
+                var pixel = bytes.Slice(texel * (int)bytesPerPixel, (int)bytesPerPixel);
+                var luma = PixelLuma(pixel, format);
+                sum += luma;
+                min = Math.Min(min, luma);
+                max = Math.Max(max, luma);
+                if (luma != 0)
+                {
+                    nonzero++;
+                }
+
+                samples++;
+            }
+
+            return (
+                samples > 0 ? sum / samples : 0,
+                min,
+                max,
+                samples > 0 ? (double)nonzero / samples : 0);
+        }
+
+        // Average of the R,G,B channels of one pixel, normalised to 0..1 for
+        // unorm formats and left in linear scale for float formats.
+        private static double PixelLuma(ReadOnlySpan<byte> pixel, Format format)
+        {
+            switch (format)
+            {
+                case Format.R8G8B8A8Unorm:
+                case Format.R8G8B8A8Srgb:
+                case Format.R8G8B8A8Uint:
+                    return (pixel[0] + pixel[1] + pixel[2]) / (3.0 * 255.0);
+                case Format.B8G8R8A8Unorm:
+                case Format.B8G8R8A8Srgb:
+                    return (pixel[2] + pixel[1] + pixel[0]) / (3.0 * 255.0);
+                case Format.R8Unorm:
+                case Format.R8Uint:
+                    return pixel[0] / 255.0;
+                case Format.R8G8Unorm:
+                    return (pixel[0] + pixel[1]) / (2.0 * 255.0);
+                case Format.A2B10G10R10UnormPack32:
+                {
+                    var v = BitConverter.ToUInt32(pixel);
+                    var r = v & 0x3FF;
+                    var g = (v >> 10) & 0x3FF;
+                    var b = (v >> 20) & 0x3FF;
+                    return (r + g + b) / (3.0 * 1023.0);
+                }
+                case Format.A2R10G10B10UnormPack32:
+                {
+                    var v = BitConverter.ToUInt32(pixel);
+                    var b = v & 0x3FF;
+                    var g = (v >> 10) & 0x3FF;
+                    var r = (v >> 20) & 0x3FF;
+                    return (r + g + b) / (3.0 * 1023.0);
+                }
+                case Format.R16G16B16A16Sfloat:
+                    return ((double)BitConverter.ToHalf(pixel) +
+                            (double)BitConverter.ToHalf(pixel[2..]) +
+                            (double)BitConverter.ToHalf(pixel[4..])) / 3.0;
+                case Format.R16G16Sfloat:
+                    return ((double)BitConverter.ToHalf(pixel) +
+                            (double)BitConverter.ToHalf(pixel[2..])) / 2.0;
+                case Format.R16Sfloat:
+                    return (double)BitConverter.ToHalf(pixel);
+                case Format.R32G32B32A32Sfloat:
+                    return (BitConverter.ToSingle(pixel) +
+                            BitConverter.ToSingle(pixel[4..]) +
+                            BitConverter.ToSingle(pixel[8..])) / 3.0;
+                case Format.R32G32Sfloat:
+                    return (BitConverter.ToSingle(pixel) +
+                            BitConverter.ToSingle(pixel[4..])) / 2.0;
+                case Format.R32Sfloat:
+                    return BitConverter.ToSingle(pixel);
+                default:
+                    // Best-effort: treat the first up-to-3 bytes as unorm.
+                    var acc = 0;
+                    var n = Math.Min(3, pixel.Length);
+                    for (var i = 0; i < n; i++)
+                    {
+                        acc += pixel[i];
+                    }
+
+                    return n > 0 ? acc / (n * 255.0) : 0;
+            }
+        }
+
+        private void LogRenderGraphMean(
+            GuestImageResource image,
+            ReadOnlySpan<byte> bytes,
+            uint bytesPerPixel,
+            ulong shaderAddress)
+        {
+            var (mean, min, max, nonzero) =
+                ComputeRenderGraphLuma(bytes, image.Format, bytesPerPixel);
+            Console.Error.WriteLine(
+                $"[RGMEAN] shader=0x{shaderAddress:X16} addr=0x{image.Address:X16} " +
+                $"{image.Width}x{image.Height} fmt={image.Format} " +
+                $"mean={mean:G6} min={min:G6} max={max:G6} nonzero_frac={nonzero:G4}");
+        }
 
         private static string DecodeExposureTexel(
             ReadOnlySpan<byte> texel,
@@ -15422,6 +15625,19 @@ internal static unsafe class VulkanVideoPresenter
                 return true;
             }
 
+            // Render-graph mode: read back every distinct color/float target and
+            // sampled texture once so the buffer lineage has a mean-luminance for
+            // each node. Deduped per address and capped so the heavy per-target
+            // queue-idle readback does not run unboundedly.
+            if (TraceRenderGraphEnabled &&
+                GetReadbackBytesPerPixel(image.Format) != 0 &&
+                Interlocked.Read(ref _renderGraphMeanLogCount) < 20000 &&
+                _tracedGuestImageContents.Add(image.Address))
+            {
+                Interlocked.Increment(ref _renderGraphMeanLogCount);
+                return true;
+            }
+
             if (_traceGuestImageShaderFilterEnabled &&
                 !AddressListContains(
                     "SHARPEMU_TRACE_GUEST_IMAGE_SHADER_ADDRS",
@@ -15601,6 +15817,21 @@ internal static unsafe class VulkanVideoPresenter
                 Environment.GetEnvironmentVariable("SHARPEMU_TRACE_EXPOSURE"),
                 "1",
                 StringComparison.Ordinal);
+        // SHARPEMU_TRACE_RENDERGRAPH=1 emits a per-draw/per-dispatch dataflow
+        // edge ([RGRAPH]) naming the shader, its bound color render targets and
+        // their sizes, and its sampled input textures. Combined with per-target
+        // mean-luminance readback ([RGMEAN], via the existing trace-retire
+        // machinery) and the flip present source ([RGFLIP]), this reconstructs
+        // the color buffer lineage for a single frame so the pass where mean
+        // luminance collapses to zero can be pinpointed. Heavy (per-target
+        // readback with a queue idle); measurement only, no behaviour change
+        // when unset.
+        internal static readonly bool TraceRenderGraphEnabled =
+            string.Equals(
+                Environment.GetEnvironmentVariable("SHARPEMU_TRACE_RENDERGRAPH"),
+                "1",
+                StringComparison.Ordinal);
+        private static long _renderGraphMeanLogCount;
         private static readonly long _traceGuestImageOccurrence =
             long.TryParse(
                 Environment.GetEnvironmentVariable("SHARPEMU_TRACE_GUEST_IMAGE_OCCURRENCE"),
