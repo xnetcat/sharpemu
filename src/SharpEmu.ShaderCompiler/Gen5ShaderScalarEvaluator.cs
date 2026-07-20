@@ -2712,6 +2712,40 @@ public static class Gen5ShaderScalarEvaluator
             Console.Error.WriteLine(
                 $"[CBPROV][MEM] shader=0x{state.Program.Address:X16} " +
                 $"pc=0x{instruction.Pc:X} src=0x{descriptorSource:X16}{sb}");
+
+            // The malformed descriptor slot frequently looks like an SRT node
+            // {id, flags, pointer_lo, pointer_hi} rather than a leaf V#. Read
+            // the four dwords the shader consumed as a V#, then interpret
+            // dword[2:3] as a guest pointer and dump the memory it targets so
+            // we can tell whether a real V# lives one dereference deeper
+            // (shadPS4 walks the SRT tree recursively).  Read-only probe.
+            TryReadUInt32(ctx, descriptorSource, out var vsharp0);
+            TryReadUInt32(ctx, descriptorSource + 4, out var vsharp1);
+            TryReadUInt32(ctx, descriptorSource + 8, out var vsharp2);
+            TryReadUInt32(ctx, descriptorSource + 12, out var vsharp3);
+            var derefPointer =
+                (ulong)vsharp2 | ((ulong)vsharp3 << 32);
+            var masked = derefPointer & 0xFFFF_FFFF_FFFFUL;
+            var derefSb = new System.Text.StringBuilder();
+            if (masked >= 0x1000UL)
+            {
+                for (var offset = 0; offset < 0x40; offset += 4)
+                {
+                    var probe = masked + (ulong)offset;
+                    TryReadUInt32(ctx, probe, out var word);
+                    if (offset % 16 == 0)
+                    {
+                        derefSb.Append($" 0x{probe:X12}:");
+                    }
+
+                    derefSb.Append($" {word:X8}");
+                }
+            }
+
+            Console.Error.WriteLine(
+                $"[CBPROV][DEREF] shader=0x{state.Program.Address:X16} " +
+                $"pc=0x{instruction.Pc:X} vsharp=[{vsharp0:X8}:{vsharp1:X8}:" +
+                $"{vsharp2:X8}:{vsharp3:X8}] ptr=0x{masked:X12}{derefSb}");
         }
 
         foreach (var candidate in state.Program.Instructions)
