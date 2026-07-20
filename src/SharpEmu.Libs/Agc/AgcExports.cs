@@ -308,6 +308,11 @@ public static partial class AgcExports
         Environment.GetEnvironmentVariable("SHARPEMU_TRACE_FRAME_PACKETS"),
         "1",
         StringComparison.Ordinal);
+    private static readonly bool _traceShaderReloc = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_TRACE_SHADER_RELOC"),
+        "1",
+        StringComparison.Ordinal);
+    private static int _shaderRelocTraceCount;
     private static readonly bool _traceVertexRanges = string.Equals(
         Environment.GetEnvironmentVariable("SHARPEMU_TRACE_VERTEX_RANGES"),
         "1",
@@ -920,6 +925,11 @@ public static partial class AgcExports
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
+        if (_traceShaderReloc)
+        {
+            DumpShaderRelocationLayout(ctx, headerAddress, codeAddress);
+        }
+
         if (!RelocatePointerField(ctx, headerAddress + ShaderCxRegistersOffset) ||
             !RelocatePointerField(ctx, headerAddress + ShaderShRegistersOffset) ||
             !RelocatePointerField(ctx, headerAddress + ShaderUserDataOffset) ||
@@ -965,6 +975,95 @@ public static partial class AgcExports
         TraceCreateShader(destinationAddress, headerAddress, codeAddress, "ok");
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    // Diagnostic (SHARPEMU_TRACE_SHADER_RELOC=1): dump the raw shader binary
+    // header + candidate fixup fields + the pointed-to register/user-data
+    // blocks BEFORE relocation, so the shader-binary fixup encoding (which
+    // descriptor base dwords the real libSceAgc relocates) is determinable
+    // from one boot. All values are the on-disk RELATIVE offsets.
+    private static void DumpShaderRelocationLayout(
+        CpuContext ctx,
+        ulong headerAddress,
+        ulong codeAddress)
+    {
+        if (Interlocked.Increment(ref _shaderRelocTraceCount) > 512)
+        {
+            return;
+        }
+
+        string DumpDwords(ulong at, int count)
+        {
+            var sb = new System.Text.StringBuilder();
+            for (var i = 0; i < count; i++)
+            {
+                if ((i & 7) == 0)
+                {
+                    sb.Append($" 0x{at + (ulong)(i * 4):X10}:");
+                }
+
+                sb.Append(TryReadUInt32(ctx, at + (ulong)(i * 4), out var d)
+                    ? $" {d:X8}"
+                    : " ????????");
+            }
+
+            return sb.ToString();
+        }
+
+        TryReadUInt64(ctx, headerAddress + ShaderUserDataOffset, out var udRel);
+        TryReadUInt64(ctx, headerAddress + ShaderCxRegistersOffset, out var cxRel);
+        TryReadUInt64(ctx, headerAddress + ShaderShRegistersOffset, out var shRel);
+        TryReadUInt64(ctx, headerAddress + ShaderSpecialsOffset, out var spRel);
+        TryReadUInt64(ctx, headerAddress + 0x40, out var f40);
+        TryReadUInt64(ctx, headerAddress + 0x48, out var f48);
+        TryReadByte(ctx, headerAddress + ShaderTypeOffset, out var stype);
+        TryReadUInt32(ctx, headerAddress + ShaderNumShRegistersOffset, out var numSh);
+
+        Console.Error.WriteLine(
+            $"[SRELOC] hdr=0x{headerAddress:X16} code=0x{codeAddress:X16} type={stype} " +
+            $"numSh=0x{numSh:X} udRel=0x{udRel:X} cxRel=0x{cxRel:X} shRel=0x{shRel:X} " +
+            $"spRel=0x{spRel:X} f40=0x{f40:X} f48=0x{f48:X}");
+        Console.Error.WriteLine($"[SRELOC]  HDR{DumpDwords(headerAddress, 24)}");
+
+        // 0x40 and 0x44 are SEPARATE u32 self-relative offsets (0x44 points at
+        // the large reflection/SRT template block). Dump both targets.
+        TryReadUInt32(ctx, headerAddress + 0x40, out var o40);
+        TryReadUInt32(ctx, headerAddress + 0x44, out var o44);
+        if (o40 != 0 && o40 < 0x10_0000)
+        {
+            var t = headerAddress + 0x40 + o40;
+            Console.Error.WriteLine($"[SRELOC]  B40@0x{t:X10}{DumpDwords(t, 32)}");
+        }
+
+        if (o44 > 0x200 && o44 < 0x10_0000)
+        {
+            var t = headerAddress + 0x44 + o44;
+            Console.Error.WriteLine($"[SRELOC]  B44@0x{t:X10}{DumpDwords(t, 160)}");
+        }
+
+        if (udRel != 0 && udRel < 0x100_0000)
+        {
+            var udBase = headerAddress + ShaderUserDataOffset + udRel;
+            Console.Error.WriteLine($"[SRELOC]  UD {DumpDwords(udBase, 48)}");
+
+            // Follow the 5 UserData sub-pointers (still holding raw relative
+            // offsets pre-reloc) into their sub-tables — the SRT descriptor
+            // templates (V# base dwords) live here for spilled shaders.
+            for (var s = 0; s < 5; s++)
+            {
+                var subField = udBase + (ulong)(s * 8);
+                if (TryReadUInt64(ctx, subField, out var subRel) && subRel != 0 && subRel < 0x100_0000)
+                {
+                    Console.Error.WriteLine($"[SRELOC]  UD{s}@0x{subField + subRel:X10}{DumpDwords(subField + subRel, 24)}");
+                }
+            }
+        }
+
+        if (shRel != 0 && shRel < 0x100_0000)
+        {
+            var shEntries = (int)Math.Min(numSh, 64u) * 2;
+            Console.Error.WriteLine($"[SRELOC]  SH {DumpDwords(headerAddress + ShaderShRegistersOffset + shRel, shEntries)}");
+        }
     }
 
     [SysAbiExport(
