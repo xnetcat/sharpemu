@@ -239,6 +239,18 @@ public sealed record Gen5Vop3Control(
     uint OperandSelect,
     uint? ScalarDestination) : Gen5InstructionControl;
 
+// VOP3P (packed-math / mixed-precision) modifier block. NegateMask negates the
+// low/first FP16 lane (or the whole operand for the *_MIX ops); NegateHiMask
+// negates the high lane. OpSel/OpSelHi select which 16-bit half feeds each lane
+// (for *_MIX ops, OpSelHi selects FP16 vs FP32 per operand and OpSel picks the
+// half). Clamp saturates the result to [0,1].
+public sealed record Gen5Vop3pControl(
+    uint NegateMask,
+    uint NegateHiMask,
+    uint OpSelMask,
+    uint OpSelHiMask,
+    bool Clamp) : Gen5InstructionControl;
+
 public sealed record Gen5SdwaControl(
     uint DestinationSelect,
     uint DestinationUnused,

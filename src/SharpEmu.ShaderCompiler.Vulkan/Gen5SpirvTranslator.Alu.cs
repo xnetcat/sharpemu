@@ -19,6 +19,11 @@ public static partial class Gen5SpirvTranslator
                 return true;
             }
 
+            if (instruction.Control is Gen5Vop3pControl packedControl)
+            {
+                return TryEmitPackedAlu(instruction, packedControl, out error);
+            }
+
             if (instruction.Control is Gen5SdwaControl sdwa &&
                 (sdwa.Source0Select == 7 ||
                  sdwa.Source1Select == 7 ||
@@ -3222,6 +3227,195 @@ public static partial class Gen5SpirvTranslator
                 shuffled,
                 UInt(0));
         }
+
+        // VOP3P (packed / mixed-precision math). Only the float ops that titles
+        // actually use for HDR/tone-mapping are lowered; any other VOP3P opcode
+        // leaves the destination untouched (a defined no-op) rather than
+        // fabricating a value. Nothing here mints buffer descriptors, which is
+        // the whole point of routing 0x33 away from the SMEM path.
+        private bool TryEmitPackedAlu(
+            Gen5ShaderInstruction instruction,
+            Gen5Vop3pControl control,
+            out string error)
+        {
+            error = string.Empty;
+            if (!TryGetVectorDestination(instruction, out var destination))
+            {
+                return true;
+            }
+
+            switch (instruction.Opcode)
+            {
+                case "VFmaMixF32":
+                case "VFmaMixloF16":
+                case "VFmaMixhiF16":
+                {
+                    var product = Ext(
+                        50,
+                        _floatType,
+                        GetMixSource(instruction, control, 0),
+                        GetMixSource(instruction, control, 1),
+                        GetMixSource(instruction, control, 2));
+                    if (control.Clamp)
+                    {
+                        product = Ext(43, _floatType, product, Float(0), Float(1));
+                    }
+
+                    if (instruction.Opcode == "VFmaMixF32")
+                    {
+                        StoreV(destination, Bitcast(_uintType, product));
+                        return true;
+                    }
+
+                    // MIXLO/MIXHI write an FP16 result into one half of vdst,
+                    // preserving the other half.
+                    var packedHalf = BitwiseAnd(
+                        Ext(58, _uintType, CompositeConstruct(product, Float(0))),
+                        UInt(0xFFFF));
+                    var existing = LoadV(destination);
+                    var merged = instruction.Opcode == "VFmaMixloF16"
+                        ? BitwiseOr(
+                            BitwiseAnd(existing, UInt(0xFFFF_0000)),
+                            packedHalf)
+                        : BitwiseOr(
+                            BitwiseAnd(existing, UInt(0x0000_FFFF)),
+                            ShiftLeftLogical(packedHalf, UInt(16)));
+                    StoreV(destination, merged);
+                    return true;
+                }
+                case "VPkAddF16":
+                    StoreV(destination, EmitPackedFloat16(instruction, control, SpirvOp.FAdd));
+                    return true;
+                case "VPkMulF16":
+                    StoreV(destination, EmitPackedFloat16(instruction, control, SpirvOp.FMul));
+                    return true;
+                case "VPkMinF16":
+                    StoreV(destination, EmitPackedFloat16(instruction, control, SpirvOp.Nop, extOp: 37));
+                    return true;
+                case "VPkMaxF16":
+                    StoreV(destination, EmitPackedFloat16(instruction, control, SpirvOp.Nop, extOp: 40));
+                    return true;
+                case "VPkFmaF16":
+                    StoreV(destination, EmitPackedFloat16Fma(instruction, control));
+                    return true;
+                default:
+                    // Unimplemented VOP3P op: leave vdst defined-as-is.
+                    return true;
+            }
+        }
+
+        // Reads a VOP3P *_MIX source: an operand is FP32 when its op_sel_hi bit is
+        // clear, otherwise the FP16 half selected by op_sel (extended to FP32).
+        // The per-operand neg bit negates the resulting FP32 value.
+        private uint GetMixSource(
+            Gen5ShaderInstruction instruction,
+            Gen5Vop3pControl control,
+            int index)
+        {
+            var operand = instruction.Sources[index];
+            var isRegister = operand.Kind is
+                Gen5OperandKind.VectorRegister or Gen5OperandKind.ScalarRegister;
+            uint value;
+            // op_sel_hi selects FP16 (a half chosen by op_sel), but only for
+            // register operands; inline constants are always used as FP32.
+            if (isRegister && ((control.OpSelHiMask >> index) & 1) != 0)
+            {
+                var unpacked = Ext(62, _vec2Type, GetRawSource(instruction, index));
+                value = _module.AddInstruction(
+                    SpirvOp.CompositeExtract,
+                    _floatType,
+                    unpacked,
+                    ((control.OpSelMask >> index) & 1) != 0 ? 1u : 0u);
+            }
+            else
+            {
+                value = GetFloatSource(instruction, index);
+            }
+
+            if (((control.NegateMask >> index) & 1) != 0)
+            {
+                value = _module.AddInstruction(SpirvOp.FNegate, _floatType, value);
+            }
+
+            return value;
+        }
+
+        // Reads a VOP3P packed source as a vec2 of two FP16 lanes (as FP32),
+        // honouring op_sel (low lane half) and op_sel_hi (high lane half) plus the
+        // per-lane neg / neg_hi modifiers.
+        private uint GetPackedSource(
+            Gen5ShaderInstruction instruction,
+            Gen5Vop3pControl control,
+            int index)
+        {
+            var unpacked = Ext(62, _vec2Type, GetRawSource(instruction, index));
+            var low = _module.AddInstruction(
+                SpirvOp.CompositeExtract,
+                _floatType,
+                unpacked,
+                ((control.OpSelMask >> index) & 1) != 0 ? 1u : 0u);
+            var high = _module.AddInstruction(
+                SpirvOp.CompositeExtract,
+                _floatType,
+                unpacked,
+                ((control.OpSelHiMask >> index) & 1) != 0 ? 1u : 0u);
+            if (((control.NegateMask >> index) & 1) != 0)
+            {
+                low = _module.AddInstruction(SpirvOp.FNegate, _floatType, low);
+            }
+
+            if (((control.NegateHiMask >> index) & 1) != 0)
+            {
+                high = _module.AddInstruction(SpirvOp.FNegate, _floatType, high);
+            }
+
+            return CompositeConstruct(low, high);
+        }
+
+        private uint EmitPackedFloat16(
+            Gen5ShaderInstruction instruction,
+            Gen5Vop3pControl control,
+            SpirvOp op,
+            uint extOp = 0)
+        {
+            var a = GetPackedSource(instruction, control, 0);
+            var b = GetPackedSource(instruction, control, 1);
+            var result = extOp != 0
+                ? Ext(extOp, _vec2Type, a, b)
+                : _module.AddInstruction(op, _vec2Type, a, b);
+            return PackFloat16Pair(result, control.Clamp);
+        }
+
+        private uint EmitPackedFloat16Fma(
+            Gen5ShaderInstruction instruction,
+            Gen5Vop3pControl control)
+        {
+            var result = Ext(
+                50,
+                _vec2Type,
+                GetPackedSource(instruction, control, 0),
+                GetPackedSource(instruction, control, 1),
+                GetPackedSource(instruction, control, 2));
+            return PackFloat16Pair(result, control.Clamp);
+        }
+
+        private uint PackFloat16Pair(uint pair, bool clamp)
+        {
+            if (clamp)
+            {
+                pair = Ext(
+                    43,
+                    _vec2Type,
+                    pair,
+                    CompositeConstruct(Float(0), Float(0)),
+                    CompositeConstruct(Float(1), Float(1)));
+            }
+
+            return Ext(58, _uintType, pair);
+        }
+
+        private uint CompositeConstruct(uint x, uint y) =>
+            _module.AddInstruction(SpirvOp.CompositeConstruct, _vec2Type, x, y);
 
         private uint EmitFloatResult(
             Gen5ShaderInstruction instruction,
