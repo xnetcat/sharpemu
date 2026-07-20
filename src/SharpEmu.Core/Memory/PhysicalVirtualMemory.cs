@@ -913,6 +913,10 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
             SharpEmu.HLE.GuestImageWriteTracker.BeginManagedWrite(
                 virtualAddress,
                 (ulong)source.Length);
+        using var eudWatchWrite =
+            SharpEmu.HLE.EudDescriptorWatchpoint.BeginManagedWrite(
+                virtualAddress,
+                (ulong)source.Length);
         var requiresExclusiveAccess = false;
         _gate.EnterReadLock();
         try

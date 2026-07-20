@@ -2313,6 +2313,28 @@ public static class Gen5ShaderScalarEvaluator
             }
         }
 
+        // Diagnostic watchpoint: when an EUD-spilled buffer descriptor decodes
+        // as garbage (unpopulated slot), arm a write-watch on the guest page it
+        // was read from to capture the producing store's RIP/thread/timing.
+        if (EudDescriptorWatchpoint.Enabled &&
+            isBufferLoad &&
+            deferredDescriptorAddress != 0 &&
+            IsMalformedEudDescriptor(hasBufferDescriptor, bufferDescriptor))
+        {
+            TryReadUInt32(ctx, deferredDescriptorAddress, out var eudWord0);
+            TryReadUInt32(ctx, deferredDescriptorAddress + 4, out var eudWord1);
+            TryReadUInt32(ctx, deferredDescriptorAddress + 8, out var eudWord2);
+            TryReadUInt32(ctx, deferredDescriptorAddress + 12, out var eudWord3);
+            EudDescriptorWatchpoint.Arm(
+                deferredDescriptorAddress,
+                4 * sizeof(uint),
+                $"prog=0x{state.Program.Address:X16},pc=0x{instruction.Pc:X},s{scalarBase.Value}",
+                eudWord0,
+                eudWord1,
+                eudWord2,
+                eudWord3);
+        }
+
         var deferredBufferLoad =
             isBufferLoad &&
             address == 0 &&
@@ -2844,6 +2866,34 @@ public static class Gen5ShaderScalarEvaluator
                 address: 0x1000,
                 strictScalarLoad: false),
             "A valid scalar pointer must not be treated as an unbound resource.");
+    }
+
+    // A buffer descriptor read out of an EUD/SRT table that decodes to an
+    // implausible resource: the slot was not populated with a real V# at the
+    // time the shader scalar chain was evaluated on the submit thread. Matches
+    // the num_records-as-pointer and garbage-high-base signatures proven for
+    // the Superliminal menu-scene EUD-spilled constant buffers.
+    private static bool IsMalformedEudDescriptor(
+        bool hasBufferDescriptor,
+        in BufferDescriptor descriptor)
+    {
+        if (!hasBufferDescriptor)
+        {
+            return true;
+        }
+
+        if (descriptor.BaseAddress == 0)
+        {
+            // The all-zero slot is already handled by the base==0 deferred path.
+            return false;
+        }
+
+        var recordsLookLikePointer =
+            descriptor.NumRecords > 0x0100_0000u &&
+            descriptor.BaseAddress < 0x0001_0000UL;
+        var baseHasGarbageHighBits =
+            descriptor.BaseAddress >= 0x0000_0010_0000_0000UL;
+        return recordsLookLikePointer || baseHasGarbageHighBits;
     }
 
     private static bool TryDecodeBufferDescriptor(

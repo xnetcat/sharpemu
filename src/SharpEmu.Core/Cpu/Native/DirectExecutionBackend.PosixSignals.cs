@@ -94,6 +94,7 @@ public sealed unsafe partial class DirectExecutionBackend
 
 		WarmUpPosixSignalPath();
 		SharpEmu.HLE.GuestImageWriteTracker.WarmUp();
+		SharpEmu.HLE.EudDescriptorWatchpoint.WarmUp();
 
 		if (!InstallPosixSignalHandler(PosixSigSegv) ||
 			!InstallPosixSignalHandler(PosixSigBus) ||
@@ -208,6 +209,27 @@ public sealed unsafe partial class DirectExecutionBackend
 		}
 		try
 		{
+			// EUD descriptor watchpoint (diagnostic, SHARPEMU_WATCH_EUD=1) runs
+			// before the image tracker so it can claim writes to a watched EUD
+			// spill page and capture the faulting RIP before the image tracker
+			// would swallow the fault. It restores write access and resumes.
+			if (signal != PosixSigIll &&
+				siginfo != 0 &&
+				SharpEmu.HLE.EudDescriptorWatchpoint.Enabled)
+			{
+				var watchFaultAddress = *(ulong*)((byte*)siginfo + PosixSigInfoAddressOffset);
+				byte* watchRegisters = GetPosixRegisterBase(ucontext);
+				ulong watchRip = watchRegisters != null
+					? *(ulong*)(watchRegisters + PosixRegisterOffsets[16])
+					: 0;
+				if (SharpEmu.HLE.EudDescriptorWatchpoint.TryHandleWatchpointFault(
+					watchFaultAddress,
+					watchRip))
+				{
+					return;
+				}
+			}
+
 			// Guest-image write tracking runs first: it only needs the fault
 			// address (safe for host and guest threads alike) and must resume
 			// the faulting write immediately after restoring write access.

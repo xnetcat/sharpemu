@@ -3773,6 +3773,15 @@ public static partial class AgcExports
         uint dwordCount,
         bool tracePackets)
     {
+        if (EudDescriptorWatchpoint.Enabled)
+        {
+            // Submit boundary: drain captured EUD-store events, re-read watched
+            // slots for silent (aliased/managed) population, and re-arm.
+            EudDescriptorWatchpoint.OnSubmitBoundary(
+                (ulong address, out uint value) => TryReadUInt32(ctx, address, out value),
+                $"queue={state.QueueName},submission={state.ActiveSubmissionId},dwords={dwordCount}");
+        }
+
         var offset = 0u;
         while (offset < dwordCount)
         {
