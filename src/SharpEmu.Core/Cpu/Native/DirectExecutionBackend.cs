@@ -4718,6 +4718,12 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			var deliverySucceeded = false;
 			string? deliveryError = null;
 			var deliveryStarted = Stopwatch.GetTimestamp();
+			// Same isolation the safe-point path needs, and this is the dominant
+			// delivery path: the handler's nested imports must not consume a block
+			// the interrupted import already staged, or the interrupted thread
+			// never parks on the wait it asked for and its wake is bound to a
+			// frame that has returned.
+			var interruptedStagedState = GuestThreadExecution.SaveAndResetStagedState();
 			try
 			{
 				deliverySucceeded = TryCallGuestFunction(
@@ -4739,6 +4745,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			}
 			finally
 			{
+				GuestThreadExecution.RestoreStagedState(interruptedStagedState);
 				PendingGuestException? followUp = null;
 				if (logGuestExceptions)
 				{
