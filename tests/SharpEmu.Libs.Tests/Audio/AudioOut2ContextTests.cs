@@ -66,4 +66,29 @@ public sealed class AudioOut2ContextTests
 
         Assert.Equal(0, AudioOut2Exports.AudioOut2ContextGetQueueLevel(_ctx));
     }
+
+    [Fact]
+    public void ContextQueryMemory_WritesEightBytesOnly()
+    {
+        // Silent Hill places the eight-byte memory-info slot immediately below
+        // the 0x40-byte context-param block it passes to ContextCreate next.
+        // Anything written past the slot corrupts that param block in place.
+        const ulong infoAddress = MemoryBase + 0x200;
+        const ulong paramAddress = infoAddress + 8;
+        Span<byte> poison = stackalloc byte[0x18];
+        poison.Fill(0xAB);
+        Assert.True(_memory.TryWrite(infoAddress, poison));
+
+        _ctx[CpuRegister.Rdi] = paramAddress;
+        _ctx[CpuRegister.Rsi] = infoAddress;
+        var result = AudioOut2Exports.AudioOut2ContextQueryMemory(_ctx);
+
+        Assert.Equal(0, result);
+        Span<byte> after = stackalloc byte[0x18];
+        Assert.True(_memory.TryRead(infoAddress, after));
+        Assert.NotEqual(0xABABABABABABABABUL, BinaryPrimitives.ReadUInt64LittleEndian(after));
+        // The param block starting eight bytes in must be untouched.
+        Assert.Equal(0xABABABABABABABABUL, BinaryPrimitives.ReadUInt64LittleEndian(after[8..]));
+        Assert.Equal(0xABABABABABABABABUL, BinaryPrimitives.ReadUInt64LittleEndian(after[16..]));
+    }
 }

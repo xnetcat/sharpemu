@@ -118,14 +118,11 @@ public static class AudioOut2Exports
             return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        Span<byte> memoryInfo = stackalloc byte[0x20];
-        memoryInfo.Clear();
-        BinaryPrimitives.WriteUInt64LittleEndian(memoryInfo[0x00..], AudioOut2ContextMemorySize);
-        BinaryPrimitives.WriteUInt64LittleEndian(memoryInfo[0x08..], AudioOut2ContextMemoryAlignment);
-        BinaryPrimitives.WriteUInt64LittleEndian(memoryInfo[0x10..], AudioOut2ContextMemorySize);
-        BinaryPrimitives.WriteUInt64LittleEndian(memoryInfo[0x18..], AudioOut2ContextMemoryAlignment);
-
-        return ctx.Memory.TryWrite(memoryInfoAddress, memoryInfo)
+        // The out structure is a single 64-bit memory size. Silent Hill's Wwise
+        // sink allocates exactly eight bytes for it, immediately below the
+        // context-param block it passes to ContextCreate right after — writing
+        // the former 0x20-byte guess corrupted that param block in place.
+        return TryWriteUInt64(ctx, memoryInfoAddress, AudioOut2ContextMemorySize)
             ? SetReturn(ctx, 0)
             : SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
     }
