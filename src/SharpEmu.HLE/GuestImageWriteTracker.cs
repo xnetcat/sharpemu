@@ -30,6 +30,9 @@ public static unsafe class GuestImageWriteTracker
         public ulong End;
         public int Dirty;
         public int Armed;
+        // Set when an arm was skipped because a managed guest write held a pin
+        // over this range; the last pin to drain re-arms it.
+        public int ArmDeferred;
         public int FirstCpuWriteSeen;
         public int PendingFirstCpuWrite;
         public long WriteGeneration;
@@ -50,6 +53,12 @@ public static unsafe class GuestImageWriteTracker
     }
 
     private static readonly object _gate = new();
+    // Number of managed guest writes currently copying into tracked pages.
+    // While non-zero no range may be armed read-only; see BeginManagedWrite.
+    private static int _managedWritePins;
+    // Ranges whose arm was deferred by a pin, so the drain in EndManagedWrite
+    // can skip the range walk entirely in the common case.
+    private static int _armDeferredCount;
     private static readonly Dictionary<ulong, TrackedRange> _rangesByAddress = new();
 
     /// <summary>Immutable snapshot read lock-free from the signal handler and
@@ -319,9 +328,33 @@ public static unsafe class GuestImageWriteTracker
     /// </summary>
     public static void NotifyManagedWrite(ulong address, ulong byteCount)
     {
+        if (BeginManagedWrite(address, byteCount))
+        {
+            EndManagedWrite();
+        }
+    }
+
+    /// <summary>
+    /// Unprotects any tracked pages the write covers and pins them writable for
+    /// the duration of the copy. Returns true when a pin was taken, in which
+    /// case the caller must call <see cref="EndManagedWrite"/> in a finally.
+    /// </summary>
+    /// <remarks>
+    /// Disarming before the copy is not enough on its own: arming runs from GPU
+    /// threads under a lock unrelated to the caller's, so it can mprotect the
+    /// range read-only between the disarm and the copy. The copy then faults in
+    /// managed code, which is a fatal AccessViolationException rather than a
+    /// recoverable guest fault. The pin makes <see cref="ArmLocked"/> defer
+    /// instead, and the ordering is closed on both sides: a pin taken before
+    /// ArmLocked re-checks causes ArmLocked to undo its mprotect, and a pin
+    /// taken after that re-check disarms the range itself below, because the
+    /// increment always precedes the disarm.
+    /// </remarks>
+    public static bool BeginManagedWrite(ulong address, ulong byteCount)
+    {
         if (!_enabled || address == 0 || byteCount == 0)
         {
-            return;
+            return false;
         }
 
         var end = address > ulong.MaxValue - byteCount
@@ -331,12 +364,15 @@ public static unsafe class GuestImageWriteTracker
         // Fast rejection for the hot path: this runs on every managed guest
         // write, and almost none of them touch tracked texture pages. The
         // bounds live inside the snapshot so they are always consistent with
-        // the ranges the per-page visit below would consult.
+        // the ranges the per-page visit below would consult. Only writes that
+        // actually overlap tracked pages pay for the pin.
         var snapshot = Volatile.Read(ref _rangeSnapshot);
         if (snapshot.Ranges.Length == 0 || end <= snapshot.Start || address >= snapshot.End)
         {
-            return;
+            return false;
         }
+
+        Interlocked.Increment(ref _managedWritePins);
 
         var candidate = address;
         while (candidate < end)
@@ -348,6 +384,37 @@ public static unsafe class GuestImageWriteTracker
                 break;
             }
             candidate = nextPage;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Releases a pin taken by <see cref="BeginManagedWrite"/>, re-arming any
+    /// range whose arm was deferred once the last in-flight write drains.
+    /// </summary>
+    public static void EndManagedWrite()
+    {
+        if (Interlocked.Decrement(ref _managedWritePins) != 0)
+        {
+            return;
+        }
+
+        if (Volatile.Read(ref _armDeferredCount) == 0)
+        {
+            return;
+        }
+
+        lock (_gate)
+        {
+            foreach (var range in _rangesByAddress.Values)
+            {
+                if (Interlocked.Exchange(ref range.ArmDeferred, 0) == 1)
+                {
+                    Interlocked.Decrement(ref _armDeferredCount);
+                    ArmLocked(range, "rearm-deferred");
+                }
+            }
         }
     }
 
@@ -495,12 +562,46 @@ public static unsafe class GuestImageWriteTracker
             return;
         }
 
+        // A managed guest write may already be copying into this range. Arming
+        // it read-only underneath that copy faults it in managed code, which is
+        // fatal. Defer and let the last pin re-arm.
+        if (Volatile.Read(ref _managedWritePins) > 0)
+        {
+            Volatile.Write(ref range.Armed, 0);
+            if (Interlocked.Exchange(ref range.ArmDeferred, 1) == 0)
+            {
+                Interlocked.Increment(ref _armDeferredCount);
+            }
+
+            return;
+        }
+
         // A new publication/rearm starts a new first-write lifetime.
         Volatile.Write(ref range.FirstCpuWriteSeen, 0);
         var failed = Mprotect(
             (nint)range.Start,
             (nuint)(range.End - range.Start),
             ProtRead) != 0;
+
+        // Close the window against a pin taken between the check above and the
+        // mprotect: undo the arm so the in-flight copy stays writable. A pin
+        // taken after this re-check disarms the range itself, because
+        // BeginManagedWrite increments before it disarms.
+        if (!failed && Volatile.Read(ref _managedWritePins) > 0)
+        {
+            _ = Mprotect(
+                (nint)range.Start,
+                (nuint)(range.End - range.Start),
+                ProtRead | ProtWrite);
+            Volatile.Write(ref range.Armed, 0);
+            if (Interlocked.Exchange(ref range.ArmDeferred, 1) == 0)
+            {
+                Interlocked.Increment(ref _armDeferredCount);
+            }
+
+            return;
+        }
+
         if (failed)
         {
             Volatile.Write(ref range.Armed, 0);

@@ -1063,8 +1063,29 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         // there). Pre-visit the span so tracked pages are unprotected and
         // their owners dirtied before the copy; guest addresses are
         // host-identical, matching the tracker's fault addresses.
-        GuestImageWriteTracker.NotifyManagedWrite(virtualAddress, (ulong)source.Length);
+        //
+        // Unprotecting alone is racy: the tracker arms ranges from GPU threads
+        // under its own lock, so it can re-protect between the unprotect and
+        // the copy below. Hold the pin across the whole write instead, which
+        // makes an overlapping arm defer until the copy has drained.
+        var pinnedManagedWrite = GuestImageWriteTracker.BeginManagedWrite(
+            virtualAddress,
+            (ulong)source.Length);
+        try
+        {
+            return TryWritePinned(virtualAddress, source);
+        }
+        finally
+        {
+            if (pinnedManagedWrite)
+            {
+                GuestImageWriteTracker.EndManagedWrite();
+            }
+        }
+    }
 
+    private bool TryWritePinned(ulong virtualAddress, ReadOnlySpan<byte> source)
+    {
         var requiresExclusiveAccess = false;
         _gate.EnterReadLock();
         try
@@ -1147,9 +1168,10 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
             return false;
         }
 
-        // Match TryWrite's managed-write notification before touching an
-        // identity-mapped guest page protected by the image tracker.
-        GuestImageWriteTracker.NotifyManagedWrite(destinationAddress, length);
+        // Match TryWrite's managed-write pin before touching an identity-mapped
+        // guest page protected by the image tracker, and hold it across the
+        // copy so a concurrent arm cannot re-protect underneath it.
+        var pinnedManagedWrite = GuestImageWriteTracker.BeginManagedWrite(destinationAddress, length);
 
         _gate.EnterReadLock();
         try
@@ -1187,6 +1209,10 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         finally
         {
             _gate.ExitReadLock();
+            if (pinnedManagedWrite)
+            {
+                GuestImageWriteTracker.EndManagedWrite();
+            }
         }
     }
 
