@@ -6692,6 +6692,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			}
 			ulong rsp = cpuContext[CpuRegister.Rsp];
 			Console.Error.WriteLine($"[LOADER][ERROR] Stall snapshot: rip=0x{cpuContext.Rip:X16} rsp=0x{rsp:X16} rbp=0x{cpuContext[CpuRegister.Rbp]:X16} rax=0x{cpuContext[CpuRegister.Rax]:X16} rbx=0x{cpuContext[CpuRegister.Rbx]:X16} rcx=0x{cpuContext[CpuRegister.Rcx]:X16} rdx=0x{cpuContext[CpuRegister.Rdx]:X16} rsi=0x{cpuContext[CpuRegister.Rsi]:X16} rdi=0x{cpuContext[CpuRegister.Rdi]:X16}");
+			LogStallFrameChain(cpuContext);
 			ulong num = cpuContext.Rip & 0xFFFFFFFFFFFFFFF0uL;
 			for (int i = 0; i < _importEntries.Length; i++)
 			{
@@ -6762,6 +6763,42 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		catch
 		{
 		}
+	}
+
+	// Recovers the stalled thread's guest call sites so a wait that never
+	// resolves can be attributed to real code instead of just the libkernel
+	// import stub it is parked in. Scans the stack rather than walking rbp:
+	// shipping UE builds omit frame pointers, so rbp is an ordinary register
+	// and a frame-chain walk yields garbage after the first entry. Only runs
+	// when the watchdog is already dumping a stall.
+	private void LogStallFrameChain(CpuContext cpuContext)
+	{
+		const ulong guestImageStart = 0x8_0000_0000UL;
+		const ulong guestImageEnd = 0x8_2000_0000UL;
+		var rsp = cpuContext[CpuRegister.Rsp];
+		var builder = new System.Text.StringBuilder(256);
+		var found = 0;
+		for (var offset = 0UL; offset < 0x400 && found < 12; offset += sizeof(ulong))
+		{
+			if (!cpuContext.TryReadUInt64(rsp + offset, out var candidate) ||
+				candidate < guestImageStart ||
+				candidate >= guestImageEnd)
+			{
+				continue;
+			}
+
+			if (builder.Length != 0)
+			{
+				builder.Append(',');
+			}
+
+			builder.Append($"+0x{offset:X}:0x{candidate:X}");
+			found++;
+		}
+
+		Console.Error.WriteLine(
+			$"[LOADER][ERROR] Stall stack-scan rsp=0x{rsp:X16}: " +
+			$"{(builder.Length == 0 ? "none" : builder.ToString())}");
 	}
 
 	private unsafe static bool TryCaptureHostThreadContext(int hostThreadId, out HostThreadContextSnapshot snapshot)
