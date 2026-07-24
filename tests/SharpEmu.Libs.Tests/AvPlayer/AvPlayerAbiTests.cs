@@ -1,6 +1,7 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using System.Buffers.Binary;
 using SharpEmu.HLE;
 using SharpEmu.Libs.AvPlayer;
 using Xunit;
@@ -41,5 +42,53 @@ public sealed class AvPlayerAbiTests
         uint expected)
     {
         Assert.Equal(expected, AvPlayerExports.GetStreamType(generation, streamIndex));
+    }
+
+    [Fact]
+    public void Gen5StreamInfoEx_WritesDurationAfterDetailsUnion()
+    {
+        var info = new byte[104];
+
+        AvPlayerExports.WriteGen5StreamInfoEx(
+            info,
+            streamType: 1,
+            width: 378,
+            height: 150,
+            framesPerSecond: 29.97,
+            durationMilliseconds: 9_109);
+
+        Assert.Equal(104UL, BinaryPrimitives.ReadUInt64LittleEndian(info));
+        Assert.Equal(1U, BinaryPrimitives.ReadUInt32LittleEndian(info.AsSpan(8)));
+        Assert.Equal(378U, BinaryPrimitives.ReadUInt32LittleEndian(info.AsSpan(16)));
+        Assert.Equal(150U, BinaryPrimitives.ReadUInt32LittleEndian(info.AsSpan(20)));
+        Assert.Equal(29.97, BinaryPrimitives.ReadDoubleLittleEndian(info.AsSpan(0x40)));
+        Assert.Equal(9_109UL, BinaryPrimitives.ReadUInt64LittleEndian(info.AsSpan(0x60)));
+        Assert.Equal(0UL, BinaryPrimitives.ReadUInt64LittleEndian(info.AsSpan(0x18)));
+    }
+
+    [Fact]
+    public void Gen5FrameInfoEx_WritesPublishedVideoDetailsLayout()
+    {
+        var info = new byte[104];
+
+        AvPlayerExports.WriteVideoFrameInfo(
+            info,
+            Generation.Gen5,
+            extended: true,
+            bufferAddress: 0x1234_5000,
+            timestamp: 2_903,
+            width: 378,
+            height: 150,
+            pitch: 512,
+            framesPerSecond: 29.97);
+
+        Assert.Equal(0x1234_5000UL, BinaryPrimitives.ReadUInt64LittleEndian(info));
+        Assert.Equal(2_903UL, BinaryPrimitives.ReadUInt64LittleEndian(info.AsSpan(16)));
+        Assert.Equal(378U, BinaryPrimitives.ReadUInt32LittleEndian(info.AsSpan(24)));
+        Assert.Equal(150U, BinaryPrimitives.ReadUInt32LittleEndian(info.AsSpan(28)));
+        Assert.Equal(512U, BinaryPrimitives.ReadUInt32LittleEndian(info.AsSpan(60)));
+        Assert.Equal(8, info[64]);
+        Assert.Equal(8, info[65]);
+        Assert.Equal(29.97, BinaryPrimitives.ReadDoubleLittleEndian(info.AsSpan(0x48)));
     }
 }
