@@ -276,7 +276,12 @@ public static class KernelPthreadCompatExports
         LibraryName = "libKernel")]
     public static int PthreadYield(CpuContext ctx)
     {
-        _ = ctx;
+        // AvPlayer state notifications originate on a service/controller
+        // thread on the console.  SharpEmu queues them until it reaches a safe
+        // guest execution boundary.  A title can wait for StateReady by
+        // yielding without submitting another flip or polling AvPlayer, so
+        // service that queue here as well as on the rendering path.
+        AvPlayer.AvPlayerExports.PumpPendingEvents(ctx);
         Thread.Yield();
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
