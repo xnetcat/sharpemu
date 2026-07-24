@@ -643,6 +643,31 @@ public static partial class KernelMemoryCompatExports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
+    [SysAbiExport(Nid = "2pOuoWoCxdk", ExportName = "sceKernelAioPollRequest",
+        Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libKernel")]
+    public static int KernelAioPollRequest(CpuContext ctx) => KernelAioCompleteSingle(ctx);
+
+    [SysAbiExport(Nid = "KOF-oJbQVvc", ExportName = "sceKernelAioWaitRequest",
+        Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libKernel")]
+    public static int KernelAioWaitRequest(CpuContext ctx) => KernelAioCompleteSingle(ctx);
+
+    private static int KernelAioCompleteSingle(CpuContext ctx)
+    {
+        // Submission runs synchronously, so a singular request is complete as
+        // soon as the guest waits or polls it. The state out-pointer is required:
+        // callers keep polling if success is returned without updating it.
+        var stateAddress = ctx[CpuRegister.Rsi];
+        if (stateAddress != 0)
+        {
+            Span<byte> state = stackalloc byte[sizeof(uint)];
+            BinaryPrimitives.WriteUInt32LittleEndian(state, AioStateCompleted);
+            _ = ctx.Memory.TryWrite(stateAddress, state);
+        }
+
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
     [SysAbiExport(Nid = "fR521KIGgb8", ExportName = "sceKernelAioCancelRequest",
         Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libKernel")]
     public static int KernelAioCancelRequest(CpuContext ctx)
