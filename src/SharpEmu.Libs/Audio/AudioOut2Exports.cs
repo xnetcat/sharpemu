@@ -241,10 +241,16 @@ public static class AudioOut2Exports
     public static int AudioOut2ContextGetQueueLevel(CpuContext ctx)
     {
         // The advance path paces synchronously, so the queue is always drained.
-        var levelAddress = ctx[CpuRegister.Rsi];
-        if (levelAddress != 0)
+        // The ABI exposes two adjacent 32-bit levels (queued, available). Writing
+        // one 64-bit value corrupts the next stack local when the outputs are
+        // four bytes apart — Silent Hill's Wwise sink keeps its stack canary
+        // right behind them and dies in __stack_chk_fail.
+        var queuedAddress = ctx[CpuRegister.Rsi];
+        var availableAddress = ctx[CpuRegister.Rdx];
+        if ((queuedAddress != 0 && !TryWriteUInt32(ctx, queuedAddress, 0)) ||
+            (availableAddress != 0 && !TryWriteUInt32(ctx, availableAddress, 0)))
         {
-            _ = TryWriteUInt64(ctx, levelAddress, 0);
+            return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
 
         return SetReturn(ctx, 0);
@@ -371,6 +377,13 @@ public static class AudioOut2Exports
     {
         Span<byte> buffer = stackalloc byte[sizeof(ulong)];
         BinaryPrimitives.WriteUInt64LittleEndian(buffer, value);
+        return ctx.Memory.TryWrite(address, buffer);
+    }
+
+    private static bool TryWriteUInt32(CpuContext ctx, ulong address, uint value)
+    {
+        Span<byte> buffer = stackalloc byte[sizeof(uint)];
+        BinaryPrimitives.WriteUInt32LittleEndian(buffer, value);
         return ctx.Memory.TryWrite(address, buffer);
     }
 
