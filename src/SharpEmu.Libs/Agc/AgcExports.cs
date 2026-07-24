@@ -4248,47 +4248,70 @@ public static partial class AgcExports
             return;
         }
 
+        bool ApplyDmaDataGuestMemory()
+        {
+            InvalidateDcbWindowIfOverlaps(destinationAddress, byteCount);
+            var immediateFill =
+                compactLayout &&
+                destinationAddress >= 0x10000 &&
+                sourceAddress <= uint.MaxValue;
+            var copied =
+                byteCount != 0 &&
+                byteCount <= 256u * 1024u * 1024u &&
+                destinationAddress != 0 &&
+                (immediateFill
+                    ? TryFillGuestMemory(ctx, (uint)sourceAddress, destinationAddress, byteCount)
+                    : sourceAddress != 0 &&
+                      TryCopyGuestMemory(ctx, sourceAddress, destinationAddress, byteCount));
+            if (copied)
+            {
+                MirrorDmaWriteToGuestImage(
+                    ctx,
+                    destinationAddress,
+                    byteCount,
+                    immediateFill ? (uint)sourceAddress : null);
+            }
+
+            if (tracePacket)
+            {
+                TraceAgc(
+                    $"agc.dcb.dma_data dst=0x{destinationAddress:X16} " +
+                    $"src=0x{sourceAddress:X16} bytes={byteCount} " +
+                    $"fill={immediateFill} copied={copied}");
+            }
+
+            return copied;
+        }
+
+        var eagerAttempted = false;
+        var eagerApplied = false;
         SubmitOrderedGpuSideEffect(
             ctx,
             gpuState,
             state,
             () =>
             {
-                InvalidateDcbWindowIfOverlaps(destinationAddress, byteCount);
-                var immediateFill =
-                    compactLayout &&
-                    destinationAddress >= 0x10000 &&
-                    sourceAddress <= uint.MaxValue;
-                var copied =
-                    byteCount != 0 &&
-                    byteCount <= 256u * 1024u * 1024u &&
-                    destinationAddress != 0 &&
-                    (immediateFill
-                        ? TryFillGuestMemory(ctx, (uint)sourceAddress, destinationAddress, byteCount)
-                        : sourceAddress != 0 &&
-                          TryCopyGuestMemory(ctx, sourceAddress, destinationAddress, byteCount));
-                if (copied)
+                if (ShouldRetryQueuedGuestWrite(eagerAttempted))
                 {
-                    MirrorDmaWriteToGuestImage(
-                        ctx,
-                        destinationAddress,
-                        byteCount,
-                        immediateFill ? (uint)sourceAddress : null);
+                    _ = ApplyDmaDataGuestMemory();
                 }
-
-                if (tracePacket)
+                else if (tracePacket)
                 {
                     TraceAgc(
                         $"agc.dcb.dma_data dst=0x{destinationAddress:X16} " +
-                        $"src=0x{sourceAddress:X16} bytes={byteCount} " +
-                        $"fill={immediateFill} copied={copied}");
+                        $"bytes={byteCount} eager={eagerApplied} requeued=false");
                 }
             },
             $"agc_dma_data dst=0x{destinationAddress:X16} bytes={byteCount}",
             packetAddress,
             destinationAddress,
             byteCount,
-            deferLabelCompletion: true);
+            deferLabelCompletion: true,
+            eagerGuestMemoryApply: () =>
+            {
+                eagerAttempted = true;
+                eagerApplied = ApplyDmaDataGuestMemory();
+            });
     }
 
     private static bool PacketRequiresPendingAcquireFlush(
@@ -4318,8 +4341,31 @@ public static partial class AgcExports
         ulong packetAddress,
         ulong producerAddress = 0,
         ulong producerLength = 0,
-        bool deferLabelCompletion = false)
+        bool deferLabelCompletion = false,
+        Action? eagerGuestMemoryApply = null,
+        bool eagerWatchedLabelWrite = false)
     {
+        // Draw translation reads descriptors out of guest memory while walking
+        // the packet stream, so a DMA_DATA/WRITE_DATA targeting a descriptor has
+        // to be visible to packets later in the same command buffer. Deferring it
+        // to the ordered queue makes the walk read stale memory and silently drop
+        // the draw. Apply once here; the queued action then skips re-writing, and
+        // the queue still owns image mirroring and label publication.
+        if (eagerGuestMemoryApply is not null &&
+            _eagerGpuDataWritesEnabled &&
+            producerAddress != 0 &&
+            producerLength != 0 &&
+            producerLength <= MaxEagerGpuDataWriteBytes)
+        {
+            var hasActiveWait = GpuWaitRegistry
+                .SnapshotInRange(ctx.Memory, producerAddress, producerLength)
+                .Count != 0;
+            if (ShouldEagerlyApplyGuestWrite(hasActiveWait, eagerWatchedLabelWrite))
+            {
+                eagerGuestMemoryApply();
+            }
+        }
+
         var producer = RegisterLabelProducer(
             ctx.Memory,
             state,
@@ -5162,21 +5208,34 @@ public static partial class AgcExports
             }
         }
 
+        bool ApplyWriteDataGuestMemory()
+        {
+            InvalidateDcbWindowIfOverlaps(
+                destinationAddress,
+                incrementAddress ? (ulong)dwordCount * sizeof(uint) : sizeof(uint));
+            var wrote = destination is 1 or 2 or 4 or 5;
+            for (uint index = 0; wrote && index < dwordCount; index++)
+            {
+                var targetAddress = destinationAddress +
+                    (incrementAddress ? (ulong)index * sizeof(uint) : 0);
+                wrote = TryWriteUInt32(ctx, targetAddress, values[index]);
+            }
+
+            return wrote;
+        }
+
+        var eagerAttempted = false;
+        var eagerApplied = false;
         SubmitOrderedGpuSideEffect(
             ctx,
             gpuState,
             state,
             () =>
             {
-                InvalidateDcbWindowIfOverlaps(
-                    destinationAddress,
-                    incrementAddress ? (ulong)dwordCount * sizeof(uint) : sizeof(uint));
-                var wroteData = destination is 1 or 2 or 4 or 5;
-                for (uint index = 0; wroteData && index < dwordCount; index++)
+                var wroteData = eagerApplied;
+                if (ShouldRetryQueuedGuestWrite(eagerAttempted))
                 {
-                    var targetAddress = destinationAddress +
-                        (incrementAddress ? (ulong)index * sizeof(uint) : 0);
-                    wroteData = TryWriteUInt32(ctx, targetAddress, values[index]);
+                    wroteData = ApplyWriteDataGuestMemory();
                 }
 
                 if (tracePacket)
@@ -5185,7 +5244,8 @@ public static partial class AgcExports
                         $"agc.dcb.write_data dst={destination} " +
                         $"addr=0x{destinationAddress:X16} count={dwordCount} " +
                         $"increment={incrementAddress} confirm={writeConfirm} " +
-                        $"cache={cachePolicy} standard={standardPacket} wrote={wroteData}");
+                        $"cache={cachePolicy} standard={standardPacket} " +
+                        $"wrote={wroteData} eager={eagerApplied}");
                 }
             },
             $"write_data dst=0x{destinationAddress:X16} count={dwordCount}",
@@ -5193,7 +5253,12 @@ public static partial class AgcExports
             destination is 1 or 2 or 4 or 5 ? destinationAddress : 0,
             destination is 1 or 2 or 4 or 5
                 ? incrementAddress ? (ulong)dwordCount * sizeof(uint) : sizeof(uint)
-                : 0);
+                : 0,
+            eagerGuestMemoryApply: () =>
+            {
+                eagerAttempted = true;
+                eagerApplied = ApplyWriteDataGuestMemory();
+            });
     }
 
     private static (uint Destination, bool IncrementAddress, bool WriteConfirm, uint CachePolicy)
@@ -6149,6 +6214,27 @@ public static partial class AgcExports
             writesGuestMemory ? destinationAddress : 0,
             writesGuestMemory ? writeLength : 0);
     }
+
+    // Guest-memory writes issued by GPU packets are applied once at packet-walk
+    // time so descriptors written by DMA_DATA/WRITE_DATA are visible to draws
+    // later in the same command buffer. SHARPEMU_EAGER_GPU_DATA_WRITES=0 opts out.
+    private static readonly bool _eagerGpuDataWritesEnabled = !string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_EAGER_GPU_DATA_WRITES"),
+        "0",
+        StringComparison.Ordinal);
+    private const ulong MaxEagerGpuDataWriteBytes = 16 * 1024 * 1024;
+
+    // A write into a range some queue is actively waiting on is the producer for
+    // that wait; publishing it early would release the waiter before the ordered
+    // queue has fenced the work behind it. Such writes stay queued unless the
+    // caller states this is the watched label write itself.
+    internal static bool ShouldEagerlyApplyGuestWrite(
+        bool hasActiveWait,
+        bool eagerWatchedLabelWrite) =>
+        !hasActiveWait || eagerWatchedLabelWrite;
+
+    /// <summary>The queued action re-writes only when no eager attempt was made.</summary>
+    internal static bool ShouldRetryQueuedGuestWrite(bool eagerAttempted) => !eagerAttempted;
 
     private static long _labelWriteFailureCount;
 
