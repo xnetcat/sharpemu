@@ -61,6 +61,9 @@ public static class VideoOutExports
     // sceVideoOutGetEventId (mapped below), so the exact value is internal; only
     // its distinctness from the flip ident matters for GetEventId/GetEventData.
     private const ulong SceVideoOutInternalEventVblank = 0x40;
+    // Distinct internal ident for output-mode-change events, same convention as
+    // the vblank ident above.
+    private const ulong SceVideoOutInternalEventOutputMode = 0x41;
     private const short OrbisKernelEventFilterVideoOut = -13;
 
     private static readonly object _stateGate = new();
@@ -653,6 +656,43 @@ public static class VideoOutExports
     }
 
     [SysAbiExport(
+        Nid = "kmSe30JTs+E",
+        ExportName = "sceVideoOutAddOutputModeEvent",
+        Target = Generation.Gen5,
+        LibraryName = "libSceVideoOut")]
+    public static int VideoOutAddOutputModeEvent(CpuContext ctx)
+    {
+        var equeue = ctx[CpuRegister.Rdi];
+        var handle = unchecked((int)ctx[CpuRegister.Rsi]);
+        var userData = ctx[CpuRegister.Rdx];
+        if (!TryGetPort(handle, out _))
+        {
+            return OrbisVideoOutErrorInvalidHandle;
+        }
+
+        if (!KernelEventQueueCompatExports.IsValidEqueue(equeue))
+        {
+            return OrbisVideoOutErrorInvalidEventQueue;
+        }
+
+        // The emulated display never changes mode after open, so no per-port
+        // registration is retained. Report the current mode once: titles register
+        // this event during boot and block until the mode is delivered, and a
+        // registration that never reports anything makes them tear the equeue
+        // back down and abandon display bring-up.
+        _ = KernelEventQueueCompatExports.TriggerDisplayEvent(
+            equeue,
+            SceVideoOutInternalEventOutputMode,
+            OrbisKernelEventFilterVideoOut,
+            eventHint: 0,
+            userData: userData);
+        TraceVideoOut(
+            $"videoout.add_output_mode_event eq=0x{equeue:X16} handle={handle} " +
+            $"udata=0x{userData:X16}");
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
         Nid = "oNOQn3knW6s",
         ExportName = "sceVideoOutDeleteVblankEvent",
         Target = Generation.Gen4 | Generation.Gen5,
@@ -765,7 +805,8 @@ public static class VideoOutExports
             return OrbisVideoOutErrorInvalidEvent;
         }
 
-        // sceVideoOutGetEventId reports the event kind: 0 = flip, 1 = vblank.
+        // sceVideoOutGetEventId reports the event kind: 0 = flip, 1 = vblank,
+        // 2 = output-mode change.
         if (ident == SceVideoOutInternalEventFlip)
         {
             return 0;
@@ -774,6 +815,11 @@ public static class VideoOutExports
         if (ident == SceVideoOutInternalEventVblank)
         {
             return 1;
+        }
+
+        if (ident == SceVideoOutInternalEventOutputMode)
+        {
+            return 2;
         }
 
         return OrbisVideoOutErrorInvalidEvent;
@@ -801,7 +847,9 @@ public static class VideoOutExports
         }
 
         if (filter != OrbisKernelEventFilterVideoOut ||
-            (ident != SceVideoOutInternalEventFlip && ident != SceVideoOutInternalEventVblank))
+            (ident != SceVideoOutInternalEventFlip &&
+             ident != SceVideoOutInternalEventVblank &&
+             ident != SceVideoOutInternalEventOutputMode))
         {
             return OrbisVideoOutErrorInvalidEvent;
         }
