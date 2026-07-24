@@ -53,13 +53,47 @@ public static unsafe class GuestImageWriteTracker
     }
 
     private static readonly object _gate = new();
-    // Number of managed guest writes currently copying into tracked pages.
-    // While non-zero no range may be armed read-only; see BeginManagedWrite.
-    private static int _managedWritePins;
-    // Ranges whose arm was deferred by a pin, so the drain in EndManagedWrite
-    // can skip the range walk entirely in the common case.
-    private static int _armDeferredCount;
     private static readonly Dictionary<ulong, TrackedRange> _rangesByAddress = new();
+
+    // ---- managed-write lease -----------------------------------------------
+    //
+    // Managed guest writes copy with Buffer.MemoryCopy. If the tracker drops
+    // write access on the destination at any instant during that copy the
+    // runtime raises a fatal, non-resumable AccessViolationException (a native
+    // guest store faults into the POSIX signal bridge instead and recovers).
+    // So arming must be excluded from managed writes outright: noticing the
+    // clash afterwards and restoring the protection cannot un-fault a copy that
+    // already ran.
+    //
+    // _writeLease is a shared/exclusive lease over the tracker's mprotect
+    // calls. Managed writes take the shared side for the whole copy;
+    // ArmLocked takes the exclusive side around its mprotect.
+    //
+    // LOCK ORDER (never invert):
+    //     GuestImageWriteTracker._gate
+    //       -> _writeLease (exclusive, taken by ArmLocked)
+    //     _writeLease (shared, taken by BeginManagedWrite)
+    //       -> PhysicalVirtualMemory._gate
+    //       -> PosixHostMemory.Gate
+    // A shared holder never takes _gate: BeginManagedWrite is lock-free, and
+    // EndManagedWrite releases its share before it takes _gate. Every caller
+    // takes the shared lease before PhysicalVirtualMemory's gate and releases
+    // it after (see PhysicalVirtualMemory.TryWrite/TryCopy), so a thread
+    // holding a memory gate never waits on the lease.
+    private const int LeaseExclusiveHeld = 1 << 30;
+    private const int LeaseExclusiveWaiting = 1 << 29;
+    private const int LeaseSharedMask = LeaseExclusiveWaiting - 1;
+    private static int _writeLease;
+
+    // Shared leases held by this thread. Only used to detect re-entrancy: a
+    // thread that arms while inside its own managed write must not wait for
+    // itself (deadlock) and must not protect the page it is copying into.
+    [ThreadStatic]
+    private static int _threadWriteLeases;
+
+    // Ranges whose arm was skipped by that re-entrancy guard, so the drain in
+    // EndManagedWrite can skip the range walk entirely in the common case.
+    private static int _armDeferredCount;
 
     /// <summary>Immutable snapshot read lock-free from the signal handler and
     /// the managed-write pre-visit; rebuilt on every mutation under the gate
@@ -335,23 +369,35 @@ public static unsafe class GuestImageWriteTracker
     }
 
     /// <summary>
-    /// Unprotects any tracked pages the write covers and pins them writable for
-    /// the duration of the copy. Returns true when a pin was taken, in which
-    /// case the caller must call <see cref="EndManagedWrite"/> in a finally.
+    /// Unprotects any tracked pages the write covers and leases them writable
+    /// for the duration of the copy. Returns true when a lease was taken, in
+    /// which case the caller must call <see cref="EndManagedWrite"/> in a
+    /// finally.
     /// </summary>
     /// <remarks>
-    /// Disarming before the copy is not enough on its own: arming runs from GPU
-    /// threads under a lock unrelated to the caller's, so it can mprotect the
-    /// range read-only between the disarm and the copy. The copy then faults in
-    /// managed code, which is a fatal AccessViolationException rather than a
-    /// recoverable guest fault. The pin makes <see cref="ArmLocked"/> defer
-    /// instead, and the ordering is closed on both sides: a pin taken before
-    /// ArmLocked re-checks causes ArmLocked to undo its mprotect, and a pin
-    /// taken after that re-check disarms the range itself below, because the
-    /// increment always precedes the disarm.
+    /// Disarming before the copy is not enough on its own, and neither is a
+    /// flag the armer merely consults: arming runs from GPU threads under a
+    /// lock unrelated to the caller's, and its protection change is an mprotect
+    /// syscall. An armer that checks for in-flight writes, misses one, and then
+    /// mprotects has already made the page read-only for as long as it takes to
+    /// notice and undo it — and a managed copy that faults in that window dies
+    /// with a fatal AccessViolationException that no later repair can take
+    /// back. The lease excludes the two outright: while it is held
+    /// <see cref="ArmLocked"/> cannot run its mprotect at all.
     /// </remarks>
-    public static bool BeginManagedWrite(ulong address, ulong byteCount)
+    public static bool BeginManagedWrite(ulong address, ulong byteCount) =>
+        BeginManagedWrite(address, byteCount, out _);
+
+    /// <inheritdoc cref="BeginManagedWrite(ulong,ulong)"/>
+    /// <param name="pagesWritable">
+    /// False when the tracker holds a lease but could not restore write access
+    /// (the mprotect itself failed). The caller must not copy directly in that
+    /// case — the page really is read-only and a managed store would be fatal —
+    /// and must instead take a path that changes the protection itself.
+    /// </param>
+    public static bool BeginManagedWrite(ulong address, ulong byteCount, out bool pagesWritable)
     {
+        pagesWritable = true;
         if (!_enabled || address == 0 || byteCount == 0)
         {
             return false;
@@ -365,19 +411,32 @@ public static unsafe class GuestImageWriteTracker
         // write, and almost none of them touch tracked texture pages. The
         // bounds live inside the snapshot so they are always consistent with
         // the ranges the per-page visit below would consult. Only writes that
-        // actually overlap tracked pages pay for the pin.
-        var snapshot = Volatile.Read(ref _rangeSnapshot);
-        if (snapshot.Ranges.Length == 0 || end <= snapshot.Start || address >= snapshot.End)
+        // actually overlap tracked pages pay for the lease.
+        if (!OverlapsTrackedBounds(address, end))
         {
             return false;
         }
 
-        Interlocked.Increment(ref _managedWritePins);
+        AcquireWriteLeaseShared();
+
+        // Re-test under the lease. Track publishes a new range into the
+        // snapshot before ArmLocked protects it, and that arm is now blocked
+        // behind this lease, so a range that appeared between the two tests is
+        // visible here and still writable.
+        if (!OverlapsTrackedBounds(address, end))
+        {
+            ReleaseWriteLeaseShared();
+            return false;
+        }
 
         var candidate = address;
         while (candidate < end)
         {
-            _ = TryHandleWriteFault(candidate);
+            if (VisitWriteFault(candidate) == WriteFaultOutcome.UnprotectFailed)
+            {
+                pagesWritable = false;
+            }
+
             var nextPage = (candidate & ~0xFFFUL) + 0x1000UL;
             if (nextPage <= candidate)
             {
@@ -389,18 +448,23 @@ public static unsafe class GuestImageWriteTracker
         return true;
     }
 
+    private static bool OverlapsTrackedBounds(ulong address, ulong end)
+    {
+        var snapshot = Volatile.Read(ref _rangeSnapshot);
+        return snapshot.Ranges.Length != 0 && end > snapshot.Start && address < snapshot.End;
+    }
+
     /// <summary>
-    /// Releases a pin taken by <see cref="BeginManagedWrite"/>, re-arming any
-    /// range whose arm was deferred once the last in-flight write drains.
+    /// Releases a lease taken by <see cref="BeginManagedWrite"/>, re-arming any
+    /// range whose arm was skipped by the re-entrancy guard.
     /// </summary>
     public static void EndManagedWrite()
     {
-        if (Interlocked.Decrement(ref _managedWritePins) != 0)
-        {
-            return;
-        }
+        ReleaseWriteLeaseShared();
 
-        if (Volatile.Read(ref _armDeferredCount) == 0)
+        // Only the outermost release may re-arm: an inner one would protect a
+        // page this thread is still copying into.
+        if (_threadWriteLeases != 0 || Volatile.Read(ref _armDeferredCount) == 0)
         {
             return;
         }
@@ -417,6 +481,92 @@ public static unsafe class GuestImageWriteTracker
             }
         }
     }
+
+    private static void AcquireWriteLeaseShared()
+    {
+        var spin = new SpinWait();
+        while (true)
+        {
+            var observed = Volatile.Read(ref _writeLease);
+            if ((observed & (LeaseExclusiveHeld | LeaseExclusiveWaiting)) == 0 &&
+                Interlocked.CompareExchange(ref _writeLease, observed + 1, observed) == observed)
+            {
+                _threadWriteLeases++;
+                return;
+            }
+
+            // An arm is in progress or queued. Waiting here (rather than
+            // racing it) is what keeps the page's protection stable for the
+            // copy, and it also stops a steady stream of writes from starving
+            // arming — which would silently disable CPU-write detection.
+            //
+            // The exclusive holder only runs a single mprotect and never
+            // blocks, so this resolves in microseconds; -1 keeps SpinWait from
+            // escalating to a millisecond sleep and turning a guest write into
+            // a scheduling stall.
+            spin.SpinOnce(sleep1Threshold: -1);
+        }
+    }
+
+    private static void ReleaseWriteLeaseShared()
+    {
+        _threadWriteLeases--;
+        Interlocked.Decrement(ref _writeLease);
+    }
+
+    /// <summary>
+    /// Takes the exclusive side of the write lease so no managed guest write is
+    /// copying while the caller changes page protection. Returns false when the
+    /// calling thread already holds a shared lease, which means it is arming
+    /// from inside its own managed write: protecting the page would fault that
+    /// copy and waiting would deadlock on itself, so the caller must defer.
+    /// </summary>
+    private static bool TryAcquireWriteLeaseExclusive()
+    {
+        if (_threadWriteLeases > 0)
+        {
+            return false;
+        }
+
+        // Only ArmLocked takes the exclusive side, and it always runs under
+        // _gate, so there is never a second exclusive acquirer to contend with.
+        var spin = new SpinWait();
+        while (true)
+        {
+            var observed = Volatile.Read(ref _writeLease);
+            if (Interlocked.CompareExchange(
+                    ref _writeLease,
+                    observed | LeaseExclusiveWaiting,
+                    observed) == observed)
+            {
+                break;
+            }
+
+            spin.SpinOnce(sleep1Threshold: -1);
+        }
+
+        // The waiting bit is published, so no new shared lease can be granted;
+        // drain the ones already in flight. Each holder only has a bounded copy
+        // left to run and never blocks on the tracker, so this terminates.
+        spin = new SpinWait();
+        while (true)
+        {
+            var observed = Volatile.Read(ref _writeLease);
+            if ((observed & LeaseSharedMask) == 0 &&
+                Interlocked.CompareExchange(
+                    ref _writeLease,
+                    (observed & ~LeaseExclusiveWaiting) | LeaseExclusiveHeld,
+                    observed) == observed)
+            {
+                return true;
+            }
+
+            spin.SpinOnce();
+        }
+    }
+
+    private static void ReleaseWriteLeaseExclusive() =>
+        Interlocked.Add(ref _writeLease, -LeaseExclusiveHeld);
 
     /// <summary>
     /// Flushes scalar first-write records captured by the POSIX signal handler.
@@ -443,11 +593,34 @@ public static unsafe class GuestImageWriteTracker
     /// range, restore write access, mark the range dirty, and return true so
     /// the faulting write can be retried. Must not allocate or lock.
     /// </summary>
-    public static bool TryHandleWriteFault(ulong faultAddress)
+    public static bool TryHandleWriteFault(ulong faultAddress) =>
+        VisitWriteFault(faultAddress) == WriteFaultOutcome.Writable;
+
+    private enum WriteFaultOutcome
+    {
+        /// <summary>No tracked range covers the address.</summary>
+        NotTracked,
+
+        /// <summary>The address is covered and its pages are writable.</summary>
+        Writable,
+
+        /// <summary>The address is covered but the mprotect failed, so the
+        /// pages are still read-only.</summary>
+        UnprotectFailed,
+    }
+
+    /// <summary>
+    /// Shared core of <see cref="TryHandleWriteFault"/> and
+    /// <see cref="BeginManagedWrite"/>. Distinguishes "not tracked" from
+    /// "tracked but could not be unprotected" so a managed writer can react to
+    /// the second instead of copying into a page it has been told is protected.
+    /// Must not allocate or lock: this runs in signal context.
+    /// </summary>
+    private static WriteFaultOutcome VisitWriteFault(ulong faultAddress)
     {
         if (!_enabled || faultAddress == 0)
         {
-            return false;
+            return WriteFaultOutcome.NotTracked;
         }
 
         var ranges = Volatile.Read(ref _rangeSnapshot).Ranges;
@@ -467,7 +640,7 @@ public static unsafe class GuestImageWriteTracker
 
         if (writableStart == ulong.MaxValue)
         {
-            return false;
+            return WriteFaultOutcome.NotTracked;
         }
 
         // Ranges are page-aligned and may overlap (font atlases and other
@@ -517,7 +690,10 @@ public static unsafe class GuestImageWriteTracker
                 (nuint)(writableEnd - writableStart),
                 ProtRead | ProtWrite) != 0)
         {
-            return false;
+            // Leave Armed set: the pages really are still read-only, so the
+            // tracker's belief stays true and a managed writer is told to take
+            // a path that changes the protection itself.
+            return WriteFaultOutcome.UnprotectFailed;
         }
 
         for (var index = 0; index < ranges.Length; index++)
@@ -551,23 +727,31 @@ public static unsafe class GuestImageWriteTracker
             Volatile.Write(ref range.Dirty, 1);
         }
 
-        return true;
+        return WriteFaultOutcome.Writable;
     }
 
     private static void ArmLocked(TrackedRange range, string operation)
     {
         FlushPendingFirstCpuWrite(range);
-        if (Interlocked.Exchange(ref range.Armed, 1) == 1)
+
+        // Cheap early-out so a re-arm of an already-armed range (the common
+        // per-flip case) never pays for the lease. The authoritative test is
+        // repeated under the lease below.
+        if (Volatile.Read(ref range.Armed) == 1)
         {
             return;
         }
 
-        // A managed guest write may already be copying into this range. Arming
-        // it read-only underneath that copy faults it in managed code, which is
-        // fatal. Defer and let the last pin re-arm.
-        if (Volatile.Read(ref _managedWritePins) > 0)
+        // Take the exclusive side of the write lease so the mprotect below
+        // cannot land inside a managed guest write's copy. This waits rather
+        // than checking-and-retracting: retracting a protection after the fact
+        // does nothing for a copy that already faulted, and a managed fault is
+        // an unrecoverable AccessViolationException.
+        if (!TryAcquireWriteLeaseExclusive())
         {
-            Volatile.Write(ref range.Armed, 0);
+            // This thread is itself inside a managed guest write. Protecting
+            // now would fault our own copy, and waiting would deadlock on
+            // ourselves; the outermost EndManagedWrite re-arms instead.
             if (Interlocked.Exchange(ref range.ArmDeferred, 1) == 0)
             {
                 Interlocked.Increment(ref _armDeferredCount);
@@ -576,35 +760,47 @@ public static unsafe class GuestImageWriteTracker
             return;
         }
 
-        // A new publication/rearm starts a new first-write lifetime.
-        Volatile.Write(ref range.FirstCpuWriteSeen, 0);
-        var failed = Mprotect(
-            (nint)range.Start,
-            (nuint)(range.End - range.Start),
-            ProtRead) != 0;
-
-        // Close the window against a pin taken between the check above and the
-        // mprotect: undo the arm so the in-flight copy stays writable. A pin
-        // taken after this re-check disarms the range itself, because
-        // BeginManagedWrite increments before it disarms.
-        if (!failed && Volatile.Read(ref _managedWritePins) > 0)
+        bool failed;
+        try
         {
-            _ = Mprotect(
+            // Claim the range only now. Setting Armed before the lease was
+            // acquired let a managed write that was already inside its own
+            // lease observe the range as armed, unprotect it (a no-op, the page
+            // was still writable) and clear Armed - after which this mprotect
+            // still ran and left a protected page recorded as disarmed. The
+            // next managed write then trusted the flag, skipped the unprotect
+            // and copied into a read-only page.
+            if (Interlocked.Exchange(ref range.Armed, 1) == 1)
+            {
+                return;
+            }
+
+            // A new publication/rearm starts a new first-write lifetime.
+            Volatile.Write(ref range.FirstCpuWriteSeen, 0);
+            failed = Mprotect(
                 (nint)range.Start,
                 (nuint)(range.End - range.Start),
-                ProtRead | ProtWrite);
-            Volatile.Write(ref range.Armed, 0);
-            if (Interlocked.Exchange(ref range.ArmDeferred, 1) == 0)
+                ProtRead) != 0;
+            if (failed)
             {
-                Interlocked.Increment(ref _armDeferredCount);
+                Volatile.Write(ref range.Armed, 0);
             }
-
-            return;
+            else if (Volatile.Read(ref range.Armed) == 0)
+            {
+                // The POSIX fault handler runs in signal context and so cannot
+                // take the lease; it can disarm an overlapping range while this
+                // arm is in flight. Restoring write access keeps the flag and
+                // the hardware in agreement - the direction that only ever adds
+                // access, so it can never fault anyone.
+                _ = Mprotect(
+                    (nint)range.Start,
+                    (nuint)(range.End - range.Start),
+                    ProtRead | ProtWrite);
+            }
         }
-
-        if (failed)
+        finally
         {
-            Volatile.Write(ref range.Armed, 0);
+            ReleaseWriteLeaseExclusive();
         }
 
         if (range.TraceLifetime)
@@ -618,9 +814,21 @@ public static unsafe class GuestImageWriteTracker
     private static void DisarmLocked(TrackedRange range, string operation)
     {
         FlushPendingFirstCpuWrite(range);
+
+        // A pending re-arm dies with the disarm; leaving the flag set would
+        // keep _armDeferredCount positive forever and make every managed write
+        // take the gate on release.
+        if (Interlocked.Exchange(ref range.ArmDeferred, 0) == 1)
+        {
+            Interlocked.Decrement(ref _armDeferredCount);
+        }
+
         var wasArmed = Interlocked.Exchange(ref range.Armed, 0) == 1;
         if (wasArmed)
         {
+            // No lease needed: this only adds write access, which can never
+            // fault an in-flight copy, and it is serialised against ArmLocked
+            // by _gate.
             _ = Mprotect(
                 (nint)range.Start,
                 (nuint)(range.End - range.Start),
