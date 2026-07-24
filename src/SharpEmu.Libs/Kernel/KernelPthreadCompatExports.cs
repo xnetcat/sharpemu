@@ -37,6 +37,8 @@ public static class KernelPthreadCompatExports
         string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_PTHREAD_CONDS"), "1", StringComparison.Ordinal);
     private static readonly HashSet<ulong>? _tracePthreadMutexFilter = ParseTraceAddressFilter(
         Environment.GetEnvironmentVariable("SHARPEMU_LOG_PTHREAD_MUTEX_FILTER"));
+    private static readonly HashSet<ulong>? _tracePthreadCondFilter = ParseTraceAddressFilter(
+        Environment.GetEnvironmentVariable("SHARPEMU_LOG_PTHREAD_COND_FILTER"));
     // Per-title compatibility lever, off unless configured. Gives an *untimed*
     // pthread_cond_wait a periodic recheck so a waiter whose wakeup never
     // arrives re-evaluates its predicate instead of parking forever. This is a
@@ -2199,14 +2201,27 @@ public static class KernelPthreadCompatExports
 
     private static void TracePthreadCond(string operation, ulong condAddress, ulong mutexAddress, PthreadCondState? state, bool timed, int result)
     {
-        if (!_tracePthreadConds)
+        // An address filter makes a targeted cond trace affordable: the unfiltered
+        // stream is ~1.26M lines in 20s and shifts timing enough to change the
+        // failure mode under investigation. A filter match logs even when the
+        // global cond trace flag is off.
+        if (_tracePthreadCondFilter is { Count: > 0 })
+        {
+            if (!_tracePthreadCondFilter.Contains(condAddress))
+            {
+                return;
+            }
+        }
+        else if (!_tracePthreadConds)
         {
             return;
         }
 
+        var currentThreadId = KernelPthreadState.GetCurrentThreadUniqueId();
         Console.Error.WriteLine(
             $"[LOADER][TRACE] pthread_cond_{operation}: cond=0x{condAddress:X16} mutex=0x{mutexAddress:X16} " +
-            $"waiters={(state?.Waiters ?? 0)} epoch=0x{(state?.SignalEpoch ?? 0):X} timed={timed} result=0x{unchecked((uint)result):X8}");
+            $"waiters={(state?.Waiters ?? 0)} epoch=0x{(state?.SignalEpoch ?? 0):X} timed={timed} " +
+            $"tid=0x{currentThreadId:X16} result=0x{unchecked((uint)result):X8}");
     }
 
     private static bool ShouldTracePthread()

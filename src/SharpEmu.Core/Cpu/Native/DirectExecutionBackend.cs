@@ -6700,6 +6700,12 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			ulong rsp = cpuContext[CpuRegister.Rsp];
 			Console.Error.WriteLine($"[LOADER][ERROR] Stall snapshot: rip=0x{cpuContext.Rip:X16} rsp=0x{rsp:X16} rbp=0x{cpuContext[CpuRegister.Rbp]:X16} rax=0x{cpuContext[CpuRegister.Rax]:X16} rbx=0x{cpuContext[CpuRegister.Rbx]:X16} rcx=0x{cpuContext[CpuRegister.Rcx]:X16} rdx=0x{cpuContext[CpuRegister.Rdx]:X16} rsi=0x{cpuContext[CpuRegister.Rsi]:X16} rdi=0x{cpuContext[CpuRegister.Rdi]:X16}");
 			LogStallFrameChain(cpuContext);
+			// At a pthread_cond_(timed)wait stub, rdi is the cond and rsi the
+			// mutex. Dumping the surrounding guest object lets a stalled wait's
+			// owning event structure (e.g. UE FPThreadEvent: mutex + cond +
+			// trigger state) be decoded offline without a debugger attach.
+			LogStallGuestObject(cpuContext, "rdi-obj", cpuContext[CpuRegister.Rdi]);
+			LogStallGuestObject(cpuContext, "rsi-obj", cpuContext[CpuRegister.Rsi]);
 			ulong num = cpuContext.Rip & 0xFFFFFFFFFFFFFFF0uL;
 			for (int i = 0; i < _importEntries.Length; i++)
 			{
@@ -6759,7 +6765,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 						$"rdi=0x{Volatile.Read(ref thread.LastImportRdi):X16} rsi=0x{Volatile.Read(ref thread.LastImportRsi):X16} " +
 						$"rdx=0x{Volatile.Read(ref thread.LastImportRdx):X16} block={thread.BlockReason ?? "none"}{hostContextText}");
 					logged++;
-					if (logged >= 48 && threads.Length > logged)
+					if (logged >= 128 && threads.Length > logged)
 					{
 						Console.Error.WriteLine($"[LOADER][ERROR] Stall guest-thread: ... {threads.Length - logged} more");
 						break;
@@ -6806,6 +6812,38 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		Console.Error.WriteLine(
 			$"[LOADER][ERROR] Stall stack-scan rsp=0x{rsp:X16}: " +
 			$"{(builder.Length == 0 ? "none" : builder.ToString())}");
+	}
+
+	// Dumps the guest memory around a pointer-shaped register so the object a
+	// stalled wait is parked on (cond/mutex and its enclosing event structure)
+	// can be decoded offline. 0x40 bytes before the address are included because
+	// the pointed-at member typically sits inside a larger struct.
+	private void LogStallGuestObject(CpuContext cpuContext, string label, ulong address)
+	{
+		if (address < 0x1000 || address >= 0x0000_8000_0000_0000UL)
+		{
+			return;
+		}
+
+		var start = address >= 0x40 ? address - 0x40 : 0;
+		var builder = new System.Text.StringBuilder(360);
+		for (var offset = 0UL; offset < 0x80; offset += sizeof(ulong))
+		{
+			if (!cpuContext.TryReadUInt64(start + offset, out var value))
+			{
+				return;
+			}
+
+			if (builder.Length != 0)
+			{
+				builder.Append(' ');
+			}
+
+			builder.Append($"{value:X16}");
+		}
+
+		Console.Error.WriteLine(
+			$"[LOADER][ERROR] Stall {label} base=0x{start:X16} (reg=0x{address:X16}): {builder}");
 	}
 
 	private unsafe static bool TryCaptureHostThreadContext(int hostThreadId, out HostThreadContextSnapshot snapshot)
