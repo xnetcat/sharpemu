@@ -4909,20 +4909,33 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					$"rip=0x{interruptedContinuation.Rip:X16}");
 			}
 
-			if (!TryCallGuestFunction(
-					currentContext,
-					pending.Handler,
-					unchecked((ulong)pending.ExceptionType),
-					exceptionContextAddress,
-					pending.ExceptionStackBase + callbackStackOffset,
-					callbackStackSize,
-					$"kernel exception 0x{pending.ExceptionType:X2} safe point",
-					out var callbackError))
+			// The outer HLE import may already have staged a thread block. Run the
+			// exception handler with clean staging slots so its nested imports
+			// cannot consume that block and bind it to a different return frame:
+			// the interrupted thread would then never park on the wait it asked
+			// for, and its wake would be delivered to a frame that has returned.
+			var interruptedStagedState = GuestThreadExecution.SaveAndResetStagedState();
+			try
 			{
-				Console.Error.WriteLine(
-					$"[LOADER][ERROR] Guest exception safe-point delivery failed: " +
-					$"target=0x{threadHandle:X16} type=0x{pending.ExceptionType:X2} " +
-					$"error={callbackError ?? "unknown"}");
+				if (!TryCallGuestFunction(
+						currentContext,
+						pending.Handler,
+						unchecked((ulong)pending.ExceptionType),
+						exceptionContextAddress,
+						pending.ExceptionStackBase + callbackStackOffset,
+						callbackStackSize,
+						$"kernel exception 0x{pending.ExceptionType:X2} safe point",
+						out var callbackError))
+				{
+					Console.Error.WriteLine(
+						$"[LOADER][ERROR] Guest exception safe-point delivery failed: " +
+						$"target=0x{threadHandle:X16} type=0x{pending.ExceptionType:X2} " +
+						$"error={callbackError ?? "unknown"}");
+				}
+			}
+			finally
+			{
+				GuestThreadExecution.RestoreStagedState(interruptedStagedState);
 			}
 		}
 		finally

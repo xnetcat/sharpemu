@@ -150,6 +150,24 @@ public readonly record struct GuestCpuContinuation(
     uint Mxcsr,
     bool RestoreFullFpuState);
 
+/// <summary>
+/// Snapshot of import-boundary actions staged by the current guest thread.
+/// Nested guest execution must use a separate staging episode so it cannot
+/// consume or overwrite actions belonging to the interrupted import.
+/// </summary>
+public readonly record struct GuestThreadStagedState(
+    string? BlockReason,
+    bool BlockContinuationValid,
+    GuestCpuContinuation BlockContinuation,
+    string? BlockWakeKey,
+    IGuestThreadBlockWaiter? BlockWaiter,
+    long BlockDeadlineTimestamp,
+    bool EntryExit,
+    ulong EntryExitValue,
+    string? EntryExitReason,
+    bool ContextTransfer,
+    GuestCpuContinuation ContextTransferTarget);
+
 public static class GuestThreadExecution
 {
     private sealed class DelegateGuestThreadBlockWaiter : IGuestThreadBlockWaiter
@@ -548,6 +566,58 @@ public static class GuestThreadExecution
         _currentImportReturnRip = previous.ReturnRip;
         _currentImportResumeRsp = previous.ResumeRsp;
         _currentImportReturnSlotAddress = previous.ReturnSlotAddress;
+    }
+
+    /// <summary>
+    /// Saves and clears actions staged by the current import. A guest exception
+    /// handler can issue nested HLE calls before the interrupted import consumes
+    /// its staged block; without isolation, the nested calls can consume that
+    /// block and resume it against the handler's import boundary — the
+    /// interrupted thread then never parks on the wait it asked for, and the
+    /// wake it was owed goes to a frame that has already returned.
+    /// </summary>
+    public static GuestThreadStagedState SaveAndResetStagedState()
+    {
+        var saved = new GuestThreadStagedState(
+            _pendingBlockReason,
+            _pendingBlockContinuationValid,
+            _pendingBlockContinuation,
+            _pendingBlockWakeKey,
+            _pendingBlockWaiter,
+            _pendingBlockDeadlineTimestamp,
+            _pendingEntryExit,
+            _pendingEntryExitValue,
+            _pendingEntryExitReason,
+            _pendingContextTransfer,
+            _pendingContextTransferTarget);
+        _pendingBlockReason = null;
+        _pendingBlockContinuationValid = false;
+        _pendingBlockContinuation = default;
+        _pendingBlockWakeKey = null;
+        _pendingBlockWaiter = null;
+        _pendingBlockDeadlineTimestamp = 0;
+        _pendingEntryExit = false;
+        _pendingEntryExitValue = 0;
+        _pendingEntryExitReason = null;
+        _pendingContextTransfer = false;
+        _pendingContextTransferTarget = default;
+        return saved;
+    }
+
+    /// <summary>Restores a staging episode saved by <see cref="SaveAndResetStagedState"/>.</summary>
+    public static void RestoreStagedState(GuestThreadStagedState state)
+    {
+        _pendingBlockReason = state.BlockReason;
+        _pendingBlockContinuationValid = state.BlockContinuationValid;
+        _pendingBlockContinuation = state.BlockContinuation;
+        _pendingBlockWakeKey = state.BlockWakeKey;
+        _pendingBlockWaiter = state.BlockWaiter;
+        _pendingBlockDeadlineTimestamp = state.BlockDeadlineTimestamp;
+        _pendingEntryExit = state.EntryExit;
+        _pendingEntryExitValue = state.EntryExitValue;
+        _pendingEntryExitReason = state.EntryExitReason;
+        _pendingContextTransfer = state.ContextTransfer;
+        _pendingContextTransferTarget = state.ContextTransferTarget;
     }
 
     public static bool TryGetCurrentImportCallFrame(out GuestImportCallFrame frame)
