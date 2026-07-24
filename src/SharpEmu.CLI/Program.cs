@@ -273,6 +273,11 @@ internal static partial class Program
             SetEnvironmentDefault("SHARPEMU_DISABLE_IMPORT_LOOP_GUARD", "1");
 
             // Unreal's own thread heartbeat trips under emulation timing.
+            // scePthreadMutexLock returned EDEADLK 671 times in one session: the
+            // guest-tracked self-lock heuristic misreads this title's adaptive-mutex
+            // wrappers, which take one logical acquisition through two lock calls.
+            SetEnvironmentDefault("SHARPEMU_PTHREAD_ADAPTIVE_SELF_LOCK_DEADLOCK", "0");
+
             SetEnvironmentDefault("SHARPEMU_GUEST_ARGS", "-nothreadtimeout");
 
             Console.Error.WriteLine(

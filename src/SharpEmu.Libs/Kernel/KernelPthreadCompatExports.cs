@@ -1908,7 +1908,17 @@ public static class KernelPthreadCompatExports
         return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY;
     }
 
+    // Some PS5 runtime wrappers layer an adaptive lock over scePthreadMutexLock
+    // for a single logical acquisition and then unlock once. Reporting EDEADLK
+    // for that duplicate breaks the caller. Titles that need the permissive
+    // reading set this to 0; the default keeps the stricter self-deadlock report.
+    private static readonly bool _adaptiveSelfLockDeadlock = !string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_PTHREAD_ADAPTIVE_SELF_LOCK_DEADLOCK"),
+        "0",
+        StringComparison.Ordinal);
+
     private static bool IsGuestTrackedSelfLock(CpuContext ctx, ulong mutexAddress, ulong currentThreadId) =>
+        _adaptiveSelfLockDeadlock &&
         KernelMemoryCompatExports.TryReadUInt64Compat(ctx, mutexAddress + 8, out var guestOwner) &&
         guestOwner == currentThreadId;
 
