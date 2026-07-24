@@ -42,6 +42,11 @@ public static class AvPlayerExports
         public double FramesPerSecond { get; set; } = 30.0;
         public ulong DurationMilliseconds { get; set; }
         public bool HasAudio { get; set; }
+        // The PS5 player differs from the PS4 one in ways that outlive a single
+        // export call (it holds the last frame while paused, completes on its
+        // own media clock, and uses a 256-byte NV12 pitch), so the creating
+        // generation is remembered here instead of being re-derived per call.
+        public bool IsGen5 { get; init; }
         public bool Started { get; set; }
         public bool Paused { get; set; }
         public bool Looping { get; set; }
@@ -144,6 +149,7 @@ public static class AvPlayerExports
             Players.Add(handle, new PlayerState
             {
                 Handle = handle,
+                IsGen5 = IsGen5Target(ctx.TargetGeneration),
                 AutoStart = TryReadByte(ctx, initDataAddress + autoStartOffset, out var autoStart) && autoStart != 0,
                 AllocatorObject = TryReadUInt64(ctx, initDataAddress, out var allocatorObject) ? allocatorObject : 0,
                 AllocateTextureCallback = TryReadUInt64(ctx, initDataAddress + 24, out var allocateTexture) ? allocateTexture : 0,
@@ -199,6 +205,7 @@ public static class AvPlayerExports
             Players.Add(handle, new PlayerState
             {
                 Handle = handle,
+                IsGen5 = IsGen5Target(ctx.TargetGeneration),
                 AutoStart = TryReadByte(ctx, initDataAddress + autoStartOffset, out var autoStart) && autoStart != 0,
                 AllocatorObject = TryReadUInt64(ctx, initDataAddress + 8, out var allocatorObject) ? allocatorObject : 0,
                 AllocateTextureCallback = TryReadUInt64(ctx, initDataAddress + 32, out var allocateTexture) ? allocateTexture : 0,
@@ -632,7 +639,8 @@ public static class AvPlayerExports
         int height,
         ulong durationMilliseconds,
         bool hasAudio = false,
-        double framesPerSecond = 30.0)
+        double framesPerSecond = 30.0,
+        bool isGen5 = true)
     {
         PlayerState? previous;
         lock (StateGate)
@@ -641,6 +649,7 @@ public static class AvPlayerExports
             Players[handle] = new PlayerState
             {
                 Handle = handle,
+                IsGen5 = isGen5,
                 Width = width,
                 Height = height,
                 DurationMilliseconds = durationMilliseconds,
@@ -776,8 +785,13 @@ public static class AvPlayerExports
 
             if (player.Paused)
             {
+                // The PS5 player keeps presenting the paused frame. Gen4 titles
+                // kept the historical "no data while paused" answer: holding the
+                // frame for them is unvalidated behaviour on a path they already
+                // work with.
                 return SetReturn(
                     ctx,
+                    player.IsGen5 &&
                     player.LastGuestBuffer != 0 &&
                     WriteHeldVideoFrameInfo(ctx, player, infoAddress, extended)
                         ? 1
@@ -838,7 +852,12 @@ public static class AvPlayerExports
 
     private static bool TryFinishPlaybackByClock(PlayerState player)
     {
-        if (!player.Started ||
+        // Clock-driven completion is a PS5 behaviour. Gen4 titles keep ending
+        // playback only when a frame poll drains the stream, which is how they
+        // already run: ending a movie from a probed duration could truncate one
+        // whose container duration disagrees with its real frame count.
+        if (!player.IsGen5 ||
+            !player.Started ||
             player.Paused ||
             player.Looping ||
             player.EndOfStream ||
@@ -892,12 +911,19 @@ public static class AvPlayerExports
 
         player.EndOfStream = true;
         player.PlaybackClock.Stop();
-        player.PendingEvents.Enqueue(1); // StateStop
+        // Gen4 titles reached the end of a stream without ever being sent a
+        // state event and are known to work that way; only the PS5 player
+        // announces the completion it drove itself.
+        if (player.IsGen5)
+        {
+            player.PendingEvents.Enqueue(1); // StateStop
+            Trace($"event queued handle=0x{player.Handle:X16} id=1");
+        }
+
         Trace(
             $"completed handle=0x{player.Handle:X16} " +
             $"time_ms={player.PlaybackClock.ElapsedMilliseconds} " +
             $"last_video_ts={player.LastVideoTimestamp}");
-        Trace($"event queued handle=0x{player.Handle:X16} id=1");
     }
 
     private static bool EnsureDecoder(PlayerState player)
@@ -1082,12 +1108,7 @@ public static class AvPlayerExports
             return false;
         }
 
-        var framePitch = extended
-            ? AlignUp(player.Width, 256)
-            : AlignUp(player.Width, 16);
-        var frameHeight = extended
-            ? player.Height
-            : AlignUp(player.Height, 16);
+        var (framePitch, frameHeight) = GetFrameGeometry(player, extended);
         var bufferStride = checked(framePitch * frameHeight * 3 / 2);
         if (player.GuestBuffers[0] == 0)
         {
@@ -1148,18 +1169,27 @@ public static class AvPlayerExports
         return ctx.Memory.TryWrite(infoAddress, info);
     }
 
+    /// <summary>
+    /// NV12 geometry of the buffer handed to the guest. The PS5 extended ABI
+    /// uses a 256-byte-aligned row over the source height; everything else
+    /// (including PS4 sceAvPlayerGetVideoDataEx, which titles already run
+    /// against) stays on the historical 16-byte grid.
+    /// </summary>
+    private static (int Pitch, int Height) GetFrameGeometry(PlayerState player, bool extended)
+    {
+        var gen5Extended = extended && player.IsGen5;
+        return (
+            gen5Extended ? AlignUp(player.Width, 256) : AlignUp(player.Width, 16),
+            gen5Extended ? player.Height : AlignUp(player.Height, 16));
+    }
+
     private static bool WriteHeldVideoFrameInfo(
         CpuContext ctx,
         PlayerState player,
         ulong infoAddress,
         bool extended)
     {
-        var framePitch = extended
-            ? AlignUp(player.Width, 256)
-            : AlignUp(player.Width, 16);
-        var frameHeight = extended
-            ? player.Height
-            : AlignUp(player.Height, 16);
+        var (framePitch, frameHeight) = GetFrameGeometry(player, extended);
         Span<byte> info = extended
             ? stackalloc byte[FrameInfoExSize]
             : stackalloc byte[FrameInfoSize];
@@ -1711,6 +1741,9 @@ public static class AvPlayerExports
         resolved = Path.GetFullPath(current);
         return true;
     }
+
+    internal static bool IsGen5Target(Generation generation) =>
+        (generation & Generation.Gen5) != 0;
 
     internal static ulong GetAutoStartOffset(Generation generation, bool extended) =>
         (generation & Generation.Gen5) != 0

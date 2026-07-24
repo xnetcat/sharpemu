@@ -24,6 +24,17 @@ public sealed class AvPlayerAbiTests
     }
 
     [Theory]
+    [InlineData(Generation.Gen4, false)]
+    [InlineData(Generation.Gen5, true)]
+    [InlineData(Generation.Gen4 | Generation.Gen5, true)]
+    public void Gen5Target_SelectsThePs5PlayerBehaviour(Generation generation, bool expected)
+    {
+        // Gates the paused-frame hold, the media-clock completion and the
+        // 256-byte NV12 pitch, none of which are validated on Gen4 titles.
+        Assert.Equal(expected, AvPlayerExports.IsGen5Target(generation));
+    }
+
+    [Theory]
     [InlineData(Generation.Gen4, 40)]
     [InlineData(Generation.Gen5, 32)]
     public void LegacyStreamInfoSize_MatchesGeneration(Generation generation, int expected)
