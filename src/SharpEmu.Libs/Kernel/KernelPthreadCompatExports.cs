@@ -37,6 +37,15 @@ public static class KernelPthreadCompatExports
         string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_PTHREAD_CONDS"), "1", StringComparison.Ordinal);
     private static readonly HashSet<ulong>? _tracePthreadMutexFilter = ParseTraceAddressFilter(
         Environment.GetEnvironmentVariable("SHARPEMU_LOG_PTHREAD_MUTEX_FILTER"));
+    // Per-title compatibility lever, off unless configured. Gives an *untimed*
+    // pthread_cond_wait a periodic recheck so a waiter whose wakeup never
+    // arrives re-evaluates its predicate instead of parking forever. This is a
+    // workaround for an unidentified missing wake, NOT a fix — see
+    // ConfigureKnownTitleCompatibility in Program.cs.
+    private static readonly TimeSpan? _condCompatibilityRecheck = ParsePositiveMilliseconds(
+        Environment.GetEnvironmentVariable("SHARPEMU_PTHREAD_COND_RECHECK_MS"));
+    private static readonly HashSet<ulong>? _condCompatibilityRecheckFilter = ParseTraceAddressFilter(
+        Environment.GetEnvironmentVariable("SHARPEMU_PTHREAD_COND_RECHECK_FILTER"));
     private static long _nextSynchronizationWaiterId;
 
     private sealed class PthreadMutexState
@@ -140,6 +149,7 @@ public static class KernelPthreadCompatExports
         public required PthreadMutexState MutexState { get; init; }
         public required string WakeKey { get; init; }
         public required bool Cooperative { get; init; }
+        public bool CompatibilityRecheck { get; init; }
         public bool PosixErrors { get; init; }
         public LinkedListNode<PthreadCondWaiter>? Node { get; set; }
         public PthreadMutexWaiter? MutexWaiter { get; set; }
@@ -1506,7 +1516,7 @@ public static class KernelPthreadCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
-        if (!TryResolveCondState(ctx, condAddress, createIfZero: true, out _, out var state))
+        if (!TryResolveCondState(ctx, condAddress, createIfZero: true, out var resolvedCondAddress, out var state))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
         }
@@ -1543,12 +1553,15 @@ public static class KernelPthreadCompatExports
 
         var cooperative = GuestThreadExecution.IsGuestThread &&
             GuestThreadExecution.TryGetCurrentImportCallFrame(out _);
+        var compatibilityRecheck = !timed &&
+            ShouldCompatibilityRecheck(condAddress, resolvedCondAddress);
         var waiter = new PthreadCondWaiter
         {
             ThreadId = currentThreadId,
             MutexState = mutexState,
             Cooperative = cooperative,
             PosixErrors = posixErrors,
+            CompatibilityRecheck = compatibilityRecheck,
             WakeKey = cooperative
                 ? $"pthread_cond_waiter:{Interlocked.Increment(ref _nextSynchronizationWaiterId)}"
                 : string.Empty,
@@ -1568,16 +1581,17 @@ public static class KernelPthreadCompatExports
                 return unlockResult;
             }
 
-            if (cooperative && timed)
+            if (cooperative && (timed || compatibilityRecheck))
             {
                 waiter.TimeoutTimer = new Timer(
                     static callbackState =>
                     {
-                        var (condState, condWaiter) = ((PthreadCondState, PthreadCondWaiter))callbackState!;
-                        CompleteCondWaiter(condState, condWaiter, timedOut: true);
+                        var (condState, condWaiter, isTimed) =
+                            ((PthreadCondState, PthreadCondWaiter, bool))callbackState!;
+                        CompleteCondWaiter(condState, condWaiter, timedOut: isTimed);
                     },
-                    (state, waiter),
-                    GetCondWaitTimeout(timeoutUsec),
+                    (state, waiter, timed),
+                    timed ? GetCondWaitTimeout(timeoutUsec) : _condCompatibilityRecheck!.Value,
                     Timeout.InfiniteTimeSpan);
             }
         }
@@ -1606,7 +1620,17 @@ public static class KernelPthreadCompatExports
             {
                 if (!timed)
                 {
-                    Monitor.Wait(state.SyncRoot);
+                    if (!waiter.CompatibilityRecheck)
+                    {
+                        Monitor.Wait(state.SyncRoot);
+                        continue;
+                    }
+
+                    if (!Monitor.Wait(state.SyncRoot, _condCompatibilityRecheck.GetValueOrDefault()))
+                    {
+                        CompleteCondWaiterLocked(state, waiter, timedOut: false);
+                    }
+
                     continue;
                 }
 
@@ -2191,9 +2215,28 @@ public static class KernelPthreadCompatExports
             _tracePthreadMutexFilter.Contains(resolvedAddress);
     }
 
+    private static TimeSpan? ParsePositiveMilliseconds(string? value) =>
+        int.TryParse(value, out var milliseconds) && milliseconds > 0
+            ? TimeSpan.FromMilliseconds(milliseconds)
+            : null;
+
+    private static bool ShouldCompatibilityRecheck(ulong condAddress, ulong resolvedCondAddress) =>
+        _condCompatibilityRecheck.HasValue &&
+        (_condCompatibilityRecheckFilter is null ||
+         _condCompatibilityRecheckFilter.Contains(condAddress) ||
+         _condCompatibilityRecheckFilter.Contains(resolvedCondAddress));
+
     private static HashSet<ulong>? ParseTraceAddressFilter(string? filter)
     {
         if (string.IsNullOrWhiteSpace(filter))
+        {
+            return null;
+        }
+
+        // '*'/'all' means every address: a null set is the match-everything form.
+        var normalizedFilter = filter.Trim();
+        if (normalizedFilter is "*" ||
+            normalizedFilter.Equals("all", StringComparison.OrdinalIgnoreCase))
         {
             return null;
         }

@@ -235,6 +235,66 @@ internal static partial class Program
         }
     }
 
+    /// <summary>
+    /// Applies per-title compatibility defaults for titles known to need them.
+    /// Every value here is a WORKAROUND, not a fix: it papers over a defect that
+    /// has not been root-caused. Each is a default only — an explicit environment
+    /// variable always wins, so a run can opt out to reproduce the raw behaviour.
+    /// </summary>
+    private static void ConfigureKnownTitleCompatibility(string ebootPath)
+    {
+        var installRoot = Path.GetDirectoryName(ebootPath) ?? string.Empty;
+        var paramPath = Path.Combine(installRoot, "sce_sys", "param.json");
+        try
+        {
+            if (!File.Exists(paramPath) ||
+                !File.ReadAllText(paramPath).Contains("PPSA10112", StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            // SILENT HILL: The Short Message (PPSA10112).
+            //
+            // The title parks its engine thread graph after the content-warning
+            // screen: 47 of 48 guest threads stop making import progress and the
+            // terminal waiter has never been identified (see the project handoff).
+            // Giving every untimed pthread_cond_wait a 10ms recheck lets a waiter
+            // whose wakeup is missing re-evaluate its predicate and continue.
+            // This masks the defect; it does not explain it.
+            SetEnvironmentDefault("SHARPEMU_PTHREAD_COND_RECHECK_MS", "10");
+            SetEnvironmentDefault("SHARPEMU_PTHREAD_COND_RECHECK_FILTER", "*");
+
+            // Deliver AGC completion events to every registered graphics event,
+            // not just the one registered with ident 0.
+            SetEnvironmentDefault("SHARPEMU_AGC_SUBMIT_COMPLETION_EVENT", "1");
+
+            // The recheck keeps the guest live but slow; the import-loop guard
+            // reads that as a wedged loop and force-exits an otherwise healthy run.
+            SetEnvironmentDefault("SHARPEMU_DISABLE_IMPORT_LOOP_GUARD", "1");
+
+            // Unreal's own thread heartbeat trips under emulation timing.
+            SetEnvironmentDefault("SHARPEMU_GUEST_ARGS", "-nothreadtimeout");
+
+            Console.Error.WriteLine(
+                "[LOADER][WARN] PPSA10112 compatibility defaults applied (WORKAROUNDS, " +
+                "not fixes): pthread cond recheck, AGC completion events, import-loop " +
+                "guard off, -nothreadtimeout. Set the variables explicitly to override.");
+        }
+        catch (IOException exception)
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][WARN] Could not inspect title metadata: {exception.Message}");
+        }
+    }
+
+    private static void SetEnvironmentDefault(string name, string value)
+    {
+        if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable(name)))
+        {
+            Environment.SetEnvironmentVariable(name, value);
+        }
+    }
+
     private static int RunEmulator(string[] args, bool isMitigatedChild)
     {
         Console.Error.WriteLine($"[DEBUG] SharpEmu starting with {args.Length} args");
@@ -278,6 +338,8 @@ internal static partial class Program
             Log.Error($"EBOOT file was not found: {ebootPath}");
             return 2;
         }
+
+        ConfigureKnownTitleCompatibility(ebootPath);
 
         if (!TryGetDebugServerOptions(args, out var debugServerEnabled, out var debugServerOptions, out var debugServerError))
         {
