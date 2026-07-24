@@ -4204,6 +4204,7 @@ internal static unsafe class VulkanVideoPresenter
                 ShaderStorageImageExtendedFormats = supportedFeatures.ShaderStorageImageExtendedFormats,
                 ShaderStorageImageReadWithoutFormat = supportedFeatures.ShaderStorageImageReadWithoutFormat,
                 ShaderStorageImageWriteWithoutFormat = supportedFeatures.ShaderStorageImageWriteWithoutFormat,
+                TextureCompressionBC = supportedFeatures.TextureCompressionBC,
                 RobustBufferAccess = supportedFeatures.RobustBufferAccess,
             };
 
@@ -4241,6 +4242,13 @@ internal static unsafe class VulkanVideoPresenter
                 Console.Error.WriteLine(
                     "[LOADER][WARN] GPU does not support shaderStorageImage(Read|Write)WithoutFormat " +
                     "translated shaders using unformatted storage image load/store will fail.");
+            }
+
+            if (!supportedFeatures.TextureCompressionBC)
+            {
+                Console.Error.WriteLine(
+                    "[LOADER][WARN] GPU does not support textureCompressionBC " +
+                    "guest BC1-BC7 textures cannot be sampled directly.");
             }
 
             var maintenance8Features = new PhysicalDeviceMaintenance8FeaturesKHR
