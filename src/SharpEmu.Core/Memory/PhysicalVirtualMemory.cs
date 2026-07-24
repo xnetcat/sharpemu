@@ -1066,27 +1066,40 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         //
         // Unprotecting alone is racy: the tracker arms ranges from GPU threads
         // under its own lock, so it can re-protect between the unprotect and
-        // the copy below. Hold the pin across the whole write instead, which
-        // makes an overlapping arm defer until the copy has drained.
-        var pinnedManagedWrite = GuestImageWriteTracker.BeginManagedWrite(
+        // the copy below. Hold the tracker's write lease across the whole
+        // write instead, which blocks an overlapping arm until the copy has
+        // drained. The lease is taken before this object's gate and released
+        // after it, never the other way round (see the lock order documented
+        // on GuestImageWriteTracker).
+        var leasedManagedWrite = GuestImageWriteTracker.BeginManagedWrite(
             virtualAddress,
-            (ulong)source.Length);
+            (ulong)source.Length,
+            out var trackedPagesWritable);
         try
         {
-            return TryWritePinned(virtualAddress, source);
+            return TryWriteLeased(virtualAddress, source, trackedPagesWritable);
         }
         finally
         {
-            if (pinnedManagedWrite)
+            if (leasedManagedWrite)
             {
                 GuestImageWriteTracker.EndManagedWrite();
             }
         }
     }
 
-    private bool TryWritePinned(ulong virtualAddress, ReadOnlySpan<byte> source)
+    private bool TryWriteLeased(
+        ulong virtualAddress,
+        ReadOnlySpan<byte> source,
+        bool trackedPagesWritable)
     {
-        var requiresExclusiveAccess = false;
+        // The tracker holds the lease but could not restore write access. The
+        // fast path below would copy straight into a read-only page, which is a
+        // fatal AccessViolation in managed code — and dropping the write is no
+        // better, because a dropped GPU release-label write strands every
+        // waiter on that label. Take the exclusive path, which changes the
+        // protection itself before copying.
+        var requiresExclusiveAccess = !trackedPagesWritable;
         _gate.EnterReadLock();
         try
         {
@@ -1112,7 +1125,8 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                     }
                 }
 
-                if (!CanWriteWithoutProtectionChange((ulong)destPtr, (ulong)source.Length, region))
+                if (requiresExclusiveAccess ||
+                    !CanWriteWithoutProtectionChange((ulong)destPtr, (ulong)source.Length, region))
                 {
                     requiresExclusiveAccess = true;
                 }
@@ -1168,14 +1182,28 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
             return false;
         }
 
-        // Match TryWrite's managed-write pin before touching an identity-mapped
-        // guest page protected by the image tracker, and hold it across the
-        // copy so a concurrent arm cannot re-protect underneath it.
-        var pinnedManagedWrite = GuestImageWriteTracker.BeginManagedWrite(destinationAddress, length);
+        // Match TryWrite's managed-write lease before touching an
+        // identity-mapped guest page protected by the image tracker, and hold
+        // it across the copy so a concurrent arm cannot re-protect underneath
+        // it. Taken before this object's gate and released after it, matching
+        // the lock order documented on GuestImageWriteTracker.
+        var leasedManagedWrite = GuestImageWriteTracker.BeginManagedWrite(
+            destinationAddress,
+            length,
+            out var trackedPagesWritable);
 
         _gate.EnterReadLock();
         try
         {
+            if (!trackedPagesWritable)
+            {
+                // The destination is still write-protected by the tracker.
+                // Copying anyway would be a fatal AccessViolation; there is no
+                // protection-changing fallback on this path, so report the
+                // failure rather than take the process down.
+                return false;
+            }
+
             var sourceRegion = FindRegion(sourceAddress, length);
             var destinationRegion = FindRegion(destinationAddress, length);
             if (sourceRegion is null || destinationRegion is null ||
@@ -1209,7 +1237,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         finally
         {
             _gate.ExitReadLock();
-            if (pinnedManagedWrite)
+            if (leasedManagedWrite)
             {
                 GuestImageWriteTracker.EndManagedWrite();
             }
