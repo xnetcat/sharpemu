@@ -77,15 +77,17 @@ public sealed class AvPlayerAbiTests
             extended: true,
             bufferAddress: 0x1234_5000,
             timestamp: 2_903,
-            width: 378,
+            width: 512,
+            visibleWidth: 378,
             height: 150,
             pitch: 512,
             framesPerSecond: 29.97);
 
         Assert.Equal(0x1234_5000UL, BinaryPrimitives.ReadUInt64LittleEndian(info));
         Assert.Equal(2_903UL, BinaryPrimitives.ReadUInt64LittleEndian(info.AsSpan(16)));
-        Assert.Equal(378U, BinaryPrimitives.ReadUInt32LittleEndian(info.AsSpan(24)));
+        Assert.Equal(512U, BinaryPrimitives.ReadUInt32LittleEndian(info.AsSpan(24)));
         Assert.Equal(150U, BinaryPrimitives.ReadUInt32LittleEndian(info.AsSpan(28)));
+        Assert.Equal(134U, BinaryPrimitives.ReadUInt32LittleEndian(info.AsSpan(48)));
         Assert.Equal(512U, BinaryPrimitives.ReadUInt32LittleEndian(info.AsSpan(60)));
         Assert.Equal(8, info[64]);
         Assert.Equal(8, info[65]);
