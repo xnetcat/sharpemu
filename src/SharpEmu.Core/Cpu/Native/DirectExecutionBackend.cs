@@ -6792,12 +6792,22 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 						hostContextText = $" host_tid={hostThreadId} host_ctx=unavailable";
 					}
 
+					var syncText = string.Empty;
+					if (SharpEmu.HLE.GuestThreadExecution.GuestSyncObjectDescriber is { } describeSyncObject)
+					{
+						var described = describeSyncObject(Volatile.Read(ref thread.LastImportRdi));
+						if (described is not null)
+						{
+							syncText = $" sync[{described}]";
+						}
+					}
+
 					Console.Error.WriteLine(
 						$"[LOADER][ERROR] Stall guest-thread: handle=0x{thread.ThreadHandle:X16} name='{thread.Name}' " +
 						$"state={thread.State} imports={Interlocked.Read(ref thread.ImportCount)} " +
 						$"nid={Volatile.Read(ref thread.LastImportNid) ?? "none"} ret=0x{Volatile.Read(ref thread.LastReturnRip):X16} " +
 						$"rdi=0x{Volatile.Read(ref thread.LastImportRdi):X16} rsi=0x{Volatile.Read(ref thread.LastImportRsi):X16} " +
-						$"rdx=0x{Volatile.Read(ref thread.LastImportRdx):X16} block={thread.BlockReason ?? "none"}{hostContextText}");
+						$"rdx=0x{Volatile.Read(ref thread.LastImportRdx):X16} block={thread.BlockReason ?? "none"}{syncText}{hostContextText}");
 					logged++;
 					if (logged >= 128 && threads.Length > logged)
 					{

@@ -170,6 +170,13 @@ public readonly record struct GuestThreadStagedState(
 
 public static class GuestThreadExecution
 {
+    /// <summary>
+    /// Set by the pthread HLE layer so backend stall snapshots can name the
+    /// owner of the synchronization object a blocked thread is parked on.
+    /// Returns null when the address is not a known sync object.
+    /// </summary>
+    public static Func<ulong, string?>? GuestSyncObjectDescriber;
+
     private sealed class DelegateGuestThreadBlockWaiter : IGuestThreadBlockWaiter
     {
         private readonly Func<int> _resume;

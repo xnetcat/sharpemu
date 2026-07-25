@@ -166,6 +166,21 @@ public static class KernelPthreadCompatExports
     {
         RunSynchronizationSelfChecks();
         GuestThreadExecution.GuestThreadAbandoned += AbandonMutexesOwnedByThread;
+        GuestThreadExecution.GuestSyncObjectDescriber = DescribeSyncObject;
+    }
+
+    // Lets the stall watchdog name the owner of the mutex a blocked thread is
+    // parked on. Diagnostic-only; a miss returns null so unrelated rdi values
+    // stay silent.
+    private static string? DescribeSyncObject(ulong address)
+    {
+        if (_mutexStates.TryGetValue(address, out var mutexState))
+        {
+            return $"mutex owner=0x{mutexState.OwnerThreadId:X} rec={mutexState.RecursionCount} " +
+                $"waiters={mutexState.QueuedWaiterCount}";
+        }
+
+        return null;
     }
 
     /// <summary>
