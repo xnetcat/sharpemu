@@ -143,7 +143,78 @@ public sealed unsafe partial class DirectExecutionBackend
 
 		Console.Error.WriteLine(
 			$"[LOADER][ERROR] posix-signal#{traceIndex}: guest stack return candidates:{candidates}");
+
+		DescribeFaultingFrame(contextRecord, traceIndex);
 		Console.Error.Flush();
+	}
+
+	// Guest allocations sit here; stacks are below it and the modules above it,
+	// so a value in this window is worth dereferencing and one outside it is not.
+	private const ulong GuestHeapWindowStart = 0x70_0000_0000UL;
+	private const ulong GuestHeapWindowEnd = 0x80_0000_0000UL;
+
+	/// <summary>
+	/// The callee-saved block below the frame pointer, plus one level of
+	/// dereference for anything in it that looks like a heap object. A crash
+	/// inside a callee has already overwritten the registers that named the
+	/// caller's data, but the callee pushed the caller's copies on entry, so
+	/// this is where an argument that arrived wrong can still be recovered.
+	/// Any dereference here can itself fault; the handler's reentry guard turns
+	/// that into a clean termination rather than a loop.
+	/// </summary>
+	private static unsafe void DescribeFaultingFrame(byte* contextRecord, int traceIndex)
+	{
+		ulong framePointer = ReadCtxU64(contextRecord, CTX_RAX + 40);
+		if (framePointer == 0 || (framePointer & 7) != 0)
+		{
+			return;
+		}
+
+		var saved = new System.Text.StringBuilder();
+		var derefs = new System.Text.StringBuilder();
+		var derefCount = 0;
+		for (var slot = 0; slot <= 7; slot++)
+		{
+			var address = framePointer - (ulong)slot * 8;
+			ulong value = *(ulong*)address;
+			saved.Append($" [rbp-0x{slot * 8:X2}]=0x{value:X}");
+			if (derefCount >= 4 ||
+				value < GuestHeapWindowStart ||
+				value >= GuestHeapWindowEnd ||
+				(value & 7) != 0)
+			{
+				continue;
+			}
+
+			derefCount++;
+			// A container's first two words are the interesting ones: for a
+			// UE TArray they are the element storage and the packed count/
+			// capacity pair.
+			ulong storage = *(ulong*)value;
+			derefs.Append($" 0x{value:X}->[0x{storage:X},0x{*(ulong*)(value + 8):X}]");
+			if (storage < GuestHeapWindowStart ||
+				storage >= GuestHeapWindowEnd ||
+				(storage & 7) != 0)
+			{
+				continue;
+			}
+
+			// One more hop into the element storage. Whether only the first
+			// element is wrong or all of them are separates a container whose
+			// elements were never written from one that was corrupted after
+			// being filled, and nothing above this level can tell them apart.
+			derefs.Append(
+				$"{{0x{*(ulong*)storage:X},0x{*(ulong*)(storage + 8):X}," +
+				$"0x{*(ulong*)(storage + 16):X},0x{*(ulong*)(storage + 24):X}}}");
+		}
+
+		Console.Error.WriteLine(
+			$"[LOADER][ERROR] posix-signal#{traceIndex}: caller-saved frame:{saved}");
+		if (derefCount > 0)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][ERROR] posix-signal#{traceIndex}: frame derefs:{derefs}");
+		}
 	}
 
 	// True while the current thread's in-flight POSIX fault carries the real
