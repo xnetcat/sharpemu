@@ -568,6 +568,7 @@ public static class KernelPthreadCompatExports
 
         var now = DateTimeOffset.UtcNow;
         var deltaSeconds = seconds - now.ToUnixTimeSeconds();
+        TraceCondDeadline(seconds, nanoseconds, deltaSeconds);
         var nowNanoseconds = (now.Ticks % TimeSpan.TicksPerSecond) * 100L;
         uint timeoutUsec;
         if (deltaSeconds < 0)
@@ -2050,6 +2051,24 @@ public static class KernelPthreadCompatExports
         {
             _ = GuestThreadExecution.Scheduler?.WakeBlockedThreads(waiter.WakeKey, 1);
         }
+    }
+
+    private static long _condDeadlineTraceCount;
+
+    // A guest that builds its absolute deadline from a different clock than the
+    // one this conversion compares against would see every timed wait expire
+    // instantly and spin. Logs the first few deadlines so the guest's clock base
+    // is identifiable from a normal run.
+    private static void TraceCondDeadline(long seconds, long nanoseconds, long deltaSeconds)
+    {
+        if (Interlocked.Increment(ref _condDeadlineTraceCount) > 8)
+        {
+            return;
+        }
+
+        Console.Error.WriteLine(
+            $"[LOADER][INFO] cond_timedwait deadline: guest_sec={seconds} guest_nsec={nanoseconds} " +
+            $"host_unix_sec={DateTimeOffset.UtcNow.ToUnixTimeSeconds()} delta_sec={deltaSeconds}");
     }
 
     private static TimeSpan GetCondWaitTimeout(uint timeoutUsec)

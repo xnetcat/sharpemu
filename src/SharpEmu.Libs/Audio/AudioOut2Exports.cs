@@ -32,11 +32,15 @@ public static class AudioOut2Exports
     // derived from a live model rather than hardcoded to zero.
     private const uint ContextQueueDepth = 2;
 
-    // Escape hatch for the queue-full wait. Off means submissions never block,
-    // which is only useful for isolating audio pacing during diagnosis.
-    private static readonly bool _backpressureEnabled = !string.Equals(
+    // Blocking submission is opt-in. The guest calls Advance/Push from inside
+    // its own critical sections, so any wait here is held across a guest lock:
+    // measured on Silent Hill, a per-grain wait kept Wwise's bank-manager mutex
+    // busy continuously and cut AK::BankManager from 153k to 19k imports per
+    // run. Backpressure is therefore reported through the queue level, which a
+    // producer polls, rather than enforced by sleeping in the call.
+    private static readonly bool _blockingSubmitEnabled = string.Equals(
         Environment.GetEnvironmentVariable("SHARPEMU_AUDIOOUT2_PACE"),
-        "0",
+        "1",
         StringComparison.Ordinal);
 
     private sealed class ContextState
@@ -78,14 +82,10 @@ public static class AudioOut2Exports
             }
         }
 
-        // Applies hardware backpressure: submitting is instant while the
-        // modeled output queue has a free slot and only waits once it is full,
-        // exactly as a real sink behaves. A cadence-forcing sleep must NOT be
-        // used here — the guest calls this from inside its own critical
-        // sections (Wwise ticks audio while holding its bank-manager mutex), so
-        // an unconditional per-grain sleep serializes unrelated guest threads
-        // behind emulator-invented latency. A self-pacing producer never fills
-        // the queue and so never waits; a free-running one is paced by it.
+        // Records a grain entering the modeled output queue. The queue drains
+        // by wall-clock grain time, so ReadQueueLevel reports real occupancy
+        // and a polling producer paces itself against it. Waiting here is
+        // opt-in only: the guest calls this while holding its own locks.
         public void SubmitGrain()
         {
             long delay;
@@ -103,7 +103,7 @@ public static class AudioOut2Exports
                 _queueTailTimestamp += grainTicks;
             }
 
-            if (delay > 0 && _backpressureEnabled)
+            if (delay > 0 && _blockingSubmitEnabled)
             {
                 Thread.Sleep(TimeSpan.FromSeconds((double)delay / Stopwatch.Frequency));
             }
