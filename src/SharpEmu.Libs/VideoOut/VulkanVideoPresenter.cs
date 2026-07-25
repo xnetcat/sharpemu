@@ -5474,6 +5474,16 @@ internal static unsafe class VulkanVideoPresenter
                 return;
             }
 
+            if (_flipDrainDiagnostic)
+            {
+                // Diagnostic only: proves whether the snapshot reads the image
+                // before its draws are visible. A pass here means the fix is a
+                // real dependency, not this drain.
+                Check(
+                    _vk.QueueWaitIdle(_queue),
+                    "vkQueueWaitIdle(flip drain diagnostic)");
+            }
+
             EnsureGuestSubmissionCapacity();
             var snapshot = CreateGuestFlipSnapshot(source, work.Version);
             var commandBuffer = AllocateGuestCommandBuffer();
@@ -5624,6 +5634,7 @@ internal static unsafe class VulkanVideoPresenter
                     $"vk.flip_capture version={work.Version} " +
                     $"queue={_activeGuestQueue.Name} submission={_activeGuestQueue.SubmissionId} " +
                     $"work_sequence={_activeGuestWorkSequence} addr=0x{work.Address:X16} " +
+                    $"image=0x{source.Image.Handle:X} " +
                     $"size={work.Width}x{work.Height} pitch={effectivePitch}");
             }
             finally
@@ -11902,8 +11913,15 @@ internal static unsafe class VulkanVideoPresenter
                 }
                 if (_traceVulkanShaderEnabled)
                 {
+                    // queue/submission/work_sequence match vk.flip_capture so a
+                    // flip can be checked to execute after the draws it presents.
                     TraceVulkanShader(
                         $"vk.offscreen_draw mrt={targets.Length} " +
+                        $"queue={_activeGuestQueue.Name} " +
+                        $"submission={_activeGuestQueue.SubmissionId} " +
+                        $"work_sequence={_activeGuestWorkSequence} " +
+                        $"addr=0x{firstTarget.Address:X16} " +
+                        $"image=0x{firstTarget.Image.Handle:X} " +
                         $"size={firstTarget.Width}x{firstTarget.Height} " +
                         $"textures={work.Draw.Textures.Count}");
                 }
@@ -15681,6 +15699,12 @@ internal static unsafe class VulkanVideoPresenter
                 : count == _tracePresentedGuestImageOccurrence;
         }
 
+        private static readonly bool _flipDrainDiagnostic =
+            string.Equals(
+                Environment.GetEnvironmentVariable("SHARPEMU_FLIP_DRAIN"),
+                "1",
+                StringComparison.Ordinal);
+
         private static readonly bool _traceRenderTargetAddresses =
             string.Equals(
                 Environment.GetEnvironmentVariable("SHARPEMU_TRACE_RT_ADDRS"),
@@ -16332,7 +16356,12 @@ internal static unsafe class VulkanVideoPresenter
             uint imageIndex,
             GuestImageResource source)
         {
-            TraceRenderTargetAddress("present", source.Address);
+            // Keyed by image handle as well: a flip snapshot is a fresh image
+            // per frame, the live guest image is one of two. The line count
+            // therefore says which one presentation actually blits.
+            TraceRenderTargetAddress(
+                $"present image=0x{source.Image.Handle:X}",
+                source.Address);
             var presentedCount = Interlocked.Increment(ref _presentedSwapchainCount);
             var periodicDumpInterval = SwapchainDumpInterval();
             var traceDestination =
