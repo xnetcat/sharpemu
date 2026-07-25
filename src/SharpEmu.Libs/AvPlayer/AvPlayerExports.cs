@@ -26,7 +26,8 @@ public static class AvPlayerExports
     private const int MaxGuestPathLength = 4096;
     private static readonly object StateGate = new();
     private static readonly Dictionary<ulong, PlayerState> Players = new();
-    private static int _traceCount;
+    private static readonly Dictionary<string, int> TraceCounts = new(StringComparer.Ordinal);
+    private static long _audioPolls;
 
     private sealed class PlayerState : IDisposable
     {
@@ -410,7 +411,11 @@ public static class AvPlayerExports
         ExportName = "sceAvPlayerEnableStream",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libSceAvPlayer")]
-    public static int AvPlayerEnableStream(CpuContext ctx) => ValidatePlayer(ctx);
+    public static int AvPlayerEnableStream(CpuContext ctx)
+    {
+        Trace($"enable_stream handle=0x{ctx[CpuRegister.Rdi]:X16} index={ctx[CpuRegister.Rsi]}");
+        return ValidatePlayer(ctx);
+    }
 
     [SysAbiExport(
         Nid = "k-q+xOxdc3E",
@@ -432,6 +437,7 @@ public static class AvPlayerExports
     {
         var streamIndex = unchecked((uint)ctx[CpuRegister.Rsi]);
         var infoAddress = ctx[CpuRegister.Rdx];
+        Trace($"stream_info_ex handle=0x{ctx[CpuRegister.Rdi]:X16} index={streamIndex}");
         lock (StateGate)
         {
             if (!Players.TryGetValue(ctx[CpuRegister.Rdi], out var player) ||
@@ -532,10 +538,26 @@ public static class AvPlayerExports
         var infoAddress = ctx[CpuRegister.Rsi];
         lock (StateGate)
         {
-            if (!Players.TryGetValue(ctx[CpuRegister.Rdi], out var player) ||
-                infoAddress == 0 || !player.Started || player.Paused || player.EndOfStream ||
-                player.SourcePath is null || !player.HasAudio || !EnsureAudioDecoder(player))
+            var polls = ++_audioPolls;
+            if (!Players.TryGetValue(ctx[CpuRegister.Rdi], out var player))
             {
+                Trace($"audio_poll n={polls} reject=no_player handle=0x{ctx[CpuRegister.Rdi]:X16}");
+                return SetReturn(ctx, 0);
+            }
+
+            var reject =
+                infoAddress == 0 ? "null_info"
+                : !player.Started ? "not_started"
+                : player.Paused ? "paused"
+                : player.EndOfStream ? "end_of_stream"
+                : player.SourcePath is null ? "no_source"
+                : !player.HasAudio ? "no_audio_stream"
+                : null;
+            if (reject is not null || !EnsureAudioDecoder(player))
+            {
+                Trace(
+                    $"audio_poll n={polls} reject={reject ?? "decoder_start_failed"} " +
+                    $"handle=0x{player.Handle:X16} source='{player.SourcePath}'");
                 return SetReturn(ctx, 0);
             }
 
@@ -546,6 +568,7 @@ public static class AvPlayerExports
             if (player.RawAudioFrame is null ||
                 !ReadExactly(player.AudioDecoderOutput, player.RawAudioFrame))
             {
+                Trace($"audio_poll n={polls} reject=pcm_underrun handle=0x{player.Handle:X16}");
                 return SetReturn(ctx, 0);
             }
             if (player.AudioBufferBase == 0)
@@ -625,11 +648,10 @@ public static class AvPlayerExports
     {
         lock (StateGate)
         {
-            return SetReturn(
-                ctx,
-                Players.TryGetValue(ctx[CpuRegister.Rdi], out var player)
-                    ? player.HasAudio ? 2 : 1
-                    : InvalidParameters);
+            var found = Players.TryGetValue(ctx[CpuRegister.Rdi], out var player);
+            var count = found ? player!.HasAudio ? 2 : 1 : InvalidParameters;
+            Trace($"stream_count handle=0x{ctx[CpuRegister.Rdi]:X16} count={count}");
+            return SetReturn(ctx, count);
         }
     }
 
@@ -677,7 +699,11 @@ public static class AvPlayerExports
         ExportName = "sceAvPlayerGetStreamInfo",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libSceAvPlayer")]
-    public static int AvPlayerGetStreamInfo(CpuContext ctx) => GetStreamInfoCore(ctx);
+    public static int AvPlayerGetStreamInfo(CpuContext ctx)
+    {
+        Trace($"stream_info handle=0x{ctx[CpuRegister.Rdi]:X16} index={ctx[CpuRegister.Rsi]}");
+        return GetStreamInfoCore(ctx);
+    }
 
     // The destination size is fixed by the caller's generation, so it is derived
     // here rather than passed in: sceAvPlayerGetStreamInfoEx is a different
@@ -2027,9 +2053,24 @@ public static class AvPlayerExports
         return result;
     }
 
+    /// <summary>
+    /// Rate-limits the trace per message kind (its first token) rather than
+    /// across the whole player. A single shared budget was spent entirely on the
+    /// video frames of the first movie, which then hid every later event - a
+    /// second source, the audio path, completion - behind traces nobody needed.
+    /// </summary>
     private static void Trace(string message)
     {
-        var count = Interlocked.Increment(ref _traceCount);
+        var separator = message.IndexOf(' ');
+        var category = separator < 0 ? message : message[..separator];
+        int count;
+        lock (TraceCounts)
+        {
+            TraceCounts.TryGetValue(category, out count);
+            count++;
+            TraceCounts[category] = count;
+        }
+
         if (count <= 32 || count % 300 == 0)
         {
             Console.Error.WriteLine($"[AVPLAYER][INFO] {message}");

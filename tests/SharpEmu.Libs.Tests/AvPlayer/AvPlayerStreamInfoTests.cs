@@ -78,6 +78,36 @@ public sealed class AvPlayerStreamInfoTests
         }
     }
 
+    [Theory]
+    [InlineData(false, 1)]
+    [InlineData(true, 2)]
+    public void StreamCountAnnouncesTheAudioStreamOnlyWhenTheMediaCarriesOne(
+        bool hasAudio,
+        int expected)
+    {
+        // This is the only signal the guest player has for deciding whether to
+        // ask for audio at all, so a wrong count silently produces a mute movie
+        // that looks like a broken decoder.
+        var memory = new FakeCpuMemory(BaseAddress, MemorySize);
+        var context = new CpuContext(memory, Generation.Gen5);
+
+        AvPlayerExports.RegisterPlayerForTest(
+            Handle,
+            1280,
+            720,
+            DurationMilliseconds,
+            hasAudio: hasAudio);
+        try
+        {
+            context[CpuRegister.Rdi] = Handle;
+            Assert.Equal(expected, AvPlayerExports.AvPlayerStreamCount(context));
+        }
+        finally
+        {
+            AvPlayerExports.RemovePlayerForTest(Handle);
+        }
+    }
+
     [Fact]
     public void GetStreamInfoRejectsAudioIndexForVideoOnlyMedia()
     {
