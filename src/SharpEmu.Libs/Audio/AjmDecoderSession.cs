@@ -108,6 +108,10 @@ internal sealed class AjmDecoderSession : IDisposable
 
     public static AjmDecoderSession Unsupported(string reason) => new(reason);
 
+    /// <summary>Whether SharpEmu has a decoder for an AJM codec type at all.</summary>
+    public static bool IsCodecSupported(uint codecType) =>
+        codecType is AjmCodecType.Mp3Dec or AjmCodecType.At9Dec or AjmCodecType.M4aacDec;
+
     /// <summary>
     /// Builds a decoder for an AJM instance, or explains why the codec cannot be decoded.
     /// </summary>
