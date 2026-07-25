@@ -6422,6 +6422,39 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				: 0;
 		long periodicSnapshotTicks = (long)((double)periodicSnapshotSeconds * Stopwatch.Frequency);
 		long lastPeriodicSnapshot = Stopwatch.GetTimestamp();
+		if (_ueEventKick && _ueEventKickMs > 0)
+		{
+			var kickThread = new Thread(new ThreadStart(delegate
+			{
+				var kickTotal = 0L;
+				var passes = 0L;
+				// Boot is not a safe time to kick: the render thread's early
+				// waits are initialization handshakes, not task-queue stalls,
+				// and waking them early faults the title. Only probe once the
+				// title has reached the steady state under investigation.
+				var kickDelaySeconds =
+					int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_UE_EVENT_KICK_DELAY_S"), out var delay)
+						? delay
+						: 30;
+				Thread.Sleep(TimeSpan.FromSeconds(kickDelaySeconds));
+				while (!_stallWatchdogStop)
+				{
+					Thread.Sleep(_ueEventKickMs);
+					kickTotal += KickStalledUeEvents();
+					if (++passes % 100 == 0)
+					{
+						Console.Error.WriteLine(
+							$"[LOADER][ERROR] ue-event-kick passes={passes} events_kicked={kickTotal}");
+					}
+				}
+			}))
+			{
+				IsBackground = true,
+				Name = "UeEventKick",
+			};
+			kickThread.Start();
+		}
+
 		_stallWatchdogThread = new Thread(new ThreadStart(delegate
 		{
 			while (!_stallWatchdogStop)
@@ -6562,6 +6595,124 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	// This background dispatcher closes the hole: it drains the ready queue on
 	// a short interval regardless of whether any guest thread pumps. It is
 	// deliberately self-contained (it does not touch Pump or the pump-depth
+	// Diagnostic probe switch, read once. See the kick site in the stall
+	// snapshot for what it does and why it exists.
+	private static readonly bool _ueEventKick = string.Equals(
+		Environment.GetEnvironmentVariable("SHARPEMU_UE_EVENT_KICK"),
+		"1",
+		StringComparison.Ordinal);
+
+	// Cadence for the standalone kick pass, in milliseconds. 0 disables it and
+	// leaves the kick attached to the periodic snapshot instead.
+	private static readonly int _ueEventKickMs =
+		int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_UE_EVENT_KICK_MS"), out var kickMs) && kickMs > 0
+			? kickMs
+			: 0;
+
+	// Thread-name prefixes the fast kick pass is allowed to poke. A spurious
+	// wake is only safe for waiters that re-check their own state and go back to
+	// sleep — UE's named task threads re-poll their task queue. Kicking every
+	// stalled event instead segfaults the title during boot, because plenty of
+	// UE waiters treat a triggered event as "the thing I waited for happened".
+	private static readonly string[] _ueEventKickThreads =
+		(Environment.GetEnvironmentVariable("SHARPEMU_UE_EVENT_KICK_THREADS") ?? "RenderThread,RHIThread")
+			.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+	private static bool IsUeEventKickTarget(string? name)
+	{
+		if (string.IsNullOrEmpty(name))
+		{
+			return false;
+		}
+
+		foreach (var prefix in _ueEventKickThreads)
+		{
+			if (name.StartsWith(prefix, StringComparison.Ordinal))
+			{
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	// Force-triggers every stalled UE FPThreadEvent, without the per-thread
+	// snapshot logging, so the probe can run at a frame-rate cadence. Returns
+	// how many events it kicked. See the kick site in the stall snapshot for
+	// the reasoning; this is the same operation on a faster clock.
+	private int KickStalledUeEvents()
+	{
+		var cpuContext = _cpuContext;
+		if (cpuContext is null)
+		{
+			return 0;
+		}
+
+		var threads = SnapshotGuestThreads();
+
+		// Only FPThreadEvent objects may be poked. Every other condvar in the
+		// process (libc, Wwise, Sony middleware) has unrelated memory 0x28 bytes
+		// below it, and writing a trigger word there corrupts the guest — an
+		// earlier version of this probe without the check segfaulted the title
+		// during boot. Identify the class by its vtable rather than a hardcoded
+		// address: UE parks dozens of threads on FPThreadEvent, so the modal
+		// vtable pointer among cond-blocked threads is that class.
+		var vtableCounts = new Dictionary<ulong, int>();
+		foreach (var thread in threads)
+		{
+			var rdi = Volatile.Read(ref thread.LastImportRdi);
+			if (thread.BlockReason is "pthread_cond_wait" &&
+				rdi > 0x28 &&
+				cpuContext.TryReadUInt64(rdi - 0x28, out var vtable) &&
+				vtable != 0)
+			{
+				vtableCounts.TryGetValue(vtable, out var count);
+				vtableCounts[vtable] = count + 1;
+			}
+		}
+
+		var eventVtable = 0UL;
+		var bestCount = 0;
+		foreach (var pair in vtableCounts)
+		{
+			if (pair.Value > bestCount)
+			{
+				bestCount = pair.Value;
+				eventVtable = pair.Key;
+			}
+		}
+
+		if (bestCount < 4)
+		{
+			return 0;
+		}
+
+		var kicked = 0;
+		foreach (var thread in threads)
+		{
+			var blockedRdi = Volatile.Read(ref thread.LastImportRdi);
+			if (thread.BlockReason is not "pthread_cond_wait" ||
+				!IsUeEventKickTarget(thread.Name) ||
+				blockedRdi <= 0x28 ||
+				!cpuContext.TryReadUInt64(blockedRdi - 0x28, out var vtable) ||
+				vtable != eventVtable ||
+				!cpuContext.TryReadUInt64(blockedRdi - 0x28 + 0x10, out var eventFlags) ||
+				(eventFlags & 0xFF) != 1 ||
+				((eventFlags >> 32) & 0xFFFFFFFF) != 0 ||
+				!cpuContext.TryWriteUInt64(
+					blockedRdi - 0x28 + 0x10,
+					(eventFlags & 0xFFFFFFFFUL) | (1UL << 32)))
+			{
+				continue;
+			}
+
+			_ = SharpEmu.HLE.GuestThreadExecution.GuestCondSignaller?.Invoke(blockedRdi);
+			kicked++;
+		}
+
+		return kicked;
+	}
+
 	// guard) so it cannot alter the existing cooperative dispatch path.
 	private void StartReadyThreadDispatcher()
 	{
@@ -6802,12 +6953,52 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 						}
 					}
 
+					// UE parks every worker in FEventPThread::Wait, whose object sits
+					// 0x28 bytes below the condvar the thread blocks on. Decoding
+					// TriggerState here separates "the guest never triggered this
+					// event" (0) from "we lost a delivered wake" (non-zero while the
+					// thread is still blocked), which no other line in the snapshot
+					// can distinguish.
+					var eventText = string.Empty;
+					var blockedRdi = Volatile.Read(ref thread.LastImportRdi);
+					if (thread.BlockReason is { } blockReason &&
+						blockReason.StartsWith("pthread_cond", StringComparison.Ordinal) &&
+						blockedRdi > 0x28 &&
+						cpuContext.TryReadUInt64(blockedRdi - 0x28 + 0x10, out var eventFlags) &&
+						cpuContext.TryReadUInt64(blockedRdi - 0x28 + 0x18, out var eventWaiters))
+					{
+						eventText =
+							$" evt[base=0x{blockedRdi - 0x28:X} init={eventFlags & 0xFF} " +
+							$"manual={(eventFlags >> 8) & 0xFF} trig={(eventFlags >> 32) & 0xFFFFFFFF} " +
+							$"waiters={eventWaiters}]";
+
+						// Diagnostic probe (off by default): force-trigger every UE
+						// event that no guest thread has triggered, so a thread that
+						// is stalled with work already sitting in its task queue
+						// wakes up and drains it. Answers one question and nothing
+						// else — if the title advances under the kick the wake was
+						// never sent, if it stays parked the queues are genuinely
+						// empty and the missing work is further upstream.
+						if (_ueEventKick &&
+							_ueEventKickMs == 0 &&
+							(eventFlags & 0xFF) == 1 &&
+							((eventFlags >> 32) & 0xFFFFFFFF) == 0 &&
+							blockReason.Equals("pthread_cond_wait", StringComparison.Ordinal) &&
+							cpuContext.TryWriteUInt64(
+								blockedRdi - 0x28 + 0x10,
+								(eventFlags & 0xFFFFFFFFUL) | (1UL << 32)))
+						{
+							var signalled = SharpEmu.HLE.GuestThreadExecution.GuestCondSignaller?.Invoke(blockedRdi) ?? -1;
+							eventText += $" KICKED(signal=0x{signalled:X})";
+						}
+					}
+
 					Console.Error.WriteLine(
 						$"[LOADER][ERROR] Stall guest-thread: handle=0x{thread.ThreadHandle:X16} name='{thread.Name}' " +
 						$"state={thread.State} imports={Interlocked.Read(ref thread.ImportCount)} " +
 						$"nid={Volatile.Read(ref thread.LastImportNid) ?? "none"} ret=0x{Volatile.Read(ref thread.LastReturnRip):X16} " +
 						$"rdi=0x{Volatile.Read(ref thread.LastImportRdi):X16} rsi=0x{Volatile.Read(ref thread.LastImportRsi):X16} " +
-						$"rdx=0x{Volatile.Read(ref thread.LastImportRdx):X16} block={thread.BlockReason ?? "none"}{syncText}{hostContextText}");
+						$"rdx=0x{Volatile.Read(ref thread.LastImportRdx):X16} block={thread.BlockReason ?? "none"}{syncText}{eventText}{hostContextText}");
 					logged++;
 					if (logged >= 128 && threads.Length > logged)
 					{

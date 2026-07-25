@@ -143,6 +143,10 @@ public static class KernelPthreadCompatExports
         public LinkedList<PthreadCondWaiter> WaiterQueue { get; } = new();
         public ulong SignalEpoch { get; set; }
         public int Waiters { get; set; }
+        // Diagnostics only: how many waiters a signal/broadcast actually
+        // completed. Separating this from SignalEpoch distinguishes "the guest
+        // never signalled" from "the guest signalled but no waiter matched".
+        public ulong Wakes { get; set; }
     }
 
     private sealed class PthreadCondWaiter
@@ -167,7 +171,14 @@ public static class KernelPthreadCompatExports
         RunSynchronizationSelfChecks();
         GuestThreadExecution.GuestThreadAbandoned += AbandonMutexesOwnedByThread;
         GuestThreadExecution.GuestSyncObjectDescriber = DescribeSyncObject;
+        GuestThreadExecution.GuestCondSignaller = SignalCondForDiagnostics;
     }
+
+    // Diagnostic probe support: signal a condition variable by guest address
+    // without a calling CPU context. Only reaches conds we already track, so a
+    // stale or unknown address is a no-op rather than a fault.
+    private static int SignalCondForDiagnostics(ulong condAddress) =>
+        PthreadCondSignalCore(null, condAddress, broadcast: true);
 
     // Lets the stall watchdog name the owner of the mutex a blocked thread is
     // parked on. Diagnostic-only; a miss returns null so unrelated rdi values
@@ -178,6 +189,15 @@ public static class KernelPthreadCompatExports
         {
             return $"mutex owner=0x{mutexState.OwnerThreadId:X} rec={mutexState.RecursionCount} " +
                 $"waiters={mutexState.QueuedWaiterCount}";
+        }
+
+        if (_condStates.TryGetValue(address, out var condState))
+        {
+            lock (condState.SyncRoot)
+            {
+                return $"cond waiters={condState.Waiters} signals={condState.SignalEpoch} " +
+                    $"wakes={condState.Wakes}";
+            }
         }
 
         return null;
@@ -1679,7 +1699,7 @@ public static class KernelPthreadCompatExports
         return waitResult;
     }
 
-    private static int PthreadCondSignalCore(CpuContext ctx, ulong condAddress, bool broadcast)
+    private static int PthreadCondSignalCore(CpuContext? ctx, ulong condAddress, bool broadcast)
     {
         if (condAddress == 0)
         {
@@ -1701,6 +1721,7 @@ public static class KernelPthreadCompatExports
                 var waiter = node.Value;
                 if (waiter.CompletionState == 0 && CompleteCondWaiterLocked(state, waiter, timedOut: false))
                 {
+                    state.Wakes++;
                     (completedWaiters ??= new List<PthreadCondWaiter>()).Add(waiter);
                     if (!broadcast)
                     {

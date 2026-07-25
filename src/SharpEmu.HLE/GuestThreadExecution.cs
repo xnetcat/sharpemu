@@ -177,6 +177,13 @@ public static class GuestThreadExecution
     /// </summary>
     public static Func<ulong, string?>? GuestSyncObjectDescriber;
 
+    /// <summary>
+    /// Set by the pthread HLE layer so a diagnostic probe can signal the
+    /// condition variable a blocked guest thread is parked on. Diagnostic-only:
+    /// nothing on a normal execution path calls this.
+    /// </summary>
+    public static Func<ulong, int>? GuestCondSignaller;
+
     private sealed class DelegateGuestThreadBlockWaiter : IGuestThreadBlockWaiter
     {
         private readonly Func<int> _resume;

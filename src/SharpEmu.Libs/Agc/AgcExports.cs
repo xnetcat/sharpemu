@@ -3940,6 +3940,14 @@ public static partial class AgcExports
             _labelProducers.Add(producer);
         }
 
+        if (_traceAgcLabels)
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][WARN] agc.label_producer seq={producer.Sequence} " +
+                $"queue={state.QueueName} submission={state.ActiveSubmissionId} " +
+                $"addr=0x{address:X16} len=0x{length:X} name='{debugName}'");
+        }
+
         if (_traceAgc)
         {
             foreach (var waiting in GpuWaitRegistry.SnapshotInRange(memory, address, length))
@@ -4969,6 +4977,43 @@ public static partial class AgcExports
         return true;
     }
 
+    private static readonly bool _traceAgcLabels = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_LOG_AGC_LABELS"),
+        "1",
+        StringComparison.Ordinal);
+
+    // Dumps the raw dwords of a wait packet that suspended its queue. A wait on
+    // an address nobody writes is equally consistent with "the producer is
+    // missing" and "we decoded the address field from the wrong offset", and
+    // only the raw packet distinguishes the two.
+    private static void TraceWaitPacketWords(
+        CpuContext ctx,
+        ulong packetAddress,
+        uint length,
+        bool isStandard,
+        bool is64Bit)
+    {
+        if (!_traceAgcLabels)
+        {
+            return;
+        }
+
+        var builder = new System.Text.StringBuilder(160);
+        for (var index = 0u; index <= length && index < 16u; index++)
+        {
+            if (!TryReadUInt32(ctx, packetAddress + (index * sizeof(uint)), out var word))
+            {
+                break;
+            }
+
+            builder.Append(index == 0 ? string.Empty : " ").Append($"{word:X8}");
+        }
+
+        Console.Error.WriteLine(
+            $"[LOADER][WARN] agc.wait_packet packet=0x{packetAddress:X16} len={length} " +
+            $"standard={isStandard} bits={(is64Bit ? 64 : 32)} words=[{builder}]");
+    }
+
     // Returns true when the DCB should suspend parsing at this wait (its
     // continuation was registered into GpuWaitRegistry); false to keep parsing
     // (already satisfied, unreadable, or legacy force-satisfy mode).
@@ -5173,6 +5218,7 @@ public static partial class AgcExports
             packetAddress,
             stale: false,
             currentValue);
+        TraceWaitPacketWords(ctx, packetAddress, length, isStandard, is64Bit);
         if (tracePacket)
         {
             TraceAgc(
@@ -5214,6 +5260,12 @@ public static partial class AgcExports
         SubmittedGpuState gpuState)
     {
         var delayMilliseconds = 1;
+        // Diagnostic accounting only: distinguishes "queues are suspended but
+        // draining" from "queues are wedged", which the per-wait warnings alone
+        // cannot show because they fire at suspend time, before the producer
+        // that satisfies them has necessarily been parsed.
+        var resumedTotal = 0L;
+        var nextReportTicks = System.Diagnostics.Stopwatch.GetTimestamp();
         long observedSignal;
         lock (gpuState.WaitMonitorSignalGate)
         {
@@ -5239,6 +5291,16 @@ public static partial class AgcExports
                     gpuState.WaitMonitorRunning = false;
                     return;
                 }
+            }
+
+            resumedTotal += resumed;
+            if (_traceAgcLabels &&
+                System.Diagnostics.Stopwatch.GetTimestamp() >= nextReportTicks)
+            {
+                nextReportTicks = System.Diagnostics.Stopwatch.GetTimestamp() +
+                    (2L * System.Diagnostics.Stopwatch.Frequency);
+                Console.Error.WriteLine(
+                    $"[LOADER][WARN] agc.wait_monitor outstanding={remaining} resumed_total={resumedTotal}");
             }
 
             delayMilliseconds = resumed != 0
