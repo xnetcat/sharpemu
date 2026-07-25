@@ -34,7 +34,12 @@ internal sealed class AjmDecoderSession : IDisposable
 
     private static int _activeSessions;
 
-    private readonly object _gate = new();
+    // Two locks, and never taken in the other order. Writing to FFmpeg's stdin can block for
+    // as long as FFmpeg is behind, and FFmpeg only drains stdin while something is draining
+    // its stdout — so the reader thread must be able to bank PCM without waiting on whoever
+    // is mid-write. Holding one lock across both would deadlock the pair.
+    private readonly object _processGate = new();
+    private readonly object _pcmGate = new();
     private readonly uint _codecType;
     private readonly int _channels;
     private readonly AjmFormatEncoding _encoding;
@@ -45,12 +50,19 @@ internal sealed class AjmDecoderSession : IDisposable
 
     private Process? _process;
     private Thread? _reader;
+
+    /// <summary>
+    /// Bumped every time a process is started. A reader thread whose generation is stale
+    /// belongs to a torn-down process and must not bank PCM into the new stream's buffer.
+    /// </summary>
+    private int _generation;
+
     private byte[] _pcm = [];
     private int _pcmStart;
     private int _pcmEnd;
     private bool _counted;
-    private bool _faulted;
-    private bool _disposed;
+    private volatile bool _faulted;
+    private volatile bool _disposed;
 
     private AjmDecoderSession(
         string ffmpegPath,
@@ -196,7 +208,7 @@ internal sealed class AjmDecoderSession : IDisposable
             pending = input.ToArray();
         }
 
-        lock (_gate)
+        lock (_processGate)
         {
             if (_faulted || _disposed || !EnsureProcess())
             {
@@ -230,18 +242,18 @@ internal sealed class AjmDecoderSession : IDisposable
     /// </summary>
     public void Reset()
     {
-        lock (_gate)
+        lock (_processGate)
         {
             StopProcess();
-            _pcmStart = 0;
-            _pcmEnd = 0;
             _faulted = false;
         }
+
+        DiscardPcm();
     }
 
     public void Dispose()
     {
-        lock (_gate)
+        lock (_processGate)
         {
             if (_disposed)
             {
@@ -250,6 +262,18 @@ internal sealed class AjmDecoderSession : IDisposable
 
             _disposed = true;
             StopProcess();
+        }
+
+        DiscardPcm();
+    }
+
+    private void DiscardPcm()
+    {
+        lock (_pcmGate)
+        {
+            _pcmStart = 0;
+            _pcmEnd = 0;
+            Monitor.PulseAll(_pcmGate);
         }
     }
 
@@ -340,12 +364,16 @@ internal sealed class AjmDecoderSession : IDisposable
             return false;
         }
 
-        _pcm = new byte[64 << 10];
-        _pcmStart = 0;
-        _pcmEnd = 0;
+        lock (_pcmGate)
+        {
+            _pcm = new byte[64 << 10];
+            _pcmStart = 0;
+            _pcmEnd = 0;
+        }
 
         var process = _process;
-        _reader = new Thread(() => ReadLoop(process))
+        var generation = Interlocked.Increment(ref _generation);
+        _reader = new Thread(() => ReadLoop(process, generation))
         {
             IsBackground = true,
             Name = "ajm-decoder",
@@ -400,7 +428,7 @@ internal sealed class AjmDecoderSession : IDisposable
         }
     }
 
-    private void ReadLoop(Process process)
+    private void ReadLoop(Process process, int generation)
     {
         var buffer = new byte[16 << 10];
         try
@@ -413,15 +441,15 @@ internal sealed class AjmDecoderSession : IDisposable
                     return;
                 }
 
-                lock (_gate)
+                if (Volatile.Read(ref _generation) != generation)
                 {
-                    if (_disposed || !ReferenceEquals(_process, process))
-                    {
-                        return;
-                    }
+                    return;
+                }
 
+                lock (_pcmGate)
+                {
                     Append(buffer.AsSpan(0, read));
-                    Monitor.PulseAll(_gate);
+                    Monitor.PulseAll(_pcmGate);
                 }
             }
         }
@@ -432,9 +460,10 @@ internal sealed class AjmDecoderSession : IDisposable
         }
         finally
         {
-            lock (_gate)
+            // Wake anyone parked in DrainPcm: no more PCM is coming from this process.
+            lock (_pcmGate)
             {
-                Monitor.PulseAll(_gate);
+                Monitor.PulseAll(_pcmGate);
             }
         }
     }
@@ -486,7 +515,7 @@ internal sealed class AjmDecoderSession : IDisposable
     private int DrainPcm(Span<byte> output)
     {
         var deadline = Environment.TickCount64 + WaitMilliseconds;
-        lock (_gate)
+        lock (_pcmGate)
         {
             while (true)
             {
@@ -505,13 +534,13 @@ internal sealed class AjmDecoderSession : IDisposable
                     return count;
                 }
 
-                if (_disposed || _faulted || _process is null || _process.HasExited)
+                if (_disposed || _faulted)
                 {
                     return 0;
                 }
 
                 var remaining = deadline - Environment.TickCount64;
-                if (remaining <= 0 || !Monitor.Wait(_gate, (int)remaining))
+                if (remaining <= 0 || !Monitor.Wait(_pcmGate, (int)remaining))
                 {
                     return 0;
                 }

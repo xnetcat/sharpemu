@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using SharpEmu.HLE;
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Text;
@@ -76,6 +77,12 @@ public static class AjmExports
     /// </summary>
     private sealed class AjmInstanceState(uint instanceId, uint codecType, ulong flags)
     {
+        /// <summary>
+        /// Serializes job execution against this instance. Two threads can start batches that
+        /// both target the same decoder, and the codec session is not re-entrant.
+        /// </summary>
+        public object Gate { get; } = new();
+
         public uint InstanceId { get; } = instanceId;
 
         public uint CodecType { get; } = codecType;
@@ -1103,32 +1110,35 @@ public static class AjmExports
             return;
         }
 
-        switch (job.Kind)
+        lock (instance.Gate)
         {
-            case AjmJobKind.Initialize:
-                ExecuteInitializeJob(ctx, instance, job);
-                break;
-            case AjmJobKind.ClearContext:
-                instance.Reset();
-                Trace($"job_clear_context instance=0x{instance.InstanceId:X8}");
-                WriteSidebandResult(ctx, job.SidebandOutput, 0, 0);
-                break;
-            case AjmJobKind.SetGaplessDecode:
-                ExecuteSetGaplessJob(ctx, instance, job);
-                break;
-            case AjmJobKind.SetResampleParameters:
-                ExecuteSetResampleJob(ctx, instance, job);
-                break;
-            case AjmJobKind.GetResampleInfo:
-                ExecuteGetResampleInfoJob(ctx, instance, job);
-                break;
-            case AjmJobKind.Decode:
-            case AjmJobKind.DecodeSplit:
-                ExecuteDecodeJob(ctx, instance, job);
-                break;
-            default:
-                WriteSidebandResult(ctx, job.SidebandOutput, AjmJobResult.UnsupportedFlag, 0);
-                break;
+            switch (job.Kind)
+            {
+                case AjmJobKind.Initialize:
+                    ExecuteInitializeJob(ctx, instance, job);
+                    break;
+                case AjmJobKind.ClearContext:
+                    instance.Reset();
+                    Trace($"job_clear_context instance=0x{instance.InstanceId:X8}");
+                    WriteSidebandResult(ctx, job.SidebandOutput, 0, 0);
+                    break;
+                case AjmJobKind.SetGaplessDecode:
+                    ExecuteSetGaplessJob(ctx, instance, job);
+                    break;
+                case AjmJobKind.SetResampleParameters:
+                    ExecuteSetResampleJob(ctx, instance, job);
+                    break;
+                case AjmJobKind.GetResampleInfo:
+                    ExecuteGetResampleInfoJob(ctx, instance, job);
+                    break;
+                case AjmJobKind.Decode:
+                case AjmJobKind.DecodeSplit:
+                    ExecuteDecodeJob(ctx, instance, job);
+                    break;
+                default:
+                    WriteSidebandResult(ctx, job.SidebandOutput, AjmJobResult.UnsupportedFlag, 0);
+                    break;
+            }
         }
     }
 
@@ -1263,40 +1273,54 @@ public static class AjmExports
             return;
         }
 
-        var output = new byte[(int)Math.Min(outputSize, MaxSilentPcmBytes)];
-        var decoded = decoder.Decode(input, output, out var inputConsumed, out var framesDecoded);
-        if (decoded > 0)
+        // Decode jobs run on the title's audio thread many times a second; renting keeps the
+        // PCM staging buffer off the GC's hot path.
+        var capacity = (int)Math.Min(outputSize, MaxSilentPcmBytes);
+        var output = ArrayPool<byte>.Shared.Rent(capacity);
+        try
         {
-            WriteGuestBuffers(ctx, job.OutputBuffers, output.AsSpan(0, decoded));
-        }
+            var decoded = decoder.Decode(
+                input,
+                output.AsSpan(0, capacity),
+                out var inputConsumed,
+                out var framesDecoded);
+            if (decoded > 0)
+            {
+                WriteGuestBuffers(ctx, job.OutputBuffers, output.AsSpan(0, decoded));
+            }
 
-        if (decoded < output.Length)
+            if (decoded < capacity)
+            {
+                ClearRemainingOutput(ctx, job.OutputBuffers, decoded, capacity);
+            }
+
+            instance.TotalDecodedSamples += SamplesForBytes(instance, (ulong)decoded);
+
+            var result = 0;
+            if (decoded == 0)
+            {
+                // The decoder swallowed the input but has not produced PCM yet. PARTIAL_INPUT
+                // is the codec's own "feed me more" status and is what titles retry against.
+                result |= AjmJobResult.PartialInput;
+            }
+
+            WriteDecodeSideband(
+                ctx,
+                job.SidebandOutput,
+                inputConsumed,
+                decoded,
+                instance.TotalDecodedSamples,
+                (uint)framesDecoded,
+                result);
+
+            Trace(
+                $"job_decode instance=0x{instance.InstanceId:X8} codec={AjmCodecType.Name(instance.CodecType)} " +
+                $"in={inputSize} consumed={inputConsumed} out={outputSize} written={decoded} frames={framesDecoded}");
+        }
+        finally
         {
-            ClearRemainingOutput(ctx, job.OutputBuffers, decoded, output.Length);
+            ArrayPool<byte>.Shared.Return(output);
         }
-
-        instance.TotalDecodedSamples += SamplesForBytes(instance, (ulong)decoded);
-
-        var result = 0;
-        if (decoded == 0)
-        {
-            // The decoder swallowed the input but has not produced PCM yet. PARTIAL_INPUT is
-            // the codec's own "feed me more" status and is what titles retry against.
-            result |= AjmJobResult.PartialInput;
-        }
-
-        WriteDecodeSideband(
-            ctx,
-            job.SidebandOutput,
-            inputConsumed,
-            decoded,
-            instance.TotalDecodedSamples,
-            (uint)framesDecoded,
-            result);
-
-        Trace(
-            $"job_decode instance=0x{instance.InstanceId:X8} codec={AjmCodecType.Name(instance.CodecType)} " +
-            $"in={inputSize} consumed={inputConsumed} out={outputSize} written={decoded} frames={framesDecoded}");
     }
 
     /// <summary>
@@ -1416,7 +1440,9 @@ public static class AjmExports
         var cursor = 0;
         foreach (var buffer in buffers)
         {
-            var end = cursor + (int)Math.Min(buffer.Size, (ulong)int.MaxValue);
+            // Clamp against the staging capacity rather than the guest's declared size: a
+            // bogus descriptor must not be able to overflow the running cursor.
+            var end = cursor + (int)Math.Min(buffer.Size, (ulong)(total - cursor));
             if (end > filled)
             {
                 var start = Math.Max(cursor, filled);
