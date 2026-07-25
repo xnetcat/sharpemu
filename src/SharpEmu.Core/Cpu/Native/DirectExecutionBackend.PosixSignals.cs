@@ -84,6 +84,68 @@ public sealed unsafe partial class DirectExecutionBackend
 	[ThreadStatic]
 	private static int _posixSignalHandlerDepth;
 
+	// PS5 guest modules are all mapped in this window (eboot at 0x8_0000_0000
+	// with the .prx set immediately above it), so a stack qword inside it is a
+	// candidate return address. Used only to annotate a fatal-fault dump.
+	private const ulong GuestImageWindowStart = 0x8_0000_0000UL;
+	private const ulong GuestImageWindowEnd = 0x9_0000_0000UL;
+
+	/// <summary>
+	/// Registers and a stack walk for a fault nothing could recover, printed
+	/// immediately before the process dies on it. The register file names the
+	/// bad pointer's provenance (which argument or field it came from) and the
+	/// stack qwords inside the guest image window are candidate return
+	/// addresses, which is the only way to identify the calling guest code -
+	/// UE 4.27 ships without frame pointers, so there is no chain to walk.
+	/// </summary>
+	private static unsafe void DescribeUnrecoveredGuestFault(byte* contextRecord, int traceIndex)
+	{
+		ulong rsp = ReadCtxU64(contextRecord, CTX_RSP);
+		Console.Error.WriteLine(
+			$"[LOADER][ERROR] posix-signal#{traceIndex}: unrecovered guest fault, registers:" +
+			$" rax=0x{ReadCtxU64(contextRecord, CTX_RAX):X16}" +
+			$" rcx=0x{ReadCtxU64(contextRecord, CTX_RAX + 8):X16}" +
+			$" rdx=0x{ReadCtxU64(contextRecord, CTX_RAX + 16):X16}" +
+			$" rbx=0x{ReadCtxU64(contextRecord, CTX_RAX + 24):X16}" +
+			$" rsp=0x{rsp:X16}" +
+			$" rbp=0x{ReadCtxU64(contextRecord, CTX_RAX + 40):X16}" +
+			$" rsi=0x{ReadCtxU64(contextRecord, CTX_RAX + 48):X16}" +
+			$" rdi=0x{ReadCtxU64(contextRecord, CTX_RAX + 56):X16}");
+		Console.Error.WriteLine(
+			$"[LOADER][ERROR] posix-signal#{traceIndex}: registers:" +
+			$" r8=0x{ReadCtxU64(contextRecord, CTX_RAX + 64):X16}" +
+			$" r9=0x{ReadCtxU64(contextRecord, CTX_RAX + 72):X16}" +
+			$" r10=0x{ReadCtxU64(contextRecord, CTX_RAX + 80):X16}" +
+			$" r11=0x{ReadCtxU64(contextRecord, CTX_RAX + 88):X16}" +
+			$" r12=0x{ReadCtxU64(contextRecord, CTX_RAX + 96):X16}" +
+			$" r13=0x{ReadCtxU64(contextRecord, CTX_RAX + 104):X16}" +
+			$" r14=0x{ReadCtxU64(contextRecord, CTX_RAX + 112):X16}" +
+			$" r15=0x{ReadCtxU64(contextRecord, CTX_RAX + 120):X16}");
+
+		if (rsp == 0 || (rsp & 7) != 0)
+		{
+			Console.Error.Flush();
+			return;
+		}
+
+		// Reading the faulting thread's own stack: it is mapped, but a wild rsp
+		// would fault again inside the handler, so the alignment check above is
+		// the guard and the walk stays short.
+		var candidates = new System.Text.StringBuilder();
+		for (int slot = 0; slot < 64; slot++)
+		{
+			ulong value = *(ulong*)(rsp + (ulong)slot * 8);
+			if (value >= GuestImageWindowStart && value < GuestImageWindowEnd)
+			{
+				candidates.Append($" +{slot * 8:X2}:0x{value:X}");
+			}
+		}
+
+		Console.Error.WriteLine(
+			$"[LOADER][ERROR] posix-signal#{traceIndex}: guest stack return candidates:{candidates}");
+		Console.Error.Flush();
+	}
+
 	// True while the current thread's in-flight POSIX fault carries the real
 	// XMM registers in the CONTEXT scratch buffer and writes to them will
 	// reach the mcontext on resume. Gates recovery paths (SSE4a EXTRQ/
@@ -352,6 +414,10 @@ public sealed unsafe partial class DirectExecutionBackend
 		}
 		if (disposition != -1 && !_posixSignalWarmup)
 		{
+			// The process is about to die on this fault. Two lines of rip and
+			// fault address cannot say which guest call passed the bad pointer,
+			// and there is no second chance to ask, so spend the context here.
+			DescribeUnrecoveredGuestFault(contextRecord, traceIndex);
 			return false;
 		}
 
