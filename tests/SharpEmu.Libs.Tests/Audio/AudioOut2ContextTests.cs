@@ -129,4 +129,46 @@ public sealed class AudioOut2ContextTests
         Assert.Equal(0xABABABABABABABABUL, BinaryPrimitives.ReadUInt64LittleEndian(after[8..]));
         Assert.Equal(0xABABABABABABABABUL, BinaryPrimitives.ReadUInt64LittleEndian(after[16..]));
     }
+
+    /// <summary>
+    /// The port state is 0x40 bytes, not 0x20. Both guest call sites in
+    /// PPSA10112 say so: one copies the buffer out with two 32-byte loads
+    /// (vmovups ymm0,[rbp-0x80] / ymm1,[rbp-0x60] then stores both into a
+    /// long-lived object), and the other reserves exactly 0x40 between its
+    /// buffer and the next local. Filling only the first half left the rest as
+    /// whatever the guest stack held, and that stale half was copied into the
+    /// object as if it were state.
+    /// </summary>
+    [Fact]
+    public void PortGetState_FillsTheWholeStateAndNothingBeyondIt()
+    {
+        const ulong stateAddress = MemoryBase + 0x200;
+        const int stateSize = 0x40;
+
+        Span<byte> poison = stackalloc byte[stateSize + 0x20];
+        poison.Fill(0xCD);
+        Assert.True(_memory.TryWrite(stateAddress, poison));
+
+        // A real handle observed from the title; the type bits select the
+        // reported output mode and channel count.
+        _ctx[CpuRegister.Rdi] = 0x20020002;
+        _ctx[CpuRegister.Rsi] = stateAddress;
+        Assert.Equal(0, AudioOut2Exports.AudioOut2PortGetState(_ctx));
+
+        Span<byte> written = stackalloc byte[stateSize];
+        Assert.True(_memory.TryRead(stateAddress, written));
+        // Every byte the guest will copy out must come from us. The tail is the
+        // half that used to be left stale, so assert it explicitly.
+        for (var offset = 0x08; offset < stateSize; offset++)
+        {
+            Assert.Equal(0, written[offset]);
+        }
+
+        Span<byte> beyond = stackalloc byte[0x20];
+        Assert.True(_memory.TryRead(stateAddress + stateSize, beyond));
+        foreach (var value in beyond)
+        {
+            Assert.Equal(0xCD, value);
+        }
+    }
 }

@@ -354,7 +354,16 @@ public static class AudioOut2Exports
         }
 
         var type = (int)((handle >> 16) & 0xFF);
-        Span<byte> state = stackalloc byte[0x20];
+        // 0x40, taken from both guest call sites rather than assumed. One reads
+        // the buffer back with two 32-byte loads and copies all of it into a
+        // long-lived object:
+        //     vmovups ymm0, [rbp-0x80]   vmovups ymm1, [rbp-0x60]
+        //     vmovups [rbx+0x20], ymm1   vmovups [rbx], ymm0
+        // and the other reserves exactly 0x40 between its buffer and the next
+        // local. Filling only 0x20 left the upper half as whatever the guest
+        // stack happened to hold, and that stale half was then laundered into
+        // the object as if it were state.
+        Span<byte> state = stackalloc byte[0x40];
         state.Clear();
         var output = type == 2 ? 0x40 : 0x01;
         var channels = type == 2 ? 1 : 2;
