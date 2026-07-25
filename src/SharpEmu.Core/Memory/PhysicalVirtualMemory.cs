@@ -1,6 +1,7 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using System.Buffers.Binary;
 using System.Runtime.InteropServices;
 using SharpEmu.Core.Loader;
 using SharpEmu.HLE;
@@ -1054,8 +1055,73 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         }
     }
 
+    // Detects an HLE write that is about to overwrite half of a guest pointer.
+    // The mprotect write tracker cannot see this class at all: the managed
+    // write path below unprotects and disarms the range before copying, so a
+    // page watch records nothing when the writer is us rather than guest code.
+    // Rather than watch an address - the slot moves every run and is only
+    // recoverable once the guest has already crashed on it - this recognises
+    // the write by its EFFECT, which needs no address and no arming.
+    private static readonly bool _traceGuestPointerSplit = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_TRACE_POINTER_SPLIT"),
+        "1",
+        StringComparison.Ordinal);
+
+    private static long _guestPointerSplitCount;
+
+    /// <summary>
+    /// A four-byte write landing on the low half of an eight-byte slot that
+    /// currently holds a guest heap pointer, leaving the high half intact. That
+    /// is the exact shape of the PPSA10112 corruption: a valid pointer whose
+    /// low dword became 1 while its high dword still matched its neighbours.
+    /// </summary>
+    private void ReportGuestPointerSplit(ulong virtualAddress, ReadOnlySpan<byte> source)
+    {
+        if (source.Length != 4 || (virtualAddress & 7) != 0)
+        {
+            return;
+        }
+
+        Span<byte> existing = stackalloc byte[8];
+        if (!TryRead(virtualAddress, existing))
+        {
+            return;
+        }
+
+        var previous = BinaryPrimitives.ReadUInt64LittleEndian(existing);
+        var high = previous >> 32;
+        // Guest heap pointers live in 0x70_0000_0000..0x80_0000_0000, so a slot
+        // whose high dword is in 0x70..0x7F and whose low dword is a real
+        // offset was a pointer before this write.
+        if (high is < 0x70 or >= 0x80 || (uint)previous == 0)
+        {
+            return;
+        }
+
+        var incoming = BinaryPrimitives.ReadUInt32LittleEndian(source);
+        // Only the value that was actually observed. Any 4-byte store onto a
+        // pointer-shaped slot is common (58k per run) and almost all of them
+        // are legitimate writes to a field that merely follows a pointer; the
+        // corruption being hunted writes exactly 1.
+        if (incoming != 1)
+        {
+            return;
+        }
+
+        Console.Error.WriteLine(
+            $"[LOADER][ERROR] guest_pointer_split#{Interlocked.Increment(ref _guestPointerSplitCount)}: " +
+            $"addr=0x{virtualAddress:X16} was=0x{previous:X16} becomes=0x{high:X8}{incoming:X8} " +
+            $"value=0x{incoming:X8}{Environment.NewLine}{Environment.StackTrace}");
+        Console.Error.Flush();
+    }
+
     public bool TryWrite(ulong virtualAddress, ReadOnlySpan<byte> source)
     {
+        if (_traceGuestPointerSplit)
+        {
+            ReportGuestPointerSplit(virtualAddress, source);
+        }
+
         // A managed write into a page the guest-image write tracker has
         // protected surfaces as a fatal AccessViolation — the runtime turns
         // SIGSEGV in managed code into an exception before the resumable
