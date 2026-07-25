@@ -846,6 +846,18 @@ public static partial class AgcExports
 
         if (cxRegistersAddress == 0 || ucRegistersAddress == 0 || hullShaderAddress != 0 || geometryShaderAddress == 0)
         {
+            if (_tracePrimitiveState)
+            {
+                // A rejected call writes no primitive type, so the register set
+                // the draw submits keeps whatever the last accepted state left
+                // there.
+                Console.Error.WriteLine(
+                    $"[LOADER][TRACE] agc.prim_state_reject reason=args " +
+                    $"prim=0x{primitiveType:X} cx=0x{cxRegistersAddress:X16} " +
+                    $"uc=0x{ucRegistersAddress:X16} hs=0x{hullShaderAddress:X16} " +
+                    $"gs=0x{geometryShaderAddress:X16}");
+            }
+
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
@@ -853,6 +865,14 @@ public static partial class AgcExports
             !TryReadUInt64(ctx, geometryShaderAddress + ShaderSpecialsOffset, out var specialsAddress) ||
             specialsAddress == 0)
         {
+            if (_tracePrimitiveState)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][TRACE] agc.prim_state_reject reason=shader " +
+                    $"prim=0x{primitiveType:X} gs=0x{geometryShaderAddress:X16} " +
+                    $"type={shaderType}");
+            }
+
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
@@ -5898,6 +5918,14 @@ public static partial class AgcExports
                 }
 
                 directDestination[startRegister + index] = value;
+                if (_tracePrimitiveState &&
+                    op == ItSetUconfigReg &&
+                    startRegister + index == VgtPrimitiveType)
+                {
+                    Console.Error.WriteLine(
+                        "[LOADER][TRACE] agc.prim_reg_write source=direct " +
+                        $"value=0x{value:X}");
+                }
             }
 
             return;
@@ -5932,6 +5960,14 @@ public static partial class AgcExports
             // Dropping it leaves stale depth/render-control state active in
             // later passes.
             destination[registerOffset] = value;
+            if (_tracePrimitiveState &&
+                register == RUcRegsIndirect &&
+                registerOffset == VgtPrimitiveType)
+            {
+                Console.Error.WriteLine(
+                    "[LOADER][TRACE] agc.prim_reg_write source=indirect " +
+                    $"value=0x{value:X} table=0x{registersAddress:X16}");
+            }
         }
     }
 
@@ -7059,6 +7095,15 @@ public static partial class AgcExports
         }
 
         state.UcRegisters.TryGetValue(VgtPrimitiveType, out var primitiveType);
+        if (_tracePrimitiveState)
+        {
+            // Interleaved with agc.prim_reg_write so the register value a draw
+            // actually sees can be traced back to the write that set it.
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] agc.prim_draw prim=0x{primitiveType:X} " +
+                $"verts={vertexCount} rt0=0x{(renderTargets.Length > 0 ? renderTargets[0].Address : 0):X16}");
+        }
+
         var guestTargets = new GuestRenderTarget[renderTargets.Length];
         for (var index = 0; index < renderTargets.Length; index++)
         {

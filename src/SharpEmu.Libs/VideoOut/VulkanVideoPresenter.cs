@@ -470,6 +470,58 @@ internal static unsafe class VulkanVideoPresenter
             ? z
             : 0;
     private const uint GuestPrimitiveRectList = 0x11;
+    private const uint GuestPrimitiveTriangleList = 0x4;
+
+    private static readonly bool _probeThreeVertexRect = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_PROBE_THREE_VERTEX_RECT"),
+        "1",
+        StringComparison.Ordinal);
+
+    /// <summary>
+    /// Whether a three-vertex draw's buffers actually carry a fourth vertex at
+    /// the position a rect would synthesise (v1 + v2 - v0). Distinguishes a
+    /// fullscreen pass whose quad was decoded as one triangle from a genuine
+    /// three-vertex triangle, which has no fourth vertex to find.
+    /// </summary>
+    private static bool HasFourthRectVertex(VulkanTranslatedGuestDraw draw)
+    {
+        foreach (var buffer in draw.VertexBuffers)
+        {
+            if (buffer.Stride == 0 ||
+                buffer.ComponentCount < 2 ||
+                buffer.NumberFormat != 7)
+            {
+                continue;
+            }
+
+            var last = buffer.OffsetBytes + (3L * buffer.Stride) + (2 * sizeof(float));
+            if (last > buffer.Length)
+            {
+                continue;
+            }
+
+            float Component(int vertex, int component) =>
+                BitConverter.ToSingle(
+                    buffer.Data,
+                    checked((int)(buffer.OffsetBytes + ((long)vertex * buffer.Stride))) +
+                        (component * sizeof(float)));
+
+            for (var component = 0; component < 2; component++)
+            {
+                var expected = Component(1, component) +
+                    Component(2, component) -
+                    Component(0, component);
+                if (Math.Abs(expected - Component(3, component)) > 1e-4f)
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        return false;
+    }
 
     private static readonly object _gate = new();
     private readonly record struct PendingGuestWork(
@@ -2939,6 +2991,11 @@ internal static unsafe class VulkanVideoPresenter
             Environment.GetEnvironmentVariable("SHARPEMU_GPU_DETILE"), "0", StringComparison.Ordinal);
         private static readonly bool _gpuDetileLog = string.Equals(
             Environment.GetEnvironmentVariable("SHARPEMU_LOG_GPU_DETILE"), "1", StringComparison.Ordinal);
+        // Which route each sampled texture's pixels took into its image. A
+        // substituted ("fallback") 8_8_8_8 payload is OPAQUE black, so it is not
+        // merely invisible - it erases whatever the quad sampling it covers.
+        private static readonly bool _logTexturePath = string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_LOG_TEXTURE_PATH"), "1", StringComparison.Ordinal);
         private VulkanDetilePass? _detilePass;
         private long _gpuDetileCount;
         private SwapchainKHR _swapchain;
@@ -5474,6 +5531,33 @@ internal static unsafe class VulkanVideoPresenter
                 return;
             }
 
+            if (_traceFrameTrajectory > 0)
+            {
+                var matchesTrajectory =
+                    _trajectoryAwaitingFlip && work.Address == _trajectoryAddress;
+                Console.Error.WriteLine(
+                    "[LOADER][TRACE] vk.trajectory_flip " +
+                    $"version={work.Version} queue={_activeGuestQueue.Name} " +
+                    $"work_sequence={_activeGuestWorkSequence} " +
+                    $"addr=0x{work.Address:X16} " +
+                    $"armed=0x{_trajectoryAddress:X16} " +
+                    $"awaiting={(_trajectoryAwaitingFlip ? 1 : 0)} " +
+                    $"draws_remaining={_trajectoryRemaining} " +
+                    $"match={(matchesTrajectory ? 1 : 0)}");
+                if (matchesTrajectory)
+                {
+                    // The last point in the frame at which the content still
+                    // belongs to the guest: whatever this reads is exactly what
+                    // the capture copies and the window presents.
+                    _trajectoryAwaitingFlip = false;
+                    _commandBuffer = _presentationCommandBuffer;
+                    Check(
+                        _vk.QueueWaitIdle(_queue),
+                        "vkQueueWaitIdle(frame trajectory flip)");
+                    TraceGuestImageContents(source);
+                }
+            }
+
             if (_flipDrainDiagnostic)
             {
                 // Diagnostic only: proves whether the snapshot reads the image
@@ -6404,18 +6488,37 @@ internal static unsafe class VulkanVideoPresenter
                     }
                 }
 
+                var probeAsRect = _probeThreeVertexRect &&
+                    draw.PrimitiveType == GuestPrimitiveTriangleList &&
+                    draw.VertexCount == 3 &&
+                    HasFourthRectVertex(draw);
                 if (draw.IndexBuffer is { Length: > 0 } indexBuffer)
                 {
-                    resources.IndexBuffer = CreateHostBuffer(
-                        indexBuffer.Data.AsSpan(0, indexBuffer.Length),
-                        BufferUsageFlags.IndexBufferBit,
-                        out resources.IndexMemory,
-                        out _);
-                    resources.Index32Bit = indexBuffer.Is32Bit;
+                    if (!probeAsRect)
+                    {
+                        resources.IndexBuffer = CreateHostBuffer(
+                            indexBuffer.Data.AsSpan(0, indexBuffer.Length),
+                            BufferUsageFlags.IndexBufferBit,
+                            out resources.IndexMemory,
+                            out _);
+                        resources.Index32Bit = indexBuffer.Is32Bit;
+                    }
+
                     if (indexBuffer.Pooled)
                     {
                         GuestDataPool.Shared.Return(indexBuffer.Data);
                     }
+                }
+
+                if (probeAsRect)
+                {
+                    // Diagnostic only (SHARPEMU_PROBE_THREE_VERTEX_RECT): a rect
+                    // covers the parallelogram v0,v1,v2,v1+v2-v0, which for these
+                    // draws is the fourth vertex already present in the buffer,
+                    // so a four-vertex strip reproduces it. Answers whether the
+                    // guest intends a rect where we decode a triangle list.
+                    resources.VertexCount = 4;
+                    resources.Topology = PrimitiveTopology.TriangleStrip;
                 }
 
                 CreateTranslatedDescriptorResources(
@@ -8431,6 +8534,7 @@ internal static unsafe class VulkanVideoPresenter
             VkBuffer stagingBuffer = default;
             DeviceMemory stagingMemory = default;
             ulong contentFingerprint;
+            var texturePath = "gpu-detile";
             if (gpuTiledSource is { } gpuSource)
             {
                 // GPU detile: no CPU staging; the compute pass writes the image directly.
@@ -8468,6 +8572,12 @@ internal static unsafe class VulkanVideoPresenter
                 var pixels = cpuDetiled.Length == (int)(expectedSize * layers)
                     ? cpuDetiled
                     : CreateFallbackTexturePixels(texture.Format, rowLength, height, expectedSize);
+                // Substituted pixels are indistinguishable from real ones once
+                // uploaded, and the 8_8_8_8 substitute is OPAQUE black, so a
+                // fullscreen quad that takes it erases whatever it covers.
+                texturePath = ReferenceEquals(pixels, cpuDetiled)
+                    ? cpuDetiled.Length == texture.RgbaPixels.Length ? "staged" : "cpu-detile"
+                    : "fallback";
                 if (!ReferenceEquals(pixels, texture.RgbaPixels))
                 {
                     layers = 1;
@@ -8620,6 +8730,12 @@ internal static unsafe class VulkanVideoPresenter
                             linear, $"{TextureDebugName(texture, vkFormat)} staging(cpu-fallback)");
                     }
                 }
+                if (!gpuDetiled)
+                {
+                    texturePath = stagingBuffer.Handle == 0
+                        ? "detile-failed"
+                        : "cpu-detile-fallback";
+                }
                 else if (_gpuDetileLog && Interlocked.Increment(ref _gpuDetileCount) is 1 or 100 or 1000 or 10000)
                 {
                     Console.Error.WriteLine(
@@ -8650,6 +8766,17 @@ internal static unsafe class VulkanVideoPresenter
                 UpdatesCpuContent = texture.Address != 0,
                 WriteGeneration = texture.WriteGeneration,
             };
+
+            if (_logTexturePath)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][TRACE] vk.texture_path addr=0x{texture.Address:X16} " +
+                    $"size={width}x{height} guest_format={texture.Format} " +
+                    $"number_type={texture.NumberType} vk_format={vkFormat} " +
+                    $"tile={texture.TileMode} layers={layers} path={texturePath} " +
+                    $"guest_fallback={(texture.IsFallback ? 1 : 0)} " +
+                    $"src={DescribeTexturePayload(texture)}");
+            }
 
             if (texture.Address != 0 &&
                 !texture.ArrayedView &&
@@ -11907,6 +12034,25 @@ internal static unsafe class VulkanVideoPresenter
                                 ? writeCount == _traceLargeGuestWriteOrdinal
                             : writeCount <=
                                 (traceLargeWrites ? 2 : traceSmallWrites ? 48 : 3);
+                        if (_traceFrameTrajectory > 0)
+                        {
+                            if (_trajectoryRemaining > 0 &&
+                                target.Address == _trajectoryAddress)
+                            {
+                                _trajectoryRemaining--;
+                                shouldTraceWrite = true;
+                            }
+                            else if (_trajectoryAddress == 0 && shouldTraceWrite)
+                            {
+                                // Arm on the selected pass so the window starts
+                                // at a known point in the frame and ends at the
+                                // flip of that same frame.
+                                _trajectoryAddress = target.Address;
+                                _trajectoryRemaining = _traceFrameTrajectory;
+                                _trajectoryAwaitingFlip = true;
+                            }
+                        }
+
                         if (traceAddressWrite || shouldTraceWrite)
                         {
                             var sampledTextures = string.Join(
@@ -11914,7 +12060,13 @@ internal static unsafe class VulkanVideoPresenter
                                 work.Draw.Textures.Select(texture =>
                                     $"0x{texture.Address:X}:{texture.Width}x{texture.Height}:" +
                                     $"f{texture.Format}:n{texture.NumberType}:" +
-                                    $"storage={(texture.IsStorage ? 1 : 0)}"));
+                                    $"storage={(texture.IsStorage ? 1 : 0)}:" +
+                                    // The bytes actually read out of guest
+                                    // memory. A draw that samples an all-zero
+                                    // upload is invisible for reasons that have
+                                    // nothing to do with the draw itself.
+                                    $"fallback={(texture.IsFallback ? 1 : 0)}:" +
+                                    $"src={DescribeTexturePayload(texture)}"));
                             var pixelDigest = Convert.ToHexString(
                                 SHA256.HashData(work.Draw.PixelSpirv).AsSpan(0, 4));
                             Console.Error.WriteLine(
@@ -11938,6 +12090,16 @@ internal static unsafe class VulkanVideoPresenter
                                 $"indices={(work.Draw.IndexBuffer is { } indexBuffer
                                     ? indexBuffer.Length / (indexBuffer.Is32Bit ? 4 : 2)
                                     : 0)} " +
+                                // Which vertices the draw names, not just how
+                                // many: a fullscreen pass that reads the wrong
+                                // three of a six-vertex screen-rect buffer
+                                // covers a triangle instead of the target.
+                                $"idx=[{DescribeIndices(work.Draw.IndexBuffer)}] " +
+                                // A pass that overwrites its target instead of
+                                // blending into it is indistinguishable from a
+                                // clear in the pixels alone.
+                                $"blend=[{string.Join(',', work.Draw.RenderState.Blends)}] " +
+                                $"scissor={work.Draw.RenderState.Scissor?.ToString() ?? "none"} " +
                                 $"readback={(shouldTraceWrite ? 1 : 0)} textures=[{sampledTextures}]");
                         }
 
@@ -15818,10 +15980,79 @@ internal static unsafe class VulkanVideoPresenter
             return string.Join(';', bindings);
         }
 
+        /// <summary>
+        /// Size and occupancy of the guest bytes staged for a sampled texture,
+        /// strided so an 8 MB payload costs the same as a 1x1 one. Separates a
+        /// draw that renders nothing because its own state is wrong from one
+        /// whose texture arrived empty.
+        /// </summary>
+        private static string DescribeTexturePayload(GuestDrawTexture texture)
+        {
+            var pixels = texture.TiledSource is { Length: > 0 } tiled
+                ? tiled
+                : texture.RgbaPixels;
+            if (pixels is not { Length: > 0 })
+            {
+                return "none";
+            }
+
+            var stride = Math.Max(pixels.Length / 4096, 1);
+            var nonzero = 0;
+            var samples = 0;
+            for (var offset = 0; offset < pixels.Length; offset += stride)
+            {
+                nonzero += pixels[offset] == 0 ? 0 : 1;
+                samples++;
+            }
+
+            var kind = texture.TiledSource is { Length: > 0 } ? "tiled" : "rgba";
+            return $"{kind}{pixels.Length}:nz{nonzero}/{samples}";
+        }
+
+        private static string DescribeIndices(GuestIndexBuffer? indexBuffer)
+        {
+            if (indexBuffer is not { Length: > 0 } buffer)
+            {
+                return "none";
+            }
+
+            var stride = buffer.Is32Bit ? 4 : 2;
+            var count = Math.Min(buffer.Length / stride, 8);
+            var values = new string[count];
+            for (var index = 0; index < count; index++)
+            {
+                values[index] = (buffer.Is32Bit
+                    ? BitConverter.ToUInt32(buffer.Data, index * stride)
+                    : BitConverter.ToUInt16(buffer.Data, index * stride))
+                    .ToString(System.Globalization.CultureInfo.InvariantCulture);
+            }
+
+            return string.Join(' ', values);
+        }
+
         private static readonly string? _traceGuestWritePixelShader =
             Environment.GetEnvironmentVariable("SHARPEMU_TRACE_GUEST_WRITE_PS");
 
         private static long _tracedPixelShaderWrites;
+
+        /// <summary>
+        /// Number of draws to read a target back after, once the pass selected
+        /// by <c>SHARPEMU_TRACE_GUEST_WRITE_PS</c> has rendered into it. Two
+        /// samples taken hundreds of draws apart span several frames and
+        /// several flips, so they cannot tell a buffer that is overwritten
+        /// within a frame from one that is captured at a different phase of it.
+        /// Consecutive samples running up to that same frame's flip can.
+        /// </summary>
+        private static readonly int _traceFrameTrajectory =
+            int.TryParse(
+                Environment.GetEnvironmentVariable("SHARPEMU_TRACE_FRAME_TRAJECTORY"),
+                out var traceFrameTrajectory)
+                    ? traceFrameTrajectory
+                    : 0;
+
+        private static ulong _trajectoryAddress;
+        private static int _trajectoryRemaining;
+        private static bool _trajectoryAwaitingFlip;
 
         private static readonly bool _flipDrainDiagnostic =
             string.Equals(
