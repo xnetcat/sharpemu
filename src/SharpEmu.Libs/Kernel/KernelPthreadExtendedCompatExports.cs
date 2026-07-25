@@ -1420,6 +1420,7 @@ public static class KernelPthreadExtendedCompatExports
             currentThreadHandle,
             static _ => new ConcurrentDictionary<int, ulong>());
         values[key] = value;
+        TraceTlsAccess("set", key, currentThreadHandle, value);
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
@@ -1453,8 +1454,76 @@ public static class KernelPthreadExtendedCompatExports
             value = storedValue;
         }
 
+        TraceTlsAccess("get", key, currentThreadHandle, value);
         ctx[CpuRegister.Rax] = value;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    // UE resolves "which named thread am I" through a pthread TLS slot, and a
+    // thread that reads back another thread's identity would enqueue task-graph
+    // work as if it were the target thread — skipping the wake the target is
+    // parked on. SHARPEMU_LOG_TLS_KEYS=<key>[,<key>] logs those accesses with
+    // the owning guest thread so a mismatch is visible directly.
+    private static readonly HashSet<int>? _tracedTlsKeys = ParseTracedTlsKeys();
+    private static long _tlsTraceCount;
+
+    private static HashSet<int>? ParseTracedTlsKeys()
+    {
+        var raw = Environment.GetEnvironmentVariable("SHARPEMU_LOG_TLS_KEYS");
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return null;
+        }
+
+        var keys = new HashSet<int>();
+        foreach (var part in raw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (int.TryParse(part, out var key))
+            {
+                keys.Add(key);
+            }
+        }
+
+        return keys.Count == 0 ? null : keys;
+    }
+
+    // Reads are the hot path (one thread can poll a key thousands of times), so
+    // only registrations and anomalies are logged: a read is reported when it
+    // returns something this thread never stored, which is exactly the
+    // cross-thread identity leak worth finding.
+    private static readonly ConcurrentDictionary<(ulong Thread, int Key), ulong> _tlsLastStored = new();
+
+    private static void TraceTlsAccess(string operation, int key, ulong threadHandle, ulong value)
+    {
+        if (_tracedTlsKeys is null || !_tracedTlsKeys.Contains(key))
+        {
+            return;
+        }
+
+        var isSet = operation == "set";
+        if (isSet)
+        {
+            _tlsLastStored[(threadHandle, key)] = value;
+        }
+        else
+        {
+            var stored = _tlsLastStored.TryGetValue((threadHandle, key), out var s) ? s : 0UL;
+            if (stored == value)
+            {
+                return;
+            }
+        }
+
+        if (Interlocked.Increment(ref _tlsTraceCount) > 400)
+        {
+            return;
+        }
+
+        var name = KernelPthreadState.TryGetThreadIdentity(threadHandle, out var identity)
+            ? identity.Name
+            : "?";
+        Console.Error.WriteLine(
+            $"[LOADER][TRACE] tls_{operation}: key={key} thread=0x{threadHandle:X16} name='{name}' value=0x{value:X16}");
     }
 
     [SysAbiExport(
