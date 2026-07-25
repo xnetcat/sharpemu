@@ -11444,6 +11444,11 @@ internal static unsafe class VulkanVideoPresenter
                 return;
             }
 
+            foreach (var tracedTarget in work.Targets)
+            {
+                TraceRenderTargetAddress("draw", tracedTarget.Address);
+            }
+
             var targets = new GuestImageResource[work.Targets.Count];
             EnsureGuestSubmissionCapacity();
             for (var index = 0; index < targets.Length; index++)
@@ -15676,6 +15681,37 @@ internal static unsafe class VulkanVideoPresenter
                 : count == _tracePresentedGuestImageOccurrence;
         }
 
+        private static readonly bool _traceRenderTargetAddresses =
+            string.Equals(
+                Environment.GetEnvironmentVariable("SHARPEMU_TRACE_RT_ADDRS"),
+                "1",
+                StringComparison.Ordinal);
+
+        private static readonly HashSet<string> _tracedRenderTargetAddresses = [];
+
+        /// <summary>
+        /// One line per distinct (kind, address). Answers whether the image the
+        /// flip presents is one the translated draws ever render into.
+        /// </summary>
+        private static void TraceRenderTargetAddress(string kind, ulong address)
+        {
+            if (!_traceRenderTargetAddresses)
+            {
+                return;
+            }
+
+            var key = $"{kind} 0x{address:X16}";
+            lock (_tracedRenderTargetAddresses)
+            {
+                if (!_tracedRenderTargetAddresses.Add(key))
+                {
+                    return;
+                }
+            }
+
+            Console.Error.WriteLine($"[LOADER][TRACE] vk.rt_addr {key}");
+        }
+
         private static bool ShouldTraceVulkanResources() =>
             _traceVulkanResourcesEnabled;
 
@@ -16296,6 +16332,7 @@ internal static unsafe class VulkanVideoPresenter
             uint imageIndex,
             GuestImageResource source)
         {
+            TraceRenderTargetAddress("present", source.Address);
             var presentedCount = Interlocked.Increment(ref _presentedSwapchainCount);
             var periodicDumpInterval = SwapchainDumpInterval();
             var traceDestination =
