@@ -55,6 +55,9 @@ public static class AjmExports
     /// </summary>
     private static readonly ConcurrentDictionary<ulong, AjmBatchState> Batches = new();
 
+    /// <summary>Codec types already announced, so the report is emitted once each.</summary>
+    private static readonly ConcurrentDictionary<uint, byte> ReportedCodecs = new();
+
     private static int _nextContextId;
     private static int _nextBatchId;
     private static ulong _errorStringTableAddress;
@@ -233,6 +236,16 @@ public static class AjmExports
             {
                 return ctx.SetReturn(OrbisAjmErrorCodecAlreadyRegistered);
             }
+        }
+
+        // Which codec a title asks AJM for decides whether it can have sound at all, and it
+        // is only ever stated here. Report each distinct codec once, unconditionally, so a
+        // plain run reveals it without anyone having to know about SHARPEMU_LOG_AJM.
+        if (ReportedCodecs.TryAdd(codecType, 0))
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][INFO] ajm.codec_registered type={codecType} ({AjmCodecType.Name(codecType)}) " +
+                $"decodable={AjmDecoderSession.IsCodecSupported(codecType)}");
         }
 
         Trace($"module_register context={contextId} codec={codecType} ({AjmCodecType.Name(codecType)})");
@@ -920,6 +933,7 @@ public static class AjmExports
 
         Contexts.Clear();
         Batches.Clear();
+        ReportedCodecs.Clear();
         Interlocked.Exchange(ref _nextContextId, 0);
         Interlocked.Exchange(ref _nextBatchId, 0);
         Interlocked.Exchange(ref _errorStringTableAddress, 0);
