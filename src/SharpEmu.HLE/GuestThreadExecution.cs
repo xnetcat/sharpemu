@@ -184,6 +184,13 @@ public static class GuestThreadExecution
     /// </summary>
     public static Func<ulong, int>? GuestCondSignaller;
 
+    /// <summary>
+    /// Set by the pthread HLE layer so stall snapshots can read a guest
+    /// thread's TLS slot by (thread handle, key). Returns null when the thread
+    /// never stored that key. Diagnostic-only.
+    /// </summary>
+    public static Func<ulong, int, ulong?>? GuestTlsValueProvider;
+
     private sealed class DelegateGuestThreadBlockWaiter : IGuestThreadBlockWaiter
     {
         private readonly Func<int> _resume;

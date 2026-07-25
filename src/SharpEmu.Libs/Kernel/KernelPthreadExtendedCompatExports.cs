@@ -40,6 +40,21 @@ public static class KernelPthreadExtendedCompatExports
 
     private static readonly ConcurrentDictionary<ulong, ConcurrentDictionary<int, ulong>> _threadLocalSpecific = new();
 
+    static KernelPthreadExtendedCompatExports()
+    {
+        GuestThreadExecution.GuestTlsValueProvider = ReadTlsValue;
+    }
+
+    // Lets a stall snapshot resolve a parked thread's engine identity from its
+    // own TLS instead of a per-run heap address. UE stores &WorkerThreads[index]
+    // in a TLS key, which is the only stable route from a blocked guest thread
+    // back to its task-graph queue object.
+    private static ulong? ReadTlsValue(ulong threadHandle, int key) =>
+        _threadLocalSpecific.TryGetValue(threadHandle, out var values) &&
+        values.TryGetValue(key, out var value)
+            ? value
+            : null;
+
     internal static void GetThreadStartScheduling(
         CpuContext ctx,
         ulong attrAddress,

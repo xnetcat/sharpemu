@@ -6609,6 +6609,186 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			? kickMs
 			: 0;
 
+	// Dumps a parked thread's UE task-graph queue object. UE keeps
+	// &WorkerThreads[ThreadIndex] in a TLS key (10 for this title); that entry's
+	// first field is the FNamedTaskThread whose FStallingTaskQueue holds the
+	// MasterState deciding whether an enqueue wakes the thread. Reaching it
+	// through TLS keeps the walk valid across runs, unlike the per-run heap
+	// addresses. Diagnostic-only, and off unless asked for.
+	private static readonly bool _ueQueueDump = string.Equals(
+		Environment.GetEnvironmentVariable("SHARPEMU_UE_QUEUE_DUMP"),
+		"1",
+		StringComparison.Ordinal);
+
+	private static readonly int _ueTlsIdentityKey =
+		int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_UE_TLS_IDENTITY_KEY"), out var identityKey)
+			? identityKey
+			: 10;
+
+	private void LogUeTaskQueue(CpuContext cpuContext, GuestThreadState thread)
+	{
+		if (!_ueQueueDump ||
+			SharpEmu.HLE.GuestThreadExecution.GuestTlsValueProvider is not { } readTls)
+		{
+			return;
+		}
+
+		var workerEntry = readTls(thread.ThreadHandle, _ueTlsIdentityKey);
+		if (workerEntry is not { } workerEntryAddress ||
+			workerEntryAddress == 0 ||
+			!cpuContext.TryReadUInt64(workerEntryAddress, out var taskGraphWorker) ||
+			taskGraphWorker == 0)
+		{
+			return;
+		}
+
+		// FStallingTaskQueue pads every member to a cache line, so the queue this
+		// thread parks on sits at an offset that cannot be predicted from the
+		// struct definition alone. Anchor on the one field whose value is already
+		// known — the StallRestartEvent pointer, which is the event the thread is
+		// blocked on — and report a window around it. MasterState, the word that
+		// decides whether an enqueue wakes this thread, lives just below it.
+		var blockedRdi = Volatile.Read(ref thread.LastImportRdi);
+		var eventBase = blockedRdi > 0x28 ? blockedRdi - 0x28 : 0;
+		var header = new System.Text.StringBuilder(160);
+		for (var index = 0UL; index < 8; index++)
+		{
+			if (!cpuContext.TryReadUInt64(taskGraphWorker + (index * sizeof(ulong)), out var value))
+			{
+				break;
+			}
+
+			header.Append(index == 0 ? string.Empty : " ").Append($"{value:X16}");
+		}
+
+		Console.Error.WriteLine(
+			$"[LOADER][ERROR] Stall ue-queue name='{thread.Name}' " +
+			$"worker_entry=0x{workerEntryAddress:X16} named_thread=0x{taskGraphWorker:X16} " +
+			$"event_base=0x{eventBase:X16} header=[{header}]");
+
+		if (eventBase == 0)
+		{
+			return;
+		}
+
+		var scanned = 0UL;
+		var unreadable = 0UL;
+		var hits = 0;
+		// FStallingTaskQueue pads to a cache line per member and there are two
+		// queues, so the StallRestartEvent field can sit well past a naive
+		// estimate of the object size. Scan wide enough that a miss means the
+		// field genuinely is not inline rather than that the window was short.
+		for (var offset = 0UL; offset < 0x20000; offset += sizeof(ulong))
+		{
+			// Do not stop at the first unreadable qword: the allocation is
+			// followed by unmapped pages often enough that breaking here is what
+			// made an earlier version of this scan report no hits at all.
+			if (!cpuContext.TryReadUInt64(taskGraphWorker + offset, out var value))
+			{
+				unreadable++;
+				continue;
+			}
+
+			scanned++;
+			if (value != eventBase)
+			{
+				continue;
+			}
+
+			hits++;
+
+			var windowStart = offset >= 0x60 ? offset - 0x60 : 0;
+			var window = new System.Text.StringBuilder(320);
+			for (var probe = windowStart; probe <= offset + 0x10; probe += sizeof(ulong))
+			{
+				if (!cpuContext.TryReadUInt64(taskGraphWorker + probe, out var windowValue))
+				{
+					break;
+				}
+
+				window.Append(probe == windowStart ? string.Empty : " ").Append($"{windowValue:X16}");
+			}
+
+			Console.Error.WriteLine(
+				$"[LOADER][ERROR] Stall ue-queue-hit name='{thread.Name}' " +
+				$"stall_restart_event_at=+0x{offset:X} window_from=+0x{windowStart:X} " +
+				$"window=[{window}]");
+		}
+
+		Console.Error.WriteLine(
+			$"[LOADER][ERROR] Stall ue-queue-scan name='{thread.Name}' hits={hits} " +
+			$"readable_qwords={scanned} unreadable_qwords={unreadable}");
+	}
+
+	// Recovers a cooperatively blocked thread's guest call chain. The stall
+	// snapshot only stack-scans the active context, which cannot say which UE
+	// function a parked worker is waiting inside — the difference between "idle
+	// waiting for work" and "blocked on another thread's result".
+	private void LogBlockedThreadStack(CpuContext cpuContext, GuestThreadState thread)
+	{
+		if (!_ueQueueDump || !thread.HasBlockedContinuation)
+		{
+			return;
+		}
+
+		const ulong guestImageStart = 0x8_0000_0000UL;
+		const ulong guestImageEnd = 0x8_2000_0000UL;
+		var rsp = thread.BlockedContinuation.Rsp;
+		if (rsp == 0)
+		{
+			return;
+		}
+
+		var builder = new System.Text.StringBuilder(320);
+		var found = 0;
+		for (var offset = 0UL; offset < 0x600 && found < 16; offset += sizeof(ulong))
+		{
+			if (!cpuContext.TryReadUInt64(rsp + offset, out var candidate) ||
+				candidate < guestImageStart ||
+				candidate >= guestImageEnd)
+			{
+				continue;
+			}
+
+			if (builder.Length != 0)
+			{
+				builder.Append(',');
+			}
+
+			builder.Append($"+0x{offset:X}:0x{candidate:X}");
+			found++;
+		}
+
+		var continuation = thread.BlockedContinuation;
+		Console.Error.WriteLine(
+			$"[LOADER][ERROR] Stall blocked-stack name='{thread.Name}' " +
+			$"rip=0x{continuation.Rip:X} rsp=0x{rsp:X16} rbp=0x{continuation.Rbp:X16} " +
+			$"rdi=0x{continuation.Rdi:X16} rsi=0x{continuation.Rsi:X16} " +
+			$"r12=0x{continuation.R12:X16} r13=0x{continuation.R13:X16} " +
+			$"r14=0x{continuation.R14:X16} r15=0x{continuation.R15:X16} " +
+			$"scan={(builder.Length == 0 ? "none" : builder.ToString())}");
+
+		// Raw stack words as well as the return-address scan: identifying the
+		// frame only says which function is waiting, not which object it waits
+		// on. The locals holding that object are on this stack, so capture them
+		// in the same pass rather than needing another run once the frame layout
+		// is known.
+		var words = new System.Text.StringBuilder(1024);
+		for (var offset = 0UL; offset < 0x200; offset += sizeof(ulong))
+		{
+			if (!cpuContext.TryReadUInt64(rsp + offset, out var value))
+			{
+				break;
+			}
+
+			words.Append(offset == 0 ? string.Empty : " ").Append($"{value:X16}");
+		}
+
+		Console.Error.WriteLine(
+			$"[LOADER][ERROR] Stall blocked-stack-words name='{thread.Name}' " +
+			$"from=0x{rsp:X16} words=[{words}]");
+	}
+
 	// Thread-name prefixes the fast kick pass is allowed to poke. A spurious
 	// wake is only safe for waiters that re-check their own state and go back to
 	// sleep — UE's named task threads re-poll their task queue. Kicking every
@@ -6999,6 +7179,12 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 						$"nid={Volatile.Read(ref thread.LastImportNid) ?? "none"} ret=0x{Volatile.Read(ref thread.LastReturnRip):X16} " +
 						$"rdi=0x{Volatile.Read(ref thread.LastImportRdi):X16} rsi=0x{Volatile.Read(ref thread.LastImportRsi):X16} " +
 						$"rdx=0x{Volatile.Read(ref thread.LastImportRdx):X16} block={thread.BlockReason ?? "none"}{syncText}{eventText}{hostContextText}");
+					if (IsUeEventKickTarget(thread.Name))
+					{
+						LogUeTaskQueue(cpuContext, thread);
+						LogBlockedThreadStack(cpuContext, thread);
+					}
+
 					logged++;
 					if (logged >= 128 && threads.Length > logged)
 					{

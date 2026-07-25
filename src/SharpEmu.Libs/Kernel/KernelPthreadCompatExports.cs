@@ -147,6 +147,10 @@ public static class KernelPthreadCompatExports
         // completed. Separating this from SignalEpoch distinguishes "the guest
         // never signalled" from "the guest signalled but no waiter matched".
         public ulong Wakes { get; set; }
+        // Signals attributable to the diagnostic probe rather than to a guest
+        // scePthreadCondSignal/Broadcast. Without the split, a probe run's
+        // signal count reads as if the guest were still signalling.
+        public ulong ProbeSignals { get; set; }
     }
 
     private sealed class PthreadCondWaiter
@@ -177,8 +181,18 @@ public static class KernelPthreadCompatExports
     // Diagnostic probe support: signal a condition variable by guest address
     // without a calling CPU context. Only reaches conds we already track, so a
     // stale or unknown address is a no-op rather than a fault.
-    private static int SignalCondForDiagnostics(ulong condAddress) =>
-        PthreadCondSignalCore(null, condAddress, broadcast: true);
+    private static int SignalCondForDiagnostics(ulong condAddress)
+    {
+        if (TryResolveCondState(null, condAddress, createIfZero: false, out _, out var state))
+        {
+            lock (state.SyncRoot)
+            {
+                state.ProbeSignals++;
+            }
+        }
+
+        return PthreadCondSignalCore(null, condAddress, broadcast: true);
+    }
 
     // Lets the stall watchdog name the owner of the mutex a blocked thread is
     // parked on. Diagnostic-only; a miss returns null so unrelated rdi values
@@ -196,7 +210,8 @@ public static class KernelPthreadCompatExports
             lock (condState.SyncRoot)
             {
                 return $"cond waiters={condState.Waiters} signals={condState.SignalEpoch} " +
-                    $"wakes={condState.Wakes}";
+                    $"guest_signals={condState.SignalEpoch - condState.ProbeSignals} " +
+                    $"probe_signals={condState.ProbeSignals} wakes={condState.Wakes}";
             }
         }
 
