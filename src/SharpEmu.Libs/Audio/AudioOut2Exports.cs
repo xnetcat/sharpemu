@@ -32,10 +32,16 @@ public static class AudioOut2Exports
     // derived from a live model rather than hardcoded to zero.
     private const uint ContextQueueDepth = 2;
 
+    // Escape hatch for the queue-full wait. Off means submissions never block,
+    // which is only useful for isolating audio pacing during diagnosis.
+    private static readonly bool _backpressureEnabled = !string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_AUDIOOUT2_PACE"),
+        "0",
+        StringComparison.Ordinal);
+
     private sealed class ContextState
     {
         private readonly object _paceGate = new();
-        private long _nextAdvanceTimestamp;
         private long _queueTailTimestamp;
 
         public ContextState(uint frequency, uint channels, uint grainSamples)
@@ -52,22 +58,6 @@ public static class AudioOut2Exports
         private long GrainTicks() =>
             checked((long)Math.Ceiling(Stopwatch.Frequency * (double)GrainSamples / Frequency));
 
-        // Records one grain entering the modeled output queue. The queue drains
-        // by wall-clock grain time, so the reported level rises with pushes and
-        // falls as "playback" consumes them — the movement Wwise's sink priming
-        // loop waits to observe.
-        public void NoteGrainQueued()
-        {
-            lock (_paceGate)
-            {
-                var now = Stopwatch.GetTimestamp();
-                var grainTicks = GrainTicks();
-                var tail = _queueTailTimestamp < now ? now : _queueTailTimestamp;
-                var cappedTail = now + grainTicks * ContextQueueDepth;
-                tail += grainTicks;
-                _queueTailTimestamp = tail > cappedTail ? cappedTail : tail;
-            }
-        }
 
         public (uint Queued, uint Available) ReadQueueLevel()
         {
@@ -88,26 +78,32 @@ public static class AudioOut2Exports
             }
         }
 
-        // Blocks the advancing thread until one grain worth of wall-clock time
-        // has elapsed since the previous advance, matching hardware timing so
-        // audio-gated titles neither spin nor drift ahead.
-        public void PaceAdvance()
+        // Applies hardware backpressure: submitting is instant while the
+        // modeled output queue has a free slot and only waits once it is full,
+        // exactly as a real sink behaves. A cadence-forcing sleep must NOT be
+        // used here — the guest calls this from inside its own critical
+        // sections (Wwise ticks audio while holding its bank-manager mutex), so
+        // an unconditional per-grain sleep serializes unrelated guest threads
+        // behind emulator-invented latency. A self-pacing producer never fills
+        // the queue and so never waits; a free-running one is paced by it.
+        public void SubmitGrain()
         {
             long delay;
             lock (_paceGate)
             {
                 var now = Stopwatch.GetTimestamp();
-                if (_nextAdvanceTimestamp < now)
+                var grainTicks = GrainTicks();
+                if (_queueTailTimestamp < now)
                 {
-                    _nextAdvanceTimestamp = now;
+                    _queueTailTimestamp = now;
                 }
 
-                delay = _nextAdvanceTimestamp - now;
-                _nextAdvanceTimestamp += checked(
-                    (long)Math.Ceiling(Stopwatch.Frequency * (double)GrainSamples / Frequency));
+                var slack = _queueTailTimestamp - now - grainTicks * (ContextQueueDepth - 1);
+                delay = slack > 0 ? slack : 0;
+                _queueTailTimestamp += grainTicks;
             }
 
-            if (delay > 0)
+            if (delay > 0 && _backpressureEnabled)
             {
                 Thread.Sleep(TimeSpan.FromSeconds((double)delay / Stopwatch.Frequency));
             }
@@ -253,8 +249,7 @@ public static class AudioOut2Exports
             // FMOD's PS5 output path uses ContextPush as the submission clock
             // and does not call ContextAdvance. Pace pushes to one hardware
             // grain so the feeder cannot outrun playback and starve the game.
-            context.NoteGrainQueued();
-            context.PaceAdvance();
+            context.SubmitGrain();
         }
 
         return SetReturn(ctx, 0);
@@ -271,8 +266,7 @@ public static class AudioOut2Exports
         // wall-clock cadence so the guest audio thread runs at the right speed.
         if (Contexts.TryGetValue(ctx[CpuRegister.Rdi], out var context))
         {
-            context.NoteGrainQueued();
-            context.PaceAdvance();
+            context.SubmitGrain();
         }
 
         return SetReturn(ctx, 0);
