@@ -26,6 +26,11 @@ public static class AudioOut2Exports
     // can pace to the real playback cadence (grain samples at the sample rate).
     private static readonly ConcurrentDictionary<ulong, ContextState> Contexts = new();
 
+    /// <summary>Live mastering chains, keyed by the handle handed back to the title.</summary>
+    private static readonly ConcurrentDictionary<ulong, ulong> MasteringHandles = new();
+
+    private const ulong MasteringHandleTag = 0x2001_0000_0000UL;
+
     private sealed class ContextState
     {
         private readonly object _paceGate = new();
@@ -365,6 +370,78 @@ public static class AudioOut2Exports
         return TryWriteUInt64(ctx, outUserAddress, handle)
             ? SetReturn(ctx, 0)
             : SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    /// <summary>
+    /// Creates the mastering (output-bus limiter/EQ) chain for a context. SharpEmu applies no
+    /// mastering, so the call succeeds and publishes a handle the title can pass back to
+    /// SetParam/Term without the chain doing anything to the samples.
+    /// </summary>
+    [SysAbiExport(
+        Nid = "XHl38ZNknbs",
+        ExportName = "sceAudioOut2MasteringInit",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAudioOut2")]
+    public static int AudioOut2MasteringInit(CpuContext ctx)
+    {
+        var contextHandle = ctx[CpuRegister.Rdi];
+        var paramAddress = ctx[CpuRegister.Rsi];
+        var outHandleAddress = ctx[CpuRegister.Rdx];
+        if (contextHandle == 0)
+        {
+            return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        // The handle is derived from the context so Term can reject a mismatched pairing
+        // instead of accepting any value.
+        var handle = MasteringHandleTag | (contextHandle & 0xFFFF);
+        MasteringHandles[handle] = contextHandle;
+        TraceAudioOut2(
+            $"mastering-init context=0x{contextHandle:X} param=0x{paramAddress:X} handle=0x{handle:X}");
+
+        return outHandleAddress == 0 || TryWriteUInt64(ctx, outHandleAddress, handle)
+            ? SetReturn(ctx, 0)
+            : SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    /// <summary>
+    /// Updates one mastering parameter. Accepted and recorded in the trace, but not applied:
+    /// SharpEmu does not model the output-bus processor.
+    /// </summary>
+    [SysAbiExport(
+        Nid = "v8iOE+j8a5o",
+        ExportName = "sceAudioOut2MasteringSetParam",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAudioOut2")]
+    public static int AudioOut2MasteringSetParam(CpuContext ctx)
+    {
+        var handle = ctx[CpuRegister.Rdi];
+        var paramAddress = ctx[CpuRegister.Rsi];
+        if (handle == 0 || !MasteringHandles.ContainsKey(handle))
+        {
+            return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        TraceAudioOut2($"mastering-set-param handle=0x{handle:X} param=0x{paramAddress:X}");
+        return SetReturn(ctx, 0);
+    }
+
+    /// <summary>Tears down a mastering chain created by <c>sceAudioOut2MasteringInit</c>.</summary>
+    [SysAbiExport(
+        Nid = "2bbBBOkH4CY",
+        ExportName = "sceAudioOut2MasteringTerm",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAudioOut2")]
+    public static int AudioOut2MasteringTerm(CpuContext ctx)
+    {
+        var handle = ctx[CpuRegister.Rdi];
+        if (handle == 0 || !MasteringHandles.TryRemove(handle, out _))
+        {
+            return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        TraceAudioOut2($"mastering-term handle=0x{handle:X}");
+        return SetReturn(ctx, 0);
     }
 
     private static bool TryWriteUInt64(CpuContext ctx, ulong address, ulong value)
