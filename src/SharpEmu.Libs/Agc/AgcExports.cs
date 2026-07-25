@@ -1728,6 +1728,54 @@ public static partial class AgcExports
         return (int)ctx[CpuRegister.Rax];
     }
 
+    /// <summary>
+    /// Non-indexed indirect draw. Identical in shape to its indexed sibling and
+    /// already understood by the packet walk, which reads the draw count from
+    /// the indirect-args buffer and treats this opcode as non-indexed. Leaving
+    /// it unresolved was worse than a dropped draw: the guest builds its command
+    /// stream by calling these to append a packet and advance its write pointer,
+    /// so an unresolved call appends nothing and hands back a pointer the caller
+    /// then writes from — leaving stale bytes in the stream for the walk to
+    /// misread as some other packet.
+    /// </summary>
+    [SysAbiExport(
+        Nid = "1q1titRBL6o",
+        ExportName = "sceAgcDcbDrawIndirect",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int DcbDrawIndirect(CpuContext ctx)
+    {
+        var commandBufferAddress = ctx[CpuRegister.Rdi];
+        var dataOffset = (uint)ctx[CpuRegister.Rsi];
+        var modifier = (uint)ctx[CpuRegister.Rdx];
+        if (commandBufferAddress == 0 ||
+            !TryAllocateCommandDwords(ctx, commandBufferAddress, 5, out var commandAddress) ||
+            !TryWriteUInt32(ctx, commandAddress, Pm4(5, ItDrawIndirect, 0)) ||
+            !TryWriteUInt32(ctx, commandAddress + 4, dataOffset) ||
+            !TryWriteUInt32(ctx, commandAddress + 8, 0) ||
+            !TryWriteUInt32(ctx, commandAddress + 12, 0) ||
+            !TryWriteUInt32(ctx, commandAddress + 16, modifier))
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        TraceAgc(
+            $"agc.dcb_draw_indirect buf=0x{commandBufferAddress:X16} " +
+            $"cmd=0x{commandAddress:X16} offset=0x{dataOffset:X8} modifier=0x{modifier:X8}");
+        return ReturnPointer(ctx, commandAddress);
+    }
+
+    [SysAbiExport(
+        Nid = "cxPZ4Wgvdj8",
+        ExportName = "sceAgcDcbDrawIndirectGetSize",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int DcbDrawIndirectGetSize(CpuContext ctx)
+    {
+        ctx[CpuRegister.Rax] = 5u * sizeof(uint);
+        return (int)ctx[CpuRegister.Rax];
+    }
+
     [SysAbiExport(
         Nid = "rUuVjyR+Rd4",
         ExportName = "sceAgcDcbGetLodStatsGetSize",
