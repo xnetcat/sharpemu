@@ -11930,6 +11930,14 @@ internal static unsafe class VulkanVideoPresenter
                                 $"vbufs={work.Draw.VertexBuffers.Count} " +
                                 $"vpos=[{DescribeVertexPositions(work.Draw)}] " +
                                 $"init=[{string.Join(',', initializedAtDraw.Select(flag => flag ? 1 : 0))}] " +
+                                // An indexed quad supplies 6 indices over 4
+                                // vertices; VertexCount doubles as the index
+                                // count, so a mismatch between the two shows a
+                                // count decoded from the wrong field.
+                                $"indexed={(work.Draw.IndexBuffer is null ? 0 : 1)} " +
+                                $"indices={(work.Draw.IndexBuffer is { } indexBuffer
+                                    ? indexBuffer.Length / (indexBuffer.Is32Bit ? 4 : 2)
+                                    : 0)} " +
                                 $"readback={(shouldTraceWrite ? 1 : 0)} textures=[{sampledTextures}]");
                         }
 
