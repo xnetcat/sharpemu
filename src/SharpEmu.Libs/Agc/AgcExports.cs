@@ -234,6 +234,13 @@ public static partial class AgcExports
         Environment.GetEnvironmentVariable("SHARPEMU_LOG_AGC_PRIM"),
         "1",
         StringComparison.Ordinal);
+    // Reports each NOP-wrapped release-mem packet with its header, so packets
+    // that write to a guest object can be compared against the ones that write
+    // to a label and the two candidate causes told apart.
+    private static readonly bool _logReleaseMemDecode = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_LOG_RELEASE_MEM_DECODE"),
+        "1",
+        StringComparison.Ordinal);
     // Drop a draw on an undecodable texture descriptor instead of substituting
     // a 1x1 fallback binding. Off by default so a garbage descriptor degrades
     // the pass rather than dropping it (Demon's Souls composite feeders).
@@ -5875,6 +5882,27 @@ public static partial class AgcExports
         var dataSelection = (control >> 16) & 0xFFu;
         var destinationAddress = ((ulong)destinationHi << 32) | destinationLo;
         var data = ((ulong)dataHi << 32) | dataLo;
+        if (_logReleaseMemDecode)
+        {
+            // This handler identifies its packet as a NOP whose register field
+            // happens to equal RReleaseMem, which unrelated bytes can satisfy by
+            // coincidence. Report the header next to the fields so a packet that
+            // writes somewhere implausible can be compared against one that does
+            // not: a decode fault would look identical across both, while a
+            // misidentified packet has a header our own encoder never emits.
+            TryReadUInt32(ctx, packetAddress, out var header);
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] agc.release_mem_packet addr=0x{packetAddress:X16} " +
+                $"header=0x{header:X8} expected_header=0x{Pm4(8, ItNop, RReleaseMem):X8} " +
+                $"control=0x{control:X8} data_sel={dataSelection} " +
+                $"dst=0x{destinationAddress:X16} data=0x{data:X16} " +
+                // Our encoder only ever emits a destination the guest gave it,
+                // and those land in the label arena; a guest object address here
+                // means the packet was not ours to begin with.
+                $"dst_is_heap_object={(destinationAddress >= 0x70_0000_0000UL &&
+                    destinationAddress < 0x80_0000_0000UL ? 1 : 0)}");
+        }
+
         var writeLength = dataSelection switch
         {
             1 => (ulong)sizeof(uint),
