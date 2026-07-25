@@ -11875,8 +11875,28 @@ internal static unsafe class VulkanVideoPresenter
                             ? previousCount + 1
                             : 1;
                         _tracedGuestWriteCounts[target.Address] = writeCount;
+                        // Write ordinals are not stable between runs, so
+                        // selecting a specific pass by ordinal picks a different
+                        // shader each time. Selecting by pixel-shader digest is
+                        // run-stable and is the only way to sample one named
+                        // pass at steady state.
+                        var tracePixelShader =
+                            _traceGuestWritePixelShader is { Length: > 0 } wantedShader &&
+                            string.Equals(
+                                Convert.ToHexString(
+                                    SHA256.HashData(work.Draw.PixelSpirv).AsSpan(0, 4)),
+                                wantedShader,
+                                StringComparison.OrdinalIgnoreCase);
                         var shouldTraceWrite = tracePixelSpirv || traceTitleDraw
                             ? true
+                            : tracePixelShader
+                                // Nth occurrence of THAT shader, so the sample
+                                // lands at steady state rather than on the
+                                // opening frames.
+                                ? ++_tracedPixelShaderWrites ==
+                                    (_traceGuestWriteOrdinal > 0
+                                        ? _traceGuestWriteOrdinal
+                                        : 60)
                             : traceAddressWrite && _traceGuestWriteOrdinal > 0
                                 ? writeCount == _traceGuestWriteOrdinal
                             : _traceLargeGuestWriteOrdinal != 0
@@ -11916,6 +11936,26 @@ internal static unsafe class VulkanVideoPresenter
                                 _vk.QueueWaitIdle(_queue),
                                 "vkQueueWaitIdle(guest write trace)");
                             TraceGuestImageContents(target);
+
+                            // The draw's inputs as well as its output. Black
+                            // output over non-black input is this shader's
+                            // problem; black output over black input is
+                            // whatever should have filled the input.
+                            foreach (var sampled in work.Draw.Textures)
+                            {
+                                GuestImageResource? sampledImage;
+                                lock (_gate)
+                                {
+                                    _guestImages.TryGetValue(
+                                        sampled.Address,
+                                        out sampledImage);
+                                }
+
+                                if (sampledImage is { Initialized: true })
+                                {
+                                    TraceGuestImageContents(sampledImage);
+                                }
+                            }
                         }
                     }
                 }
@@ -15764,6 +15804,11 @@ internal static unsafe class VulkanVideoPresenter
 
             return string.Join(';', bindings);
         }
+
+        private static readonly string? _traceGuestWritePixelShader =
+            Environment.GetEnvironmentVariable("SHARPEMU_TRACE_GUEST_WRITE_PS");
+
+        private static long _tracedPixelShaderWrites;
 
         private static readonly bool _flipDrainDiagnostic =
             string.Equals(
