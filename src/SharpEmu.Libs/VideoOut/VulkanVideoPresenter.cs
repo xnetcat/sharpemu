@@ -15728,7 +15728,11 @@ internal static unsafe class VulkanVideoPresenter
             {
                 var components = (int)Math.Clamp(buffer.ComponentCount, 1u, 4u);
                 var vertices = new List<string>();
-                for (var vertex = 0u; vertex < Math.Min(draw.VertexCount, 3u); vertex++)
+                // Six, not three: a fullscreen pass that covers half its target
+                // is either a wrong transform or a quad whose second triangle
+                // was never issued, and only the records past the draw's own
+                // vertex count distinguish the two.
+                for (var vertex = 0u; vertex < Math.Min(Math.Max(draw.VertexCount, 6u), 6u); vertex++)
                 {
                     var offset = (long)vertex * buffer.Stride + buffer.OffsetBytes;
                     if (offset < 0 ||
