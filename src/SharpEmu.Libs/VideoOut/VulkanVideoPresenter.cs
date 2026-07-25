@@ -11583,6 +11583,10 @@ internal static unsafe class VulkanVideoPresenter
                     };
                 }
 
+                // Sampled before recording, because the draw marks its targets
+                // initialized: an uninitialized target selects the CLEARING
+                // render pass, which wipes whatever an earlier pass wrote.
+                var initializedAtDraw = targets.Select(target => target.Initialized).ToArray();
                 var renderPass = depthFramebuffer is null
                     ? firstTarget.Initialized
                         ? firstTarget.RenderPass
@@ -11925,6 +11929,7 @@ internal static unsafe class VulkanVideoPresenter
                                 // so stale vertex descriptors cannot explain it.
                                 $"vbufs={work.Draw.VertexBuffers.Count} " +
                                 $"vpos=[{DescribeVertexPositions(work.Draw)}] " +
+                                $"init=[{string.Join(',', initializedAtDraw.Select(flag => flag ? 1 : 0))}] " +
                                 $"readback={(shouldTraceWrite ? 1 : 0)} textures=[{sampledTextures}]");
                         }
 
