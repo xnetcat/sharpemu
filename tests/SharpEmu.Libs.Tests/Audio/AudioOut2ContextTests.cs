@@ -48,8 +48,9 @@ public sealed class AudioOut2ContextTests
         Assert.True(_memory.TryRead(AvailableAddress - 4, after));
         // Byte before the lower slot untouched.
         Assert.Equal(0xCDCDCDCDu, BinaryPrimitives.ReadUInt32LittleEndian(after));
-        // Both 4-byte slots written.
-        Assert.Equal(0u, BinaryPrimitives.ReadUInt32LittleEndian(after[4..]));
+        // Both 4-byte slots written: unknown handle reports an empty queue with
+        // full availability.
+        Assert.Equal(2u, BinaryPrimitives.ReadUInt32LittleEndian(after[4..]));
         Assert.Equal(0u, BinaryPrimitives.ReadUInt32LittleEndian(after[8..]));
         // The bytes above the queued slot — where the guest's stack canary lives
         // in Silent Hill's AK::EventManager frame — must stay untouched. An
@@ -65,6 +66,41 @@ public sealed class AudioOut2ContextTests
         _ctx[CpuRegister.Rdx] = 0;
 
         Assert.Equal(0, AudioOut2Exports.AudioOut2ContextGetQueueLevel(_ctx));
+    }
+
+    [Fact]
+    public void ContextGetQueueLevel_RisesWithPushesAndSumsToDepth()
+    {
+        // Wwise's sink-priming loop pushes grains until the reported queue
+        // level rises; a level frozen at zero deadlocks audio init with the
+        // bank-manager mutex held.
+        const ulong paramAddress = MemoryBase + 0x300;
+        const ulong outHandleAddress = MemoryBase + 0x380;
+        _ctx[CpuRegister.Rdi] = paramAddress;
+        _ctx[CpuRegister.Rsi] = MemoryBase + 0x1000;
+        _ctx[CpuRegister.Rdx] = 0x10000;
+        _ctx[CpuRegister.Rcx] = outHandleAddress;
+        Assert.Equal(0, AudioOut2Exports.AudioOut2ContextCreate(_ctx));
+        Span<byte> handleBytes = stackalloc byte[8];
+        Assert.True(_memory.TryRead(outHandleAddress, handleBytes));
+        var handle = BinaryPrimitives.ReadUInt64LittleEndian(handleBytes);
+
+        _ctx[CpuRegister.Rdi] = handle;
+        Assert.Equal(0, AudioOut2Exports.AudioOut2ContextPush(_ctx));
+        _ctx[CpuRegister.Rdi] = handle;
+        Assert.Equal(0, AudioOut2Exports.AudioOut2ContextPush(_ctx));
+
+        _ctx[CpuRegister.Rdi] = handle;
+        _ctx[CpuRegister.Rsi] = QueuedAddress;
+        _ctx[CpuRegister.Rdx] = AvailableAddress;
+        Assert.Equal(0, AudioOut2Exports.AudioOut2ContextGetQueueLevel(_ctx));
+
+        Span<byte> levels = stackalloc byte[8];
+        Assert.True(_memory.TryRead(AvailableAddress, levels));
+        var available = BinaryPrimitives.ReadUInt32LittleEndian(levels);
+        var queued = BinaryPrimitives.ReadUInt32LittleEndian(levels[4..]);
+        Assert.True(queued >= 1, $"queue level should rise after pushes, was {queued}");
+        Assert.Equal(2u, queued + available);
     }
 
     [Fact]

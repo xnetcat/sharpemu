@@ -26,10 +26,17 @@ public static class AudioOut2Exports
     // can pace to the real playback cadence (grain samples at the sample rate).
     private static readonly ConcurrentDictionary<ulong, ContextState> Contexts = new();
 
+    // Modeled hardware output-queue depth: a submitted grain plus one in
+    // flight. Wwise primes the sink until the queue level reported by
+    // sceAudioOut2ContextGetQueueLevel actually rises, so the level must be
+    // derived from a live model rather than hardcoded to zero.
+    private const uint ContextQueueDepth = 2;
+
     private sealed class ContextState
     {
         private readonly object _paceGate = new();
         private long _nextAdvanceTimestamp;
+        private long _queueTailTimestamp;
 
         public ContextState(uint frequency, uint channels, uint grainSamples)
         {
@@ -41,6 +48,45 @@ public static class AudioOut2Exports
         public uint Frequency { get; }
         public uint Channels { get; }
         public uint GrainSamples { get; }
+
+        private long GrainTicks() =>
+            checked((long)Math.Ceiling(Stopwatch.Frequency * (double)GrainSamples / Frequency));
+
+        // Records one grain entering the modeled output queue. The queue drains
+        // by wall-clock grain time, so the reported level rises with pushes and
+        // falls as "playback" consumes them — the movement Wwise's sink priming
+        // loop waits to observe.
+        public void NoteGrainQueued()
+        {
+            lock (_paceGate)
+            {
+                var now = Stopwatch.GetTimestamp();
+                var grainTicks = GrainTicks();
+                var tail = _queueTailTimestamp < now ? now : _queueTailTimestamp;
+                var cappedTail = now + grainTicks * ContextQueueDepth;
+                tail += grainTicks;
+                _queueTailTimestamp = tail > cappedTail ? cappedTail : tail;
+            }
+        }
+
+        public (uint Queued, uint Available) ReadQueueLevel()
+        {
+            lock (_paceGate)
+            {
+                var now = Stopwatch.GetTimestamp();
+                var remaining = _queueTailTimestamp - now;
+                if (remaining <= 0)
+                {
+                    return (0u, ContextQueueDepth);
+                }
+
+                var grainTicks = GrainTicks();
+                var queued = (uint)Math.Min(
+                    ContextQueueDepth,
+                    (ulong)((remaining + grainTicks - 1) / grainTicks));
+                return (queued, ContextQueueDepth - queued);
+            }
+        }
 
         // Blocks the advancing thread until one grain worth of wall-clock time
         // has elapsed since the previous advance, matching hardware timing so
@@ -207,6 +253,7 @@ public static class AudioOut2Exports
             // FMOD's PS5 output path uses ContextPush as the submission clock
             // and does not call ContextAdvance. Pace pushes to one hardware
             // grain so the feeder cannot outrun playback and starve the game.
+            context.NoteGrainQueued();
             context.PaceAdvance();
         }
 
@@ -224,6 +271,7 @@ public static class AudioOut2Exports
         // wall-clock cadence so the guest audio thread runs at the right speed.
         if (Contexts.TryGetValue(ctx[CpuRegister.Rdi], out var context))
         {
+            context.NoteGrainQueued();
             context.PaceAdvance();
         }
 
@@ -237,15 +285,24 @@ public static class AudioOut2Exports
         LibraryName = "libSceAudioOut2")]
     public static int AudioOut2ContextGetQueueLevel(CpuContext ctx)
     {
-        // The advance path paces synchronously, so the queue is always drained.
         // The ABI exposes two adjacent 32-bit levels (queued, available). Writing
         // one 64-bit value corrupts the next stack local when the outputs are
         // four bytes apart — Silent Hill's Wwise sink keeps its stack canary
-        // right behind them and dies in __stack_chk_fail.
+        // right behind them and dies in __stack_chk_fail. The values come from
+        // the modeled queue: Wwise's sink-priming loop pushes grains until the
+        // reported level rises, holding its bank-manager mutex the whole time,
+        // so a hardcoded zero deadlocks the entire audio init.
+        uint queuedGrains = 0;
+        var availableGrains = ContextQueueDepth;
+        if (Contexts.TryGetValue(ctx[CpuRegister.Rdi], out var context))
+        {
+            (queuedGrains, availableGrains) = context.ReadQueueLevel();
+        }
+
         var queuedAddress = ctx[CpuRegister.Rsi];
         var availableAddress = ctx[CpuRegister.Rdx];
-        if ((queuedAddress != 0 && !TryWriteUInt32(ctx, queuedAddress, 0)) ||
-            (availableAddress != 0 && !TryWriteUInt32(ctx, availableAddress, 0)))
+        if ((queuedAddress != 0 && !TryWriteUInt32(ctx, queuedAddress, queuedGrains)) ||
+            (availableAddress != 0 && !TryWriteUInt32(ctx, availableAddress, availableGrains)))
         {
             return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
