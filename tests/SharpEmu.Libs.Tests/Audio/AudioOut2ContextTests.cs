@@ -37,7 +37,9 @@ public sealed class AudioOut2ContextTests
         poison.Fill(0xCD);
         Assert.True(_memory.TryWrite(AvailableAddress - 4, poison));
 
-        _ctx[CpuRegister.Rdi] = 2;
+        // Handles come from a process-wide counter shared with every other test
+        // in the assembly, so this case names one that can never be issued.
+        _ctx[CpuRegister.Rdi] = ulong.MaxValue;
         _ctx[CpuRegister.Rsi] = QueuedAddress;
         _ctx[CpuRegister.Rdx] = AvailableAddress;
         var result = AudioOut2Exports.AudioOut2ContextGetQueueLevel(_ctx);
@@ -61,7 +63,7 @@ public sealed class AudioOut2ContextTests
     [Fact]
     public void ContextGetQueueLevel_NullPointersAreAccepted()
     {
-        _ctx[CpuRegister.Rdi] = 2;
+        _ctx[CpuRegister.Rdi] = ulong.MaxValue;
         _ctx[CpuRegister.Rsi] = 0;
         _ctx[CpuRegister.Rdx] = 0;
 
