@@ -11900,6 +11900,11 @@ internal static unsafe class VulkanVideoPresenter
                                 $"ps_bytes={work.Draw.PixelSpirv.Length} ps_hash={pixelDigest} " +
                                 $"vertices={work.Draw.VertexCount} instances={work.Draw.InstanceCount} " +
                                 $"primitive=0x{work.Draw.PrimitiveType:X} " +
+                                // A pass with no vertex buffers builds its
+                                // positions from the vertex index in the shader,
+                                // so stale vertex descriptors cannot explain it.
+                                $"vbufs={work.Draw.VertexBuffers.Count} " +
+                                $"vpos=[{DescribeVertexPositions(work.Draw)}] " +
                                 $"readback={(shouldTraceWrite ? 1 : 0)} textures=[{sampledTextures}]");
                         }
 
@@ -15703,6 +15708,57 @@ internal static unsafe class VulkanVideoPresenter
             return _tracePresentedGuestImageOccurrence == 0
                 ? count == 1
                 : count == _tracePresentedGuestImageOccurrence;
+        }
+
+        /// <summary>
+        /// The first few vertices of each binding, decoded as floats. A pass
+        /// whose positions are zero, garbage or off-screen rasterises nothing
+        /// and reports no error, which is indistinguishable from a draw that
+        /// never ran unless the data itself is inspected.
+        /// </summary>
+        private static string DescribeVertexPositions(VulkanTranslatedGuestDraw draw)
+        {
+            if (draw.VertexBuffers.Count == 0)
+            {
+                return "none";
+            }
+
+            var bindings = new List<string>();
+            foreach (var buffer in draw.VertexBuffers)
+            {
+                var components = (int)Math.Clamp(buffer.ComponentCount, 1u, 4u);
+                var vertices = new List<string>();
+                for (var vertex = 0u; vertex < Math.Min(draw.VertexCount, 3u); vertex++)
+                {
+                    var offset = (long)vertex * buffer.Stride + buffer.OffsetBytes;
+                    if (offset < 0 ||
+                        offset + (long)components * sizeof(float) > buffer.Length)
+                    {
+                        vertices.Add("oob");
+                        continue;
+                    }
+
+                    var scalars = new string[components];
+                    for (var component = 0; component < components; component++)
+                    {
+                        scalars[component] = BitConverter
+                            .ToSingle(
+                                buffer.Data,
+                                checked((int)offset) + component * sizeof(float))
+                            .ToString(
+                                "0.###",
+                                System.Globalization.CultureInfo.InvariantCulture);
+                    }
+
+                    vertices.Add($"({string.Join('/', scalars)})");
+                }
+
+                bindings.Add(
+                    $"loc{buffer.Location}:fmt{buffer.DataFormat}/{buffer.NumberFormat}" +
+                    $":stride{buffer.Stride}:{string.Join(' ', vertices)}");
+            }
+
+            return string.Join(';', bindings);
         }
 
         private static readonly bool _flipDrainDiagnostic =
