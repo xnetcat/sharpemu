@@ -3985,6 +3985,11 @@ public static partial class AgcExports
             });
     }
 
+    private static readonly bool _logSideEffectLag = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_LOG_SIDE_EFFECT_LAG"),
+        "1",
+        StringComparison.Ordinal);
+
     private static void SubmitOrderedGpuSideEffect(
         CpuContext ctx,
         SubmittedGpuState gpuState,
@@ -4036,8 +4041,28 @@ public static partial class AgcExports
             }
         }
 
+        // How long a guest-memory side effect sits between submission and
+        // execution. Hardware retires a release-mem label at end-of-pipe; we
+        // run it whenever the ordered queue reaches it. If that lag spans a
+        // guest free-and-reuse of the destination, the write lands in whatever
+        // now occupies the address. Heap destinations only — the command-buffer
+        // ones cannot be repurposed under us.
+        var submittedTicks = _logSideEffectLag && producerAddress != 0 &&
+                             producerAddress < 0x80_0000_0000UL
+            ? System.Diagnostics.Stopwatch.GetTimestamp()
+            : 0L;
+
         void ApplyAndQueueCompletion()
         {
+            if (submittedTicks != 0)
+            {
+                var lagMs = (System.Diagnostics.Stopwatch.GetTimestamp() - submittedTicks) * 1000.0 /
+                            System.Diagnostics.Stopwatch.Frequency;
+                Console.Error.WriteLine(
+                    $"[LOADER][TRACE] agc.side_effect_lag dst=0x{producerAddress:X16} " +
+                    $"len={producerLength} lag_ms={lagMs:F3} name='{debugName}'");
+            }
+
             action();
             // DMA side effects can enqueue a Vulkan image mirror while this
             // ordered action is executing. Completing the label here would
