@@ -1099,11 +1099,12 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         }
 
         var incoming = BinaryPrimitives.ReadUInt32LittleEndian(source);
-        // Only the value that was actually observed. Any 4-byte store onto a
-        // pointer-shaped slot is common (58k per run) and almost all of them
-        // are legitimate writes to a field that merely follows a pointer; the
-        // corruption being hunted writes exactly 1.
-        if (incoming != 1)
+        // Any 4-byte store onto a pointer-shaped slot is common (58k per run)
+        // and almost all are legitimate writes to a field that merely follows a
+        // pointer, so this stays narrow. It admits 0 as well as 1 because the
+        // observed crash register is 0x0000007000000000 — a slot whose low dword
+        // was zeroed, which the old 1-only filter could never have reported.
+        if (incoming is not (0 or 1))
         {
             return;
         }

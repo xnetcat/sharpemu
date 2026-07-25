@@ -1157,6 +1157,7 @@ public static class Gen5ShaderTranslator
             0x15D => "VSadU32",
             0x15E => "VCvtPkU8F32",
             0x148 => "VBfeU32",
+            0x149 => "VBfeI32",
             0x169 => "VMulLoU32",
             0x16A => "VMulHiU32",
             0x16B => "VMulLoI32",
@@ -1170,6 +1171,9 @@ public static class Gen5ShaderTranslator
             0x366 => "VMbcntHiU32B32",
             0x368 => "VCvtPknormI16F32",
             0x369 => "VCvtPknormU16F32",
+            // Gen5 also encodes this one VOP3-only, alongside the other pack
+            // conversions; 0x12F above is the VOP3 alias of its VOP2 form.
+            0x36A => "VCvtPkrtzF16F32",
             0x373 => "VMadU32U16",
             0x346 => "VLshlAddU32",
             0x347 => "VAddLshlU32",
