@@ -230,6 +230,10 @@ public static partial class AgcExports
         Environment.GetEnvironmentVariable("SHARPEMU_LOG_AGC"),
         "1",
         StringComparison.Ordinal);
+    private static readonly bool _tracePrimitiveState = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_LOG_AGC_PRIM"),
+        "1",
+        StringComparison.Ordinal);
     // Drop a draw on an undecodable texture descriptor instead of substituting
     // a 1x1 fallback binding. Off by default so a garbage descriptor degrades
     // the pass rather than dropping it (Demon's Souls composite feeders).
@@ -863,6 +867,16 @@ public static partial class AgcExports
         }
 
         TraceAgc($"agc.create_prim_state cx=0x{cxRegistersAddress:X16} uc=0x{ucRegistersAddress:X16} gs=0x{geometryShaderAddress:X16} type={shaderType} prim=0x{primitiveType:X8}");
+        if (_tracePrimitiveState)
+        {
+            // The raw type the guest passed, before anything maps it to a host
+            // topology. SHARPEMU_LOG_AGC carries this too but writes hundreds of
+            // MB, which is unusable for a question this narrow.
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] agc.prim_state_raw prim=0x{primitiveType:X8} " +
+                $"gs=0x{geometryShaderAddress:X16} type={shaderType}");
+        }
+
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
