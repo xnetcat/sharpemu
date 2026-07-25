@@ -11457,6 +11457,9 @@ internal static unsafe class VulkanVideoPresenter
 
             foreach (var tracedTarget in work.Targets)
             {
+                // Slot-qualified: a G-buffer's scene colour is often not slot 0,
+                // so an unqualified list invites reading "not slot 0" as "never
+                // rendered into".
                 TraceRenderTargetAddress("draw", tracedTarget.Address);
             }
 
@@ -11920,7 +11923,10 @@ internal static unsafe class VulkanVideoPresenter
                         $"queue={_activeGuestQueue.Name} " +
                         $"submission={_activeGuestQueue.SubmissionId} " +
                         $"work_sequence={_activeGuestWorkSequence} " +
-                        $"addr=0x{firstTarget.Address:X16} " +
+                        // Every attachment, not just slot 0: a G-buffer's scene
+                        // colour is commonly a later slot, and listing only the
+                        // first makes it look as though nothing renders into it.
+                        $"addrs={string.Join(',', targets.Select(target => $"0x{target.Address:X16}"))} " +
                         $"image=0x{firstTarget.Image.Handle:X} " +
                         $"size={firstTarget.Width}x{firstTarget.Height} " +
                         $"textures={work.Draw.Textures.Count}");
