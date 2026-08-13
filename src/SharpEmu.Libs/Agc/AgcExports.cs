@@ -56,6 +56,8 @@ public static partial class AgcExports
     private const uint ItWaitRegMem = 0x3C;
     private const uint ItIndirectBuffer = 0x3F;
     private const uint ItEventWrite = 0x46;
+    private const uint ItEventWriteEop = 0x47;
+    private const uint ItEventWriteEos = 0x48;
     private const uint ItReleaseMem = 0x49;
     private const uint ItDmaData = 0x50;
     private const uint ItRewind = 0x59;
@@ -258,6 +260,10 @@ public static partial class AgcExports
         Environment.GetEnvironmentVariable("SHARPEMU_LOG_AGC"),
         "1",
         StringComparison.Ordinal);
+    private static readonly bool _traceAgcLabels = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_LOG_AGC_LABELS"),
+        "1",
+        StringComparison.Ordinal);
     // Drop a draw on an undecodable texture descriptor instead of substituting
     // a 1x1 fallback binding. Off by default so a garbage descriptor degrades
     // the pass rather than dropping it (Demon's Souls composite feeders).
@@ -327,6 +333,7 @@ public static partial class AgcExports
     private static long _packetPayloadTraceCount;
     private static bool _tracedMissingPixelShaderBindings;
     private static long _unsatisfiedWaitTraceCount;
+    private static long _eventWriteLabelCount;
     private static long _labelProducerSequence;
     private static readonly object _labelProducerGate = new();
     private static readonly List<LabelProducerTrace> _labelProducers = [];
@@ -341,6 +348,8 @@ public static partial class AgcExports
     private static long _translatedDrawTraceCount;
     private static long _standardDmaTraceCount;
     private static long _packetParseFailureTraceCount;
+    private static long _deferredCompositeDropTraceCount;
+    private static long _deferredCompositeSynthesizeTraceCount;
     private static int _textureFallbackTraceCount;
     private static readonly object _softwarePresenterGate = new();
     private static readonly Dictionary<(ulong Source, ulong Destination), ulong> _softwarePresenterFingerprints = new();
@@ -2014,65 +2023,6 @@ public static partial class AgcExports
     }
 
     [SysAbiExport(
-        Nid = "1q1titRBL6o",
-        ExportName = "sceAgcDcbDrawIndirect",
-        Target = Generation.Gen5,
-        LibraryName = "libSceAgc")]
-    public static int DcbDrawIndirect(CpuContext ctx)
-    {
-        var commandBufferAddress = ctx[CpuRegister.Rdi];
-        var dataOffset = (uint)ctx[CpuRegister.Rsi];
-        var emit = Interlocked.Increment(ref _indirectDrawEmitCount);
-
-        if (emit <= 12 || emit % 250 == 0)
-        {
-            var rcx = ctx[CpuRegister.Rcx];
-            var dump = string.Empty;
-            for (var word = 0; word < 8; word++)
-            {
-                dump += TryReadUInt32(ctx, rcx + dataOffset + ((ulong)word * 4), out var raw)
-                    ? $" {raw}"
-                    : " ?";
-            }
-
-            Console.Error.WriteLine(
-                $"[LOADER][WARN] agc.emit_indirect#{emit} buf=0x{commandBufferAddress:X16} " +
-                $"off=0x{dataOffset:X} rdx=0x{ctx[CpuRegister.Rdx]:X} rcx=0x{rcx:X} " +
-                $"r8=0x{ctx[CpuRegister.R8]:X} rcx_words:{dump}");
-        }
-
-        if (commandBufferAddress == 0)
-        {
-            Interlocked.Increment(ref _indirectDrawEmitRejectCount);
-            return ReturnPointer(ctx, 0);
-        }
-
-        if (!TryAllocateCommandDwords(ctx, commandBufferAddress, 5, out var drawCommand) ||
-            !TryWriteUInt32(ctx, drawCommand, Pm4(5, ItDrawIndirect, 0)) ||
-            !TryWriteUInt32(ctx, drawCommand + 4, dataOffset) ||
-            !TryWriteUInt32(ctx, drawCommand + 8, 0) ||
-            !TryWriteUInt32(ctx, drawCommand + 12, 0) ||
-            !TryWriteUInt32(ctx, drawCommand + 16, 0))
-        {
-            var rejects = Interlocked.Increment(ref _indirectDrawEmitRejectCount);
-            if (rejects <= 8 || rejects % 250 == 0)
-            {
-                Console.Error.WriteLine(
-                    $"[LOADER][WARN] agc.emit_indirect_reject#{rejects} " +
-                    $"buf=0x{commandBufferAddress:X16} reason=alloc_or_write");
-            }
-
-            return ReturnPointer(ctx, 0);
-        }
-
-        TraceAgc(
-            $"agc.dcb_draw_indirect buf=0x{commandBufferAddress:X16} " +
-            $"draw=0x{drawCommand:X16} offset=0x{dataOffset:X}");
-
-        return ReturnPointer(ctx, drawCommand);
-    }
-
-    [SysAbiExport(
         Nid = "Yw0jKSqop+E",
         ExportName = "sceAgcDcbDrawIndexAuto",
         Target = Generation.Gen5,
@@ -3332,19 +3282,21 @@ public static partial class AgcExports
 
         GuestGpu.Current.AttachGuestMemory(ctx.Memory);
         var gpuState = _submittedGpuStates.GetValue(ctx.Memory, static _ => new SubmittedGpuState());
+        ulong submissionId;
         lock (gpuState.Gate)
         {
             gpuState.Graphics.QueueName = "dcb.graphics";
-            EnqueueSubmittedDcb(
-                ctx,
-                gpuState,
-                gpuState.Graphics,
+            submissionId = ++gpuState.SubmissionSequence;
+            gpuState.Graphics.PendingSubmissions.Enqueue(new SubmittedDcbState.PendingSubmission(
                 commandAddress,
                 dwordCount,
-                ++gpuState.SubmissionSequence,
-                tracePackets);
-            DrainResumableDcbs(ctx, gpuState, tracePackets);
+                submissionId,
+                tracePackets));
         }
+
+        // Parse outside the gate so the wait monitor can still drain other queues.
+        PumpSubmittedQueue(ctx, gpuState, gpuState.Graphics);
+        DrainResumableDcbsOutsideGate(ctx, gpuState, tracePackets);
 
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
@@ -3382,9 +3334,11 @@ public static partial class AgcExports
 
         GuestGpu.Current.AttachGuestMemory(ctx.Memory);
         var gpuState = _submittedGpuStates.GetValue(ctx.Memory, static _ => new SubmittedGpuState());
+        SubmittedDcbState queueState;
+        ulong submissionId;
         lock (gpuState.Gate)
         {
-            if (!gpuState.ComputeQueues.TryGetValue(ownerHandle, out var queueState))
+            if (!gpuState.ComputeQueues.TryGetValue(ownerHandle, out queueState!))
             {
                 queueState = new SubmittedDcbState();
                 gpuState.ComputeQueues.Add(ownerHandle, queueState);
@@ -3392,16 +3346,16 @@ public static partial class AgcExports
 
             queueState.QueueName = $"acb.compute[{ownerHandle}]";
             queueState.CompletionEventId = ownerHandle;
-            EnqueueSubmittedDcb(
-                ctx,
-                gpuState,
-                queueState,
+            submissionId = ++gpuState.SubmissionSequence;
+            queueState.PendingSubmissions.Enqueue(new SubmittedDcbState.PendingSubmission(
                 commandAddress,
                 dwordCount,
-                ++gpuState.SubmissionSequence,
-                tracePackets);
-            DrainResumableDcbs(ctx, gpuState, tracePackets);
+                submissionId,
+                tracePackets));
         }
+
+        PumpSubmittedQueue(ctx, gpuState, queueState);
+        DrainResumableDcbsOutsideGate(ctx, gpuState, tracePackets);
 
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
@@ -3545,35 +3499,69 @@ public static partial class AgcExports
         PumpSubmittedQueue(ctx, gpuState, state);
     }
 
+    /// <summary>
+    /// Dequeues and parses pending submissions. Must <b>not</b> be called while
+    /// holding <see cref="SubmittedGpuState.Gate"/>: parsing translates shaders and
+    /// can run for seconds under Rosetta, and holding the gate that long starves
+    /// the wait monitor (multi-second WAIT_REG_MEM stalls on Demon's Souls).
+    /// </summary>
     private static void PumpSubmittedQueue(
         CpuContext ctx,
         SubmittedGpuState gpuState,
         SubmittedDcbState state)
     {
-        if (state.IsSuspended)
+        while (true)
         {
-            return;
-        }
-
-        while (!state.HasActiveSubmission &&
-               state.PendingSubmissions.TryDequeue(out var submission))
-        {
-            state.HasActiveSubmission = true;
-            state.ActiveSubmissionId = submission.SubmissionId;
-            state.IsSuspended = ParseSubmittedDcb(
-                ctx,
-                gpuState,
-                state,
-                submission.CommandAddress,
-                submission.DwordCount,
-                submission.TracePackets);
-            if (state.IsSuspended)
+            SubmittedDcbState.PendingSubmission submission;
+            lock (gpuState.Gate)
             {
-                return;
+                if (state.IsSuspended || state.HasActiveSubmission)
+                {
+                    return;
+                }
+
+                if (!state.PendingSubmissions.TryDequeue(out submission))
+                {
+                    return;
+                }
+
+                state.HasActiveSubmission = true;
+                state.ActiveSubmissionId = submission.SubmissionId;
             }
 
-            state.HasActiveSubmission = false;
-            NotifySubmittedDcbCompleted(gpuState, state, submission.SubmissionId);
+            var suspended = false;
+            try
+            {
+                suspended = ParseSubmittedDcb(
+                    ctx,
+                    gpuState,
+                    state,
+                    submission.CommandAddress,
+                    submission.DwordCount,
+                    submission.TracePackets);
+            }
+            catch
+            {
+                lock (gpuState.Gate)
+                {
+                    state.HasActiveSubmission = false;
+                    state.IsSuspended = false;
+                }
+
+                throw;
+            }
+
+            lock (gpuState.Gate)
+            {
+                state.IsSuspended = suspended;
+                if (suspended)
+                {
+                    return;
+                }
+
+                state.HasActiveSubmission = false;
+                NotifySubmittedDcbCompleted(gpuState, state, submission.SubmissionId);
+            }
         }
     }
 
@@ -3922,22 +3910,104 @@ public static partial class AgcExports
                 TryReadUInt32(ctx, currentAddress + sizeof(uint), out var eventTypeRaw))
             {
                 var eventType = eventTypeRaw & 0x3Fu;
+                // Address-bearing EVENT_WRITE. sceAgcAcbEventWrite sets bit 8 for
+                // types 0x38/0x39; titles also emit other done/flush events with a
+                // dword-aligned destination. Without the write, WAIT_REG_MEM sits
+                // producerless until the breaker fires. Only known address-bearing
+                // forms are accepted — mis-decoding a non-address packet as a
+                // label write corrupts command-buffer memory.
+                var writesLabel = false;
+                ulong eventAddress = 0;
+                if (length >= 4 &&
+                    TryReadUInt64(ctx, currentAddress + 8, out eventAddress) &&
+                    eventAddress != 0 &&
+                    (eventAddress & 3ul) == 0 &&
+                    ((eventTypeRaw & 0x100u) != 0 ||
+                     (eventTypeRaw & 0x200u) != 0 ||
+                     (eventType & ~1u) == 0x38 ||
+                     eventType is 0x2C or 0x2D or 0x14 or 0x15 or
+                         0x04 or 0x07 or 0x10 or 0x11 or 0x16 or 0x17))
+                {
+                    writesLabel = true;
+                }
+
+                var eagerAttempted = false;
+                var eagerApplied = false;
+                bool ApplyEventWriteLabel()
+                {
+                    if (!writesLabel)
+                    {
+                        return false;
+                    }
+
+                    InvalidateDcbWindowIfOverlaps(eventAddress, sizeof(uint));
+                    if (!TryWriteUInt32(ctx, eventAddress, 1u))
+                    {
+                        return false;
+                    }
+
+                    GpuWaitRegistry.RecordProduced(ctx.Memory, eventAddress, 1);
+                    return true;
+                }
+
                 SubmitOrderedGpuSideEffect(
                     ctx,
                     gpuState,
                     state,
                     () =>
                     {
+                        if (ShouldRetryQueuedGuestWrite(eagerAttempted))
+                        {
+                            eagerApplied = ApplyEventWriteLabel();
+                        }
+
                         var triggered = KernelEventQueueCompatExports.TriggerRegisteredEventsByFilter(
                             KernelEventQueueCompatExports.KernelEventFilterGraphics,
                             eventType);
                         if (tracePackets)
                         {
-                            TraceAgc($"agc.dcb.event type=0x{eventType:X2} queues={triggered}");
+                            TraceAgc(
+                                $"agc.dcb.event type=0x{eventType:X2} queues={triggered} " +
+                                $"label=0x{eventAddress:X16} wrote={eagerApplied}");
                         }
                     },
-                    $"event_write type=0x{eventType:X2}",
-                    currentAddress);
+                    writesLabel
+                        ? $"event_write type=0x{eventType:X2} dst=0x{eventAddress:X16}"
+                        : $"event_write type=0x{eventType:X2}",
+                    currentAddress,
+                    writesLabel ? eventAddress : 0,
+                    writesLabel ? (ulong)sizeof(uint) : 0,
+                    eagerGuestMemoryApply: writesLabel
+                        ? () =>
+                        {
+                            eagerAttempted = true;
+                            eagerApplied = ApplyEventWriteLabel();
+                            if (eagerApplied)
+                            {
+                                var count = Interlocked.Increment(ref _eventWriteLabelCount);
+                                if (count <= 16 || (count & (count - 1)) == 0)
+                                {
+                                    Console.Error.WriteLine(
+                                        $"[LOADER][INFO] agc.event_write_label " +
+                                        $"type=0x{eventType:X2} dst=0x{eventAddress:X16} " +
+                                        $"count={count}");
+                                }
+                            }
+                        }
+                        : null,
+                    eagerWatchedLabelWrite: writesLabel);
+            }
+
+            if ((op is ItEventWriteEop or ItEventWriteEos) && length >= 4)
+            {
+                ApplySubmittedEventWriteEopEos(
+                    ctx,
+                    gpuState,
+                    state,
+                    currentAddress,
+                    length,
+                    isEos: op == ItEventWriteEos,
+                    tracePackets);
             }
 
             if (op == ItNop && register == RReleaseMem && length >= 7)
@@ -4139,6 +4209,15 @@ public static partial class AgcExports
 
             if (op == ItNop && register == RFlip && length >= 6)
             {
+                var flipN = Interlocked.Increment(ref _flipPacketTraceCount);
+                if (flipN <= 32 || (flipN & (flipN - 1)) == 0)
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][INFO] agc.flip_packet queue={state.QueueName} " +
+                        $"submission={state.ActiveSubmissionId} " +
+                        $"packet=0x{currentAddress:X16} n={flipN}");
+                }
+
                 TraceFramePacketSummary(state);
                 SyncCpuWrittenGuestImages(ctx);
                 if (!TryReadUInt32(ctx, currentAddress + 4, out var videoOutHandle) ||
@@ -4158,9 +4237,11 @@ public static partial class AgcExports
                         handle,
                         displayBufferIndex,
                         out var pendingDisplayBuffer) &&
-                    state.KnownRenderTargets.TryGetValue(
-                        pendingDisplayBuffer.Address,
-                        out var pendingDisplayTarget))
+                    TryResolveDeferredCompositeTarget(
+                        state,
+                        pendingDisplayBuffer,
+                        out var pendingDisplayTarget,
+                        out var compositeTargetSource))
                 {
                     var textures = CreateGuestDrawTextures(
                         ctx,
@@ -4196,7 +4277,8 @@ public static partial class AgcExports
                         $"agc.deferred_composite ps=0x{pendingComposite.PixelShaderAddress:X16} " +
                         $"src=0x{pendingComposite.Textures.FirstOrDefault()?.Descriptor.Address ?? 0:X16} " +
                         $"dst=0x{pendingDisplayTarget.Address:X16} " +
-                        $"size={pendingDisplayTarget.Width}x{pendingDisplayTarget.Height}");
+                        $"size={pendingDisplayTarget.Width}x{pendingDisplayTarget.Height} " +
+                        $"via={compositeTargetSource}");
                     state.PendingTargetlessDraw = null;
                     state.TranslatedDraw = null;
                 }
@@ -4289,6 +4371,19 @@ public static partial class AgcExports
                 state.GuestDrawKind = GuestDrawKind.None;
                 if (state.PendingTargetlessDraw is { } unusedPendingDraw)
                 {
+                    // A retained targetless blit that never resolved against the
+                    // flip surface leaves the scanout buffer uncleared/black
+                    // even when thousands of offscreen G-buffer draws ran.
+                    if (ShouldTraceHotPath(ref _deferredCompositeDropTraceCount))
+                    {
+                        var src = unusedPendingDraw.Textures.FirstOrDefault()?.Descriptor.Address ?? 0;
+                        Console.Error.WriteLine(
+                            $"[LOADER][WARN] agc.deferred_composite_dropped " +
+                            $"ps=0x{unusedPendingDraw.PixelShaderAddress:X16} " +
+                            $"src=0x{src:X16} handle={handle} index={displayBufferIndex} " +
+                            $"textures={unusedPendingDraw.Textures.Count}");
+                    }
+
                     ReturnPooledDrawArrays(
                         unusedPendingDraw,
                         globals: true,
@@ -4417,6 +4512,34 @@ public static partial class AgcExports
                     destinationAddress,
                     byteCount,
                     immediateFill ? (uint)sourceAddress : null);
+                // Small DMA fills/copies double as software fences (same niche as
+                // WRITE_DATA). Latch so CollectDeadlockBroken survives recycle.
+                if (byteCount == sizeof(uint))
+                {
+                    if (immediateFill)
+                    {
+                        GpuWaitRegistry.RecordProduced(
+                            ctx.Memory, destinationAddress, (uint)sourceAddress);
+                    }
+                    else if (TryReadUInt32(ctx, destinationAddress, out var dword))
+                    {
+                        GpuWaitRegistry.RecordProduced(
+                            ctx.Memory, destinationAddress, dword);
+                    }
+                }
+                else if (byteCount == sizeof(ulong))
+                {
+                    if (immediateFill)
+                    {
+                        GpuWaitRegistry.RecordProduced(
+                            ctx.Memory, destinationAddress, (uint)sourceAddress);
+                    }
+                    else if (ctx.TryReadUInt64(destinationAddress, out var qword))
+                    {
+                        GpuWaitRegistry.RecordProduced(
+                            ctx.Memory, destinationAddress, qword);
+                    }
+                }
             }
 
             if (tracePacket)
@@ -4510,6 +4633,18 @@ public static partial class AgcExports
             if (ShouldEagerlyApplyGuestWrite(hasActiveWait, eagerWatchedLabelWrite))
             {
                 eagerGuestMemoryApply();
+                // A watched label write that lands at packet-walk time has already
+                // latched waiters via RecordProduced. Pulse the wait monitor now
+                // so DrainResumableDcbs does not sit behind the ordered-queue
+                // completion that would otherwise re-run the same write.
+                if (eagerWatchedLabelWrite || hasActiveWait)
+                {
+                    lock (gpuState.WaitMonitorSignalGate)
+                    {
+                        gpuState.WaitMonitorSignalVersion++;
+                        Monitor.Pulse(gpuState.WaitMonitorSignalGate);
+                    }
+                }
             }
         }
 
@@ -4695,7 +4830,9 @@ public static partial class AgcExports
         ulong commandAddress,
         ulong packetAddress,
         bool stale,
-        ulong? currentValue = null)
+        ulong? currentValue = null,
+        CpuContext? dumpCtx = null,
+        SubmittedGpuState? dumpGpuState = null)
     {
         LabelProducerTrace? producer = null;
         lock (_labelProducerGate)
@@ -4763,6 +4900,12 @@ public static partial class AgcExports
                 $"command=0x{commandAddress:X16} packet=0x{packetAddress:X16} " +
                 condition + " " +
                 "producer=none-observed; remaining-suspended");
+            if (dumpCtx is not null && dumpGpuState is not null && !stale)
+            {
+                MaybeDumpMissingProducerPeers(
+                    dumpCtx, dumpGpuState, waiter, packetAddress);
+            }
+
             return;
         }
 
@@ -5029,31 +5172,13 @@ public static partial class AgcExports
         void ReadPredicate() =>
             readSucceeded = ctx.TryReadUInt64(predicateAddress, out value);
 
-        if (waitOperation != 0)
-        {
-            var sequence = GuestGpu.Current.SubmitOrderedGuestAction(
-                ReadPredicate,
-                $"set_predication read 0x{predicateAddress:X16}");
-            if (sequence == 0)
-            {
-                ReadPredicate();
-            }
-            else if (!GuestGpu.Current.WaitForGuestWork(sequence))
-            {
-                if (tracePacket)
-                {
-                    TraceAgc(
-                        $"agc.dcb.predication_wait_failed packet=0x{packetAddress:X16} " +
-                        $"addr=0x{predicateAddress:X16} sequence={sequence}");
-                }
-
-                return;
-            }
-        }
-        else
-        {
-            ReadPredicate();
-        }
+        // Fence labels are published eagerly at packet-walk time. Blocking on the
+        // Metal/Vulkan ordered queue here holds gpuState.Gate for seconds (the
+        // consumer is often stuck in waitUntilCompleted), which starves
+        // DrainResumableDcbs and turns 100ms producerless breaks into multi-
+        // second stalls during Demon's Souls boot. Read guest memory directly.
+        ReadPredicate();
+        _ = waitOperation;
 
         if (!readSucceeded)
         {
@@ -5326,6 +5451,170 @@ public static partial class AgcExports
         }
     }
 
+    private static long _eventWriteEopEosCount;
+
+    /// <summary>
+    /// PKT3_EVENT_WRITE_EOP (0x47) / EOS (0x48): standard fence producers that
+    /// AGC's RELEASE_MEM wrappers replace on newer paths, but titles still emit
+    /// raw. Without these, WAIT_REG_MEM sees producer=none-observed forever.
+    /// Layout (Mesa/radv): dword1=event, dword2=addr_lo, dword3=addr_hi|sels,
+    /// dword4=data_lo [, dword5=data_hi for EOP 64-bit].
+    /// </summary>
+    private static void ApplySubmittedEventWriteEopEos(
+        CpuContext ctx,
+        SubmittedGpuState gpuState,
+        SubmittedDcbState state,
+        ulong packetAddress,
+        uint packetLength,
+        bool isEos,
+        bool tracePacket)
+    {
+        if (!TryReadUInt32(ctx, packetAddress + 4, out var eventInfo) ||
+            !TryReadUInt32(ctx, packetAddress + 8, out var addressLo) ||
+            !TryReadUInt32(ctx, packetAddress + 12, out var addressHiAndSels))
+        {
+            return;
+        }
+
+        ulong destinationAddress;
+        uint dataSelection;
+        ulong data;
+        ulong writeLength;
+
+        if (isEos)
+        {
+            // EOS: addr_hi in low 16 of dword3; 32-bit data typically in [31:16].
+            destinationAddress =
+                ((ulong)(addressHiAndSels & 0xFFFFu) << 32) | (addressLo & ~3u);
+            dataSelection = (eventInfo >> 29) & 0x7u;
+            if (dataSelection == 0)
+            {
+                // Some EOS encodings put DATA_SEL in dword3[31:29] instead.
+                dataSelection = (addressHiAndSels >> 29) & 0x7u;
+            }
+
+            data = (addressHiAndSels >> 16) & 0xFFFFu;
+            if (packetLength >= 5 &&
+                TryReadUInt32(ctx, packetAddress + 16, out var eosDataLo))
+            {
+                data = eosDataLo;
+            }
+
+            writeLength = sizeof(uint);
+            if (dataSelection is 0 or >= 5)
+            {
+                // Discard / unknown — still treat non-zero destinations with a
+                // 32-bit payload as fence writes (DeS waits for value==1).
+                dataSelection = 1;
+            }
+        }
+        else
+        {
+            // EOP: addr_hi in low 16 of dword3; DATA_SEL in [31:29].
+            destinationAddress =
+                ((ulong)(addressHiAndSels & 0xFFFFu) << 32) | (addressLo & ~3u);
+            dataSelection = (addressHiAndSels >> 29) & 0x7u;
+            var dataLo = 0u;
+            var dataHi = 0u;
+            if (packetLength >= 5)
+            {
+                _ = TryReadUInt32(ctx, packetAddress + 16, out dataLo);
+            }
+
+            if (packetLength >= 6)
+            {
+                _ = TryReadUInt32(ctx, packetAddress + 20, out dataHi);
+            }
+
+            data = ((ulong)dataHi << 32) | dataLo;
+            writeLength = dataSelection switch
+            {
+                1 => (ulong)sizeof(uint),
+                2 or 3 or 4 => (ulong)sizeof(ulong),
+                _ => 0UL,
+            };
+        }
+
+        if (destinationAddress == 0 || writeLength == 0)
+        {
+            return;
+        }
+
+        bool ApplyEopEosGuestMemory()
+        {
+            InvalidateDcbWindowIfOverlaps(destinationAddress, writeLength);
+            ulong produced = data;
+            var wrote = false;
+            switch (dataSelection)
+            {
+                case 1:
+                    wrote = TryWriteUInt32(ctx, destinationAddress, unchecked((uint)data));
+                    produced = unchecked((uint)data);
+                    break;
+                case 2:
+                    wrote = ctx.TryWriteUInt64(destinationAddress, data);
+                    produced = data;
+                    break;
+                case 3 or 4:
+                    produced = unchecked((ulong)System.Diagnostics.Stopwatch.GetTimestamp());
+                    wrote = ctx.TryWriteUInt64(destinationAddress, produced);
+                    break;
+            }
+
+            if (wrote)
+            {
+                GpuWaitRegistry.RecordProduced(ctx.Memory, destinationAddress, produced);
+            }
+
+            return wrote;
+        }
+
+        var eagerAttempted = false;
+        var eagerApplied = false;
+        var kind = isEos ? "event_write_eos" : "event_write_eop";
+        SubmitOrderedGpuSideEffect(
+            ctx,
+            gpuState,
+            state,
+            () =>
+            {
+                var wrote = eagerApplied;
+                if (ShouldRetryQueuedGuestWrite(eagerAttempted))
+                {
+                    wrote = ApplyEopEosGuestMemory();
+                }
+
+                if (tracePacket)
+                {
+                    TraceAgc(
+                        $"agc.dcb.{kind} dst=0x{destinationAddress:X16} " +
+                        $"data_sel={dataSelection} data=0x{data:X16} wrote={wrote} " +
+                        $"eager={eagerApplied} event=0x{eventInfo:X8}");
+                }
+            },
+            $"{kind} dst=0x{destinationAddress:X16} data=0x{data:X16}",
+            packetAddress,
+            destinationAddress,
+            writeLength,
+            eagerGuestMemoryApply: () =>
+            {
+                eagerAttempted = true;
+                eagerApplied = ApplyEopEosGuestMemory();
+                if (eagerApplied)
+                {
+                    var count = Interlocked.Increment(ref _eventWriteEopEosCount);
+                    if (count <= 16 || (count & (count - 1)) == 0)
+                    {
+                        Console.Error.WriteLine(
+                            $"[LOADER][INFO] agc.{kind}_label " +
+                            $"dst=0x{destinationAddress:X16} data_sel={dataSelection} " +
+                            $"data=0x{data:X16} count={count}");
+                    }
+                }
+            },
+            eagerWatchedLabelWrite: true);
+    }
+
     private static void ApplySubmittedWriteData(
         CpuContext ctx,
         SubmittedGpuState gpuState,
@@ -5366,6 +5655,13 @@ public static partial class AgcExports
                 var targetAddress = destinationAddress +
                     (incrementAddress ? (ulong)index * sizeof(uint) : 0);
                 wrote = TryWriteUInt32(ctx, targetAddress, values[index]);
+                if (wrote)
+                {
+                    // WRITE_DATA is a common software-fence producer. Latch each
+                    // dword so CollectDeadlockBroken can wake waiters after the
+                    // guest recycles the label (same contract as release_mem).
+                    GpuWaitRegistry.RecordProduced(ctx.Memory, targetAddress, values[index]);
+                }
             }
 
             return wrote;
@@ -5405,7 +5701,11 @@ public static partial class AgcExports
             {
                 eagerAttempted = true;
                 eagerApplied = ApplyWriteDataGuestMemory();
-            });
+            },
+            // Same Metal stall as release_mem: deferring a watched write_data
+            // behind the ordered GPU queue parks waiters for seconds. Memory
+            // destinations are fence-like; publish them at packet-walk time.
+            eagerWatchedLabelWrite: destination is 1 or 2 or 4 or 5);
     }
 
     private static (uint Destination, bool IncrementAddress, bool WriteConfirm, uint CachePolicy)
@@ -5606,6 +5906,21 @@ public static partial class AgcExports
              out var deadlockMs) && deadlockMs > 0
             ? deadlockMs
             : 500L) * System.Diagnostics.Stopwatch.Frequency / 1000L;
+
+    // Producerless WAIT_REG_MEM (no release_mem / event_write has ever published
+    // the label) cannot be deadlock-broken via RecordProduced. On Metal these
+    // sit for seconds in cross-queue rings (DeS boot). After this age, write the
+    // waited reference so the queue can advance. Default off: inventing fence
+    // values can advance other titles past real cross-queue waits. Opt in with
+    // SHARPEMU_GPU_PRODUCERLESS_BREAK_MS=25 (or similar) for DeS-style rings
+    // while EVENT_WRITE/EOP latch coverage is still incomplete.
+    private static readonly long _gpuProducerlessBreakTicks =
+        (long.TryParse(
+             Environment.GetEnvironmentVariable("SHARPEMU_GPU_PRODUCERLESS_BREAK_MS"),
+             out var producerlessMs) &&
+         producerlessMs > 0
+            ? producerlessMs
+            : 0L) * System.Diagnostics.Stopwatch.Frequency / 1000L;
 
     // Reads the WAIT_REG_MEM watched address, reference, mask, and 3-bit compare
     // function for both the AGC NOP-encapsulated (RWaitMem32/64) and the standard
@@ -5943,13 +6258,21 @@ public static partial class AgcExports
             ctx.Memory,
             static _ => new SubmittedGpuState());
         EnsureGpuWaitMonitor(ctx, gpuState);
+        // Circular rings park RELEASE_MEM/EOP after each queue's WAIT. A new
+        // suspend must re-scan every remaining CB — an earlier scan that ran
+        // before this queue parked would have missed its producers.
+        GpuWaitRegistry.ClearPastWaitProducersScanned(ctx.Memory);
+        _ = PublishLabelProducersPastSuspendedWaits(ctx, gpuState);
+        _ = PublishLabelProducersFromPendingSubmissions(ctx, gpuState);
         TraceWaitProducerState(
             ctx.Memory,
             waiter,
             commandAddress,
             packetAddress,
             stale: false,
-            currentValue);
+            currentValue,
+            dumpCtx: ctx,
+            dumpGpuState: gpuState);
         if (tracePacket)
         {
             TraceAgc(
@@ -5997,43 +6320,71 @@ public static partial class AgcExports
             observedSignal = gpuState.WaitMonitorSignalVersion;
         }
 
-        while (true)
+        try
         {
-            int resumed;
-            int remaining;
-            lock (gpuState.Gate)
+            while (true)
             {
-                resumed = DrainResumableDcbs(ctx, gpuState, tracePackets: _traceAgc);
-                remaining = GpuWaitRegistry.CountForMemory(ctx.Memory);
-                if (_traceAgc && resumed != 0)
+                // Drain acquires Gate only for short collect passes; resume/parse
+                // runs on the ThreadPool so this monitor stays responsive to new
+                // producerless waits (otherwise one multi-second shader translate
+                // under Rosetta turns 100ms breaks into multi-second stalls).
+                var resumed = DrainResumableDcbs(
+                    ctx,
+                    gpuState,
+                    tracePackets: _traceAgc,
+                    resumeAsync: true);
+                int remaining;
+                lock (gpuState.Gate)
                 {
-                    Console.Error.WriteLine(
-                        $"[LOADER][TRACE] agc.wait_monitor_resumed count={resumed} " +
-                        $"remaining={remaining}");
+                    remaining = GpuWaitRegistry.CountForMemory(ctx.Memory);
+                    if (_traceAgc && resumed != 0)
+                    {
+                        Console.Error.WriteLine(
+                            $"[LOADER][TRACE] agc.wait_monitor_resumed count={resumed} " +
+                            $"remaining={remaining}");
+                    }
+
+                    SharpEmu.Libs.Diagnostics.LoadProgressDiagnostics.TraceGpuWaitSnapshot(
+                        ctx.Memory);
+                    GpuWaitProfile.RecordMonitorPoll(resumed != 0);
+                    GpuWaitProfile.ReportIfDue(remaining);
+                    if (remaining == 0)
+                    {
+                        return;
+                    }
                 }
 
-                SharpEmu.Libs.Diagnostics.LoadProgressDiagnostics.TraceGpuWaitSnapshot(
-                    ctx.Memory);
-                GpuWaitProfile.RecordMonitorPoll(resumed != 0);
-                GpuWaitProfile.ReportIfDue(remaining);
-                if (remaining == 0)
+                delayMilliseconds = resumed != 0
+                    ? 1
+                    : Math.Min(delayMilliseconds * 2, 16);
+                lock (gpuState.WaitMonitorSignalGate)
                 {
-                    gpuState.WaitMonitorRunning = false;
-                    return;
+                    if (gpuState.WaitMonitorSignalVersion == observedSignal)
+                    {
+                        Monitor.Wait(gpuState.WaitMonitorSignalGate, delayMilliseconds);
+                    }
+
+                    observedSignal = gpuState.WaitMonitorSignalVersion;
                 }
             }
-
-            delayMilliseconds = resumed != 0
-                ? 1
-                : Math.Min(delayMilliseconds * 2, 16);
-            lock (gpuState.WaitMonitorSignalGate)
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][ERROR] agc.wait_monitor crashed: {exception.Message}");
+        }
+        finally
+        {
+            // Always clear so EnsureGpuWaitMonitor can restart after an exit or
+            // crash. A stuck true flag leaves producerless waits parked until the
+            // next guest submit (multi-second stalls during DeS boot).
+            lock (gpuState.Gate)
             {
-                if (gpuState.WaitMonitorSignalVersion == observedSignal)
+                gpuState.WaitMonitorRunning = false;
+                if (GpuWaitRegistry.CountForMemory(ctx.Memory) > 0)
                 {
-                    Monitor.Wait(gpuState.WaitMonitorSignalGate, delayMilliseconds);
+                    EnsureGpuWaitMonitor(ctx, gpuState);
                 }
-
-                observedSignal = gpuState.WaitMonitorSignalVersion;
             }
         }
     }
@@ -6088,10 +6439,16 @@ public static partial class AgcExports
     // guest memory (labels are advanced by ReleaseMem/WriteData/DmaData packets
     // or direct CPU writes) and resumes the ones now satisfied. A resumed DCB
     // can itself write labels that unblock others, so loop to a fixed point.
+    //
+    // Must not be called while already holding Gate: resume parses outside the
+    // lock so the wait monitor is not starved during Rosetta shader translation.
+    // When resumeAsync is true (wait monitor), resumes are queued to the ThreadPool
+    // so CollectProducerlessAged can keep firing near the 100ms budget.
     private static int DrainResumableDcbs(
         CpuContext ctx,
         SubmittedGpuState gpuState,
-        bool tracePackets)
+        bool tracePackets,
+        bool resumeAsync = false)
     {
         if (!_gpuWaitSuspendEnabled)
         {
@@ -6101,95 +6458,854 @@ public static partial class AgcExports
         var resumedCount = 0;
         for (var pass = 0; pass < 256; pass++)
         {
-            var woken = GpuWaitRegistry.CollectSatisfied(ctx.Memory, (address, is64Bit) =>
-                is64Bit
-                    ? TryReadUInt64(ctx, address, out var value64) ? value64 : (ulong?)null
-                    : TryReadUInt32(ctx, address, out var value32) ? value32 : (ulong?)null);
-
-            // Indirect-dispatch dimension retries whose deadline elapsed are
-            // resumed so they drop instead of stalling. Flag each so its immediate
-            // re-parse drops the dispatch rather than suspending again.
-            var expiredRetries = GpuWaitRegistry.CollectExpiredRetries(
-                ctx.Memory, System.Diagnostics.Stopwatch.GetTimestamp());
-            if (expiredRetries is not null)
+            // Peek past every suspended WAIT for fence producers that another
+            // queue is waiting on. Must run before CollectProducerlessAged so
+            // real EOP/RELEASE_MEM wakes beat the force-break path.
+            // Also scan pending (not-yet-parsed) submissions: DeS parks graphics
+            // on …0890 labels while the matching RELEASE still sits in a queued
+            // compute CB that has not started — past-wait alone never sees it.
+            var published =
+                PublishLabelProducersPastSuspendedWaits(ctx, gpuState) +
+                PublishLabelProducersFromPendingSubmissions(ctx, gpuState);
+            if (published != 0)
             {
-                lock (_indirectDimsGate)
+                lock (gpuState.WaitMonitorSignalGate)
                 {
-                    foreach (var retry in expiredRetries)
-                    {
-                        _indirectDimsExpired.Add((ctx.Memory, retry.ResumeAddress));
-                    }
-                }
-
-                foreach (var retry in expiredRetries)
-                {
-                    ResumeSuspendedDcb(ctx, gpuState, retry, tracePackets);
+                    gpuState.WaitMonitorSignalVersion++;
+                    Monitor.Pulse(gpuState.WaitMonitorSignalGate);
                 }
             }
 
-            // Break cross-queue deadlocks: a waiter stuck past the deadline whose
-            // label a real producer already signalled (but guest memory has since
-            // been reset for reuse) is released using that produced value. Only
-            // fires for genuinely wedged waits, so fast-resolving ones on working
-            // titles are untouched.
-            var deadlockBroken = GpuWaitRegistry.CollectDeadlockBroken(
-                ctx.Memory, System.Diagnostics.Stopwatch.GetTimestamp(), _gpuDeadlockBreakTicks);
-            if (deadlockBroken is not null)
+            List<GpuWaitRegistry.WaitingDcb>? woken;
+            List<GpuWaitRegistry.WaitingDcb>? expiredRetries;
+            List<GpuWaitRegistry.WaitingDcb>? deadlockBroken;
+            List<GpuWaitRegistry.WaitingDcb>? producerlessBroken;
+            lock (gpuState.Gate)
             {
-                foreach (var waiter in deadlockBroken)
+                woken = GpuWaitRegistry.CollectSatisfied(ctx.Memory, (address, is64Bit) =>
+                    is64Bit
+                        ? TryReadUInt64(ctx, address, out var value64) ? value64 : (ulong?)null
+                        : TryReadUInt32(ctx, address, out var value32) ? value32 : (ulong?)null);
+
+                expiredRetries = GpuWaitRegistry.CollectExpiredRetries(
+                    ctx.Memory, System.Diagnostics.Stopwatch.GetTimestamp());
+                if (expiredRetries is not null)
                 {
-                    if (tracePackets)
+                    lock (_indirectDimsGate)
+                    {
+                        foreach (var retry in expiredRetries)
+                        {
+                            _indirectDimsExpired.Add((ctx.Memory, retry.ResumeAddress));
+                        }
+                    }
+                }
+
+                var nowTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+                deadlockBroken = GpuWaitRegistry.CollectDeadlockBroken(
+                    ctx.Memory, nowTicks, _gpuDeadlockBreakTicks);
+
+                producerlessBroken = null;
+                if (_gpuProducerlessBreakTicks > 0)
+                {
+                    producerlessBroken = GpuWaitRegistry.CollectProducerlessAged(
+                        ctx.Memory, nowTicks, _gpuProducerlessBreakTicks);
+                    if (producerlessBroken is not null)
+                    {
+                        foreach (var waiter in producerlessBroken)
+                        {
+                            ulong? currentValue = waiter.Is64Bit
+                                ? TryReadUInt64(ctx, waiter.WaitAddress, out var value64)
+                                    ? value64
+                                    : null
+                                : TryReadUInt32(ctx, waiter.WaitAddress, out var value32)
+                                    ? value32
+                                    : null;
+                            ForceSatisfyGpuWait(ctx, waiter, currentValue ?? 0);
+                            Console.Error.WriteLine(
+                                $"[LOADER][WARN] agc.producerless_break " +
+                                $"label=0x{waiter.WaitAddress:X16} queue={waiter.QueueName} " +
+                                $"submission={waiter.SubmissionId}");
+                        }
+                    }
+                }
+
+                if (woken is null &&
+                    expiredRetries is null &&
+                    deadlockBroken is null &&
+                    producerlessBroken is null)
+                {
+                    if (_gpuWaitStaleTicks > 0 &&
+                        GpuWaitRegistry.CollectUnreportedStale(
+                            ctx.Memory,
+                            System.Diagnostics.Stopwatch.GetTimestamp(),
+                            _gpuWaitStaleTicks) is { } stale)
+                    {
+                        foreach (var waiter in stale)
+                        {
+                            ulong? currentValue = waiter.Is64Bit
+                                ? TryReadUInt64(ctx, waiter.WaitAddress, out var value64)
+                                    ? value64
+                                    : null
+                                : TryReadUInt32(ctx, waiter.WaitAddress, out var value32)
+                                    ? value32
+                                    : null;
+                            TraceWaitProducerState(
+                                ctx.Memory,
+                                waiter,
+                                waiter.CommandBufferAddress,
+                                waiter.ResumeAddress,
+                                stale: true,
+                                currentValue);
+                        }
+                    }
+
+                    return resumedCount;
+                }
+            }
+
+            void ResumeList(List<GpuWaitRegistry.WaitingDcb>? list, bool countTowardTotal)
+            {
+                if (list is null)
+                {
+                    return;
+                }
+
+                foreach (var waiter in list)
+                {
+                    if (tracePackets && !countTowardTotal)
                     {
                         TraceAgc(
                             $"agc.deadlock_break label=0x{waiter.WaitAddress:X16} " +
                             $"queue={waiter.QueueName} submission={waiter.SubmissionId}");
                     }
 
-                    ResumeSuspendedDcb(ctx, gpuState, waiter, tracePackets);
-                }
-            }
-
-            if (woken is null && expiredRetries is null && deadlockBroken is null)
-            {
-                if (_gpuWaitStaleTicks > 0 &&
-                    GpuWaitRegistry.CollectUnreportedStale(
-                        ctx.Memory,
-                        System.Diagnostics.Stopwatch.GetTimestamp(),
-                        _gpuWaitStaleTicks) is { } stale)
-                {
-                    foreach (var waiter in stale)
+                    if (resumeAsync)
                     {
-                        ulong? currentValue = waiter.Is64Bit
-                            ? TryReadUInt64(ctx, waiter.WaitAddress, out var value64)
-                                ? value64
-                                : null
-                            : TryReadUInt32(ctx, waiter.WaitAddress, out var value32)
-                                ? value32
-                                : null;
-                        TraceWaitProducerState(
-                            ctx.Memory,
-                            waiter,
-                            waiter.CommandBufferAddress,
-                            waiter.ResumeAddress,
-                            stale: true,
-                            currentValue);
+                        var captured = waiter;
+                        ThreadPool.UnsafeQueueUserWorkItem(
+                            static state =>
+                            {
+                                var work = ((CpuContext Context,
+                                    SubmittedGpuState GpuState,
+                                    GpuWaitRegistry.WaitingDcb Waiter,
+                                    bool TracePackets))state!;
+                                try
+                                {
+                                    Gen5ShaderScalarEvaluator.BeginGlobalMemoryReadScope();
+                                    try
+                                    {
+                                        ResumeSuspendedDcb(
+                                            work.Context,
+                                            work.GpuState,
+                                            work.Waiter,
+                                            work.TracePackets);
+                                    }
+                                    finally
+                                    {
+                                        Gen5ShaderScalarEvaluator.EndGlobalMemoryReadScope();
+                                    }
+                                }
+                                catch (Exception exception)
+                                {
+                                    Console.Error.WriteLine(
+                                        $"[LOADER][ERROR] agc.async_resume crashed: " +
+                                        $"{exception.Message}");
+                                }
+                                finally
+                                {
+                                    lock (work.GpuState.WaitMonitorSignalGate)
+                                    {
+                                        work.GpuState.WaitMonitorSignalVersion++;
+                                        Monitor.Pulse(work.GpuState.WaitMonitorSignalGate);
+                                    }
+                                }
+                            },
+                            (ctx, gpuState, captured, tracePackets));
+                    }
+                    else
+                    {
+                        ResumeSuspendedDcb(ctx, gpuState, waiter, tracePackets);
+                    }
+
+                    if (countTowardTotal)
+                    {
+                        resumedCount++;
                     }
                 }
-
-                return resumedCount;
             }
 
-            if (woken is not null)
+            ResumeList(expiredRetries, countTowardTotal: false);
+            ResumeList(deadlockBroken, countTowardTotal: false);
+            ResumeList(producerlessBroken, countTowardTotal: false);
+            ResumeList(woken, countTowardTotal: true);
+
+            // Async resumes run elsewhere; one collect pass is enough per poll.
+            if (resumeAsync)
             {
-                foreach (var waiter in woken)
-                {
-                    ResumeSuspendedDcb(ctx, gpuState, waiter, tracePackets);
-                    resumedCount++;
-                }
+                return resumedCount;
             }
         }
 
         return resumedCount;
+    }
+
+    private static int DrainResumableDcbsOutsideGate(
+        CpuContext ctx,
+        SubmittedGpuState gpuState,
+        bool tracePackets) =>
+        DrainResumableDcbs(ctx, gpuState, tracePackets);
+
+    private static long _pastWaitProducerPublishCount;
+
+    /// <summary>
+    /// Serial parsing cannot run two queues concurrently, so each WAIT_REG_MEM
+    /// parks its CB before a later RELEASE_MEM/EOP that another queue needs.
+    /// Walk remaining packets after every suspended wait and publish only
+    /// fence-like guest writes so real producers latch waiters instead of the
+    /// aged producerless breaker inventing values.
+    /// </summary>
+    private static int PublishLabelProducersPastSuspendedWaits(
+        CpuContext ctx,
+        SubmittedGpuState gpuState)
+    {
+        var waiters = GpuWaitRegistry.SnapshotWaiters(ctx.Memory);
+        if (waiters is null || waiters.Count == 0)
+        {
+            return 0;
+        }
+
+        var published = 0;
+        foreach (var waiter in waiters)
+        {
+            if (waiter.PastWaitProducersScanned ||
+                waiter.TotalDwords <= waiter.ResumeOffset)
+            {
+                continue;
+            }
+
+            published += ScanRemainingForLabelProducers(ctx, gpuState, waiter);
+            GpuWaitRegistry.MarkPastWaitProducersScanned(
+                ctx.Memory,
+                waiter.ResumeAddress,
+                waiter.QueueName,
+                waiter.SubmissionId);
+        }
+
+        return published;
+    }
+
+    private static long _pendingProducerPublishCount;
+    private static readonly HashSet<(ulong Command, uint Dwords, ulong Submission)>
+        _scannedPendingSubmissions = new();
+
+    /// <summary>
+    /// Fence producers often live in compute CBs that are queued behind a
+    /// suspended graphics wait. Walk every pending submission once and publish
+    /// RELEASE_MEM / WRITE_DATA / EVENT_WRITE* so waiters latch before the
+    /// producerless breaker invents values.
+    /// </summary>
+    private static int PublishLabelProducersFromPendingSubmissions(
+        CpuContext ctx,
+        SubmittedGpuState gpuState)
+    {
+        List<(SubmittedDcbState Queue, SubmittedDcbState.PendingSubmission Pending)>?
+            snapshot = null;
+        lock (gpuState.Gate)
+        {
+            void Capture(SubmittedDcbState queue)
+            {
+                foreach (var pending in queue.PendingSubmissions)
+                {
+                    snapshot ??= new(32);
+                    snapshot.Add((queue, pending));
+                }
+            }
+
+            Capture(gpuState.Graphics);
+            foreach (var (_, queue) in gpuState.ComputeQueues)
+            {
+                Capture(queue);
+            }
+        }
+
+        if (snapshot is null)
+        {
+            return 0;
+        }
+
+        var published = 0;
+        foreach (var (queue, pending) in snapshot)
+        {
+            var key = (pending.CommandAddress, pending.DwordCount, pending.SubmissionId);
+            if (!_scannedPendingSubmissions.Add(key))
+            {
+                continue;
+            }
+
+            if (_scannedPendingSubmissions.Count > 4096)
+            {
+                _scannedPendingSubmissions.Clear();
+                _scannedPendingSubmissions.Add(key);
+            }
+
+            published += ScanRangeForLabelProducers(
+                ctx,
+                gpuState,
+                queue,
+                pending.CommandAddress,
+                pending.DwordCount,
+                chainDepth: 0,
+                out _);
+        }
+
+        if (published != 0)
+        {
+            var count = Interlocked.Add(ref _pendingProducerPublishCount, published);
+            if (count <= 32 || (count & (count - 1)) == 0)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][INFO] agc.pending_producers published={published} total={count}");
+            }
+        }
+
+        return published;
+    }
+
+    private static int ScanRemainingForLabelProducers(
+        CpuContext ctx,
+        SubmittedGpuState gpuState,
+        in GpuWaitRegistry.WaitingDcb waiter)
+    {
+        var state = waiter.State as SubmittedDcbState ?? gpuState.Graphics;
+        var published = ScanRangeForLabelProducers(
+            ctx,
+            gpuState,
+            state,
+            waiter.ResumeAddress,
+            waiter.TotalDwords - waiter.ResumeOffset,
+            chainDepth: 0,
+            out var sawFlip);
+        if (published != 0)
+        {
+            var count = Interlocked.Add(ref _pastWaitProducerPublishCount, published);
+            if (count <= 32 || (count & (count - 1)) == 0)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][INFO] agc.past_wait_producers " +
+                    $"queue={waiter.QueueName} submission={waiter.SubmissionId} " +
+                    $"published={published} total={count} " +
+                    $"resume=0x{waiter.ResumeAddress:X16} flip_later={sawFlip}");
+            }
+        }
+        else if (sawFlip && ShouldTraceHotPath(ref _flipPacketTraceCount))
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][INFO] agc.past_wait_flip_ahead " +
+                $"queue={waiter.QueueName} submission={waiter.SubmissionId} " +
+                $"resume=0x{waiter.ResumeAddress:X16}");
+        }
+
+        return published;
+    }
+
+    private static int ScanRangeForLabelProducers(
+        CpuContext ctx,
+        SubmittedGpuState gpuState,
+        SubmittedDcbState state,
+        ulong startAddress,
+        uint dwordCount,
+        int chainDepth,
+        out bool sawFlip)
+    {
+        sawFlip = false;
+        if (dwordCount == 0 || dwordCount > 0x100000u || chainDepth > MaxSubmittedChainDepth)
+        {
+            return 0;
+        }
+
+        var published = 0;
+        uint offset = 0;
+        while (offset < dwordCount)
+        {
+            var packetAddress = startAddress + ((ulong)offset * sizeof(uint));
+            if (!TryReadUInt32(ctx, packetAddress, out var header))
+            {
+                break;
+            }
+
+            var packetType = header >> 30;
+            if (packetType == 2)
+            {
+                offset++;
+                continue;
+            }
+
+            if (packetType != 3)
+            {
+                break;
+            }
+
+            var length = Pm4Length(header);
+            if (length < 2 || offset + length > dwordCount)
+            {
+                break;
+            }
+
+            var op = (header >> 8) & 0xFFu;
+            var register = (header >> 2) & 0x3Fu;
+            if (op == ItIndirectBuffer &&
+                length >= 4 &&
+                TryReadUInt32(ctx, packetAddress + 4, out var chainLow) &&
+                TryReadUInt32(ctx, packetAddress + 8, out var chainHigh) &&
+                TryReadUInt32(ctx, packetAddress + 12, out var chainDwords))
+            {
+                var chainAddress = ((ulong)(chainHigh & 0xFFFFu) << 32) | chainLow;
+                var chainLength = chainDwords & 0xFFFFFu;
+                if (chainAddress != 0 && chainLength != 0)
+                {
+                    published += ScanRangeForLabelProducers(
+                        ctx,
+                        gpuState,
+                        state,
+                        chainAddress,
+                        chainLength,
+                        chainDepth + 1,
+                        out var chainedFlip);
+                    sawFlip |= chainedFlip;
+                    break;
+                }
+            }
+            else if (op == ItEventWriteEop || op == ItEventWriteEos)
+            {
+                ApplySubmittedEventWriteEopEos(
+                    ctx,
+                    gpuState,
+                    state,
+                    packetAddress,
+                    length,
+                    isEos: op == ItEventWriteEos,
+                    tracePacket: false);
+                published++;
+            }
+            else if (op == ItEventWrite && length >= 4)
+            {
+                if (TryReadUInt32(ctx, packetAddress + 4, out var eventTypeRaw) &&
+                    TryReadUInt64(ctx, packetAddress + 8, out var eventAddress) &&
+                    eventAddress != 0 &&
+                    (eventAddress & 3ul) == 0)
+                {
+                    var eventType = eventTypeRaw & 0x3Fu;
+                    var writesLabel =
+                        (eventTypeRaw & 0x100u) != 0 ||
+                        (eventTypeRaw & 0x200u) != 0 ||
+                        (eventType & ~1u) == 0x38 ||
+                        eventType is 0x2C or 0x2D or 0x14 or 0x15 or
+                            0x04 or 0x07 or 0x10 or 0x11 or 0x16 or 0x17;
+                    // Past a suspended wait, also publish when the destination is
+                    // a live waiter even if the type bits look unfamiliar — DeS
+                    // emits address-bearing EVENT_WRITE forms our filter misses,
+                    // and writing a watched label is far safer than inventing one.
+                    var waitedLabel = writesLabel ||
+                        GpuWaitRegistry.HasWaiter(ctx.Memory, eventAddress);
+                    if (waitedLabel && TryWriteUInt32(ctx, eventAddress, 1u))
+                    {
+                        _ = GpuWaitRegistry.RecordProduced(ctx.Memory, eventAddress, 1);
+                        published++;
+                    }
+                }
+            }
+            else if (op == ItReleaseMem && length >= 8)
+            {
+                ApplySubmittedStandardReleaseMem(
+                    ctx, gpuState, state, packetAddress, tracePacket: false);
+                published++;
+            }
+            else if (op == ItNop && register == RReleaseMem && length >= 7)
+            {
+                ApplySubmittedReleaseMem(
+                    ctx, gpuState, state, packetAddress, tracePacket: false);
+                published++;
+            }
+            else if (op == ItWriteData && length >= 4)
+            {
+                ApplySubmittedWriteData(
+                    ctx,
+                    gpuState,
+                    state,
+                    packetAddress,
+                    length,
+                    standardPacket: true,
+                    tracePacket: false);
+                published++;
+            }
+            else if (op == ItNop && register == RWriteData && length >= 4)
+            {
+                ApplySubmittedWriteData(
+                    ctx,
+                    gpuState,
+                    state,
+                    packetAddress,
+                    length,
+                    standardPacket: false,
+                    tracePacket: false);
+                published++;
+            }
+            else if (op == ItNop && register == RFlip && length >= 6)
+            {
+                sawFlip = true;
+            }
+
+            offset += length;
+        }
+
+        return published;
+    }
+
+    private static long _flipPacketTraceCount;
+    private static long _missingProducerDumpCount;
+    private static readonly HashSet<(object Memory, ulong Address)> _dumpedMissingProducers = new();
+
+    private static void MaybeDumpMissingProducerPeers(
+        CpuContext ctx,
+        SubmittedGpuState gpuState,
+        in GpuWaitRegistry.WaitingDcb waiter,
+        ulong packetAddress)
+    {
+        if (Interlocked.Read(ref _missingProducerDumpCount) >= 12)
+        {
+            return;
+        }
+
+        lock (_labelProducerGate)
+        {
+            if (!_dumpedMissingProducers.Add((ctx.Memory, waiter.WaitAddress)))
+            {
+                return;
+            }
+        }
+
+        var dumpIndex = Interlocked.Increment(ref _missingProducerDumpCount);
+        var peers = GpuWaitRegistry.SnapshotWaiters(ctx.Memory);
+        var peerSummaries = new List<string>(8);
+        var matchingDest = 0;
+        var flipLater = false;
+        if (peers is not null)
+        {
+            foreach (var peer in peers)
+            {
+                if (peerSummaries.Count >= 8)
+                {
+                    break;
+                }
+
+                var remaining = peer.TotalDwords - peer.ResumeOffset;
+                if (remaining == 0 || remaining > 0x40000u)
+                {
+                    continue;
+                }
+
+                SummarizeRemainingPackets(
+                    ctx,
+                    peer.ResumeAddress,
+                    remaining,
+                    waiter.WaitAddress,
+                    out var ops,
+                    out var destHits,
+                    out var sawFlip);
+                matchingDest += destHits;
+                if (string.Equals(peer.QueueName, waiter.QueueName, StringComparison.Ordinal))
+                {
+                    flipLater |= sawFlip;
+                }
+
+                peerSummaries.Add(
+                    $"{peer.QueueName}#{peer.SubmissionId}:remain={remaining}," +
+                    $"ops={ops},dst_hits={destHits},flip={sawFlip}");
+            }
+        }
+
+        SummarizeRemainingPackets(
+            ctx,
+            waiter.ResumeAddress,
+            waiter.TotalDwords - waiter.ResumeOffset,
+            waiter.WaitAddress,
+            out var selfOps,
+            out var selfHits,
+            out var selfFlip);
+        flipLater |= selfFlip;
+        matchingDest += selfHits;
+
+        var hex = FormatPacketHexPreview(ctx, waiter.ResumeAddress, 24);
+        var opHist = FormatOpcodeHistogram(
+            ctx,
+            waiter.ResumeAddress,
+            Math.Min(waiter.TotalDwords - waiter.ResumeOffset, 0x400u));
+
+        Console.Error.WriteLine(
+            $"[LOADER][INFO] agc.missing_producer_dump n={dumpIndex} " +
+            $"label=0x{waiter.WaitAddress:X16} queue={waiter.QueueName} " +
+            $"submission={waiter.SubmissionId} packet=0x{packetAddress:X16} " +
+            $"self_ops={selfOps} self_dst={selfHits} flip_later={flipLater} " +
+            $"peer_dst_hits={matchingDest} peers=[{string.Join("; ", peerSummaries)}]");
+        if (dumpIndex <= 4)
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][INFO] agc.missing_producer_hex n={dumpIndex} {hex}");
+            Console.Error.WriteLine(
+                $"[LOADER][INFO] agc.missing_producer_ophist n={dumpIndex} {opHist}");
+        }
+
+        _ = gpuState;
+    }
+
+    private static string FormatPacketHexPreview(
+        CpuContext ctx,
+        ulong startAddress,
+        int dwordCount)
+    {
+        var parts = new List<string>(dwordCount);
+        for (var i = 0; i < dwordCount; i++)
+        {
+            if (!TryReadUInt32(ctx, startAddress + ((ulong)i * sizeof(uint)), out var dword))
+            {
+                parts.Add("????????");
+                break;
+            }
+
+            parts.Add($"{dword:X8}");
+        }
+
+        return string.Join(' ', parts);
+    }
+
+    private static string FormatOpcodeHistogram(
+        CpuContext ctx,
+        ulong startAddress,
+        uint dwordCount)
+    {
+        var counts = new Dictionary<(uint Op, uint Reg, uint Len), int>();
+        uint offset = 0;
+        while (offset < dwordCount)
+        {
+            var packetAddress = startAddress + ((ulong)offset * sizeof(uint));
+            if (!TryReadUInt32(ctx, packetAddress, out var header))
+            {
+                break;
+            }
+
+            var packetType = header >> 30;
+            if (packetType == 2)
+            {
+                offset++;
+                continue;
+            }
+
+            if (packetType != 3)
+            {
+                break;
+            }
+
+            var length = Pm4Length(header);
+            if (length < 2 || offset + length > dwordCount)
+            {
+                break;
+            }
+
+            var key = ((header >> 8) & 0xFFu, (header >> 2) & 0x3Fu, length);
+            counts[key] = counts.GetValueOrDefault(key) + 1;
+            offset += length;
+        }
+
+        var top = counts
+            .OrderByDescending(static pair => pair.Value)
+            .Take(12)
+            .Select(static pair =>
+                $"op=0x{pair.Key.Op:X2}/r=0x{pair.Key.Reg:X2}/len={pair.Key.Len}x{pair.Value}");
+        return string.Join(',', top);
+    }
+
+    private static void SummarizeRemainingPackets(
+        CpuContext ctx,
+        ulong startAddress,
+        uint dwordCount,
+        ulong targetLabel,
+        out string opsSummary,
+        out int destinationHits,
+        out bool sawFlip)
+    {
+        destinationHits = 0;
+        sawFlip = false;
+        var release = 0;
+        var writeData = 0;
+        var eventWrite = 0;
+        var dispatch = 0;
+        var wait = 0;
+        var other = 0;
+        var chain = 0;
+        var eventDestinations = new List<string>(6);
+        uint offset = 0;
+        while (offset < dwordCount && offset < 0x10000u)
+        {
+            var packetAddress = startAddress + ((ulong)offset * sizeof(uint));
+            if (!TryReadUInt32(ctx, packetAddress, out var header))
+            {
+                break;
+            }
+
+            var packetType = header >> 30;
+            if (packetType == 2)
+            {
+                offset++;
+                continue;
+            }
+
+            if (packetType != 3)
+            {
+                break;
+            }
+
+            var length = Pm4Length(header);
+            if (length < 2 || offset + length > dwordCount)
+            {
+                break;
+            }
+
+            var op = (header >> 8) & 0xFFu;
+            var register = (header >> 2) & 0x3Fu;
+            if (op == ItIndirectBuffer && length >= 4)
+            {
+                chain++;
+                if (TryReadUInt32(ctx, packetAddress + 4, out var chainLow) &&
+                    TryReadUInt32(ctx, packetAddress + 8, out var chainHigh) &&
+                    TryReadUInt32(ctx, packetAddress + 12, out var chainDwords))
+                {
+                    var chainAddress = ((ulong)(chainHigh & 0xFFFFu) << 32) | chainLow;
+                    var chainLength = chainDwords & 0xFFFFFu;
+                    if (chainAddress != 0 && chainLength != 0)
+                    {
+                        SummarizeRemainingPackets(
+                            ctx,
+                            chainAddress,
+                            chainLength,
+                            targetLabel,
+                            out _,
+                            out var nestedHits,
+                            out var nestedFlip);
+                        destinationHits += nestedHits;
+                        sawFlip |= nestedFlip;
+                        break;
+                    }
+                }
+            }
+            else if (op is ItDispatchDirect or ItDispatchIndirect)
+            {
+                dispatch++;
+            }
+            else if (op == ItWaitRegMem ||
+                     (op == ItNop && register is RWaitMem32 or RWaitMem64))
+            {
+                wait++;
+            }
+            else if (op == ItReleaseMem || (op == ItNop && register == RReleaseMem))
+            {
+                release++;
+                if (TryReadProducerDestination(ctx, packetAddress, op, register, length, out var dest) &&
+                    dest == targetLabel)
+                {
+                    destinationHits++;
+                }
+            }
+            else if (op == ItWriteData || (op == ItNop && register == RWriteData))
+            {
+                writeData++;
+                if (TryReadProducerDestination(ctx, packetAddress, op, register, length, out var dest) &&
+                    dest == targetLabel)
+                {
+                    destinationHits++;
+                }
+            }
+            else if (op is ItEventWrite or ItEventWriteEop or ItEventWriteEos)
+            {
+                eventWrite++;
+                if (TryReadProducerDestination(ctx, packetAddress, op, register, length, out var dest))
+                {
+                    if (dest == targetLabel)
+                    {
+                        destinationHits++;
+                    }
+
+                    if (eventDestinations.Count < 6)
+                    {
+                        var type = 0u;
+                        _ = TryReadUInt32(ctx, packetAddress + 4, out type);
+                        eventDestinations.Add($"t=0x{type:X}/d=0x{dest:X}");
+                    }
+                }
+            }
+            else if (op == ItNop && register == RFlip)
+            {
+                sawFlip = true;
+                other++;
+            }
+            else
+            {
+                other++;
+            }
+
+            offset += length;
+        }
+
+        opsSummary =
+            $"rel={release}/wd={writeData}/ew={eventWrite}/disp={dispatch}/" +
+            $"wait={wait}/chain={chain}/other={other}";
+        if (eventDestinations.Count != 0)
+        {
+            opsSummary += $"/ew_dst=[{string.Join(',', eventDestinations)}]";
+        }
+    }
+
+    private static bool TryReadProducerDestination(
+        CpuContext ctx,
+        ulong packetAddress,
+        uint op,
+        uint register,
+        uint length,
+        out ulong destination)
+    {
+        destination = 0;
+        if (op == ItReleaseMem && length >= 8)
+        {
+            return TryReadUInt64(ctx, packetAddress + 12, out destination) && destination != 0;
+        }
+
+        if (op == ItNop && register == RReleaseMem && length >= 7)
+        {
+            return TryReadUInt64(ctx, packetAddress + 12, out destination) && destination != 0;
+        }
+
+        if ((op == ItWriteData || (op == ItNop && register == RWriteData)) && length >= 4)
+        {
+            return TryReadUInt64(ctx, packetAddress + 8, out destination) && destination != 0;
+        }
+
+        if (op == ItEventWrite && length >= 4)
+        {
+            return TryReadUInt64(ctx, packetAddress + 8, out destination) && destination != 0;
+        }
+
+        if ((op is ItEventWriteEop or ItEventWriteEos) && length >= 4)
+        {
+            if (!TryReadUInt32(ctx, packetAddress + 8, out var addressLo) ||
+                !TryReadUInt32(ctx, packetAddress + 12, out var addressHiAndSels))
+            {
+                return false;
+            }
+
+            destination = ((ulong)(addressHiAndSels & 0xFFFFu) << 32) | (addressLo & ~3u);
+            return destination != 0;
+        }
+
+        return false;
     }
 
     private static void ResumeSuspendedDcb(
@@ -6210,11 +7326,16 @@ public static partial class AgcExports
             $"resume=0x{waiter.ResumeAddress:X16} remaining_dwords={remainingDwords} " +
             $"waited_ms={waitedMilliseconds:F3}");
         GpuWaitProfile.RecordResume(waiter.WaitAddress, waitedMilliseconds);
+
         if (remainingDwords == 0)
         {
-            state.IsSuspended = false;
-            state.HasActiveSubmission = false;
-            NotifySubmittedDcbCompleted(gpuState, state, waiter.SubmissionId);
+            lock (gpuState.Gate)
+            {
+                state.IsSuspended = false;
+                state.HasActiveSubmission = false;
+                NotifySubmittedDcbCompleted(gpuState, state, waiter.SubmissionId);
+            }
+
             PumpSubmittedQueue(ctx, gpuState, state);
             return;
         }
@@ -6226,25 +7347,35 @@ public static partial class AgcExports
                 $"resume=0x{waiter.ResumeAddress:X16} dwords={remainingDwords} forced=False");
         }
 
-        System.Diagnostics.Debug.Assert(state.HasActiveSubmission);
-        System.Diagnostics.Debug.Assert(state.IsSuspended);
-        state.QueueName = waiter.QueueName ?? state.QueueName;
-        state.ActiveSubmissionId = waiter.SubmissionId;
-        state.IsSuspended = false;
-        if (ParseSubmittedDcb(
-                ctx,
-                gpuState,
-                state,
-                waiter.ResumeAddress,
-                remainingDwords,
-                tracePackets))
+        lock (gpuState.Gate)
         {
-            state.IsSuspended = true;
-            return;
+            System.Diagnostics.Debug.Assert(state.HasActiveSubmission);
+            System.Diagnostics.Debug.Assert(state.IsSuspended);
+            state.QueueName = waiter.QueueName ?? state.QueueName;
+            state.ActiveSubmissionId = waiter.SubmissionId;
+            state.IsSuspended = false;
         }
 
-        state.HasActiveSubmission = false;
-        NotifySubmittedDcbCompleted(gpuState, state, waiter.SubmissionId);
+        var suspended = ParseSubmittedDcb(
+            ctx,
+            gpuState,
+            state,
+            waiter.ResumeAddress,
+            remainingDwords,
+            tracePackets);
+
+        lock (gpuState.Gate)
+        {
+            if (suspended)
+            {
+                state.IsSuspended = true;
+                return;
+            }
+
+            state.HasActiveSubmission = false;
+            NotifySubmittedDcbCompleted(gpuState, state, waiter.SubmissionId);
+        }
+
         PumpSubmittedQueue(ctx, gpuState, state);
     }
 
@@ -6309,43 +7440,72 @@ public static partial class AgcExports
                                 destinationAddress != 0 &&
                                 writeLength != 0;
 
+        bool ApplyStandardReleaseMemGuestMemory()
+        {
+            if (writesGuestMemory)
+            {
+                InvalidateDcbWindowIfOverlaps(destinationAddress, writeLength);
+            }
+
+            ulong producedValue = 0;
+            var wroteData = false;
+            if (writesGuestMemory)
+            {
+                switch (dataSelection)
+                {
+                    case 1:
+                        wroteData = TryWriteUInt32(ctx, destinationAddress, dataLo);
+                        producedValue = dataLo;
+                        break;
+                    case 2:
+                        wroteData = ctx.TryWriteUInt64(destinationAddress, data);
+                        producedValue = data;
+                        break;
+                    // Hardware counter writes are timing values sampled at the
+                    // release point, not the immediate payload in ordinal 6/7.
+                    case 3 or 4:
+                        producedValue = unchecked((ulong)System.Diagnostics.Stopwatch.GetTimestamp());
+                        wroteData = ctx.TryWriteUInt64(destinationAddress, producedValue);
+                        break;
+                }
+            }
+
+            // Record + latch the written value so a same-frame label reset
+            // cannot lose the wakeup, and so the deadlock breaker can release
+            // a cross-queue waiter later (see ApplySubmittedReleaseMem).
+            if (wroteData && dataSelection is 1 or 2 or 3 or 4)
+            {
+                GpuWaitRegistry.RecordProduced(ctx.Memory, destinationAddress, producedValue);
+            }
+            else if (!wroteData && dataSelection is 1 or 2)
+            {
+                // See ApplySubmittedReleaseMem: a dropped label write strands
+                // every waiter on this label permanently.
+                ReportLabelWriteFailure(
+                    "release_mem_standard", destinationAddress, data, dataSelection);
+            }
+
+            return wroteData;
+        }
+
+        // Always publish fence labels at packet-walk time. Deferring them to the
+        // Metal/Vulkan ordered queue parks cross-queue waiters behind GPU batch
+        // drains for seconds (DeS Mac boot: p90 waited_ms ≈ 5s). Eager write +
+        // RecordProduced wakes live waiters immediately; if the guest recycles
+        // the label before the wait registers, CollectDeadlockBroken still
+        // recovers within the deadlock-break window (~500ms) instead.
+        var eagerAttempted = false;
+        var eagerApplied = false;
         SubmitOrderedGpuSideEffect(
             ctx,
             gpuState,
             state,
             () =>
             {
-                if (writesGuestMemory)
+                var wroteData = eagerApplied;
+                if (ShouldRetryQueuedGuestWrite(eagerAttempted))
                 {
-                    InvalidateDcbWindowIfOverlaps(destinationAddress, writeLength);
-                }
-
-                var wroteData = writesGuestMemory && (dataSelection switch
-                {
-                    1 => TryWriteUInt32(ctx, destinationAddress, dataLo),
-                    2 => ctx.TryWriteUInt64(destinationAddress, data),
-                    // Hardware counter writes are timing values sampled at the
-                    // release point, not the immediate payload in ordinal 6/7.
-                    3 or 4 => ctx.TryWriteUInt64(
-                        destinationAddress,
-                        unchecked((ulong)System.Diagnostics.Stopwatch.GetTimestamp())),
-                    _ => false,
-                });
-
-                // Record + latch the written value so a same-frame label reset
-                // cannot lose the wakeup, and so the deadlock breaker can release
-                // a cross-queue waiter later (see ApplySubmittedReleaseMem).
-                if (wroteData && dataSelection is 1 or 2)
-                {
-                    GpuWaitRegistry.RecordProduced(
-                        ctx.Memory, destinationAddress, dataSelection == 1 ? dataLo : data);
-                }
-                else if (!wroteData && dataSelection is 1 or 2)
-                {
-                    // See ApplySubmittedReleaseMem: a dropped label write strands
-                    // every waiter on this label permanently.
-                    ReportLabelWriteFailure(
-                        "release_mem_standard", destinationAddress, data, dataSelection);
+                    wroteData = ApplyStandardReleaseMemGuestMemory();
                 }
 
                 if (tracePacket)
@@ -6353,13 +7513,21 @@ public static partial class AgcExports
                     TraceAgc(
                         $"agc.dcb.release_mem_standard dst_sel={destination} " +
                         $"dst=0x{destinationAddress:X16} data_sel={dataSelection} " +
-                        $"data=0x{data:X16} wrote={wroteData}");
+                        $"data=0x{data:X16} wrote={wroteData} eager={eagerApplied}");
                 }
             },
             $"release_mem_standard dst=0x{destinationAddress:X16} data=0x{data:X16}",
             packetAddress,
             writesGuestMemory ? destinationAddress : 0,
-            writesGuestMemory ? writeLength : 0);
+            writesGuestMemory ? writeLength : 0,
+            eagerGuestMemoryApply: writesGuestMemory
+                ? () =>
+                {
+                    eagerAttempted = true;
+                    eagerApplied = ApplyStandardReleaseMemGuestMemory();
+                }
+                : null,
+            eagerWatchedLabelWrite: writesGuestMemory);
     }
 
     // Guest-memory writes issued by GPU packets are applied once at packet-walk
@@ -6441,56 +7609,95 @@ public static partial class AgcExports
             2 or 3 => (ulong)sizeof(ulong),
             _ => 0UL,
         };
+        var writesGuestMemory = dataSelection is 1 or 2 or 3 &&
+                                destinationAddress != 0 &&
+                                writeLength != 0;
+
+        bool ApplyReleaseMemGuestMemory()
+        {
+            InvalidateDcbWindowIfOverlaps(destinationAddress, writeLength);
+            ulong producedValue = 0;
+            var wroteData = false;
+            switch (dataSelection)
+            {
+                case 1:
+                    wroteData = TryWriteUInt32(ctx, destinationAddress, dataLo);
+                    producedValue = dataLo;
+                    break;
+                case 2:
+                    wroteData = ctx.TryWriteUInt64(destinationAddress, data);
+                    producedValue = data;
+                    break;
+                // Data selection 3 samples the GPU clock at the release
+                // point. The packet payload is ignored by hardware; Unity
+                // uses the nonzero timestamp as submit-completion state.
+                case 3:
+                    producedValue = unchecked((ulong)System.Diagnostics.Stopwatch.GetTimestamp());
+                    wroteData = ctx.TryWriteUInt64(destinationAddress, producedValue);
+                    break;
+            }
+
+            // Latch waiters against the value we just wrote: the guest reuses
+            // these labels and can reset them to 0 before the wake pass reads
+            // memory, which otherwise loses the wakeup and stalls at a black
+            // screen (Astro Bot: graphics queue waiting on a compute EOP label).
+            if (wroteData && dataSelection is 1 or 2 or 3)
+            {
+                GpuWaitRegistry.RecordProduced(ctx.Memory, destinationAddress, producedValue);
+            }
+            else if (!wroteData && dataSelection is 1 or 2)
+            {
+                // A label write that fails is not a benign miss: this packet
+                // is the producer a suspended WAIT_REG_MEM is waiting for, and
+                // RecordProduced above is skipped, so the deadlock breaker has
+                // no value to replay either. The queue then never resumes.
+                // Never let that happen quietly.
+                ReportLabelWriteFailure("release_mem", destinationAddress, data, dataSelection);
+            }
+
+            return wroteData;
+        }
+
+        // Always publish fence labels at packet-walk time. Deferring them to the
+        // Metal/Vulkan ordered queue parks cross-queue waiters behind GPU batch
+        // drains for seconds (DeS Mac boot: p90 waited_ms ≈ 5s). Eager write +
+        // RecordProduced wakes live waiters immediately; if the guest recycles
+        // the label before the wait registers, CollectDeadlockBroken still
+        // recovers within the deadlock-break window (~500ms) instead.
+        var eagerAttempted = false;
+        var eagerApplied = false;
         SubmitOrderedGpuSideEffect(
             ctx,
             gpuState,
             state,
             () =>
             {
-                InvalidateDcbWindowIfOverlaps(destinationAddress, writeLength);
-                var wroteData = dataSelection switch
+                var wroteData = eagerApplied;
+                if (ShouldRetryQueuedGuestWrite(eagerAttempted))
                 {
-                    1 => TryWriteUInt32(ctx, destinationAddress, dataLo),
-                    2 => ctx.TryWriteUInt64(destinationAddress, data),
-                    // Data selection 3 samples the GPU clock at the release
-                    // point. The packet payload is ignored by hardware; Unity
-                    // uses the nonzero timestamp as submit-completion state.
-                    3 => ctx.TryWriteUInt64(
-                        destinationAddress,
-                        unchecked((ulong)System.Diagnostics.Stopwatch.GetTimestamp())),
-                    _ => false,
-                };
-
-                // Latch waiters against the value we just wrote: the guest reuses
-                // these labels and can reset them to 0 before the wake pass reads
-                // memory, which otherwise loses the wakeup and stalls at a black
-                // screen (Astro Bot: graphics queue waiting on a compute EOP label).
-                if (wroteData && dataSelection is 1 or 2)
-                {
-                    GpuWaitRegistry.RecordProduced(
-                        ctx.Memory, destinationAddress, dataSelection == 1 ? dataLo : data);
-                }
-                else if (!wroteData && dataSelection is 1 or 2)
-                {
-                    // A label write that fails is not a benign miss: this packet
-                    // is the producer a suspended WAIT_REG_MEM is waiting for, and
-                    // RecordProduced above is skipped, so the deadlock breaker has
-                    // no value to replay either. The queue then never resumes.
-                    // Never let that happen quietly.
-                    ReportLabelWriteFailure("release_mem", destinationAddress, data, dataSelection);
+                    wroteData = ApplyReleaseMemGuestMemory();
                 }
 
                 if (tracePacket)
                 {
                     TraceAgc(
                         $"agc.dcb.release_mem dst=0x{destinationAddress:X16} " +
-                        $"data_sel={dataSelection} data=0x{data:X16} wrote={wroteData}");
+                        $"data_sel={dataSelection} data=0x{data:X16} wrote={wroteData} " +
+                        $"eager={eagerApplied}");
                 }
             },
             $"release_mem dst=0x{destinationAddress:X16} data=0x{data:X16}",
             packetAddress,
-            dataSelection is 1 or 2 or 3 ? destinationAddress : 0,
-            writeLength);
+            writesGuestMemory ? destinationAddress : 0,
+            writeLength,
+            eagerGuestMemoryApply: writesGuestMemory
+                ? () =>
+                {
+                    eagerAttempted = true;
+                    eagerApplied = ApplyReleaseMemGuestMemory();
+                }
+                : null,
+            eagerWatchedLabelWrite: writesGuestMemory);
     }
 
     private static void ApplySubmittedRegisters(
@@ -8571,8 +9778,6 @@ public static partial class AgcExports
     private static readonly object _renderTargetProbeGate = new();
     private static long _renderTargetSampleTraceCount;
     private static long _indirectDrawProbeCount;
-    private static long _indirectDrawEmitCount;
-    private static long _indirectDrawEmitRejectCount;
     private static long _indirectMultiProbeCount;
 
     private static void NoteRenderTargetAddress(ulong address)
@@ -11196,7 +12401,7 @@ public static partial class AgcExports
                     out _);
                 var globalMemoryBuffers =
                     CreateTranslatedComputeGlobalBuffers(evaluation);
-                GuestGpu.Current.SubmitComputeDispatch(
+                var workSequence = GuestGpu.Current.SubmitComputeDispatch(
                     shaderAddress,
                     computeShader,
                     textures,
@@ -11215,9 +12420,35 @@ public static partial class AgcExports
                     dispatch.ThreadCountX,
                     dispatch.ThreadCountY,
                     dispatch.ThreadCountZ);
-                // Vulkan queue order keeps dependent dispatches coherent. CPU visibility is
-                // published by explicit PM4 release/write actions instead of per dispatch.
                 gpuDispatch = true;
+                // Only block when Metal will write buffers back to guest memory.
+                // Writable-but-not-writeback bindings do not produce CPU-visible
+                // fence labels from this path; waiting on them just stalls parse.
+                var needsWriteBackSync = false;
+                foreach (var buffer in globalMemoryBuffers)
+                {
+                    if (buffer.Writable && buffer.WriteBackToGuest && buffer.BaseAddress != 0)
+                    {
+                        needsWriteBackSync = true;
+                        break;
+                    }
+                }
+
+                if (needsWriteBackSync &&
+                    workSequence != 0 &&
+                    !GuestGpu.Current.WaitForGuestWork(workSequence))
+                {
+                    computeError =
+                        $"global-write-sync-timeout sequence={workSequence}";
+                }
+                else if (needsWriteBackSync && workSequence != 0)
+                {
+                    lock (gpuState.WaitMonitorSignalGate)
+                    {
+                        gpuState.WaitMonitorSignalVersion++;
+                        Monitor.Pulse(gpuState.WaitMonitorSignalGate);
+                    }
+                }
             }
         }
 
@@ -13573,6 +14804,60 @@ public static partial class AgcExports
         return count <= 8 || count % 100_000 == 0;
     }
 
+    /// <summary>
+    /// Resolves the scanout surface for a retained targetless blit. Prefer an
+    /// AGC-observed color target; otherwise synthesize one from VideoOut so the
+    /// deferred composite is not silently dropped when the title never rebound
+    /// the display buffer as CB0 (Demon's Souls black world with live UI).
+    /// </summary>
+    private static bool TryResolveDeferredCompositeTarget(
+        SubmittedDcbState state,
+        VideoOutExports.DisplayBufferInfo displayBuffer,
+        out RenderTargetDescriptor target,
+        out string source)
+    {
+        if (state.KnownRenderTargets.TryGetValue(displayBuffer.Address, out target))
+        {
+            source = "known_rt";
+            return true;
+        }
+
+        if (displayBuffer.Address == 0 ||
+            displayBuffer.Width == 0 ||
+            displayBuffer.Height == 0)
+        {
+            target = default;
+            source = "invalid_display";
+            return false;
+        }
+
+        VideoOutExports.MapPixelFormatToColorTarget(
+            displayBuffer.PixelFormat,
+            out var dataFormat,
+            out var numberType);
+        target = new RenderTargetDescriptor(
+            Slot: 0,
+            Address: displayBuffer.Address,
+            Width: displayBuffer.Width,
+            Height: displayBuffer.Height,
+            Format: dataFormat,
+            NumberType: numberType,
+            TileMode: displayBuffer.TilingMode);
+        state.KnownRenderTargets[displayBuffer.Address] = target;
+        source = "display_buffer";
+        if (ShouldTraceHotPath(ref _deferredCompositeSynthesizeTraceCount))
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][WARN] agc.deferred_composite_synthesize " +
+                $"dst=0x{displayBuffer.Address:X16} " +
+                $"{displayBuffer.Width}x{displayBuffer.Height} " +
+                $"fmt={dataFormat}/num={numberType} " +
+                $"pixel_fmt=0x{displayBuffer.PixelFormat:X}");
+        }
+
+        return true;
+    }
+
     // Interpolated-string handlers gated on the trace flags: when tracing is
     // off (the normal case) the compiler skips every AppendFormatted call, so
     // the interpolation never runs. These functions are on the hottest guest
@@ -14103,38 +15388,47 @@ public static partial class AgcExports
         var tracePackets = string.Equals(
             Environment.GetEnvironmentVariable("SHARPEMU_LOG_AGC"), "1", StringComparison.Ordinal);
 
+        GuestGpu.Current.AttachGuestMemory(ctx.Memory);
         var gpuState = _submittedGpuStates.GetValue(ctx.Memory, static _ => new SubmittedGpuState());
         lock (gpuState.Gate)
         {
-            Gen5ShaderScalarEvaluator.BeginGlobalMemoryReadScope();
-            try
+            gpuState.Graphics.QueueName = "dcb.graphics";
+            for (uint i = 0; i < bufferCount; i++)
             {
-                for (uint i = 0; i < bufferCount; i++)
+                if (!ctx.TryReadUInt64(addressArray + i * 8, out var commandAddress) ||
+                    commandAddress == 0 ||
+                    !ctx.TryReadUInt32(sizeArray + i * 4, out var dwordCount) ||
+                    dwordCount == 0)
                 {
-                    if (!ctx.TryReadUInt64(addressArray + i * 8, out var commandAddress) ||
-                        commandAddress == 0 ||
-                        !ctx.TryReadUInt32(sizeArray + i * 4, out var dwordCount) ||
-                        dwordCount == 0)
-                    {
-                        continue;
-                    }
-
-                    if (tracePackets)
-                    {
-                        TraceAgc(
-                            $"agc.driver_submit_multi_dcbs index={i}/{bufferCount} " +
-                            $"addr=0x{commandAddress:X16} dwords={dwordCount}");
-                    }
-
-                    ParseSubmittedDcb(ctx, gpuState, gpuState.Graphics, commandAddress, dwordCount, tracePackets);
+                    continue;
                 }
 
-                DrainResumableDcbs(ctx, gpuState, tracePackets);
+                if (tracePackets)
+                {
+                    TraceAgc(
+                        $"agc.driver_submit_multi_dcbs index={i}/{bufferCount} " +
+                        $"addr=0x{commandAddress:X16} dwords={dwordCount}");
+                }
+
+                var submissionId = ++gpuState.SubmissionSequence;
+                gpuState.Graphics.PendingSubmissions.Enqueue(new SubmittedDcbState.PendingSubmission(
+                    commandAddress,
+                    dwordCount,
+                    submissionId,
+                    tracePackets));
             }
-            finally
-            {
-                Gen5ShaderScalarEvaluator.EndGlobalMemoryReadScope();
-            }
+        }
+
+        // Parse outside the gate so the wait monitor can still drain other queues.
+        Gen5ShaderScalarEvaluator.BeginGlobalMemoryReadScope();
+        try
+        {
+            PumpSubmittedQueue(ctx, gpuState, gpuState.Graphics);
+            DrainResumableDcbsOutsideGate(ctx, gpuState, tracePackets);
+        }
+        finally
+        {
+            Gen5ShaderScalarEvaluator.EndGlobalMemoryReadScope();
         }
 
         ctx[CpuRegister.Rax] = 0;

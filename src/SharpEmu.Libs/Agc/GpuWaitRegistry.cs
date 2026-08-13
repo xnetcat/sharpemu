@@ -49,6 +49,10 @@ internal static class GpuWaitRegistry
         // (Stopwatch ticks) after which the waiter is resumed even if unsatisfied,
         // so a legitimately empty indirect dispatch can never stall forever.
         public long RetryDeadlineTicks;
+        // True after PublishLabelProducersPastSuspendedWaits has scanned the
+        // remaining packets after this wait for fence producers. Avoids
+        // re-scanning the same suspended CB every monitor poll.
+        public bool PastWaitProducersScanned;
     }
 
     private static readonly object _gate = new();
@@ -91,6 +95,103 @@ internal static class GpuWaitRegistry
             }
 
             return total;
+        }
+    }
+
+    /// <summary>
+    /// Snapshot of every waiter for <paramref name="memory"/> so callers can
+    /// peek past suspended WAIT_REG_MEM packets for fence producers without
+    /// holding the registry gate across guest memory writes.
+    /// </summary>
+    public static List<WaitingDcb>? SnapshotWaiters(object memory)
+    {
+        lock (_gate)
+        {
+            List<WaitingDcb>? snapshot = null;
+            foreach (var (_, list) in _waiters)
+            {
+                foreach (var waiter in list)
+                {
+                    if (!ReferenceEquals(waiter.Memory, memory))
+                    {
+                        continue;
+                    }
+
+                    snapshot ??= new List<WaitingDcb>();
+                    snapshot.Add(waiter);
+                }
+            }
+
+            return snapshot;
+        }
+    }
+
+    /// <summary>True when any waiter is registered on <paramref name="address"/>
+    /// for <paramref name="memory"/>.</summary>
+    public static bool HasWaiter(object memory, ulong address)
+    {
+        lock (_gate)
+        {
+            return _waiters.TryGetValue(address, out var list) &&
+                   list.Exists(waiter => ReferenceEquals(waiter.Memory, memory));
+        }
+    }
+
+    /// <summary>
+    /// Clears the past-wait producer scan sticky bit so a newly suspended
+    /// queue re-examines every remaining CB for fence producers.
+    /// </summary>
+    public static void ClearPastWaitProducersScanned(object memory)
+    {
+        lock (_gate)
+        {
+            foreach (var (_, list) in _waiters)
+            {
+                for (var i = 0; i < list.Count; i++)
+                {
+                    var waiter = list[i];
+                    if (!ReferenceEquals(waiter.Memory, memory) ||
+                        !waiter.PastWaitProducersScanned)
+                    {
+                        continue;
+                    }
+
+                    waiter.PastWaitProducersScanned = false;
+                    list[i] = waiter;
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Marks that the remaining packets after this wait were scanned for
+    /// fence producers. Matched by resume address + queue + submission.
+    /// </summary>
+    public static void MarkPastWaitProducersScanned(
+        object memory,
+        ulong resumeAddress,
+        string? queueName,
+        ulong submissionId)
+    {
+        lock (_gate)
+        {
+            foreach (var (_, list) in _waiters)
+            {
+                for (var i = 0; i < list.Count; i++)
+                {
+                    var waiter = list[i];
+                    if (!ReferenceEquals(waiter.Memory, memory) ||
+                        waiter.ResumeAddress != resumeAddress ||
+                        waiter.SubmissionId != submissionId ||
+                        !string.Equals(waiter.QueueName, queueName, StringComparison.Ordinal))
+                    {
+                        continue;
+                    }
+
+                    waiter.PastWaitProducersScanned = true;
+                    list[i] = waiter;
+                }
+            }
         }
     }
 
@@ -536,6 +637,70 @@ internal static class GpuWaitRegistry
                         nowTicks - waiter.RegisteredTicks < minAgeTicks ||
                         !_lastProduced.TryGetValue((memory, address), out var produced) ||
                         !Compare(waiter, produced))
+                    {
+                        continue;
+                    }
+
+                    broken ??= new List<WaitingDcb>();
+                    broken.Add(waiter);
+                    list.RemoveAt(i);
+                }
+
+                if (list.Count == 0)
+                {
+                    emptied ??= new List<ulong>();
+                    emptied.Add(address);
+                }
+            }
+
+            if (emptied is not null)
+            {
+                foreach (var address in emptied)
+                {
+                    _waiters.Remove(address);
+                }
+            }
+        }
+
+        return broken;
+    }
+
+    /// <summary>
+    /// Returns waiters that have been stuck longer than
+    /// <paramref name="minAgeTicks"/> with no recorded producer value for their
+    /// label. Used to unblock cross-queue rings where the real producer packet
+    /// was never observed (missing EVENT_WRITE / release_mem handling).
+    /// </summary>
+    public static List<WaitingDcb>? CollectProducerlessAged(
+        object memory,
+        long nowTicks,
+        long minAgeTicks)
+    {
+        if (minAgeTicks <= 0)
+        {
+            return null;
+        }
+
+        List<WaitingDcb>? broken = null;
+        lock (_gate)
+        {
+            List<ulong>? emptied = null;
+            foreach (var (address, list) in _waiters)
+            {
+                for (var i = list.Count - 1; i >= 0; i--)
+                {
+                    var waiter = list[i];
+                    if (!ReferenceEquals(waiter.Memory, memory) ||
+                        nowTicks - waiter.RegisteredTicks < minAgeTicks)
+                    {
+                        continue;
+                    }
+
+                    // A stale produced value that does not satisfy this waiter
+                    // still blocks CollectDeadlockBroken; treat it like no
+                    // producer so the force-break path can unblock the ring.
+                    if (_lastProduced.TryGetValue((memory, address), out var produced) &&
+                        Compare(waiter, produced))
                     {
                         continue;
                     }

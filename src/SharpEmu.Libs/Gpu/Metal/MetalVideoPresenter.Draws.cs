@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using System.Buffers.Binary;
+using SharpEmu.HLE;
 using SharpEmu.Libs.Agc;
 using SharpEmu.ShaderCompiler;
 using SharpEmu.ShaderCompiler.Metal;
@@ -580,7 +581,7 @@ internal static partial class MetalVideoPresenter
         if (writeBackBuffers.Count > 0)
         {
             var committed = FlushBatchedGuestCommands();
-            MetalNative.SendVoid(committed, MetalNative.Selector("waitUntilCompleted"));
+            WaitForCommittedCommandBuffer(committed);
             WriteBuffersBackToGuest(writeBackBuffers);
         }
 
@@ -668,7 +669,7 @@ internal static partial class MetalVideoPresenter
         TagSnapshotResources(commandBuffer);
         if (writeBackBuffers.Count > 0)
         {
-            MetalNative.SendVoid(commandBuffer, MetalNative.Selector("waitUntilCompleted"));
+            WaitForCommittedCommandBuffer(commandBuffer);
             WriteBuffersBackToGuest(writeBackBuffers);
         }
 
@@ -2079,7 +2080,85 @@ internal static partial class MetalVideoPresenter
                     guest.BaseAddress,
                     new ReadOnlySpan<byte>((void*)pointer, guest.Length));
             }
+
+            // Storage-buffer stores are often the only producer for a
+            // WAIT_REG_MEM label (no RELEASE_MEM). Latch any waiter whose
+            // address lands in this write-back so the monitor can resume
+            // without waiting for the producerless breaker.
+            if (guest.BaseAddress != 0 && guest.Length >= sizeof(uint))
+            {
+                LatchWaitersOverlappingWriteBack(memory, guest.BaseAddress, guest.Length);
+            }
         }
+    }
+
+    private static void LatchWaitersOverlappingWriteBack(
+        ICpuMemory memory,
+        ulong baseAddress,
+        int length)
+    {
+        var waiters = GpuWaitRegistry.SnapshotWaiters(memory);
+        if (waiters is null || waiters.Count == 0)
+        {
+            return;
+        }
+
+        var end = baseAddress + (ulong)length;
+        Span<byte> bytes64 = stackalloc byte[8];
+        Span<byte> bytes32 = stackalloc byte[4];
+        foreach (var waiter in waiters)
+        {
+            var waitAddress = waiter.WaitAddress;
+            var waitBytes = waiter.Is64Bit ? (ulong)sizeof(ulong) : sizeof(uint);
+            if (waitAddress < baseAddress || waitAddress + waitBytes > end)
+            {
+                continue;
+            }
+
+            if (waiter.Is64Bit)
+            {
+                if (!memory.TryRead(waitAddress, bytes64))
+                {
+                    continue;
+                }
+
+                var value64 = BinaryPrimitives.ReadUInt64LittleEndian(bytes64);
+                _ = GpuWaitRegistry.RecordProduced(memory, waitAddress, value64);
+            }
+            else
+            {
+                if (!memory.TryRead(waitAddress, bytes32))
+                {
+                    continue;
+                }
+
+                var value32 = BinaryPrimitives.ReadUInt32LittleEndian(bytes32);
+                _ = GpuWaitRegistry.RecordProduced(memory, waitAddress, value32);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Blocks until a committed command buffer finishes. Skips the ObjC wait
+    /// when status is already Completed (common for tiny label/writeback
+    /// batches), which otherwise serializes Demon's Souls boot behind
+    /// redundant waitUntilCompleted round-trips on the ordered queue.
+    /// </summary>
+    private static void WaitForCommittedCommandBuffer(nint commandBuffer)
+    {
+        if (commandBuffer == 0)
+        {
+            return;
+        }
+
+        // MTLCommandBufferStatusCompleted = 4.
+        const nint completed = 4;
+        if (MetalNative.Send(commandBuffer, MetalNative.Selector("status")) >= completed)
+        {
+            return;
+        }
+
+        MetalNative.SendVoid(commandBuffer, MetalNative.Selector("waitUntilCompleted"));
     }
 
     private static void ReturnPooledGuestData(TranslatedGuestDraw draw)

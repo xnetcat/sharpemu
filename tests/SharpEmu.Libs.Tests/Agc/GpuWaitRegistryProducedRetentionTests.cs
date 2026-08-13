@@ -58,6 +58,81 @@ public sealed class GpuWaitRegistryProducedRetentionTests
         GpuWaitRegistry.Clear();
     }
 
+    [Fact]
+    public void ProducerlessAgedWaitersAreCollectedAfterTheDeadline()
+    {
+        GpuWaitRegistry.Clear();
+        var memory = new object();
+        GpuWaitRegistry.Register(WatchedLabel, NewWaiter(memory, WatchedLabel));
+
+        Assert.Null(GpuWaitRegistry.CollectProducerlessAged(memory, nowTicks: 100, minAgeTicks: 500));
+
+        var broken = GpuWaitRegistry.CollectProducerlessAged(memory, nowTicks: 1_000, minAgeTicks: 500);
+        Assert.NotNull(broken);
+        Assert.Contains(broken!, waiter => waiter.WaitAddress == WatchedLabel);
+        GpuWaitRegistry.Clear();
+    }
+
+    [Fact]
+    public void ProducerlessBreakSkipsOnlyWhenProducedValueSatisfiesTheWait()
+    {
+        GpuWaitRegistry.Clear();
+        var memory = new object();
+        GpuWaitRegistry.Register(WatchedLabel, NewWaiter(memory, WatchedLabel));
+        Assert.True(GpuWaitRegistry.RecordProduced(memory, WatchedLabel, 1));
+
+        Assert.Null(GpuWaitRegistry.CollectProducerlessAged(memory, nowTicks: 1_000, minAgeTicks: 1));
+
+        // Unusable produced value must not block the producerless path forever.
+        GpuWaitRegistry.Clear();
+        GpuWaitRegistry.Register(WatchedLabel, NewWaiter(memory, WatchedLabel));
+        _ = GpuWaitRegistry.RecordProduced(memory, WatchedLabel, 0xDEAD);
+        var broken = GpuWaitRegistry.CollectProducerlessAged(memory, nowTicks: 1_000, minAgeTicks: 1);
+        Assert.NotNull(broken);
+        Assert.Contains(broken!, waiter => waiter.WaitAddress == WatchedLabel);
+        GpuWaitRegistry.Clear();
+    }
+
+    [Fact]
+    public void RecordProducedLatchesLiveWaiterImmediately()
+    {
+        GpuWaitRegistry.Clear();
+        var memory = new object();
+        GpuWaitRegistry.Register(WatchedLabel, NewWaiter(memory, WatchedLabel));
+
+        // WRITE_DATA / EVENT_WRITE producers must latch an already-waiting DCB
+        // without waiting for the next DrainResumableDcbs memory poll.
+        Assert.True(GpuWaitRegistry.RecordProduced(memory, WatchedLabel, 1));
+        var snapshot = GpuWaitRegistry.SnapshotOutstanding(memory);
+        Assert.Equal(1, snapshot.Outstanding);
+        Assert.Equal(1, snapshot.Latched);
+        // Latched waiters must not be treated as producerless.
+        Assert.Null(GpuWaitRegistry.CollectProducerlessAged(memory, nowTicks: 1_000, minAgeTicks: 1));
+        GpuWaitRegistry.Clear();
+    }
+
+    [Fact]
+    public void MarkPastWaitProducersScannedIsStickyPerWaiter()
+    {
+        GpuWaitRegistry.Clear();
+        var memory = new object();
+        var waiter = NewWaiter(memory, WatchedLabel);
+        waiter.ResumeAddress = 0x1000;
+        waiter.SubmissionId = 7;
+        GpuWaitRegistry.Register(WatchedLabel, waiter);
+
+        GpuWaitRegistry.MarkPastWaitProducersScanned(memory, 0x1000, "dcb.graphics", 7);
+        var snapshot = GpuWaitRegistry.SnapshotWaiters(memory);
+        Assert.NotNull(snapshot);
+        Assert.Contains(snapshot!, w => w.PastWaitProducersScanned && w.ResumeAddress == 0x1000);
+
+        GpuWaitRegistry.ClearPastWaitProducersScanned(memory);
+        snapshot = GpuWaitRegistry.SnapshotWaiters(memory);
+        Assert.NotNull(snapshot);
+        Assert.Contains(snapshot!, w => !w.PastWaitProducersScanned && w.ResumeAddress == 0x1000);
+        GpuWaitRegistry.Clear();
+    }
+
     private static GpuWaitRegistry.WaitingDcb NewWaiter(object memory, ulong address) => new()
     {
         WaitAddress = address,

@@ -115,6 +115,32 @@ public sealed class VideoOutPixelFormatTests
         Assert.False(VideoOutExports.IsHdrPixelFormat(pixelFormat));
     }
 
+    // ---- MapPixelFormatToColorTarget ----
+
+    [Fact]
+    public void MapPixelFormatToColorTarget_8BitSrgb_ReturnsFormat10NumberType9()
+    {
+        VideoOutExports.MapPixelFormatToColorTarget(0x80000000UL, out var format, out var numberType);
+        Assert.Equal(10u, format);
+        Assert.Equal(9u, numberType);
+    }
+
+    [Fact]
+    public void MapPixelFormatToColorTarget_10BitPacked_ReturnsFormat9()
+    {
+        VideoOutExports.MapPixelFormatToColorTarget(0x88060000UL, out var format, out var numberType);
+        Assert.Equal(9u, format);
+        Assert.Equal(0u, numberType);
+    }
+
+    [Fact]
+    public void MapPixelFormatToColorTarget_Unknown_FallsBackToRgba8Unorm()
+    {
+        VideoOutExports.MapPixelFormatToColorTarget(0xDEADBEEFUL, out var format, out var numberType);
+        Assert.Equal(10u, format);
+        Assert.Equal(0u, numberType);
+    }
+
     // ---- Self-check activation ----
 
     [Fact]

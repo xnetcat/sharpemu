@@ -1246,6 +1246,15 @@ public static class VideoOutExports
             $"videoout.submit_flip handle={handle} index={bufferIndex} mode={flipMode} " +
             $"arg={flipArg} addr=0x{guestImageAddress:X16} submitted={guestImageSubmitted} " +
             $"events={flipEventCount} ordered_completion={!submitGpuImage}");
+        var flipLog = Interlocked.Increment(ref _diagnosticFlipCount);
+        if (flipLog <= 32 || (flipLog & (flipLog - 1)) == 0)
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][INFO] videoout.submit_flip n={flipLog} handle={handle} " +
+                $"index={bufferIndex} mode={flipMode} addr=0x{guestImageAddress:X16} " +
+                $"gpu_image={submitGpuImage} submitted={guestImageSubmitted}");
+        }
+
         LoadProgressDiagnostics.TraceFlipSubmit(
             handle,
             bufferIndex,
@@ -1256,7 +1265,7 @@ public static class VideoOutExports
             flipEventCount);
         LoadProgressDiagnostics.TraceGpuWaitSnapshot(ctx.Memory);
         ReportFrameRate(presented: false);
-        var diagnosticFlipNumber = Interlocked.Increment(ref _diagnosticFlipCount);
+        var diagnosticFlipNumber = flipLog;
         if (_holdFirstFlipMilliseconds > 0 && diagnosticFlipNumber == _holdFlipNumber)
         {
             Console.Error.WriteLine(
@@ -1776,6 +1785,46 @@ public static class VideoOutExports
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// Maps a VideoOut pixel format to the CB data-format / number-type pair used
+    /// by deferred composite and offscreen color targets. Used when AGC never
+    /// bound the scanout surface as a color target, so <c>KnownRenderTargets</c>
+    /// cannot describe the flip destination.
+    /// </summary>
+    internal static void MapPixelFormatToColorTarget(
+        ulong pixelFormat,
+        out uint dataFormat,
+        out uint numberType)
+    {
+        var normalized = NormalizePixelFormat(pixelFormat);
+        switch (normalized)
+        {
+            case SceVideoOutPixelFormatA8R8G8B8Srgb:
+            case SceVideoOutPixelFormatA8B8G8R8Srgb:
+            case SceVideoOutPixelFormat2R8G8B8A8Srgb:
+            case SceVideoOutPixelFormat2B8G8R8A8Srgb:
+                dataFormat = 10;
+                numberType = 9;
+                return;
+            case SceVideoOutPixelFormatA2R10G10B10:
+            case SceVideoOutPixelFormatA2R10G10B10Srgb:
+            case SceVideoOutPixelFormatA2R10G10B10Bt2020Pq:
+            case SceVideoOutPixelFormat2R10G10B10A2:
+            case SceVideoOutPixelFormat2B10G10R10A2:
+            case SceVideoOutPixelFormat2R10G10B10A2Srgb:
+            case SceVideoOutPixelFormat2B10G10R10A2Srgb:
+            case SceVideoOutPixelFormat2R10G10B10A2Bt2100Pq:
+            case SceVideoOutPixelFormat2B10G10R10A2Bt2100Pq:
+                dataFormat = 9;
+                numberType = 0;
+                return;
+            default:
+                dataFormat = 10;
+                numberType = 0;
+                return;
+        }
     }
 
     internal static bool TryPackRgba8Pixel(
