@@ -911,7 +911,7 @@ public static partial class Gen5SpirvTranslator
                         SpirvDecoration.Location,
                         binding.HostLocation);
                     _pixelOutputs.Add(
-                        binding.GuestSlot,
+                        binding.ExportTarget,
                         new SpirvPixelOutput(
                             variable,
                             outputType,

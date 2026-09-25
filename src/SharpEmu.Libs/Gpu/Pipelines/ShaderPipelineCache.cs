@@ -224,6 +224,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         outputModes = new byte[PixelInputInfo.TargetCount];
         outputMappings = new ColorComponentMap[PixelInputInfo.TargetCount];
         var outputs = new List<Gen5PixelOutputBinding>(ContextRegisters.ColorTargetCount);
+        var location = 0u;
         for (var slot = 0u; slot < ContextRegisters.ColorTargetCount; slot++)
         {
             if (slot != 0 && (context.RenderTargetMaskForSlot(slot) == 0 || context.ColorTargets[slot].BaseAddress == 0))
@@ -242,9 +243,16 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
                 throw SubmissionScheduler.Fatal($"The color target format has no pixel output kind: slot={slot} layout={(uint)words.Layout} numberType={(uint)words.NumberType} order={(uint)words.Order}.");
             }
 
-            outputModes[slot] = (byte)((uint)kind + 1);
+            // A bound slot that no export reaches keeps its contents: its color write mask is zero.
+            var exportTarget = PixelExportRouting.ExportForSlot(context.ShaderInterface, slot);
+            // The high nibble keys the compiled program by the export that feeds the slot.
+            outputModes[slot] = (byte)(((uint)kind + 1) | (uint)((exportTarget + 1) << 4));
             outputMappings[slot] = new ColorComponentMap(mapping.Packed);
-            outputs.Add(new Gen5PixelOutputBinding(slot, (uint)outputs.Count, kind, mapping));
+            // No EXP target reaches 8 and above, so an unfed slot is declared but never written.
+            outputs.Add(new Gen5PixelOutputBinding(slot, location++, kind, mapping)
+            {
+                ExportTarget = exportTarget >= 0 ? (uint)exportTarget : ContextRegisters.ColorTargetCount + slot,
+            });
         }
 
         return outputs.ToArray();
@@ -442,7 +450,9 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
             // A target the pixel program never exports keeps its contents, as on hardware; the
             // host output would otherwise write an undefined value (e.g. depth-only passes that
             // leave a color target bound and export only to the null target).
-            var exported = pixelStage is null || ((pixelStage.PixelColorExportMasks >> (int)(color.Slot * 4)) & 0xFu) != 0;
+            var exportTarget = PixelExportRouting.ExportForSlot(context.ShaderInterface, color.Slot);
+            var exported = pixelStage is null ||
+                (exportTarget >= 0 && ((pixelStage.PixelColorExportMasks >> (exportTarget * 4)) & 0xFu) != 0);
             parameters.SetColorMask(index, exported ? color.Resolution.ExportMapping.ApplyMask(context.RenderTargetMaskForSlot(color.Slot)) : 0);
         }
 

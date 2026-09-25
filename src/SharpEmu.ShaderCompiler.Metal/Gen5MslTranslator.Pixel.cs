@@ -518,7 +518,7 @@ public static partial class Gen5MslTranslator
             Gen5PixelOutputBinding? binding = null;
             foreach (var candidate in _pixelOutputBindings)
             {
-                if (candidate.GuestSlot == export.Target)
+                if (candidate.ExportTarget == export.Target)
                 {
                     binding = candidate;
                     break;
