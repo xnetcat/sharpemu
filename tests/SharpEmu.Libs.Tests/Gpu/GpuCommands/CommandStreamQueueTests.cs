@@ -318,19 +318,28 @@ public sealed class CommandStreamQueueTests
     }
 
     [Fact]
-    public async Task Done_FromAnotherThreadWaitsForTheQueueAndCountsFrames()
+    public async Task Done_QueuesTheBoundaryAndOnlyWaitsForASecondOne()
     {
         var (host, queue) = NewQueue();
         Enqueue(host, queue, Graphics, 1, CreateInstanceCountPacket(1));
-        var done = Task.Run(queue.Done);
 
-        await Task.WhenAny(done, Task.Delay(100));
-        Assert.False(done.IsCompleted);
+        // The first suspend point returns without draining the accepted submissions.
+        Assert.Equal(IdleOutcome.Completed, await Task.Run(queue.Done).WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.Equal(0, queue.FrameNumber);
+        Assert.True(queue.HasPending);
+
+        // The second one waits until the first boundary has been processed.
+        var second = Task.Run(queue.Done);
+        await Task.WhenAny(second, Task.Delay(100));
+        Assert.False(second.IsCompleted);
         Assert.Equal(SliceResult.Completed, queue.ProcessOne());
-        Assert.Equal(IdleOutcome.Completed, await done.WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.Equal(SliceResult.Completed, queue.ProcessOne());
+        Assert.Equal(IdleOutcome.Completed, await second.WaitAsync(TimeSpan.FromSeconds(2)));
         Assert.Equal(1, queue.FrameNumber);
 
         // The next graphics submission starts from a reset processor.
+        Assert.Equal(SliceResult.Completed, queue.ProcessOne());
+        Assert.Equal(2, queue.FrameNumber);
         Enqueue(host, queue, Graphics, 2, CreateInstanceCountPacket(2));
         Assert.Equal(SliceResult.Completed, queue.ProcessOne());
         Assert.Equal(2UL, queue.GetInterpreter(0).SubmitId);

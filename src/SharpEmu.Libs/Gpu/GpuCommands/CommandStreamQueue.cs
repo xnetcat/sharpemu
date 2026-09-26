@@ -29,6 +29,8 @@ public sealed class CommandStreamQueue
     public const int ComputeQueueCount = 56;
     public const int QueueCount = 1 + ComputeQueueCount;
     public const int AllBlockedRetryMilliseconds = 100;
+    // The hardware lets one suspend point be in flight; a second one waits for the first.
+    public const int MaxBoundariesInFlight = 1;
 
     private readonly ICommandStreamHost _host;
     private readonly object _gate = new();
@@ -43,6 +45,7 @@ public sealed class CommandStreamQueue
     private ulong _submitId;
     private ulong _lastCompletedGpuTick;
     private int _doneCount;
+    private int _pendingBoundaries;
     private IdleOutcome _outcome = IdleOutcome.Completed;
     private Thread? _processingThread;
 
@@ -191,28 +194,57 @@ public sealed class CommandStreamQueue
 
         _queues[submission.QueueId].AddLast(submission);
         _submissionCount++;
-        if (submission.Kind != CommandSubmissionKind.FlipPreparation)
+        if (submission.Kind is not (CommandSubmissionKind.FlipPreparation or CommandSubmissionKind.FrameBoundary))
             SubmissionFlowProfile.Record(SubmissionFlowProfile.EventKind.Enqueued, submission.QueueId,
                 submission.SubmissionId, submission.Address, submission.DwordCount, _submissionCount);
         Monitor.PulseAll(_gate);
     }
 
-    // Marks the frame boundary; from another thread it first waits for the queue to drain.
+    // Marks the frame boundary. A suspend point inserts commands that drain the graphics
+    // pipe; it does not wait for them, and the hardware allows one to be in flight, so the
+    // boundary is queued behind the submissions it ends and only a second one waits.
     public IdleOutcome Done()
     {
-        var outcome = IdleOutcome.Completed;
-        if (_processingThread != Thread.CurrentThread)
+        if (_processingThread == Thread.CurrentThread)
         {
-            outcome = WaitForIdle();
+            lock (_gate)
+            {
+                _graphicsDone = true;
+                _doneCount++;
+            }
+
+            return IdleOutcome.Completed;
         }
 
         lock (_gate)
         {
-            _graphicsDone = true;
-            _doneCount++;
-        }
+            if (_outcome != IdleOutcome.Completed)
+            {
+                return _outcome;
+            }
 
-        return outcome;
+            _graphicsDone = true;
+            if (!_accepting)
+            {
+                // Shutdown: no slice will run a queued boundary, so drain as before.
+                while (_outcome == IdleOutcome.Completed && (_processing || _submissionCount != 0))
+                {
+                    Monitor.Wait(_gate);
+                }
+
+                _doneCount++;
+                return _outcome;
+            }
+
+            _pendingBoundaries++;
+            EnqueueLocked(new CommandSubmission(CommandSubmissionKind.FrameBoundary, 0, 0, 0, 0, null));
+            while (_outcome == IdleOutcome.Completed && _pendingBoundaries > MaxBoundariesInFlight)
+            {
+                Monitor.Wait(_gate);
+            }
+
+            return _outcome;
+        }
     }
 
     // Returns once nothing is pending; a cancelled or failed queue reports that instead.
@@ -348,7 +380,7 @@ public sealed class CommandStreamQueue
             _nextQueue = (selected + 1) % QueueCount;
             _processing = true;
             _processingThread = Thread.CurrentThread;
-            if (!submission.Started && submission.Kind != CommandSubmissionKind.FlipPreparation)
+            if (!submission.Started && submission.Kind is not (CommandSubmissionKind.FlipPreparation or CommandSubmissionKind.FrameBoundary))
                 SubmissionFlowProfile.Record(SubmissionFlowProfile.EventKind.ProcessingStarted, submission.QueueId,
                     submission.SubmissionId, submission.Address, submission.DwordCount, _submissionCount);
         }
@@ -388,6 +420,12 @@ public sealed class CommandStreamQueue
             }
             else
             {
+                if (submission.Kind == CommandSubmissionKind.FrameBoundary)
+                {
+                    _pendingBoundaries--;
+                    _doneCount++;
+                }
+
                 foreach (var queue in _queues)
                 {
                     if (queue.First is { } head)
@@ -411,6 +449,14 @@ public sealed class CommandStreamQueue
         {
             SlicesRun++;
             _host.PrepareCpuFlip(submission.FlipHandle, submission.FlipIndex, submission.FlipRequestId);
+            _host.Flush();
+            return true;
+        }
+
+        // A suspend point drains the graphics pipe: submit what the frame recorded.
+        if (submission.Kind == CommandSubmissionKind.FrameBoundary)
+        {
+            SlicesRun++;
             _host.Flush();
             return true;
         }
@@ -526,6 +572,14 @@ public sealed class CommandStreamQueue
                 if (queue.First is { } head && head.Value.Blocked)
                 {
                     _submissionCount -= queue.Count;
+                    foreach (var dropped in queue)
+                    {
+                        if (dropped.Kind == CommandSubmissionKind.FrameBoundary)
+                        {
+                            _pendingBoundaries--;
+                        }
+                    }
+
                     queue.Clear();
                     _outcome = IdleOutcome.Cancelled;
                 }
@@ -630,5 +684,6 @@ public sealed class CommandStreamQueue
         }
 
         _submissionCount = 0;
+        _pendingBoundaries = 0;
     }
 }
