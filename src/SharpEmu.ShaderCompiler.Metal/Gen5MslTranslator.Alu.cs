@@ -220,6 +220,61 @@ public static partial class Gen5MslTranslator
                     instruction,
                     destination,
                     $"rsqrt({F16(instruction, 0)})"),
+                "VRcpF16" => Float16Result(
+                    instruction,
+                    destination,
+                    $"(1.0f / {F16(instruction, 0)})"),
+                "VSqrtF16" => Float16Result(
+                    instruction,
+                    destination,
+                    $"sqrt({F16(instruction, 0)})"),
+                "VLogF16" => Float16Result(
+                    instruction,
+                    destination,
+                    $"log2({F16(instruction, 0)})"),
+                "VExpF16" => Float16Result(
+                    instruction,
+                    destination,
+                    $"exp2({F16(instruction, 0)})"),
+                "VFloorF16" => Float16Result(
+                    instruction,
+                    destination,
+                    $"floor({F16(instruction, 0)})"),
+                "VCeilF16" => Float16Result(
+                    instruction,
+                    destination,
+                    $"ceil({F16(instruction, 0)})"),
+                "VTruncF16" => Float16Result(
+                    instruction,
+                    destination,
+                    $"trunc({F16(instruction, 0)})"),
+                "VRndneF16" => Float16Result(
+                    instruction,
+                    destination,
+                    $"rint({F16(instruction, 0)})"),
+                "VFractF16" => Float16Result(
+                    instruction,
+                    destination,
+                    $"fract({F16(instruction, 0)})"),
+                // GCN sin/cos take revolutions; mirror the SPIR-V Tau prescale.
+                "VSinF16" => Float16Result(
+                    instruction,
+                    destination,
+                    $"sin({F16(instruction, 0)} * {TauLiteral})"),
+                "VCosF16" => Float16Result(
+                    instruction,
+                    destination,
+                    $"cos({F16(instruction, 0)} * {TauLiteral})"),
+                // The widened f16 source is always a normal f32 (or zero), so
+                // frexp reduces to exponent arithmetic on the f32 bit pattern.
+                "VFrexpMantF16" => Float16Result(
+                    instruction,
+                    destination,
+                    AsFloat(FrexpMantissaBits(AsUInt(F16(instruction, 0))))),
+                "VFrexpExpI16F16" => Int16Result(
+                    instruction,
+                    destination,
+                    FrexpExponentBits(AsUInt(F16(instruction, 0)))),
                 "VRcpF32" or "VRcpIflagF32" => FloatResult(instruction, $"(1.0f / {F(instruction, 0)})"),
                 "VLogF32" => FloatResult(instruction, $"log2({F(instruction, 0)})"),
                 "VExpF32" => FloatResult(instruction, $"exp2({F(instruction, 0)})"),
@@ -239,8 +294,22 @@ public static partial class Gen5MslTranslator
                 "VCvtF32I32" => FloatResult(instruction, $"(float)as_type<int>({RawSource(instruction, 0)})"),
                 "VCvtF32U32" => FloatResult(instruction, $"(float)({RawSource(instruction, 0)})"),
                 "VCvtU32F32" => $"(uint)({F(instruction, 0)})",
-                "VCvtU16F16" =>
-                    $"(uint)clamp(trunc(isnan({F16(instruction, 0)}) ? 0.0f : {F16(instruction, 0)}), 0.0f, 65535.0f)",
+                "VCvtU16F16" => Int16Result(
+                    instruction,
+                    destination,
+                    $"(uint)clamp(trunc(isnan({F16(instruction, 0)}) ? 0.0f : {F16(instruction, 0)}), 0.0f, 65535.0f)"),
+                "VCvtI16F16" => Int16Result(
+                    instruction,
+                    destination,
+                    AsUInt($"(int)clamp(trunc(isnan({F16(instruction, 0)}) ? 0.0f : {F16(instruction, 0)}), -32768.0f, 32767.0f)")),
+                "VCvtF16U16" => Float16Result(
+                    instruction,
+                    destination,
+                    $"(float)({U16(instruction, 0)})"),
+                "VCvtF16I16" => Float16Result(
+                    instruction,
+                    destination,
+                    $"(float)((int)(({U16(instruction, 0)}) ^ 0x8000u) - 32768)"),
                 "VCvtI32F32" => AsUInt($"(int)({F(instruction, 0)})"),
                 // RPI rounds toward positive infinity; FLR toward negative.
                 "VCvtRpiI32F32" => AsUInt($"(int)ceil({F(instruction, 0)})"),
@@ -1820,6 +1889,55 @@ public static partial class Gen5MslTranslator
             }
 
             return expression;
+        }
+
+        /// <summary>Reads the op_sel-selected 16-bit half as a zero-extended uint.</summary>
+        private string U16(Gen5ShaderInstruction instruction, int sourceIndex)
+        {
+            var raw = RawSource(
+                instruction,
+                sourceIndex,
+                applySdwaIntegerModifiers: false);
+            var shift = instruction.Control is Gen5Vop3Control control &&
+                (control.OperandSelect & (1u << sourceIndex)) != 0
+                    ? 16
+                    : 0;
+            return $"((({raw}) >> {shift}) & 0xFFFFu)";
+        }
+
+        /// <summary>
+        /// Writes a 16-bit integer result into the op_sel[3]-selected VGPR half,
+        /// preserving the other half. Integer results take no omod or clamp.
+        /// </summary>
+        private string Int16Result(
+            Gen5ShaderInstruction instruction,
+            uint destination,
+            string expression)
+        {
+            var control = instruction.Control as Gen5Vop3Control;
+            var packed = $"(({expression}) & 0xFFFFu)";
+            return ((control?.OperandSelect ?? 0) & 8) != 0
+                ? $"((v[{destination}] & 0x0000FFFFu) | (({packed}) << 16))"
+                : $"((v[{destination}] & 0xFFFF0000u) | ({packed}))";
+        }
+
+        // frexp on an f32 bit pattern that is known to be normal, zero, Inf or
+        // NaN (which is what widening an f16 always produces). The significand
+        // keeps the sign and takes exponent field 126, placing it in [0.5, 1.0);
+        // Inf/NaN pass through and zero stays zero, per the RDNA2 pseudocode.
+        private string FrexpMantissaBits(string bitsExpression)
+        {
+            var bits = Temp("uint", bitsExpression);
+            var absolute = Temp("uint", $"{bits} & 0x7FFFFFFFu");
+            return $"(({absolute} >= 0x7F800000u || {absolute} == 0u) ? {bits} : " +
+                $"(({bits} & 0x807FFFFFu) | 0x3F000000u))";
+        }
+
+        private string FrexpExponentBits(string bitsExpression)
+        {
+            var absolute = Temp("uint", $"({bitsExpression}) & 0x7FFFFFFFu");
+            return $"(({absolute} >= 0x7F800000u || {absolute} == 0u) ? 0u : " +
+                $"(({absolute} >> 23) - 126u))";
         }
 
         /// <summary>Rounds to f16 and preserves the unselected VGPR half.</summary>

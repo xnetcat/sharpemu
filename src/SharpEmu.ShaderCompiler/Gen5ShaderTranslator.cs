@@ -863,8 +863,27 @@ public static partial class Gen5ShaderTranslator
             0x43 => "VMovrelsB32",
             0x44 => "VMovrelsdB32",
             0x48 => "VMovrelsd2B32",
+            // VOP1 opcodes 0x50-0x61 are the f16 unary family (RDNA2 ISA table
+            // 13.3.2, opcodes 80-97 in decimal). Every one of them writes a
+            // 16-bit result into the VGPR half selected by VOP3 op_sel[3].
+            0x50 => "VCvtF16U16",
+            0x51 => "VCvtF16I16",
             0x52 => "VCvtU16F16",
+            0x53 => "VCvtI16F16",
+            0x54 => "VRcpF16",
+            0x55 => "VSqrtF16",
             0x56 => "VRsqF16",
+            0x57 => "VLogF16",
+            0x58 => "VExpF16",
+            0x59 => "VFrexpMantF16",
+            0x5A => "VFrexpExpI16F16",
+            0x5B => "VFloorF16",
+            0x5C => "VCeilF16",
+            0x5D => "VTruncF16",
+            0x5E => "VRndneF16",
+            0x5F => "VFractF16",
+            0x60 => "VSinF16",
+            0x61 => "VCosF16",
             _ => string.Empty,
         };
 
