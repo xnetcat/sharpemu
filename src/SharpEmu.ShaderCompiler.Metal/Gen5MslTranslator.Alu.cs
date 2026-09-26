@@ -323,11 +323,13 @@ public static partial class Gen5MslTranslator
                     instruction,
                     $"(({F(instruction, 0)} == 0.0f || {F(instruction, 1)} == 0.0f) " +
                     $"? 0.0f : ({F(instruction, 0)} * {F(instruction, 1)}))"),
+                // The accumulator is the same destination half op_sel[3] selects.
                 "VFmacF16" => Float16Result(
                     instruction,
                     destination,
                     $"fma({F16(instruction, 0)}, {F16(instruction, 1)}, " +
-                    $"(float)as_type<half>((ushort)(v[{destination}] & 0xFFFFu)))"),
+                    $"(float)as_type<half>((ushort)((v[{destination}] >> " +
+                    $"{((((instruction.Control as Gen5Vop3Control)?.OperandSelect ?? 0) & 8) != 0 ? 16 : 0)}) & 0xFFFFu)))"),
                 // D.i = (S0.i24 * S1.i24) >> 32
                 "VMulHiI32I24" => AsUInt(
                     $"(int)(((long)((as_type<int>({RawSource(instruction, 0)}) << 8) >> 8) * " +
