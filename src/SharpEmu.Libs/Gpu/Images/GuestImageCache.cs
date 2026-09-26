@@ -477,6 +477,13 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ImageCreate);
         var imageIdentifier = _slots.Insert(new CachedImage(_device, _scheduler, _backing, description));
+        if (Rendering.FrameCommandLog.Active)
+        {
+            Rendering.FrameCommandLog.Write(
+                $"  image-create 0x{description.Data.Address:X}+0x{description.Data.Size:X} {description.PixelFormat} " +
+                $"{description.Extent.Width}x{description.Extent.Height}x{description.Extent.Depth}");
+        }
+
         if (!ImageDescription.IsEmptyRange(description.Data))
         {
             AddToIndex(imageIdentifier);

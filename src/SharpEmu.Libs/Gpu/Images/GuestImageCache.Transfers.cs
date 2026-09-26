@@ -352,6 +352,13 @@ public sealed unsafe partial class GuestImageCache
             var (source, sourceOffset) = _bufferCache.ObtainBufferForImage(image.Description.Data.Address, image.Description.Data.Size);
             var sourceFinished = measureUpload ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             dataImported = true;
+            if (Rendering.FrameCommandLog.Active)
+            {
+                Rendering.FrameCommandLog.Write(
+                    $"  upload-from-guest 0x{image.Description.Data.Address:X}+0x{image.Description.Data.Size:X} {image.Description.PixelFormat} " +
+                    $"reason={reason} path={uploadPath}{(image.IsGpuModified ? " OVERWRITES-GPU-CONTENTS" : string.Empty)}");
+            }
+
             UploadFromBuffer(image, request, source, sourceOffset);
             if (measureUpload)
             {

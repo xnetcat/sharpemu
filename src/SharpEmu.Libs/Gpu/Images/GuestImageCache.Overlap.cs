@@ -187,6 +187,14 @@ public sealed partial class GuestImageCache
         RefreshCopySource(sourceImageIdentifier);
         var destination = _slots[destinationImageIdentifier];
         var source = _slots[sourceImageIdentifier];
+        if (Rendering.FrameCommandLog.Active)
+        {
+            Rendering.FrameCommandLog.Write(
+                $"  image-alias-copy CopyWholeImage 0x{source.Description.Data.Address:X} {source.Description.PixelFormat} " +
+                $"{source.Description.Extent.Width}x{source.Description.Extent.Height} -> 0x{destination.Description.Data.Address:X} " +
+                $"{destination.Description.PixelFormat} {destination.Description.Extent.Width}x{destination.Description.Extent.Height}");
+        }
+
         WatchImage(destinationImageIdentifier);
         if (source.Backing.Samples != destination.Backing.Samples)
         {
@@ -241,6 +249,14 @@ public sealed partial class GuestImageCache
         RefreshCopySource(sourceImageIdentifier);
         var destination = _slots[destinationImageIdentifier];
         var source = _slots[sourceImageIdentifier];
+        if (Rendering.FrameCommandLog.Active)
+        {
+            Rendering.FrameCommandLog.Write(
+                $"  image-alias-copy CopyIntoMip 0x{source.Description.Data.Address:X} {source.Description.PixelFormat} " +
+                $"{source.Description.Extent.Width}x{source.Description.Extent.Height} -> 0x{destination.Description.Data.Address:X} " +
+                $"{destination.Description.PixelFormat} {destination.Description.Extent.Width}x{destination.Description.Extent.Height}");
+        }
+
         WatchImage(destinationImageIdentifier);
         if (source.IsBufferModified || source.Backing.Samples != destination.Backing.Samples)
         {

@@ -79,6 +79,13 @@ public sealed partial class GuestImageCache
             return;
         }
 
+        if (Rendering.FrameCommandLog.Active)
+        {
+            Rendering.FrameCommandLog.Write(
+                $"  image-delete 0x{image.Description.Data.Address:X}+0x{image.Description.Data.Size:X} {image.Description.PixelFormat}" +
+                $"{(image.IsGpuModified ? " gpu" : string.Empty)}");
+        }
+
         if (!image.DepthOwner.IsValid)
         {
             var associations = new List<ResourceSlotIdentifier>();
