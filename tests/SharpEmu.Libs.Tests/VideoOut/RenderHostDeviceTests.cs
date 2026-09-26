@@ -164,7 +164,8 @@ public sealed unsafe partial class RenderHostDeviceTests : IClassFixture<Headles
             ShaderInterfaceRegisters shaderInterface,
             ContextRegisters context,
             ReadOnlySpan<ColorComponentMap> targetExportMapping,
-            bool pixelActive)
+            bool pixelActive,
+            uint? nggReplayParamCount = null)
         {
             EnsureModules();
             return new()
@@ -179,6 +180,13 @@ public sealed unsafe partial class RenderHostDeviceTests : IClassFixture<Headles
                 },
                 PixelInput = new PixelInputInfo { InputCount = 0, Stage = new ShaderStageResources(_pixel, _snapshot) },
             };
+        }
+
+        // The fixture has no emulated geometry stage.
+        public ComputeProgram GetNggComputeProgram(VertexStageRegisters vertex, out uint paramCount)
+        {
+            paramCount = 0;
+            return new ComputeProgram { Available = false };
         }
 
         public PipelineHandle CreateGraphicsPipeline(

@@ -137,7 +137,7 @@ public sealed class MetalRenderHostTests : IDisposable
         private ShaderProgram _pixelProgram;
         private ShaderProgram _computeProgram;
 
-        public GraphicsPrograms GetGraphicsPrograms(VertexStageRegisters vertex, PixelStageRegisters pixel, ShaderInterfaceRegisters shaderInterface, ContextRegisters context, ReadOnlySpan<ColorComponentMap> targetExportMapping, bool pixelActive)
+        public GraphicsPrograms GetGraphicsPrograms(VertexStageRegisters vertex, PixelStageRegisters pixel, ShaderInterfaceRegisters shaderInterface, ContextRegisters context, ReadOnlySpan<ColorComponentMap> targetExportMapping, bool pixelActive, uint? nggReplayParamCount = null)
         {
             if (!_vertexProgram.IsValid)
             {
@@ -167,6 +167,13 @@ public sealed class MetalRenderHostTests : IDisposable
                     }, 0x2000),
                 },
             };
+        }
+
+        // The fixture has no emulated geometry stage.
+        public ComputeProgram GetNggComputeProgram(VertexStageRegisters vertex, out uint paramCount)
+        {
+            paramCount = 0;
+            return new ComputeProgram { Available = false };
         }
 
         public PipelineHandle CreateGraphicsPipeline(ReadOnlySpan<ColorTargetState> colors, in DepthAttachmentState depth, VertexInputInfo vertexInput, PixelInputInfo? pixelInput, ContextRegisters context, in RenderingState rendering, PrimitiveTopology topology, bool primitiveRestartEnabled, bool disableBlending, ShaderProgram vertexProgram, ShaderProgram pixelProgram)

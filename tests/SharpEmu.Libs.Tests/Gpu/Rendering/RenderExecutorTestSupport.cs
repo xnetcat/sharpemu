@@ -421,11 +421,19 @@ internal sealed class FakePipelineProvider : IShaderPipelineProvider
         ShaderInterfaceRegisters shaderInterface,
         ContextRegisters context,
         ReadOnlySpan<ColorComponentMap> targetExportMapping,
-        bool pixelActive)
+        bool pixelActive,
+        uint? nggReplayParamCount = null)
     {
         Calls.Add($"get_graphics_programs pixelActive={pixelActive}");
         ExportMappings.Add(targetExportMapping.ToArray());
         return Graphics;
+    }
+
+    // The fixture has no emulated geometry stage.
+    public ComputeProgram GetNggComputeProgram(VertexStageRegisters vertex, out uint paramCount)
+    {
+        paramCount = 0;
+        return new ComputeProgram { Available = false };
     }
 
     public PipelineHandle CreateGraphicsPipeline(
