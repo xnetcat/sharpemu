@@ -600,6 +600,8 @@ internal static unsafe partial class VulkanVideoPresenter
                 // The tick of this flush, not the shared field: the presenter thread also
                 // writes _submitTimeline, so reading it here can name an older tick that is
                 // already complete and let the blit run before the copy above.
+                var recordingStillCurrent =
+                    commandBuffer.Handle == CurrentRecordingBuffer().Handle && _batchOpen;
                 var captureTick = FlushBatchedGuestCommands();
                 submitted = true;
                 _guestImageVersions.Add(version, snapshot);
@@ -610,7 +612,9 @@ internal static unsafe partial class VulkanVideoPresenter
                         $"required={captureTick} shared={_submitTimeline} " +
                         $"completed={_scheduler.Timeline.CompletedTick} " +
                         $"shared_stale={(_submitTimeline < captureTick ? 1 : 0)} " +
-                        $"shared_already_ready={(_scheduler.Timeline.CompletedTick >= _submitTimeline ? 1 : 0)}");
+                        $"shared_already_ready={(_scheduler.Timeline.CompletedTick >= _submitTimeline ? 1 : 0)} " +
+                        $"recording_current={(recordingStillCurrent ? 1 : 0)} " +
+                        $"queue={_activeGuestQueue.Name}");
                 }
 
                 lock (_gate)

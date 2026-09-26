@@ -29,6 +29,12 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private bool _tracedPresentedSwapchain;
         private bool _swapchainReadbackPending;
+        private VkBuffer _flipSourceProbeBuffer;
+        private DeviceMemory _flipSourceProbeMemory;
+        private nint _flipSourceProbeMapped;
+        private uint _flipSourceProbeWidth;
+        private uint _flipSourceProbeHeight;
+        private const uint FlipSourceProbeSide = 128;
         private long _swapchainReadbackVersion;
         private long _presentedSwapchainCount;
 
@@ -353,6 +359,11 @@ internal static unsafe partial class VulkanVideoPresenter
                 encodeForPresent ? 3u : 2u,
                 barriers);
 
+            if (traceDestination)
+            {
+                RecordFlipSourceProbe(source);
+            }
+
             var sourceX = 0u;
             var sourceY = 0u;
             var sourceWidth = source.Width;
@@ -647,6 +658,84 @@ internal static unsafe partial class VulkanVideoPresenter
                 2,
                 barriers);
             EndDebugLabel(_commandBuffer);
+        }
+
+        // LOCAL ONLY diagnostic: copy a patch of the flip snapshot that the blit
+        // reads, so a black present can be blamed on the snapshot or on the blit.
+        private void RecordFlipSourceProbe(GuestImageResource source)
+        {
+            var side = Math.Min(FlipSourceProbeSide, Math.Min(source.Width, source.Height));
+            if (side == 0)
+            {
+                return;
+            }
+
+            if (_flipSourceProbeBuffer.Handle == 0)
+            {
+                _flipSourceProbeBuffer = CreateBuffer(
+                    FlipSourceProbeSide * FlipSourceProbeSide * 8,
+                    BufferUsageFlags.TransferDstBit,
+                    MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
+                    out _flipSourceProbeMemory);
+                void* mapped;
+                Check(
+                    _vk.MapMemory(
+                        _device,
+                        _flipSourceProbeMemory,
+                        0,
+                        FlipSourceProbeSide * FlipSourceProbeSide * 8,
+                        0,
+                        &mapped),
+                    "vkMapMemory(flip source probe)");
+                _flipSourceProbeMapped = (nint)mapped;
+            }
+
+            _flipSourceProbeWidth = side;
+            _flipSourceProbeHeight = side;
+            var region = new BufferImageCopy
+            {
+                BufferOffset = 0,
+                ImageSubresource = new ImageSubresourceLayers(ImageAspectFlags.ColorBit, 0, 0, 1),
+                ImageOffset = new Offset3D(
+                    checked((int)((source.Width - side) / 2)),
+                    checked((int)((source.Height - side) / 2)),
+                    0),
+                ImageExtent = new Extent3D(side, side, 1),
+            };
+            _vk.CmdCopyImageToBuffer(
+                _commandBuffer,
+                source.Image,
+                ImageLayout.TransferSrcOptimal,
+                _flipSourceProbeBuffer,
+                1,
+                &region);
+        }
+
+        private void TraceFlipSourceProbe()
+        {
+            if (_flipSourceProbeMapped == 0 || _flipSourceProbeWidth == 0)
+            {
+                return;
+            }
+
+            var texels = checked((int)(_flipSourceProbeWidth * _flipSourceProbeHeight * 4));
+            var values = new ReadOnlySpan<Half>((void*)_flipSourceProbeMapped, texels);
+            var nonzero = 0;
+            var sum = 0.0;
+            for (var index = 0; index < texels; index++)
+            {
+                var value = (float)values[index];
+                if (value != 0f)
+                {
+                    nonzero++;
+                }
+
+                sum += value;
+            }
+
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] vk.flip_source_probe version={_swapchainReadbackVersion} " +
+                $"side={_flipSourceProbeWidth} nonzero={nonzero}/{texels} mean={sum / texels:F4}");
         }
 
         private void TraceSwapchainReadback()
