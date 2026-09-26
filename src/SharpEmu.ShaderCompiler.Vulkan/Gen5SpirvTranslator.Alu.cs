@@ -2054,6 +2054,13 @@ public static partial class Gen5SpirvTranslator
                     return false;
                 }
 
+                // RDNA2 ISA: S_ADDK_I32 writes SCC = signed overflow, exactly like
+                // S_ADD_I32. S_MOVK_I32 and S_MULK_I32 leave SCC alone.
+                if (instruction.Opcode == "SAddkI32")
+                {
+                    Store(_scc, SignedAddOverflow(current, UInt(immediate), value));
+                }
+
                 StoreS(destination, value);
                 return true;
             }
