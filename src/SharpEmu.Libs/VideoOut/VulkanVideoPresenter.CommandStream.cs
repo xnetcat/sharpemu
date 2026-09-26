@@ -585,7 +585,10 @@ internal static unsafe partial class VulkanVideoPresenter
                 VulkanSynchronization.PipelineBarrier(_vk,
                     commandBuffer, PipelineStageFlags.TransferBit, PipelineStageFlags.AllCommandsBit, 0, 0, null, 0, null, 1, &toShaderRead);
 
-                FlushBatchedGuestCommands();
+                // The tick of this flush, not the shared field: the presenter thread also
+                // writes _submitTimeline, so reading it here can name an older tick that is
+                // already complete and let the blit run before the copy above.
+                var captureTick = FlushBatchedGuestCommands();
                 submitted = true;
                 _guestImageVersions.Add(version, snapshot);
 
@@ -602,7 +605,7 @@ internal static unsafe partial class VulkanVideoPresenter
                         GuestImageAddress: displayBuffer.Address,
                         GuestImageVersion: version,
                         IsHdr: VideoOutExports.IsHdrPixelFormat(displayBuffer.PixelFormat),
-                        RequiredTick: _submitTimeline,
+                        RequiredTick: captureTick,
                         FlipRequestId: requestId);
                     _latestPresentation = presentation;
                     _pendingGuestImagePresentations.Enqueue(presentation);
