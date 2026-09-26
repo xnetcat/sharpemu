@@ -105,7 +105,12 @@ public static partial class Gen5SpirvTranslator
         private uint _privateVec2Pointer;
         private uint _privateBoolPointer;
         private uint _runtimeBufferBiases;
-        private uint _scalarRegisters;
+        // One Private variable per register the program touches, declared on first use. A whole
+        // register-file array is kept only for the VGPRs of a program that indexes them at run time
+        // (V_MOVREL*): MoltenVK lowers a 512-entry private array to thread memory, and every
+        // register access of every invocation then spills through it.
+        private readonly Dictionary<uint, uint> _scalarRegisterVariables = new();
+        private readonly Dictionary<uint, uint> _vectorRegisterVariables = new();
         private uint _vectorRegisters;
         private uint _packedHalfRegisters;
         private uint _scc;
@@ -493,20 +498,15 @@ public static partial class Gen5SpirvTranslator
             _privateBoolPointer =
                 _module.TypePointer(SpirvStorageClass.Private, _boolType);
 
-            var scalarArrayType = _module.TypeArray(_uintType, ScalarRegisterCount);
-            var vectorArrayType = _module.TypeArray(_uintType, VectorRegisterCount);
-            var privateScalarArrayPointer =
-                _module.TypePointer(SpirvStorageClass.Private, scalarArrayType);
-            var privateVectorArrayPointer =
-                _module.TypePointer(SpirvStorageClass.Private, vectorArrayType);
-            _scalarRegisters = _module.AddGlobalVariable(
-                privateScalarArrayPointer,
-                SpirvStorageClass.Private,
-                _module.ConstantNull(scalarArrayType));
-            _vectorRegisters = _module.AddGlobalVariable(
-                privateVectorArrayPointer,
-                SpirvStorageClass.Private,
-                _module.ConstantNull(vectorArrayType));
+            if (_request.Program.Instructions.Any(static instruction => instruction.Opcode.StartsWith("VMovrel", StringComparison.Ordinal)))
+            {
+                var vectorArrayType = _module.TypeArray(_uintType, VectorRegisterCount);
+                _vectorRegisters = _module.AddGlobalVariable(
+                    _module.TypePointer(SpirvStorageClass.Private, vectorArrayType),
+                    SpirvStorageClass.Private,
+                    _module.ConstantNull(vectorArrayType));
+            }
+
             _scc = _module.AddGlobalVariable(
                 _privateBoolPointer,
                 SpirvStorageClass.Private,
@@ -548,8 +548,12 @@ public static partial class Gen5SpirvTranslator
                 _module.AddName(_iterationGuard, "pcGuard");
             }
 
-            _interfaces.Add(_scalarRegisters);
-            _interfaces.Add(_vectorRegisters);
+            if (_vectorRegisters != 0)
+            {
+                _interfaces.Add(_vectorRegisters);
+                _module.AddName(_vectorRegisters, "vgpr");
+            }
+
             _interfaces.Add(_scc);
             _interfaces.Add(_vcc);
             _interfaces.Add(_exec);
@@ -561,8 +565,6 @@ public static partial class Gen5SpirvTranslator
             }
             _interfaces.Add(_programCounter);
             _interfaces.Add(_programActive);
-            _module.AddName(_scalarRegisters, "sgpr");
-            _module.AddName(_vectorRegisters, "vgpr");
 
             {
                 DeclareLayoutBindings();
@@ -6347,12 +6349,28 @@ public static partial class Gen5SpirvTranslator
                 UInt(0),
                 dwordAddress);
 
-        private uint ScalarPointer(uint register) =>
-            _module.AddInstruction(
-                SpirvOp.AccessChain,
-                _privateUintPointer,
-                _scalarRegisters,
-                UInt(register));
+        private uint ScalarPointer(uint register)
+        {
+            if (register >= ScalarRegisterCount)
+            {
+                throw new InvalidOperationException($"Scalar register s{register} is outside the register file.");
+            }
+
+            return RegisterVariable(_scalarRegisterVariables, register, "s");
+        }
+
+        private uint RegisterVariable(Dictionary<uint, uint> variables, uint register, string prefix)
+        {
+            if (!variables.TryGetValue(register, out var variable))
+            {
+                variable = _module.AddGlobalVariable(_privateUintPointer, SpirvStorageClass.Private, _module.ConstantNull(_uintType));
+                _interfaces.Add(variable);
+                _module.AddName(variable, $"{prefix}{register}");
+                variables.Add(register, variable);
+            }
+
+            return variable;
+        }
 
         private uint RuntimeBufferBiasPointer(int binding) =>
             _module.AddInstruction(
@@ -6361,12 +6379,24 @@ public static partial class Gen5SpirvTranslator
                 _runtimeBufferBiases,
                 UInt(checked((uint)binding)));
 
-        private uint VectorPointer(uint register) =>
-            _module.AddInstruction(
-                SpirvOp.AccessChain,
-                _privateUintPointer,
-                _vectorRegisters,
-                UInt(register));
+        private uint VectorPointer(uint register)
+        {
+            if (_vectorRegisters != 0)
+            {
+                return _module.AddInstruction(
+                    SpirvOp.AccessChain,
+                    _privateUintPointer,
+                    _vectorRegisters,
+                    UInt(register));
+            }
+
+            if (register >= VectorRegisterCount)
+            {
+                throw new InvalidOperationException($"Vector register v{register} is outside the register file.");
+            }
+
+            return RegisterVariable(_vectorRegisterVariables, register, "v");
+        }
 
         // The V_MOVREL* opcodes address the VGPR file with a register number that
         // is only known at run time (encoded number + M0), so the access chain
