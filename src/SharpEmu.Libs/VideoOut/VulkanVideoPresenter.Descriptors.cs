@@ -107,6 +107,11 @@ internal static unsafe partial class VulkanVideoPresenter
 
             var storage = image.ResourceClass == ShaderCompiler.Resources.ImageResourceClass.Storage;
             var resolution = ImageRequestBuilders.Texture(words, ShapeOf(image));
+            if (Gpu.Rendering.FrameCommandLog.Active)
+            {
+                Gpu.Rendering.FrameCommandLog.Write($"  descriptor {(storage ? "storage" : "sampled")} T#=[{string.Join(' ', words.Select(static word => word.ToString("X8")))}]");
+            }
+
             _ = BeginBatchedGuestCommands();
             var request = resolution.Request;
             var imageIdentifier = _imageCache.FindImage(ref request, resolution.ExactFormat);
