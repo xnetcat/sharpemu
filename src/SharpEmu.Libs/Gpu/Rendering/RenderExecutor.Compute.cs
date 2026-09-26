@@ -33,6 +33,7 @@ public sealed partial class RenderExecutor
         _host.SetDebugInformation(RecordedOperation.DispatchDirect, submitId, groupsX, groupsY, groupsZ, dispatchInitiator, compute.Address);
         if (compute.Address == 0)
         {
+            DroppedWorkLog.Dispatch("no-compute-shader", 0, groupsX, groupsY, groupsZ, dispatchInitiator);
             if (RenderTrace.Enabled && RenderTrace.NullComputeShader())
             {
                 RenderTrace.Write($"Ignoring a dispatch with no compute shader: groups={groupsX}x{groupsY}x{groupsZ} initiator=0x{dispatchInitiator:X8}");
@@ -57,6 +58,7 @@ public sealed partial class RenderExecutor
 
         if (!computeProgram.Available)
         {
+            DroppedWorkLog.Dispatch("no-compute-program", compute.Address, groupsX, groupsY, groupsZ, dispatchInitiator);
             if (RenderTrace.Enabled)
             {
                 RenderTrace.Write($"Skipping a dispatch without a program: shader=0x{compute.Address:X16} groups={groupsX}x{groupsY}x{groupsZ}");

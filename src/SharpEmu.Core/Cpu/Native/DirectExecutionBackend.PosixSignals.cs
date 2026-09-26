@@ -77,6 +77,7 @@ public sealed unsafe partial class DirectExecutionBackend
 
 	private static DirectExecutionBackend? _posixSignalBackend;
 	private static bool _posixSignalHandlersInstalled;
+	private static nint _posixSignalTrampoline;
 	private static bool _posixRawRecoveryEnabled;
 	private static bool _posixSignalWarmup;
 	private static readonly nint[] _posixPreviousActions = new nint[32];
@@ -104,6 +105,7 @@ public sealed unsafe partial class DirectExecutionBackend
 		_posixSignalBackend = this;
 		if (_posixSignalHandlersInstalled)
 		{
+			PublishSignalStackState();
 			return;
 		}
 
@@ -117,6 +119,8 @@ public sealed unsafe partial class DirectExecutionBackend
 		WarmUpPosixSignalPath();
 		SharpEmu.HLE.GuestImageWriteTracker.WarmUp();
 
+		_posixSignalTrampoline = CreatePosixSignalTrampoline();
+		PublishSignalStackState();
 		if (!InstallPosixSignalHandler(PosixSigSegv) ||
 			!InstallPosixSignalHandler(PosixSigBus) ||
 			!InstallPosixSignalHandler(PosixSigIll) ||
@@ -191,7 +195,7 @@ public sealed unsafe partial class DirectExecutionBackend
 	{
 		byte* action = stackalloc byte[PosixSigactionSize];
 		new Span<byte>(action, PosixSigactionSize).Clear();
-		*(nint*)action = (nint)(delegate* unmanaged<int, nint, nint, void>)&HandlePosixSignal;
+		*(nint*)action = _posixSignalTrampoline;
 		// No SA_ONSTACK: the runtime's alternate stacks are far too small for
 		// the recovery/diagnostic path (JIT compilation of cold handler code
 		// can run inside the signal frame). Guest faults deliver onto the 2MB

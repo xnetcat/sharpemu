@@ -3,6 +3,8 @@
 
 using SharpEmu.Libs.Gpu.GpuCommands.Packets;
 
+using SharpEmu.Libs.Gpu.Rendering;
+
 namespace SharpEmu.Libs.Gpu.GpuCommands;
 
 public sealed partial class GpuCommandInterpreter
@@ -66,6 +68,7 @@ public sealed partial class GpuCommandInterpreter
                     1 => value == 0,
                     _ => throw _host.Fatal($"The predication condition is unknown: condition=0x{condition:X8} address=0x{address:X16}."),
                 };
+                DroppedWorkLog.Predication(address, value, condition, PredicateSkip);
                 break;
             }
 
@@ -154,7 +157,9 @@ public sealed partial class GpuCommandInterpreter
                 $"address=0x{address:X16} count={executeCount} remaining={packet.Remaining}.");
         }
 
-        return ReadDword(address) == 0 ? payloadDwords + executeCount : payloadDwords;
+        var value = ReadDword(address);
+        DroppedWorkLog.ConditionalExecute(address, value, executeCount);
+        return value == 0 ? payloadDwords + executeCount : payloadDwords;
     }
 
     internal uint SetPredicationPacket(in PacketContext packet, ReadOnlySpan<uint> payload)
