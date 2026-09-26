@@ -545,6 +545,18 @@ internal static unsafe partial class VulkanVideoPresenter
                 // The refresh can end the tick; the copy records into the buffer that is current now.
                 var commandBuffer = BeginBatchedGuestCommands();
                 var extent = source.Backing.Extent;
+                if (ShouldTracePresentedGuestImageContentsForDiagnostics())
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] vk.flip_source version={version} addr=0x{displayBuffer.Address:X16} " +
+                        $"slot={imageIdentifier.Index}.{imageIdentifier.Generation} " +
+                        $"extent={extent.Width}x{extent.Height} format={source.Backing.Format} " +
+                        $"registered={source.Registered} gpuModified={source.IsGpuModified} " +
+                        $"cpuDirty={source.IsDefinitelyCpuDirty} maybeCpuDirty={source.IsMaybeCpuDirty} " +
+                        $"bufferModified={source.IsBufferModified} tick={_submitTimeline} " +
+                        $"guestFmt={displayBuffer.PixelFormat} guestSize={displayBuffer.Width}x{displayBuffer.Height} " +
+                        $"tile={displayBuffer.TilingMode}");
+                }
                 snapshot = CreateGuestFlipSnapshot(GetPresentationSnapshotFormat(source.Backing.Format),
                     extent.Width, extent.Height, displayBuffer.Address, version);
                 source.Transition(ImageLayout.TransferSrcOptimal, AccessFlags.TransferReadBit, null, commandBuffer);
@@ -591,6 +603,15 @@ internal static unsafe partial class VulkanVideoPresenter
                 var captureTick = FlushBatchedGuestCommands();
                 submitted = true;
                 _guestImageVersions.Add(version, snapshot);
+                if (ShouldTracePresentedGuestImageContentsForDiagnostics())
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] vk.flip_queued version={version} " +
+                        $"required={captureTick} shared={_submitTimeline} " +
+                        $"completed={_scheduler.Timeline.CompletedTick} " +
+                        $"shared_stale={(_submitTimeline < captureTick ? 1 : 0)} " +
+                        $"shared_already_ready={(_scheduler.Timeline.CompletedTick >= _submitTimeline ? 1 : 0)}");
+                }
 
                 lock (_gate)
                 {

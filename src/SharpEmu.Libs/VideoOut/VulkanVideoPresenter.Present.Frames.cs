@@ -29,6 +29,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private bool _tracedPresentedSwapchain;
         private bool _swapchainReadbackPending;
+        private long _swapchainReadbackVersion;
         private long _presentedSwapchainCount;
 
         private void CreateStagingBuffer(ulong size)
@@ -567,6 +568,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     1,
                     &copyRegion);
                 _swapchainReadbackPending = true;
+                _swapchainReadbackVersion = source.FlipVersion;
             }
 
             var sourceToShaderRead = new ImageMemoryBarrier2
@@ -649,7 +651,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
 
                 Console.Error.WriteLine(
-                    $"[LOADER][TRACE] vk.swapchain_image size={_extent.Width}x{_extent.Height} " +
+                    $"[LOADER][TRACE] vk.swapchain_image version={_swapchainReadbackVersion} size={_extent.Width}x{_extent.Height} " +
                     $"format={_swapchainFormat} nonzero_bytes={nonzeroBytes}/{byteCount} " +
                     $"nonblack_pixels={nonblackPixels}/{(ulong)_extent.Width * _extent.Height} " +
                     $"hash=0x{hash:X16}");
