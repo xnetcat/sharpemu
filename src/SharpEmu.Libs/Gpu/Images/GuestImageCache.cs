@@ -197,6 +197,11 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         }
 
         var image = _slots[result];
+        if (request.Role == ImageRole.DisplaySurface)
+        {
+            DumpFrameImagesIfRequested();
+        }
+
         if (request.Role == ImageRole.DisplaySurface && request.Description.Metadata.Compression != DisplayCompression.Uncompressed)
         {
             var guestDirty = image.IsBufferModified || image.IsCpuDirty;
