@@ -137,7 +137,13 @@ public sealed class MetalRenderHostTests : IDisposable
         private ShaderProgram _pixelProgram;
         private ShaderProgram _computeProgram;
 
-        public GraphicsPrograms GetGraphicsPrograms(VertexStageRegisters vertex, PixelStageRegisters pixel, ShaderInterfaceRegisters shaderInterface, ContextRegisters context, ReadOnlySpan<ColorComponentMap> targetExportMapping, bool pixelActive)
+        public ComputeProgram GetNggComputeProgram(VertexStageRegisters vertex, out uint paramCount)
+        {
+            paramCount = 0;
+            return new ComputeProgram { Available = false };
+        }
+
+        public GraphicsPrograms GetGraphicsPrograms(VertexStageRegisters vertex, PixelStageRegisters pixel, ShaderInterfaceRegisters shaderInterface, ContextRegisters context, ReadOnlySpan<ColorComponentMap> targetExportMapping, bool pixelActive, uint? nggReplayParamCount = null)
         {
             if (!_vertexProgram.IsValid)
             {
