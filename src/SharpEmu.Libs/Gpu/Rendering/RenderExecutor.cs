@@ -218,6 +218,7 @@ public sealed partial class RenderExecutor
             0,
             indirect ? arguments.FirstInstance : ResolveInstanceOffset(state.Programs.VertexInput));
         RecordDraw(submitId, banks, in draw, ref state, topology, in emission, in indexSource, primitiveRestart, setBindDebug: true, setAutoDebug: false);
+        FrameCommandLog.AfterDraw(banks);
         _host.ResetBindings();
     }
 
@@ -329,6 +330,7 @@ public sealed partial class RenderExecutor
             (uint)vertexOffset,
             indirect || _nggReplay is not null ? arguments.FirstInstance : ResolveInstanceOffset(vertexInput));
         RecordDraw(submitId, banks, in draw, ref state, topology, in emission, default, primitiveRestart: false, setBindDebug: false, setAutoDebug: true);
+        FrameCommandLog.AfterDraw(banks);
         _host.ResetBindings();
     }
 

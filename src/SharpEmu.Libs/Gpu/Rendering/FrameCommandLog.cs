@@ -22,6 +22,34 @@ internal static class FrameCommandLog
 
     public static bool Active => _writer is not null || _volumeDraw;
 
+    // Set while a frame is recorded and SHARPEMU_DUMP_TARGET_STEPS_FILE lists color target addresses:
+    // snapshots that target after every draw that renders to it, so the draw that corrupts it is found.
+    public static Action<ulong, long>? TargetStepDump;
+
+    public static void AfterDraw(RegisterBanks banks)
+    {
+        var dump = TargetStepDump;
+        if (dump is null || _writer is null)
+        {
+            return;
+        }
+
+        long sequence;
+        lock (Gate)
+        {
+            sequence = _sequence - 1;
+        }
+
+        var context = banks.Context;
+        for (var slot = 0; slot < context.ColorTargets.Length; slot++)
+        {
+            if ((context.RenderTargetMask >> (slot * 4) & 0xF) != 0)
+            {
+                dump(context.ColorTargets[slot].BaseAddress, sequence);
+            }
+        }
+    }
+
     public static void Start(string directory)
     {
         lock (Gate)

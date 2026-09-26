@@ -39,6 +39,7 @@ public sealed unsafe partial class GuestImageCache
                     Environment.GetEnvironmentVariable("SHARPEMU_DUMP_FRAME_DIR") ?? "frame-dump",
                     $"frame-{Interlocked.Increment(ref _frameDumpCount):D2}");
                 Rendering.FrameCommandLog.Start(_frameDumpDirectory);
+                StartTargetSteps(_frameDumpDirectory);
             }
 
             return;
@@ -47,6 +48,7 @@ public sealed unsafe partial class GuestImageCache
         var directory = _frameDumpDirectory;
         _frameDumpDirectory = null;
         Rendering.FrameCommandLog.Write("Flip");
+        Rendering.FrameCommandLog.TargetStepDump = null;
         Rendering.FrameCommandLog.Stop();
         Directory.CreateDirectory(directory);
         var sequence = 0;
@@ -65,6 +67,57 @@ public sealed unsafe partial class GuestImageCache
         });
         Console.Error.WriteLine(
             $"[GPU][INFO] Frame dump: {dumped} images queued to '{Path.GetFullPath(directory)}' for ticks {frameStart}..{_previousFlipTick}.");
+    }
+
+    private static readonly string? TargetStepsFile = Environment.GetEnvironmentVariable("SHARPEMU_DUMP_TARGET_STEPS_FILE");
+
+    // Reads the color target addresses to snapshot after each draw of this frame (hex, one per line).
+    private void StartTargetSteps(string directory)
+    {
+        if (TargetStepsFile is null || !File.Exists(TargetStepsFile))
+        {
+            return;
+        }
+
+        var addresses = new HashSet<ulong>();
+        foreach (var line in File.ReadAllLines(TargetStepsFile))
+        {
+            var text = line.Trim();
+            if (text.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+            {
+                text = text[2..];
+            }
+
+            if (ulong.TryParse(text, System.Globalization.NumberStyles.HexNumber, null, out var address))
+            {
+                addresses.Add(address);
+            }
+        }
+
+        if (addresses.Count == 0)
+        {
+            return;
+        }
+
+        var stepDirectory = Path.Combine(directory, "steps");
+        Directory.CreateDirectory(stepDirectory);
+        Rendering.FrameCommandLog.TargetStepDump = (address, sequence) =>
+        {
+            if (!addresses.Contains(address))
+            {
+                return;
+            }
+
+            using var held = _lock.Hold();
+            foreach (var imageIdentifier in FindImagesInRange(address, 1, pageOverlap: false))
+            {
+                var image = _slots[imageIdentifier];
+                if (image.Description.Data.Address == address && image.Backing.Exists && !image.DepthOwner.IsValid)
+                {
+                    TryDumpImage(image, stepDirectory, checked((int)sequence));
+                }
+            }
+        };
     }
 
     private bool IsFrameDumpRequested()
