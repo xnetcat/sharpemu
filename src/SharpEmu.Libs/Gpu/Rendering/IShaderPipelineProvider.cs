@@ -90,4 +90,12 @@ public interface IShaderPipelineProvider
         uint dimensionZ);
 
     PipelineHandle CreateComputePipeline(ComputeInputInfo input, ShaderProgram program);
+
+    // False means the host is still compiling this pipeline and the dispatch has to be
+    // dropped for now; the next dispatch of the same program picks the pipeline up.
+    bool TryCreateComputePipeline(ComputeInputInfo input, ShaderProgram program, out PipelineHandle handle)
+    {
+        handle = CreateComputePipeline(input, program);
+        return true;
+    }
 }

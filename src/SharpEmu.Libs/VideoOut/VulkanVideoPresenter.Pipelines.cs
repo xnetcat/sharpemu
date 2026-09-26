@@ -823,6 +823,146 @@ internal static unsafe partial class VulkanVideoPresenter
             return RegisterPipeline(entry);
         }
 
+        // One compute pipeline whose vkCreateComputePipelines call runs on a worker
+        // thread. Everything the command stream owns (descriptor and pipeline layout,
+        // the module handle) is prepared before the task starts, so the task touches
+        // nothing but the Vulkan pipeline creation itself.
+        private sealed class PendingComputePipeline
+        {
+            public required DescriptorSetLayout SetLayout;
+            public required PipelineLayout Layout;
+            public required DescriptorSetDemand Demand;
+            public required bool UsesPushDescriptors;
+            public required ulong Hash;
+            public required int SpirvBytes;
+            public required Task<Pipeline> Compile;
+            public long StartTimestamp;
+        }
+
+        private readonly Dictionary<ulong, PendingComputePipeline> _pendingComputePipelines = new();
+
+        // Metal compiles a large translated wave64 program for tens of seconds and the
+        // guest's command stream cannot advance meanwhile, which starves presentation
+        // (Demon's Souls: ~70 s of compilation for ten dispatches, one frame in 100 s).
+        // Compiling off the command-stream thread and dropping the dispatch until the
+        // pipeline exists keeps the guest running; set this to 0 to compile inline.
+        private static readonly bool _asyncComputePipelines =
+            !string.Equals(
+                Environment.GetEnvironmentVariable("SHARPEMU_ASYNC_COMPUTE_PIPELINES"),
+                "0",
+                StringComparison.Ordinal);
+
+        public bool TryCreateComputePipeline(ComputePipelineDescription description, out PipelineHandle handle)
+        {
+            if (!_asyncComputePipelines)
+            {
+                handle = CreateComputePipeline(description);
+                return true;
+            }
+
+            handle = default;
+            var key = description.Program.Id;
+            if (_pendingComputePipelines.TryGetValue(key, out var pending))
+            {
+                if (!pending.Compile.IsCompleted)
+                {
+                    return false;
+                }
+
+                _pendingComputePipelines.Remove(key);
+                var compiled = pending.Compile.GetAwaiter().GetResult();
+                ReportPipelineCreation(
+                    (long)Stopwatch.GetElapsedTime(pending.StartTimestamp).TotalMilliseconds,
+                    "compute-async",
+                    $"cs=0x{pending.Hash:X16}",
+                    pending.SpirvBytes.ToString());
+                MarkPipelineCacheDirty();
+                Interlocked.Increment(ref _perfPipelineCreations);
+                SetDebugName(ObjectType.Pipeline, compiled.Handle, $"SharpEmu compute cs=0x{pending.Hash:X16}");
+                handle = RegisterPipeline(new RenderPipelineEntry
+                {
+                    Pipeline = compiled,
+                    Layout = pending.Layout,
+                    SetLayout = pending.SetLayout,
+                    Demand = pending.Demand,
+                    UsesPushDescriptors = pending.UsesPushDescriptors,
+                    ProfileComputeHash = pending.Hash,
+                });
+                return true;
+            }
+
+            using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.PipelineSetup);
+            var bindings = new List<DescriptorSetLayoutBinding>();
+            CollectLayoutBindings(bindings, description.Stage, ShaderStage.Compute);
+            var setLayout = CreateDescriptorSetLayout(bindings, out var usesPushDescriptors, out var demand);
+            var layout = CreatePipelineLayout(setLayout, ShaderStageFlags.ComputeBit);
+            var computeModule = new ShaderModule(description.Program.Module);
+            if (computeModule.Handle == 0)
+            {
+                throw SubmissionScheduler.Fatal($"The compute pipeline has no module: hash=0x{description.Stage.Hash:X16}.");
+            }
+
+            var device = _device;
+            var cache = _pipelineCache;
+            var vk = _vk;
+            var started = new PendingComputePipeline
+            {
+                SetLayout = setLayout,
+                Layout = layout,
+                Demand = demand,
+                UsesPushDescriptors = usesPushDescriptors,
+                Hash = description.Stage.Hash,
+                SpirvBytes = SpirvBytesOf(computeModule.Handle),
+                StartTimestamp = Stopwatch.GetTimestamp(),
+                Compile = Task.Factory.StartNew(
+                    () => CompileComputePipeline(vk, device, cache, computeModule, layout),
+                    CancellationToken.None,
+                    TaskCreationOptions.LongRunning,
+                    TaskScheduler.Default),
+            };
+            _pendingComputePipelines.Add(key, started);
+            return false;
+        }
+
+        // vkCreateComputePipelines is the only call here; Vulkan synchronises host
+        // access to the pipeline cache internally, so several may run at once.
+        private static Pipeline CompileComputePipeline(
+            Vk vk,
+            Device device,
+            PipelineCache cache,
+            ShaderModule module,
+            PipelineLayout layout)
+        {
+            var entryPoint = (byte*)SilkMarshal.StringToPtr("main");
+            try
+            {
+                var stageInfo = new PipelineShaderStageCreateInfo
+                {
+                    SType = StructureType.PipelineShaderStageCreateInfo,
+                    Stage = ShaderStageFlags.ComputeBit,
+                    Module = module,
+                    PName = entryPoint,
+                };
+                var pipelineInfo = new ComputePipelineCreateInfo
+                {
+                    SType = StructureType.ComputePipelineCreateInfo,
+                    Stage = stageInfo,
+                    Layout = layout,
+                };
+                var result = vk.CreateComputePipelines(device, cache, 1, &pipelineInfo, null, out var pipeline);
+                if (result != Result.Success)
+                {
+                    throw SubmissionScheduler.Fatal($"vkCreateComputePipelines(async) failed: {result}.");
+                }
+
+                return pipeline;
+            }
+            finally
+            {
+                SilkMarshal.Free((nint)entryPoint);
+            }
+        }
+
         private void DestroyRenderPipelines()
         {
             foreach (var entry in _pipelineEntries.Values)
