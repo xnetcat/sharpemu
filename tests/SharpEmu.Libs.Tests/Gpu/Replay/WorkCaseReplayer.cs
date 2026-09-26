@@ -163,7 +163,7 @@ public static class WorkCaseReplayer
                 if (!harness.TryMapBackedAt(cursor, runEnd - cursor, GuestPageProtection.Read | GuestPageProtection.Write, out var address, out var size, register: false))
                 {
                     result.Notes.Add($"the range {range.Role} at 0x{cursor:X} could not be mapped");
-                    Console.Error.WriteLine($"[TEST][WARN] {result.Notes[^1]}");
+                    Console.Error.WriteLine($"[REPLAY][WARN] {result.Notes[^1]}");
                     break;
                 }
 
@@ -175,7 +175,7 @@ public static class WorkCaseReplayer
             if (!harness.Memory.TryWriteBacking(range.Address, bytes))
             {
                 result.Notes.Add($"the range {range.Role} at 0x{range.Address:X} could not be filled");
-                Console.Error.WriteLine($"[TEST][WARN] {result.Notes[^1]}");
+                Console.Error.WriteLine($"[REPLAY][WARN] {result.Notes[^1]}");
             }
         }
 
@@ -279,7 +279,7 @@ public static class WorkCaseReplayer
                 var identifier = presenter.Harness.Images.FindImage(ref request);
                 var found = presenter.Harness.Images.GetImage(identifier);
                 Console.Error.WriteLine(
-                    $"[TEST][INFO] readback {target.Role} image={identifier.Index} " +
+                    $"[REPLAY][INFO] readback {target.Role} image={identifier.Index} " +
                     $"extent={found.Backing.Extent.Width}x{found.Backing.Extent.Height} format={found.Backing.Format} gpu={found.IsGpuModified}");
                 return found;
             });

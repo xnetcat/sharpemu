@@ -40,10 +40,11 @@ internal static class WorkCapture
     private const ulong DirectResourceOffsetBytes = 0x80;
     private const ulong DirectResourceOffsetField = 0x00;
 
-    private static readonly WorkCaptureSelector[] Selectors = ParseSelectors(Environment.GetEnvironmentVariable("SHARPEMU_CAPTURE_WORK"));
+    // The order matters: the selector list reports the other three when it parses.
     private static readonly string Root = Environment.GetEnvironmentVariable("SHARPEMU_CAPTURE_DIR") ?? "work-capture";
     private static readonly int Limit = ParseCount(Environment.GetEnvironmentVariable("SHARPEMU_CAPTURE_LIMIT"), 8);
     private static readonly ulong ByteBudget = ParseSize(Environment.GetEnvironmentVariable("SHARPEMU_CAPTURE_MAX_BYTES"), DefaultByteBudget);
+    private static readonly WorkCaptureSelector[] Selectors = ParseSelectors(Environment.GetEnvironmentVariable("SHARPEMU_CAPTURE_WORK"));
     private static readonly ConcurrentDictionary<ulong, ShaderSource> NotedShaders = new();
     private static int _written;
 
