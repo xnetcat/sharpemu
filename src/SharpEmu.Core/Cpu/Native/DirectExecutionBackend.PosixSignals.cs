@@ -23,6 +23,7 @@ public sealed unsafe partial class DirectExecutionBackend
 	private const int PosixSigIll = 4;
 	private const int PosixSigTrap = 5;
 	private const int PosixSigAbort = 6;
+	private const int PosixSigFpe = 8;
 	private const int PosixSigSegv = 11;
 	private static readonly int PosixSigBus = OperatingSystem.IsMacOS() ? 10 : 7;
 
@@ -125,13 +126,14 @@ public sealed unsafe partial class DirectExecutionBackend
 			!InstallPosixSignalHandler(PosixSigBus) ||
 			!InstallPosixSignalHandler(PosixSigIll) ||
 			!InstallPosixSignalHandler(PosixSigTrap) ||
-			!InstallPosixSignalHandler(PosixSigAbort))
+			!InstallPosixSignalHandler(PosixSigAbort) ||
+			!InstallPosixSignalHandler(PosixSigFpe))
 		{
 			throw new InvalidOperationException("Failed to install POSIX fault signal handlers");
 		}
 
 		_posixSignalHandlersInstalled = true;
-		Console.Error.WriteLine("[LOADER][INFO] POSIX signal exception bridge installed (SIGSEGV/SIGBUS/SIGILL)");
+		Console.Error.WriteLine("[LOADER][INFO] POSIX signal exception bridge installed (SIGSEGV/SIGBUS/SIGILL/SIGFPE)");
 	}
 
 	/// <summary>
@@ -242,6 +244,7 @@ public sealed unsafe partial class DirectExecutionBackend
 			// address (safe for host and guest threads alike) and must resume
 			// the faulting write immediately after restoring write access.
 			if (signal != PosixSigIll &&
+				signal != PosixSigFpe &&
 				siginfo != 0 &&
 				SharpEmu.HLE.GuestImageWriteTracker.TryHandleWriteFault(
 					*(ulong*)((byte*)siginfo + PosixSigInfoAddressOffset)))
@@ -308,6 +311,11 @@ public sealed unsafe partial class DirectExecutionBackend
 		else if (signal == PosixSigAbort)
 		{
 			record.ExceptionCode = 1073741845u;
+		}
+		else if (signal == PosixSigFpe)
+		{
+			// STATUS_INTEGER_DIVIDE_BY_ZERO: #DE from div/idiv (zero divisor or quotient overflow).
+			record.ExceptionCode = 3221225620u;
 		}
 		else
 		{
