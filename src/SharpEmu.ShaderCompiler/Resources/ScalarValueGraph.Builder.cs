@@ -513,6 +513,46 @@ public sealed partial class ScalarValueGraph
                     state.WriteScalar(destinationRegister, Unary(ScalarOperation.BitCount32, left));
                     state.Scc = NotZero(state.Scalars[destinationRegister]);
                     return;
+                case "SBcnt0I32B32":
+                    state.WriteScalar(
+                        destinationRegister,
+                        Unary(ScalarOperation.BitCount32, Unary(ScalarOperation.Not32, left)));
+                    state.Scc = NotZero(state.Scalars[destinationRegister]);
+                    return;
+                case "SFF0I32B32":
+                    state.WriteScalar(
+                        destinationRegister,
+                        _graph.FindLowestSetBit(Unary(ScalarOperation.Not32, left), instruction.Pc));
+                    return;
+                case "SSextI32I8":
+                case "SSextI32I16":
+                    state.WriteScalar(
+                        destinationRegister,
+                        _graph.Operation(
+                            ScalarOperation.BitFieldSExtract,
+                            ScalarValueType.U32,
+                            left,
+                            _graph.Constant(0u),
+                            _graph.Constant(opcode == "SSextI32I8" ? 8u : 16u)));
+                    return;
+                case "SFlbitI32B32":
+                    // Zeros before the first one from the MSB, -1 when there are none.
+                    state.WriteScalar(
+                        destinationRegister,
+                        _graph.Select(
+                            NotZero(left),
+                            Binary(
+                                ScalarOperation.ISub32,
+                                _graph.Constant(31u),
+                                Unary(ScalarOperation.FindHighestBit32, left)),
+                            _graph.Constant(uint.MaxValue)));
+                    return;
+                case "SCmovB32":
+                    // Writes only when SCC is set, and never updates SCC.
+                    state.WriteScalar(
+                        destinationRegister,
+                        _graph.Select(state.Scc, left, state.Scalars[destinationRegister]));
+                    return;
                 case "SFF1I32B32":
                     state.WriteScalar(destinationRegister, _graph.FindLowestSetBit(left, instruction.Pc));
                     return;

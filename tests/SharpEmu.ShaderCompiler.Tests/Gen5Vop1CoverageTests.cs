@@ -153,6 +153,67 @@ public sealed class Gen5Vop1CoverageTests
         Assert.StartsWith("Vop3Raw", program.Instructions[0].Opcode, StringComparison.Ordinal);
     }
 
+    [Theory]
+    [InlineData(0x1Bu, "VPipeflush")]
+    [InlineData(0x3Bu, "VFfbhI32")]
+    [InlineData(0x3Fu, "VFrexpExpI32F32")]
+    [InlineData(0x40u, "VFrexpMantF32")]
+    [InlineData(0x41u, "VClrexcp")]
+    [InlineData(0x62u, "VSatPkU8I16")]
+    [InlineData(0x63u, "VCvtNormI16F16")]
+    [InlineData(0x64u, "VCvtNormU16F16")]
+    public void RemainingVop1GapsDecodeAndCompile(uint opcode, string expectedName)
+    {
+        var program = Decode([Vop1(opcode, 0, 257), SEndpgm]);
+        Assert.Equal(expectedName, program.Instructions[0].Opcode);
+
+        var request = ResourceTestProgram.Request(program, userDataCount: 0);
+        Assert.True(
+            Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error),
+            error);
+        ValidateWhenAvailable(shader.Spirv);
+    }
+
+    [Fact]
+    public void SwapB32ExchangesBothRegisters()
+    {
+        var program = Decode([Vop1(0x65, 4, 257), SEndpgm]);
+        Assert.Equal("VSwapB32", program.Instructions[0].Opcode);
+        Assert.Equal(4u, program.Instructions[0].Destinations[0].Value);
+        Assert.Equal(Gen5OperandKind.VectorRegister, program.Instructions[0].Sources[0].Kind);
+
+        var request = ResourceTestProgram.Request(program, userDataCount: 0);
+        Assert.True(
+            Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error),
+            error);
+        ValidateWhenAvailable(shader.Spirv);
+    }
+
+    [Theory]
+    // No f64 domain in either back end, and V_SWAPREL_B32 needs the M0-relative
+    // addressing the VOP1 operand path does not build. These decode so the error
+    // names the instruction, then get rejected at emission.
+    [InlineData(0x03u, "VCvtI32F64")]
+    [InlineData(0x0Fu, "VCvtF32F64")]
+    [InlineData(0x17u, "VTruncF64")]
+    [InlineData(0x1Au, "VFloorF64")]
+    [InlineData(0x3Cu, "VFrexpExpI32F64")]
+    [InlineData(0x3Eu, "VFractF64")]
+    [InlineData(0x68u, "VSwaprelB32")]
+    public void UnsupportedVop1OpcodesDecodeButAreRejectedByName(
+        uint opcode,
+        string expectedName)
+    {
+        var program = Decode([Vop1(opcode, 0, 257), SEndpgm]);
+        Assert.Equal(expectedName, program.Instructions[0].Opcode);
+
+        var request = ResourceTestProgram.Request(program, userDataCount: 0);
+        Assert.False(
+            Gen5SpirvTranslator.TryCompileProgram(request, out _, out var error),
+            "expected the unsupported opcode to be rejected");
+        Assert.Contains(expectedName, error, StringComparison.Ordinal);
+    }
+
     [Fact]
     public void Float16ResultsPreserveTheUnselectedDestinationHalf()
     {
