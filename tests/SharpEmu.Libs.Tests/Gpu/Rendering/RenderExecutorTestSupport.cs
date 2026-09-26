@@ -415,13 +415,24 @@ internal sealed class FakePipelineProvider : IShaderPipelineProvider
 
     public List<ColorComponentMap[]> ExportMappings { get; } = new();
 
+    public ComputeProgram GetNggComputeProgram(VertexStageRegisters vertex, out uint paramCount)
+
+    {
+
+        paramCount = 0;
+
+        return new ComputeProgram { Available = false };
+
+    }
+
+
     public GraphicsPrograms GetGraphicsPrograms(
         VertexStageRegisters vertex,
         PixelStageRegisters pixel,
         ShaderInterfaceRegisters shaderInterface,
         ContextRegisters context,
         ReadOnlySpan<ColorComponentMap> targetExportMapping,
-        bool pixelActive)
+        bool pixelActive, uint? nggReplayParamCount = null)
     {
         Calls.Add($"get_graphics_programs pixelActive={pixelActive}");
         ExportMappings.Add(targetExportMapping.ToArray());

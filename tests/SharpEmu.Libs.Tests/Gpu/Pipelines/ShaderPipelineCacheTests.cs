@@ -30,7 +30,18 @@ public sealed class ShaderPipelineCacheTests : IDisposable
 
         public List<GraphicsPipelineDescription> Descriptions { get; } = new();
 
-        public GraphicsPrograms GetGraphicsPrograms(VertexStageRegisters vertex, PixelStageRegisters pixel, ShaderInterfaceRegisters shaderInterface, ContextRegisters context, ReadOnlySpan<ColorComponentMap> targetExportMapping, bool pixelActive) => Graphics;
+        public ComputeProgram GetNggComputeProgram(VertexStageRegisters vertex, out uint paramCount)
+
+        {
+
+            paramCount = 0;
+
+            return new ComputeProgram { Available = false };
+
+        }
+
+
+        public GraphicsPrograms GetGraphicsPrograms(VertexStageRegisters vertex, PixelStageRegisters pixel, ShaderInterfaceRegisters shaderInterface, ContextRegisters context, ReadOnlySpan<ColorComponentMap> targetExportMapping, bool pixelActive, uint? nggReplayParamCount = null) => Graphics;
 
         public PipelineHandle CreateGraphicsPipeline(ReadOnlySpan<ColorTargetState> colors, in DepthAttachmentState depth, VertexInputInfo vertexInput, PixelInputInfo? pixelInput, ContextRegisters context, in RenderingState rendering, PrimitiveTopology topology, bool primitiveRestartEnabled, bool disableBlending, ShaderProgram vertexProgram, ShaderProgram pixelProgram)
         {
@@ -252,7 +263,18 @@ public sealed class ShaderPipelineCacheTests : IDisposable
     {
         private readonly GraphicsPrograms _programs = Programs();
 
-        public GraphicsPrograms GetGraphicsPrograms(VertexStageRegisters vertex, PixelStageRegisters pixel, ShaderInterfaceRegisters shaderInterface, ContextRegisters context, ReadOnlySpan<ColorComponentMap> targetExportMapping, bool pixelActive) => _programs;
+        public ComputeProgram GetNggComputeProgram(VertexStageRegisters vertex, out uint paramCount)
+
+        {
+
+            paramCount = 0;
+
+            return new ComputeProgram { Available = false };
+
+        }
+
+
+        public GraphicsPrograms GetGraphicsPrograms(VertexStageRegisters vertex, PixelStageRegisters pixel, ShaderInterfaceRegisters shaderInterface, ContextRegisters context, ReadOnlySpan<ColorComponentMap> targetExportMapping, bool pixelActive, uint? nggReplayParamCount = null) => _programs;
 
         public PipelineHandle CreateGraphicsPipeline(ReadOnlySpan<ColorTargetState> colors, in DepthAttachmentState depth, VertexInputInfo vertexInput, PixelInputInfo? pixelInput, ContextRegisters context, in RenderingState rendering, PrimitiveTopology topology, bool primitiveRestartEnabled, bool disableBlending, ShaderProgram vertexProgram, ShaderProgram pixelProgram) =>
             cache.CreateGraphicsPipeline(colors, in depth, vertexInput, pixelInput, context, in rendering, topology, primitiveRestartEnabled, disableBlending, vertexProgram, pixelProgram);

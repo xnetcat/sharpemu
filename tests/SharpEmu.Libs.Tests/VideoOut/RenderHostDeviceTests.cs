@@ -158,13 +158,24 @@ public sealed unsafe partial class RenderHostDeviceTests : IClassFixture<Headles
                 interpolationShader ?? SpirvFixedShaders.CreateSolidFragment(1f, 0f, 0f, 1f)), ShaderStage.Pixel, 2, 2));
         }
 
+        public ComputeProgram GetNggComputeProgram(VertexStageRegisters vertex, out uint paramCount)
+
+        {
+
+            paramCount = 0;
+
+            return new ComputeProgram { Available = false };
+
+        }
+
+
         public GraphicsPrograms GetGraphicsPrograms(
             VertexStageRegisters vertex,
             PixelStageRegisters pixel,
             ShaderInterfaceRegisters shaderInterface,
             ContextRegisters context,
             ReadOnlySpan<ColorComponentMap> targetExportMapping,
-            bool pixelActive)
+            bool pixelActive, uint? nggReplayParamCount = null)
         {
             EnsureModules();
             return new()
