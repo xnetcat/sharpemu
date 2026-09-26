@@ -18,7 +18,9 @@ public static partial class Gen5MslTranslator
             out string error)
         {
             error = string.Empty;
-            if (instruction.Opcode == "VNop")
+            // V_PIPEFLUSH flushes the VALU destination cache and V_CLREXCP clears
+            // the wave's exception state; neither is observable here.
+            if (instruction.Opcode is "VNop" or "VPipeflush" or "VClrexcp")
             {
                 return true;
             }
@@ -140,6 +142,25 @@ public static partial class Gen5MslTranslator
                         guardWithExec: false);
                     return true;
                 }
+                case "VSwapB32":
+                {
+                    if (instruction.Destinations.Count == 0 ||
+                        instruction.Destinations[0].Kind != Gen5OperandKind.VectorRegister ||
+                        instruction.Sources.Count == 0 ||
+                        instruction.Sources[0].Kind != Gen5OperandKind.VectorRegister)
+                    {
+                        error = "VSwapB32 expects two VGPR operands";
+                        return false;
+                    }
+
+                    var swapDestination = instruction.Destinations[0].Value;
+                    var swapSource = instruction.Sources[0].Value;
+                    var previousDestination = Temp("uint", $"v[{swapDestination}]");
+                    var previousSource = Temp("uint", $"v[{swapSource}]");
+                    StoreVector(swapDestination, previousSource);
+                    StoreVector(swapSource, previousDestination);
+                    return true;
+                }
                 case "VCndmaskB32":
                 {
                     // dst = mask-bit(lane) ? src1 : src0. Sources are raw (no
@@ -220,12 +241,86 @@ public static partial class Gen5MslTranslator
                     instruction,
                     destination,
                     $"rsqrt({F16(instruction, 0)})"),
+                "VRcpF16" => Float16Result(
+                    instruction,
+                    destination,
+                    $"(1.0f / {F16(instruction, 0)})"),
+                "VSqrtF16" => Float16Result(
+                    instruction,
+                    destination,
+                    $"sqrt({F16(instruction, 0)})"),
+                "VLogF16" => Float16Result(
+                    instruction,
+                    destination,
+                    $"log2({F16(instruction, 0)})"),
+                "VExpF16" => Float16Result(
+                    instruction,
+                    destination,
+                    $"exp2({F16(instruction, 0)})"),
+                "VFloorF16" => Float16Result(
+                    instruction,
+                    destination,
+                    $"floor({F16(instruction, 0)})"),
+                "VCeilF16" => Float16Result(
+                    instruction,
+                    destination,
+                    $"ceil({F16(instruction, 0)})"),
+                "VTruncF16" => Float16Result(
+                    instruction,
+                    destination,
+                    $"trunc({F16(instruction, 0)})"),
+                "VRndneF16" => Float16Result(
+                    instruction,
+                    destination,
+                    $"rint({F16(instruction, 0)})"),
+                "VFractF16" => Float16Result(
+                    instruction,
+                    destination,
+                    $"fract({F16(instruction, 0)})"),
+                // GCN sin/cos take revolutions; mirror the SPIR-V Tau prescale.
+                "VSinF16" => Float16Result(
+                    instruction,
+                    destination,
+                    $"sin({F16(instruction, 0)} * {TauLiteral})"),
+                "VCosF16" => Float16Result(
+                    instruction,
+                    destination,
+                    $"cos({F16(instruction, 0)} * {TauLiteral})"),
+                // The widened f16 source is always a normal f32 (or zero), so
+                // frexp reduces to exponent arithmetic on the f32 bit pattern.
+                "VFrexpMantF16" => Float16Result(
+                    instruction,
+                    destination,
+                    AsFloat(FrexpMantissaBits(AsUInt(F16(instruction, 0))))),
+                "VFrexpExpI16F16" => Int16Result(
+                    instruction,
+                    destination,
+                    FrexpExponentBits(AsUInt(F16(instruction, 0)))),
                 "VRcpF32" or "VRcpIflagF32" => FloatResult(instruction, $"(1.0f / {F(instruction, 0)})"),
                 "VLogF32" => FloatResult(instruction, $"log2({F(instruction, 0)})"),
                 "VExpF32" => FloatResult(instruction, $"exp2({F(instruction, 0)})"),
                 // GCN sin/cos take revolutions; mirror the SPIR-V Tau prescale.
                 "VSinF32" => FloatResult(instruction, $"sin({F(instruction, 0)} * {TauLiteral})"),
                 "VCosF32" => FloatResult(instruction, $"cos({F(instruction, 0)} * {TauLiteral})"),
+                "VLdexpF16" => Float16Result(
+                    instruction,
+                    destination,
+                    $"ldexp({F16(instruction, 0)}, as_type<int>({RawSource(instruction, 1)}))"),
+                // V_MUL_LEGACY_F32 differs from V_MUL_F32 only in the pre-IEEE rule
+                // that 0 * anything is 0.
+                "VMulLegacyF32" => FloatResult(
+                    instruction,
+                    $"(({F(instruction, 0)} == 0.0f || {F(instruction, 1)} == 0.0f) " +
+                    $"? 0.0f : ({F(instruction, 0)} * {F(instruction, 1)}))"),
+                "VFmacF16" => Float16Result(
+                    instruction,
+                    destination,
+                    $"fma({F16(instruction, 0)}, {F16(instruction, 1)}, " +
+                    $"(float)as_type<half>((ushort)(v[{destination}] & 0xFFFFu)))"),
+                // D.i = (S0.i24 * S1.i24) >> 32
+                "VMulHiI32I24" => AsUInt(
+                    $"(int)(((long)((as_type<int>({RawSource(instruction, 0)}) << 8) >> 8) * " +
+                    $"(long)((as_type<int>({RawSource(instruction, 1)}) << 8) >> 8)) >> 32)"),
                 "VLdexpF32" =>
                     FloatResult(instruction, $"ldexp({F(instruction, 0)}, as_type<int>({RawSource(instruction, 1)}))"),
                 "VMin3F32" =>
@@ -239,8 +334,22 @@ public static partial class Gen5MslTranslator
                 "VCvtF32I32" => FloatResult(instruction, $"(float)as_type<int>({RawSource(instruction, 0)})"),
                 "VCvtF32U32" => FloatResult(instruction, $"(float)({RawSource(instruction, 0)})"),
                 "VCvtU32F32" => $"(uint)({F(instruction, 0)})",
-                "VCvtU16F16" =>
-                    $"(uint)clamp(trunc(isnan({F16(instruction, 0)}) ? 0.0f : {F16(instruction, 0)}), 0.0f, 65535.0f)",
+                "VCvtU16F16" => Int16Result(
+                    instruction,
+                    destination,
+                    $"(uint)clamp(trunc(isnan({F16(instruction, 0)}) ? 0.0f : {F16(instruction, 0)}), 0.0f, 65535.0f)"),
+                "VCvtI16F16" => Int16Result(
+                    instruction,
+                    destination,
+                    AsUInt($"(int)clamp(trunc(isnan({F16(instruction, 0)}) ? 0.0f : {F16(instruction, 0)}), -32768.0f, 32767.0f)")),
+                "VCvtF16U16" => Float16Result(
+                    instruction,
+                    destination,
+                    $"(float)({U16(instruction, 0)})"),
+                "VCvtF16I16" => Float16Result(
+                    instruction,
+                    destination,
+                    $"(float)((int)(({U16(instruction, 0)}) ^ 0x8000u) - 32768)"),
                 "VCvtI32F32" => AsUInt($"(int)({F(instruction, 0)})"),
                 // RPI rounds toward positive infinity; FLR toward negative.
                 "VCvtRpiI32F32" => AsUInt($"(int)ceil({F(instruction, 0)})"),
@@ -357,6 +466,26 @@ public static partial class Gen5MslTranslator
                 "VBcntU32B32" => $"(popcount({RawSource(instruction, 0)}) + ({RawSource(instruction, 1)}))",
                 "VFfblB32" =>
                     $"(({RawSource(instruction, 0)}) == 0u ? 0xFFFFFFFFu : (uint)ctz({RawSource(instruction, 0)}))",
+                "VFfbhU32" =>
+                    $"(({RawSource(instruction, 0)}) == 0u ? 0xFFFFFFFFu : (uint)clz({RawSource(instruction, 0)}))",
+                // V_FFBH_I32 counts the bits below bit 31 that match the sign bit,
+                // so inverting a negative input turns it into the same clz.
+                "VFfbhI32" => EmitFindFirstBitHighSigned(instruction),
+                "VFrexpMantF32" => FloatResult(
+                    instruction,
+                    AsFloat(FrexpMantissaBits(AsUInt(F(instruction, 0))))),
+                "VFrexpExpI32F32" =>
+                    FrexpExponentBits(AsUInt(F(instruction, 0))),
+                // D.u32 = {16'b0, sat8(S.i[31:16]), sat8(S.i[15:0])}
+                "VSatPkU8I16" => EmitSaturatePackU8I16(instruction),
+                "VCvtNormI16F16" => Int16Result(
+                    instruction,
+                    destination,
+                    AsUInt($"(int)rint(clamp(isnan({F16(instruction, 0)}) ? 0.0f : {F16(instruction, 0)}, -1.0f, 1.0f) * 32767.0f)")),
+                "VCvtNormU16F16" => Int16Result(
+                    instruction,
+                    destination,
+                    $"(uint)rint(clamp(isnan({F16(instruction, 0)}) ? 0.0f : {F16(instruction, 0)}, 0.0f, 1.0f) * 65535.0f)"),
 
                 // ---- wave / lane ----
                 // mbcnt reads the mask dword the guest passes (no cross-lane
@@ -667,7 +796,8 @@ public static partial class Gen5MslTranslator
             error = string.Empty;
             var opcode = instruction.Opcode;
             string condition;
-            if (opcode is "VCmpClassF32" or "VCmpxClassF32")
+            if (opcode is
+                "VCmpClassF32" or "VCmpxClassF32" or "VCmpClassF16" or "VCmpxClassF16")
             {
                 condition = EmitCompareClass(instruction);
             }
@@ -748,6 +878,7 @@ public static partial class Gen5MslTranslator
             else
             {
                 var signed16 = opcode.EndsWith("I16", StringComparison.Ordinal);
+                var unsigned16 = opcode.EndsWith("U16", StringComparison.Ordinal);
                 var signed = signed16 ||
                     opcode.EndsWith("I32", StringComparison.Ordinal) ||
                     opcode.EndsWith("I64", StringComparison.Ordinal);
@@ -777,6 +908,8 @@ public static partial class Gen5MslTranslator
                         : wide
                         ? $"(as_type<long>({left}) {op} as_type<long>({right}))"
                         : $"(as_type<int>({left}) {op} as_type<int>({right}))"
+                    : unsigned16
+                    ? $"(((({left}) & 0xFFFFu)) {op} ((({right}) & 0xFFFFu)))"
                     : $"(({left}) {op} ({right}))";
             }
 
@@ -809,8 +942,13 @@ public static partial class Gen5MslTranslator
 
         private string EmitCompareClass(Gen5ShaderInstruction instruction)
         {
-            var source = Temp("float", F(instruction, 0));
-            var raw = Temp("uint", RawSource(instruction, 0));
+            // The f16 form widens its source first, so the only differences are
+            // where the sign bit lives and the smallest-normal threshold.
+            var isHalf = instruction.Opcode.EndsWith("F16", StringComparison.Ordinal);
+            var source = Temp("float", isHalf ? F16(instruction, 0) : F(instruction, 0));
+            var raw = Temp(
+                "uint",
+                isHalf ? AsUInt(source) : RawSource(instruction, 0));
             var mask = Temp("uint", RawSource(instruction, 1));
             var negative = Temp("bool", $"({raw} & 0x80000000u) != 0u");
             var nan = Temp("bool", $"isnan({source})");
@@ -818,7 +956,9 @@ public static partial class Gen5MslTranslator
             var zero = Temp("bool", $"{source} == 0.0f");
             var subnormal = Temp(
                 "bool",
-                $"fabs({source}) > 0.0f && fabs({source}) < as_type<float>(0x00800000u)");
+                // 2**-14 is the smallest normal f16; 0x00800000 is f32's.
+                $"fabs({source}) > 0.0f && fabs({source}) < " +
+                (isHalf ? "6.103515625e-05f)" : "as_type<float>(0x00800000u))"));
             var normal = Temp(
                 "bool",
                 $"!({nan} || {infinite} || {zero} || {subnormal})");
@@ -1210,6 +1350,59 @@ public static partial class Gen5MslTranslator
                     Line($"scc = {result} != 0u;");
                     return true;
                 }
+                case "SBcnt0I32B32":
+                {
+                    var result = Temp("uint", $"popcount(~{left})");
+                    StoreScalar(destination, result);
+                    Line($"scc = {result} != 0u;");
+                    return true;
+                }
+                case "SFF0I32B32":
+                {
+                    // First zero from the LSB: the first set bit of the inverse.
+                    var result = Temp(
+                        "uint",
+                        $"(~{left}) == 0u ? 0xFFFFFFFFu : (uint)ctz(~{left})");
+                    StoreScalar(destination, result);
+                    return true;
+                }
+                case "SFlbitI32B32":
+                {
+                    // Zeros before the first one from the MSB, -1 when there are none.
+                    var result = Temp(
+                        "uint",
+                        $"{left} == 0u ? 0xFFFFFFFFu : (uint)clz({left})");
+                    StoreScalar(destination, result);
+                    return true;
+                }
+                case "SFlbitI32":
+                {
+                    // Bits below bit 31 that match the sign bit; -1 when all do.
+                    var magnitude = Temp(
+                        "uint",
+                        $"(as_type<int>({left}) < 0) ? ~{left} : {left}");
+                    var result = Temp(
+                        "uint",
+                        $"{magnitude} == 0u ? 0xFFFFFFFFu : (uint)clz({magnitude})");
+                    StoreScalar(destination, result);
+                    return true;
+                }
+                case "SSextI32I8":
+                    StoreScalar(
+                        destination,
+                        AsUInt($"(int((({left}) & 0xFFu) ^ 0x80u) - 128)"));
+                    return true;
+                case "SSextI32I16":
+                    StoreScalar(
+                        destination,
+                        AsUInt($"(int((({left}) & 0xFFFFu) ^ 0x8000u) - 32768)"));
+                    return true;
+                case "SCmovB32":
+                    // Writes only when SCC is set, and never updates SCC.
+                    StoreScalar(
+                        destination,
+                        $"scc ? ({left}) : ({ScalarExpression(destination)})");
+                    return true;
                 case "SFF1I32B32":
                 {
                     var result = Temp(
@@ -1543,6 +1736,11 @@ public static partial class Gen5MslTranslator
                 case "SNotB64":
                     value = $"~{left}";
                     break;
+                case "SCmovB64":
+                    // Writes only when SCC is set, and never updates SCC.
+                    value = $"(scc ? ({left}) : {Scalar64Expression(destination)})";
+                    setsScc = false;
+                    break;
                 case "SWqmB64":
                 {
                     // Whole-quad mode: each 4-lane group becomes all-ones if any
@@ -1820,6 +2018,85 @@ public static partial class Gen5MslTranslator
             }
 
             return expression;
+        }
+
+        /// <summary>Reads the op_sel-selected 16-bit half as a zero-extended uint.</summary>
+        private string U16(Gen5ShaderInstruction instruction, int sourceIndex)
+        {
+            var raw = RawSource(
+                instruction,
+                sourceIndex,
+                applySdwaIntegerModifiers: false);
+            var shift = instruction.Control is Gen5Vop3Control control &&
+                (control.OperandSelect & (1u << sourceIndex)) != 0
+                    ? 16
+                    : 0;
+            return $"((({raw}) >> {shift}) & 0xFFFFu)";
+        }
+
+        /// <summary>
+        /// Writes a 16-bit integer result into the op_sel[3]-selected VGPR half,
+        /// preserving the other half. Integer results take no omod or clamp.
+        /// </summary>
+        private string Int16Result(
+            Gen5ShaderInstruction instruction,
+            uint destination,
+            string expression)
+        {
+            var control = instruction.Control as Gen5Vop3Control;
+            var packed = $"(({expression}) & 0xFFFFu)";
+            return ((control?.OperandSelect ?? 0) & 8) != 0
+                ? $"((v[{destination}] & 0x0000FFFFu) | (({packed}) << 16))"
+                : $"((v[{destination}] & 0xFFFF0000u) | ({packed}))";
+        }
+
+        // frexp on an f32 bit pattern: the significand keeps the sign and takes
+        // exponent field 126, placing it in [0.5, 1.0). Inf/NaN pass through and
+        // zero stays zero, per the RDNA2 pseudocode. Subnormals are normalised,
+        // which also makes this correct for a widened f16 (never subnormal).
+        private string FrexpMantissaBits(string bitsExpression)
+        {
+            var bits = Temp("uint", bitsExpression);
+            var absolute = Temp("uint", $"{bits} & 0x7FFFFFFFu");
+            var mantissa = Temp("uint", $"{absolute} & 0x7FFFFFu");
+            // Shifting a subnormal mantissa up drops its leading one past bit 22,
+            // which is exactly the implicit bit a normal significand carries.
+            var normalised = Temp(
+                "uint",
+                $"({absolute} < 0x800000u) " +
+                $"? (({mantissa} << (23u - (31u - (uint)clz({mantissa} | 1u)))) & 0x7FFFFFu) " +
+                $": {mantissa}");
+            return $"(({absolute} >= 0x7F800000u || {absolute} == 0u) ? {bits} : " +
+                $"(({bits} & 0x80000000u) | 0x3F000000u | {normalised}))";
+        }
+
+        private string FrexpExponentBits(string bitsExpression)
+        {
+            var absolute = Temp("uint", $"({bitsExpression}) & 0x7FFFFFFFu");
+            // A subnormal is 1.f * 2**(msb - 149), so frexp's exponent is msb - 148.
+            var exponent = Temp(
+                "uint",
+                $"({absolute} < 0x800000u) " +
+                $"? ((31u - (uint)clz(({absolute} & 0x7FFFFFu) | 1u)) - 148u) " +
+                $": (({absolute} >> 23) - 126u)");
+            return $"(({absolute} >= 0x7F800000u || {absolute} == 0u) ? 0u : {exponent})";
+        }
+
+        private string EmitFindFirstBitHighSigned(Gen5ShaderInstruction instruction)
+        {
+            var source = Temp("uint", RawSource(instruction, 0));
+            var magnitude = Temp(
+                "uint",
+                $"(as_type<int>({source}) < 0) ? ~{source} : {source}");
+            return $"(({magnitude} == 0u) ? 0xFFFFFFFFu : (uint)clz({magnitude}))";
+        }
+
+        private string EmitSaturatePackU8I16(Gen5ShaderInstruction instruction)
+        {
+            var source = Temp("uint", RawSource(instruction, 0));
+            var low = $"(uint)clamp((as_type<int>({source}) << 16) >> 16, 0, 255)";
+            var high = $"(uint)clamp(as_type<int>({source}) >> 16, 0, 255)";
+            return $"(({low}) | (({high}) << 8))";
         }
 
         /// <summary>Rounds to f16 and preserves the unselected VGPR half.</summary>
