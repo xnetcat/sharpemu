@@ -379,9 +379,9 @@ public static partial class Gen5MslTranslator
                     $"pack_float_to_unorm2x16(float2({F(instruction, 0)}, {F(instruction, 1)}))",
 
                 // ---- integer arithmetic ----
-                "VAddU32" or "VAddI32" =>
+                "VAddU32" or "VAddI32" or "VAddNcI32" =>
                     $"(({RawSource(instruction, 0)}) + ({RawSource(instruction, 1)}))",
-                "VSubU32" or "VSubI32" =>
+                "VSubU32" or "VSubI32" or "VSubNcI32" =>
                     $"(({RawSource(instruction, 0)}) - ({RawSource(instruction, 1)}))",
                 "VSubrevU32" or "VSubrevI32" =>
                     $"(({RawSource(instruction, 1)}) - ({RawSource(instruction, 0)}))",
@@ -447,7 +447,134 @@ public static partial class Gen5MslTranslator
                 "VLshlrevB32" => $"(({RawSource(instruction, 1)}) << (({RawSource(instruction, 0)}) & 31u))",
                 "VLshrB32" => $"(({RawSource(instruction, 0)}) >> (({RawSource(instruction, 1)}) & 31u))",
                 "VLshrrevB32" => $"(({RawSource(instruction, 1)}) >> (({RawSource(instruction, 0)}) & 31u))",
-                "VLshrrevB64" => EmitLshrrevB64(instruction, destination),
+                "VLshrrevB64" => EmitShiftB64(instruction, destination, ">>", signed: false),
+                "VLshlrevB64" => EmitShiftB64(instruction, destination, "<<", signed: false),
+                "VAshrrevI64" => EmitShiftB64(instruction, destination, ">>", signed: true),
+
+                // ---- VOP3-only 16-bit integer ALU ----
+                "VAddNcU16" or "VAddNcI16" => Int16Result(
+                    instruction,
+                    destination,
+                    $"(({U16(instruction, 0)}) + ({U16(instruction, 1)}))"),
+                "VSubNcU16" or "VSubNcI16" => Int16Result(
+                    instruction,
+                    destination,
+                    $"(({U16(instruction, 0)}) - ({U16(instruction, 1)}))"),
+                "VMulLoU16" => Int16Result(
+                    instruction,
+                    destination,
+                    $"(({U16(instruction, 0)}) * ({U16(instruction, 1)}))"),
+                // 16-bit shifts take their count from the low 4 bits of src0 and
+                // the value from src1.
+                "VLshlrevB16" => Int16Result(
+                    instruction,
+                    destination,
+                    $"(({U16(instruction, 1)}) << (({U16(instruction, 0)}) & 15u))"),
+                "VLshrrevB16" => Int16Result(
+                    instruction,
+                    destination,
+                    $"(({U16(instruction, 1)}) >> (({U16(instruction, 0)}) & 15u))"),
+                "VAshrrevI16" => Int16Result(
+                    instruction,
+                    destination,
+                    AsUInt($"(({S16(instruction, 1)}) >> (int)(({U16(instruction, 0)}) & 15u))")),
+                "VMinU16" => Int16Result(
+                    instruction,
+                    destination,
+                    $"min({U16(instruction, 0)}, {U16(instruction, 1)})"),
+                "VMaxU16" => Int16Result(
+                    instruction,
+                    destination,
+                    $"max({U16(instruction, 0)}, {U16(instruction, 1)})"),
+                "VMinI16" => Int16Result(
+                    instruction,
+                    destination,
+                    AsUInt($"min({S16(instruction, 0)}, {S16(instruction, 1)})")),
+                "VMaxI16" => Int16Result(
+                    instruction,
+                    destination,
+                    AsUInt($"max({S16(instruction, 0)}, {S16(instruction, 1)})")),
+                "VMin3U16" => Int16Result(
+                    instruction,
+                    destination,
+                    $"min(min({U16(instruction, 0)}, {U16(instruction, 1)}), {U16(instruction, 2)})"),
+                "VMax3U16" => Int16Result(
+                    instruction,
+                    destination,
+                    $"max(max({U16(instruction, 0)}, {U16(instruction, 1)}), {U16(instruction, 2)})"),
+                "VMed3U16" => Int16Result(
+                    instruction,
+                    destination,
+                    $"max(min({U16(instruction, 0)}, {U16(instruction, 1)}), " +
+                    $"min(max({U16(instruction, 0)}, {U16(instruction, 1)}), {U16(instruction, 2)}))"),
+                "VMin3I16" => Int16Result(
+                    instruction,
+                    destination,
+                    AsUInt($"min(min({S16(instruction, 0)}, {S16(instruction, 1)}), {S16(instruction, 2)})")),
+                "VMax3I16" => Int16Result(
+                    instruction,
+                    destination,
+                    AsUInt($"max(max({S16(instruction, 0)}, {S16(instruction, 1)}), {S16(instruction, 2)})")),
+                "VMed3I16" => Int16Result(
+                    instruction,
+                    destination,
+                    AsUInt($"max(min({S16(instruction, 0)}, {S16(instruction, 1)}), " +
+                        $"min(max({S16(instruction, 0)}, {S16(instruction, 1)}), {S16(instruction, 2)}))")),
+                "VMin3F16" => Float16Result(
+                    instruction,
+                    destination,
+                    $"fmin(fmin({F16(instruction, 0)}, {F16(instruction, 1)}), {F16(instruction, 2)})"),
+                "VMax3F16" => Float16Result(
+                    instruction,
+                    destination,
+                    $"fmax(fmax({F16(instruction, 0)}, {F16(instruction, 1)}), {F16(instruction, 2)})"),
+                "VMed3F16" => Float16Result(
+                    instruction,
+                    destination,
+                    $"fmax(fmin({F16(instruction, 0)}, {F16(instruction, 1)}), " +
+                    $"fmin(fmax({F16(instruction, 0)}, {F16(instruction, 1)}), {F16(instruction, 2)}))"),
+                // D.u16 = S0.u16 * S1.u16 + S2.u16 (the signed form only differs in
+                // the saturation this translator does not model).
+                "VMadU16" or "VMadI16" => Int16Result(
+                    instruction,
+                    destination,
+                    $"((({U16(instruction, 0)}) * ({U16(instruction, 1)})) + ({U16(instruction, 2)}))"),
+                // D.i32 = S0.i16 * S1.i16 + S2.i32
+                "VMadI32I16" => AsUInt(
+                    $"((({S16(instruction, 0)}) * ({S16(instruction, 1)})) + as_type<int>({RawSource(instruction, 2)}))"),
+                // D[31:16] = S1.f16, D[15:0] = S0.f16
+                "VPackB32F16" =>
+                    $"((uint)as_type<ushort>(half({F16(instruction, 0)})) | " +
+                    $"((uint)as_type<ushort>(half({F16(instruction, 1)})) << 16))",
+                "VCvtPknormI16F16" =>
+                    $"(({NormalizedHalf(instruction, 0, true)}) | (({NormalizedHalf(instruction, 1, true)}) << 16))",
+                "VCvtPknormU16F16" =>
+                    $"(({NormalizedHalf(instruction, 0, false)}) | (({NormalizedHalf(instruction, 1, false)}) << 16))",
+                "VPermB32" => EmitBytePermute(instruction),
+                "VDivFixupF16" => Float16Result(
+                    instruction,
+                    destination,
+                    EmitDivideFixup(
+                        F16(instruction, 0),
+                        F16(instruction, 1),
+                        F16(instruction, 2))),
+                "VDivFixupF32" => FloatResult(
+                    instruction,
+                    EmitDivideFixup(
+                        F(instruction, 0),
+                        F(instruction, 1),
+                        F(instruction, 2))),
+                // V_FMA_LEGACY_F32 is V_FMA_F32 with the pre-IEEE rule that a zero
+                // multiplicand forces a zero product.
+                "VFmaLegacyF32" => FloatResult(
+                    instruction,
+                    $"((({F(instruction, 0)} == 0.0f || {F(instruction, 1)} == 0.0f) ? 0.0f " +
+                    $": ({F(instruction, 0)} * {F(instruction, 1)})) + {F(instruction, 2)})"),
+                // D.i = S0.i24 * S1.i24 + S2.i
+                "VMadI32I24" => AsUInt(
+                    $"((((as_type<int>({RawSource(instruction, 0)}) << 8) >> 8) * " +
+                    $"((as_type<int>({RawSource(instruction, 1)}) << 8) >> 8)) + " +
+                    $"as_type<int>({RawSource(instruction, 2)}))"),
                 "VAshrI32" =>
                     AsUInt($"(as_type<int>({RawSource(instruction, 0)}) >> (({RawSource(instruction, 1)}) & 31u))"),
                 "VAshrrevI32" =>
@@ -607,12 +734,92 @@ public static partial class Gen5MslTranslator
             return $"({AsUInt(signedLeft)} * {AsUInt(signedRight)})";
         }
 
-        private string EmitLshrrevB64(Gen5ShaderInstruction instruction, uint destination)
+        // V_LSHLREV/LSHRREV/ASHRREV_B64: source 0 is the count, source 1 the pair.
+        private string EmitShiftB64(
+            Gen5ShaderInstruction instruction,
+            uint destination,
+            string op,
+            bool signed)
         {
             var shift = Temp("uint", $"({RawSource(instruction, 0)}) & 63u");
-            var shifted = Temp("ulong", $"({RawSource64(instruction, 1)}) >> {shift}");
+            var shifted = signed
+                ? Temp("ulong", $"as_type<ulong>(as_type<long>({RawSource64(instruction, 1)}) {op} {shift})")
+                : Temp("ulong", $"({RawSource64(instruction, 1)}) {op} {shift}");
             StoreVector(destination + 1, $"(uint)({shifted} >> 32)");
             return $"(uint){shifted}";
+        }
+
+        /// <summary>Reads the op_sel-selected 16-bit half as a sign-extended int.</summary>
+        private string S16(Gen5ShaderInstruction instruction, int sourceIndex) =>
+            $"(int(({U16(instruction, sourceIndex)}) ^ 0x8000u) - 32768)";
+
+        /// <summary>One f16 source as a packed snorm16 or unorm16 field.</summary>
+        private string NormalizedHalf(
+            Gen5ShaderInstruction instruction,
+            int sourceIndex,
+            bool isSigned)
+        {
+            var value = F16(instruction, sourceIndex);
+            var guarded = $"(isnan({value}) ? 0.0f : {value})";
+            return isSigned
+                ? $"(as_type<uint>((int)rint(clamp({guarded}, -1.0f, 1.0f) * 32767.0f)) & 0xFFFFu)"
+                : $"((uint)rint(clamp({guarded}, 0.0f, 1.0f) * 65535.0f) & 0xFFFFu)";
+        }
+
+        /// <summary>
+        /// V_PERM_B32: each destination byte is selected from the eight bytes of
+        /// {S0, S1} (byte 0 is S1's LSB), with selectors 8-11 replicating a sign
+        /// bit, 12 giving 0x00 and 13 or above giving 0xFF.
+        /// </summary>
+        private string EmitBytePermute(Gen5ShaderInstruction instruction)
+        {
+            var high = Temp("uint", RawSource(instruction, 0));
+            var low = Temp("uint", RawSource(instruction, 1));
+            var selectors = Temp("uint", RawSource(instruction, 2));
+            var bytes = Temp(
+                "ulong",
+                $"((ulong){high} << 32) | (ulong){low}");
+            var parts = new List<string>();
+            for (var lane = 0u; lane < 4; lane++)
+            {
+                var selector = Temp("uint", $"({selectors} >> {lane * 8}) & 0xFFu");
+                var direct = $"(uint)(({bytes} >> ({selector} * 8u)) & 0xFFul)";
+                var signIndex = $"((({selector} - 8u) * 2u) + 1u)";
+                var signByte =
+                    $"(((uint)(({bytes} >> ({signIndex} * 8u)) & 0xFFul) & 0x80u) != 0u ? 0xFFu : 0u)";
+                var value = Temp(
+                    "uint",
+                    $"({selector} < 8u) ? {direct} : " +
+                    $"(({selector} < 12u) ? {signByte} : " +
+                    $"(({selector} == 12u) ? 0u : 0xFFu))");
+                parts.Add($"({value} << {lane * 8})");
+            }
+
+            return $"({string.Join(" | ", parts)})";
+        }
+
+        /// <summary>
+        /// V_DIV_FIXUP_*: replace the quotient for the cases a raw divide cannot
+        /// express, otherwise re-apply the sign of denominator XOR numerator.
+        /// </summary>
+        private string EmitDivideFixup(string quotient, string denominator, string numerator)
+        {
+            var q = Temp("float", quotient);
+            var d = Temp("float", denominator);
+            var n = Temp("float", numerator);
+            var negative = Temp(
+                "bool",
+                $"((as_type<uint>({d}) ^ as_type<uint>({n})) & 0x80000000u) != 0u");
+            var quiet = "as_type<float>(0x7FC00000u)";
+            return
+                $"(isnan({n}) ? {quiet} : " +
+                $"(isnan({d}) ? {quiet} : " +
+                $"((({d} == 0.0f) && ({n} == 0.0f)) ? {quiet} : " +
+                $"((isinf({d}) && isinf({n})) ? {quiet} : " +
+                $"((({d} == 0.0f) || isinf({n})) " +
+                $"? ({negative} ? as_type<float>(0xFF800000u) : as_type<float>(0x7F800000u)) : " +
+                $"((isinf({d}) || ({n} == 0.0f)) ? ({negative} ? -0.0f : 0.0f) : " +
+                $"({negative} ? -fabs({q}) : fabs({q}))))))))";
         }
 
         private string EmitCvtPkU8F32(Gen5ShaderInstruction instruction)
