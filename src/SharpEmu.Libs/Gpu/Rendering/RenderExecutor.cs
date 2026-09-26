@@ -217,8 +217,12 @@ public sealed partial class RenderExecutor
             vertexOffset,
             0,
             indirect ? arguments.FirstInstance : ResolveInstanceOffset(state.Programs.VertexInput));
-        RecordDraw(submitId, banks, in draw, ref state, topology, in emission, in indexSource, primitiveRestart, setBindDebug: true, setAutoDebug: false);
+        var capture = RecordDraw(submitId, banks, in draw, ref state, topology, in emission, in indexSource, primitiveRestart, setBindDebug: true, setAutoDebug: false);
         _host.ResetBindings();
+        if (capture is not null)
+        {
+            FinishCapture(capture);
+        }
     }
 
     public void DrawAuto(ulong submitId, RegisterBanks banks, in DrawAutoArguments arguments)
@@ -328,8 +332,12 @@ public sealed partial class RenderExecutor
             0,
             (uint)vertexOffset,
             indirect || _nggReplay is not null ? arguments.FirstInstance : ResolveInstanceOffset(vertexInput));
-        RecordDraw(submitId, banks, in draw, ref state, topology, in emission, default, primitiveRestart: false, setBindDebug: false, setAutoDebug: true);
+        var capture = RecordDraw(submitId, banks, in draw, ref state, topology, in emission, default, primitiveRestart: false, setBindDebug: false, setAutoDebug: true);
         _host.ResetBindings();
+        if (capture is not null)
+        {
+            FinishCapture(capture);
+        }
     }
 
     private byte[] ConvertRestartIndices(ulong indexAddress, uint indexCount, IndexType indexType, uint restartIndex)

@@ -51,6 +51,11 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         _readbackLinearImages = readbackLinearImages;
         _blit = new ColorToMultisampleDepthBlit(device, scheduler);
         _tiler = new GpuTiler(device, scheduler, bufferCache.GetUtilityBuffer(GpuBufferUsage.Stream));
+        if (Rendering.WorkCapture.Enabled)
+        {
+            // The draw capture downloads its targets through this store; the executor has no image access.
+            Rendering.WorkCapture.ImageDownload = CaptureImageBytes;
+        }
     }
 
     public ulong TotalUsedMemory => _totalUsedMemory;

@@ -13,9 +13,15 @@ internal static class DroppedWorkLog
 {
     private const int MaxLines = 256;
     private static readonly ConcurrentDictionary<(string Reason, ulong Shader), byte> Seen = new();
+    private static long _dropped;
+
+    // Every dropped draw and dispatch of the run, including the ones the report deduplicated. A
+    // replay asserts on this: a case that drops its work proves nothing about what it renders.
+    public static long DroppedCount => Interlocked.Read(ref _dropped);
 
     public static void Draw(string reason, RegisterBanks banks)
     {
+        Interlocked.Increment(ref _dropped);
         if (FrameCommandLog.Active)
         {
             FrameCommandLog.Write($"  dropped: {reason}");
@@ -39,6 +45,7 @@ internal static class DroppedWorkLog
 
     public static void Dispatch(string reason, ulong shaderAddress, uint groupsX, uint groupsY, uint groupsZ, uint initiator)
     {
+        Interlocked.Increment(ref _dropped);
         if (FrameCommandLog.Active)
         {
             FrameCommandLog.Write($"  dropped: {reason}");

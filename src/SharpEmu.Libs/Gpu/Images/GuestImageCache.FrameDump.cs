@@ -132,6 +132,56 @@ public sealed unsafe partial class GuestImageCache
         return true;
     }
 
+    // Queues a download of the image registered at the address into the path, for the work capture.
+    // The bytes land once the recorded copy completes, which is the point of recording it here: a
+    // copy queued before the draw sees the target as the draw found it, and one queued after sees
+    // what the draw wrote.
+    internal Rendering.CapturedImageBytes? CaptureImageBytes(ulong address, string path)
+    {
+        CachedImage? found = null;
+        _slots.ForEach((_, image) =>
+        {
+            if (found is null && image.Registered && image.Backing.Exists && !image.DepthOwner.IsValid &&
+                image.Description.Data.Address == address)
+            {
+                found = image;
+            }
+        });
+        if (found is not { } image)
+        {
+            return null;
+        }
+
+        var description = image.Description;
+        var format = image.Backing.Format;
+        var texelBytes = FrameDumpTexelBytes(format);
+        if (texelBytes == 0)
+        {
+            return null;
+        }
+
+        var extent = description.Extent;
+        var depth = Math.Max(extent.Depth, 1u);
+        var layers = image.Backing.ImageType == ImageType.Type3D ? 1u : Math.Max(image.Backing.Layers, 1u);
+        var size = (ulong)extent.Width * extent.Height * depth * layers * texelBytes;
+        var buffer = new GpuBuffer(_device, _scheduler, GpuBufferUsage.Download, 0, BufferUsageFlags.TransferDstBit, size);
+        var copy = new BufferImageCopy
+        {
+            BufferOffset = 0,
+            ImageSubresource = new ImageSubresourceLayers(ImageAspectFlags.ColorBit, 0, 0, layers),
+            ImageExtent = new Extent3D(extent.Width, extent.Height, depth),
+        };
+        _scheduler.EndRendering();
+        image.DownloadToBuffer([copy], buffer.Handle, 0, size);
+        _scheduler.QueuePriorityCompletionAction(() =>
+        {
+            buffer.Invalidate(0, size);
+            File.WriteAllBytes(path, buffer.Mapped[..checked((int)size)].ToArray());
+            buffer.Dispose();
+        });
+        return new Rendering.CapturedImageBytes(format.ToString(), extent.Width, extent.Height, depth, layers, texelBytes);
+    }
+
     private static uint FrameDumpTexelBytes(Format format) => format switch
     {
         Format.R8Unorm or Format.R8Uint => 1,
