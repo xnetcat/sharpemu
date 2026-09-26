@@ -450,7 +450,13 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
             }
         }
 
-        if (instruction.Opcode is "SBitset0B32" or "SBitset1B32")
+        // These read the register their destination field names: the bit sets and the SOPK
+        // accumulations modify it, and the SOPK compares only read it.
+        var comparesDestination = instruction.Encoding == Gen5ShaderEncoding.Sopk &&
+            instruction.Opcode.StartsWith("SCmpk", StringComparison.Ordinal);
+        if (comparesDestination ||
+            instruction.Opcode is "SBitset0B32" or "SBitset1B32" ||
+            instruction.Encoding == Gen5ShaderEncoding.Sopk && instruction.Opcode is "SAddkI32" or "SMulkI32" or "SCmovkI32")
         {
             foreach (var destination in instruction.Destinations)
             {
@@ -459,6 +465,11 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
                     Use(destination.Value, 1);
                 }
             }
+        }
+
+        if (comparesDestination)
+        {
+            return;
         }
 
         switch (instruction.Control)

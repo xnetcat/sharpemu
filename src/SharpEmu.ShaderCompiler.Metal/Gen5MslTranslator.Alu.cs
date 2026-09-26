@@ -1055,6 +1055,12 @@ public static partial class Gen5MslTranslator
                 var immediate = unchecked((uint)(short)(instruction.Words[0] & 0xFFFF));
                 if (instruction.Opcode.StartsWith("SCmpk", StringComparison.Ordinal))
                 {
+                    // The unsigned compares take SIMM16 zero-extended; only the signed ones sign-extend it.
+                    if (instruction.Opcode.EndsWith("U32", StringComparison.Ordinal))
+                    {
+                        immediate = instruction.Words[0] & 0xFFFF;
+                    }
+
                     return TryEmitScalarCompareK(instruction, destination, immediate, out error);
                 }
 
