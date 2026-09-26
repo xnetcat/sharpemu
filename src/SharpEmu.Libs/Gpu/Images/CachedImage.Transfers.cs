@@ -588,4 +588,30 @@ public sealed unsafe partial class CachedImage
         _device.Vk.CmdCopyImage(command, source.Backing.Handle, ImageLayout.TransferSrcOptimal, Backing.Handle, ImageLayout.TransferDstOptimal, copyCount, copies);
         Transition(ReadyLayout, ReadyAccess, null, command);
     }
+
+    // Copies a rectangle of the source's first mip into one mip of this image, at its origin.
+    public void CopyRegionFrom(CachedImage source, uint sourceX, uint sourceY, uint mip, uint width, uint height)
+    {
+        if (mip >= Backing.MipLevels || sourceX + width > source.Backing.Extent.Width || sourceY + height > source.Backing.Extent.Height)
+        {
+            throw SubmissionScheduler.Fatal(
+                $"The region copy is out of range: mip={mip} levels={Backing.MipLevels} region={sourceX},{sourceY} {width}x{height} " +
+                $"source={source.Backing.Extent.Width}x{source.Backing.Extent.Height}.");
+        }
+
+        _scheduler.EndRendering();
+        var copy = new ImageCopy
+        {
+            SrcSubresource = new ImageSubresourceLayers(ImageAspectFlags.ColorBit, 0, 0, 1),
+            SrcOffset = new Offset3D((int)sourceX, (int)sourceY, 0),
+            DstSubresource = new ImageSubresourceLayers(ImageAspectFlags.ColorBit, mip, 0, 1),
+            Extent = new Extent3D(width, height, 1),
+        };
+        var command = new CommandBuffer(_scheduler.Current.Handle);
+        Transition(ImageLayout.TransferDstOptimal, AccessFlags.TransferWriteBit, null, command);
+        source.Transition(ImageLayout.TransferSrcOptimal, AccessFlags.TransferReadBit, null, command);
+        _device.Vk.CmdCopyImage(command, source.Backing.Handle, ImageLayout.TransferSrcOptimal, Backing.Handle, ImageLayout.TransferDstOptimal, 1, &copy);
+        Transition(ReadyLayout, ReadyAccess, null, command);
+        source.Transition(ReadyLayout, ReadyAccess, null, command);
+    }
 }
