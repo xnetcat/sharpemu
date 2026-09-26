@@ -1516,6 +1516,19 @@ public sealed partial class DirectExecutionBackend
 		var expectedEqueueTimeout =
 			string.Equals(nid, "fzyMKs9kim0", StringComparison.Ordinal) &&
 			result == OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT;
+		// scePthreadCondTimedwait and sceKernelWaitEventFlag report an elapsed timeout.
+		var expectedWaitTimeout =
+			(nid is "BmMjYxmew1w" or "JTvBflhYazQ") &&
+			result == OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT;
+		// scePthreadMutexLock on an error-checking mutex the caller already owns; titles use it
+		// to build their own recursive locks.
+		var expectedErrorCheckRelock =
+			string.Equals(nid, "9UK1vLZQft4", StringComparison.Ordinal) &&
+			result == OrbisGen2Result.ORBIS_GEN2_ERROR_DEADLOCK;
+		// scePadReadState on a handle that is not open; titles poll every pad slot.
+		var expectedPadNotOpen =
+			string.Equals(nid, "YndgXqQVV7c", StringComparison.Ordinal) &&
+			resultValue == unchecked((int)0x80920003);
 		var expectedMutexTrylockBusy =
 			(nid is "K-jXhbt2gn4" or "upoVrzMHFeE") &&
 			result == OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY;
@@ -1540,6 +1553,9 @@ public sealed partial class DirectExecutionBackend
 		if (!expectedFileProbeMiss &&
 			!expectedTimedWaitTimeout &&
 			!expectedEqueueTimeout &&
+			!expectedWaitTimeout &&
+			!expectedErrorCheckRelock &&
+			!expectedPadNotOpen &&
 			!expectedMutexTrylockBusy &&
 			!expectedSemaphoreTrywaitAgain &&
 			!expectedPollSemaBusy &&
