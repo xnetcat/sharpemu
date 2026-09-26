@@ -606,9 +606,17 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		private Action? _work;
 		private volatile bool _stopping;
 
+		// Every guest call that blocks in an HLE import resumes through a managed
+		// continuation frame, so a guest thread that blocks deep inside its own call
+		// tree nests host frames rather than unwinding. Demon's Souls' render thread
+		// overflowed the default thread stack within a minute of reaching its main
+		// loop; the reservation is virtual, so a generous stack costs nothing until
+		// it is touched.
+		private const int GuestExecutionStackBytes = 64 * 1024 * 1024;
+
 		public GuestExecutionRunner(ulong guestThreadHandle, string name, ThreadPriority priority)
 		{
-			_thread = new Thread(() => ThreadMain(guestThreadHandle))
+			_thread = new Thread(() => ThreadMain(guestThreadHandle), GuestExecutionStackBytes)
 			{
 				IsBackground = true,
 				Name = $"SharpEmu-{name}",
