@@ -840,6 +840,8 @@ internal static unsafe partial class VulkanVideoPresenter
         }
 
         private readonly Dictionary<ulong, PendingComputePipeline> _pendingComputePipelines = new();
+        private static readonly SemaphoreSlim _computeCompileSlots =
+            new(Math.Max(2, Environment.ProcessorCount / 2));
 
         // Metal compiles a large translated wave64 program for tens of seconds and the
         // guest's command stream cannot advance meanwhile, which starves presentation
@@ -915,7 +917,21 @@ internal static unsafe partial class VulkanVideoPresenter
                 SpirvBytes = SpirvBytesOf(computeModule.Handle),
                 StartTimestamp = Stopwatch.GetTimestamp(),
                 Compile = Task.Factory.StartNew(
-                    () => CompileComputePipeline(vk, device, cache, computeModule, layout),
+                    () =>
+                    {
+                        // Each compile blocks its thread inside the Metal compiler service,
+                        // so the number in flight is bounded instead of one thread per
+                        // program the frame happens to touch.
+                        _computeCompileSlots.Wait();
+                        try
+                        {
+                            return CompileComputePipeline(vk, device, cache, computeModule, layout);
+                        }
+                        finally
+                        {
+                            _computeCompileSlots.Release();
+                        }
+                    },
                     CancellationToken.None,
                     TaskCreationOptions.LongRunning,
                     TaskScheduler.Default),
