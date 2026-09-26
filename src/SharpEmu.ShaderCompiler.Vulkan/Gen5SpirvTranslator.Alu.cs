@@ -153,7 +153,9 @@ public static partial class Gen5SpirvTranslator
                         GetFloatSource(instruction, 0));
                     break;
                 case "VCvtU16F16":
+                case "VCvtI16F16":
                 {
+                    var isSigned = instruction.Opcode == "VCvtI16F16";
                     var source = GetFloat16Source(instruction, 0);
                     var sourceIsNan = _module.AddInstruction(
                         SpirvOp.IsNan,
@@ -165,10 +167,129 @@ public static partial class Gen5SpirvTranslator
                         sourceIsNan,
                         Float(0),
                         source);
-                    var bounded = Ext(43, _floatType, source, Float(0), Float(65535));
-                    result = BitwiseAnd(
-                        _module.AddInstruction(SpirvOp.ConvertFToU, _uintType, bounded),
-                        UInt(0xFFFF));
+                    var bounded = isSigned
+                        ? Ext(43, _floatType, source, Float(-32768), Float(32767))
+                        : Ext(43, _floatType, source, Float(0), Float(65535));
+                    var converted = isSigned
+                        ? Bitcast(
+                            _uintType,
+                            _module.AddInstruction(SpirvOp.ConvertFToS, _intType, bounded))
+                        : _module.AddInstruction(SpirvOp.ConvertFToU, _uintType, bounded);
+                    result = EmitInteger16Result(instruction, destination, converted);
+                    break;
+                }
+                case "VCvtF16U16":
+                    result = EmitFloat16Result(
+                        instruction,
+                        destination,
+                        _module.AddInstruction(
+                            SpirvOp.ConvertUToF,
+                            _floatType,
+                            GetUnsignedInteger16Source(instruction, 0)));
+                    break;
+                case "VCvtF16I16":
+                    result = EmitFloat16Result(
+                        instruction,
+                        destination,
+                        _module.AddInstruction(
+                            SpirvOp.ConvertSToF,
+                            _floatType,
+                            GetSignedInteger16Source(instruction, 0)));
+                    break;
+                case "VRcpF16":
+                    result = EmitFloat16Result(
+                        instruction,
+                        destination,
+                        _module.AddInstruction(
+                            SpirvOp.FDiv,
+                            _floatType,
+                            Float(1),
+                            GetFloat16Source(instruction, 0)));
+                    break;
+                case "VSqrtF16":
+                    result = EmitFloat16Unary(instruction, destination, 31);
+                    break;
+                case "VLogF16":
+                    result = EmitFloat16Unary(instruction, destination, 30);
+                    break;
+                case "VExpF16":
+                    result = EmitFloat16Unary(instruction, destination, 29);
+                    break;
+                case "VFloorF16":
+                    result = EmitFloat16Unary(instruction, destination, 8);
+                    break;
+                case "VCeilF16":
+                    result = EmitFloat16Unary(instruction, destination, 9);
+                    break;
+                case "VTruncF16":
+                    result = EmitFloat16Unary(instruction, destination, 3);
+                    break;
+                case "VRndneF16":
+                    result = EmitFloat16Unary(instruction, destination, 2);
+                    break;
+                case "VFractF16":
+                    result = EmitFloat16Unary(instruction, destination, 10);
+                    break;
+                // GCN trigonometry takes revolutions, so prescale by Tau exactly
+                // like VSinF32/VCosF32 do.
+                case "VSinF16":
+                case "VCosF16":
+                    result = EmitFloat16Result(
+                        instruction,
+                        destination,
+                        Ext(
+                            instruction.Opcode == "VSinF16" ? 13u : 14u,
+                            _floatType,
+                            _module.AddInstruction(
+                                SpirvOp.FMul,
+                                _floatType,
+                                GetFloat16Source(instruction, 0),
+                                Float(MathF.Tau))));
+                    break;
+                case "VFrexpMantF16":
+                case "VFrexpExpI16F16":
+                {
+                    // The f16 source is already widened to f32 (EmitHalfToFloat
+                    // normalises subnormals), so every finite non-zero value is a
+                    // normal f32 here and frexp reduces to exponent arithmetic.
+                    var bits = Bitcast(_uintType, GetFloat16Source(instruction, 0));
+                    var absolute = BitwiseAnd(bits, UInt(0x7FFF_FFFF));
+                    var isInfinityNan = UCmp(
+                        SpirvOp.UGreaterThanEqual,
+                        absolute,
+                        UInt(0x7F80_0000));
+                    var isZero = Equal(absolute, 0);
+                    if (instruction.Opcode == "VFrexpMantF16")
+                    {
+                        // Significand in [0.5, 1.0): exponent field 126, sign kept.
+                        var mantissa = BitwiseOr(
+                            BitwiseAnd(bits, UInt(0x807F_FFFF)),
+                            UInt(126u << 23));
+                        var value = SelectU(
+                            isInfinityNan,
+                            bits,
+                            SelectU(isZero, bits, mantissa));
+                        result = EmitFloat16Result(
+                            instruction,
+                            destination,
+                            Bitcast(_floatType, value));
+                        break;
+                    }
+
+                    var exponent = ISubU(
+                        ShiftRightLogical(absolute, UInt(23)),
+                        UInt(126));
+                    result = EmitInteger16Result(
+                        instruction,
+                        destination,
+                        SelectU(
+                            _module.AddInstruction(
+                                SpirvOp.LogicalOr,
+                                _boolType,
+                                isInfinityNan,
+                                isZero),
+                            UInt(0),
+                            exponent));
                     break;
                 }
                 case "VCvtI32F32":
@@ -4524,6 +4645,66 @@ public static partial class Gen5SpirvTranslator
                     BitwiseAnd(current, UInt(0xFFFF_0000)),
                     low16);
         }
+
+        /// <summary>
+        /// Writes a 16-bit integer result into the VGPR half selected by VOP3
+        /// op_sel[3], preserving the other half. Integer results take no output
+        /// modifier or clamp.
+        /// </summary>
+        private uint EmitInteger16Result(
+            Gen5ShaderInstruction instruction,
+            uint destination,
+            uint value)
+        {
+            var control = instruction.Control as Gen5Vop3Control;
+            var low16 = BitwiseAnd(value, UInt(0xFFFF));
+            var current = LoadV(destination);
+            return ((control?.OperandSelect ?? 0) & 8) != 0
+                ? BitwiseOr(
+                    BitwiseAnd(current, UInt(0x0000_FFFF)),
+                    ShiftLeftLogical(low16, UInt(16)))
+                : BitwiseOr(
+                    BitwiseAnd(current, UInt(0xFFFF_0000)),
+                    low16);
+        }
+
+        /// <summary>Reads the op_sel-selected 16-bit half as a zero-extended uint.</summary>
+        private uint GetUnsignedInteger16Source(
+            Gen5ShaderInstruction instruction,
+            int sourceIndex)
+        {
+            var raw = GetRawSource(
+                instruction,
+                sourceIndex,
+                applySdwaIntegerModifiers: false);
+            if (instruction.Control is Gen5Vop3Control control &&
+                (control.OperandSelect & (1u << sourceIndex)) != 0)
+            {
+                raw = ShiftRightLogical(raw, UInt(16));
+            }
+
+            return BitwiseAnd(raw, UInt(0xFFFF));
+        }
+
+        /// <summary>Reads the op_sel-selected 16-bit half as a sign-extended int.</summary>
+        private uint GetSignedInteger16Source(
+            Gen5ShaderInstruction instruction,
+            int sourceIndex) =>
+            _module.AddInstruction(
+                SpirvOp.BitFieldSExtract,
+                _intType,
+                Bitcast(_intType, GetUnsignedInteger16Source(instruction, sourceIndex)),
+                UInt(0),
+                UInt(16));
+
+        private uint EmitFloat16Unary(
+            Gen5ShaderInstruction instruction,
+            uint destination,
+            uint operation) =>
+            EmitFloat16Result(
+                instruction,
+                destination,
+                Ext(operation, _floatType, GetFloat16Source(instruction, 0)));
 
         private enum CubeCoordinate
         {
