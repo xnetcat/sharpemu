@@ -146,11 +146,16 @@ internal static unsafe partial class VulkanVideoPresenter
         // for any dim scene. Encode linear->sRGB by blitting through an sRGB
         // intermediate (sRGB stores encode), then raw-copying the encoded
         // bytes into the same-class UNORM swapchain image.
-        private Image _presentEncodeImage;
-        private DeviceMemory _presentEncodeMemory;
+        // One intermediate per swapchain image: every frame discards the encode
+        // image's contents (Undefined -> TransferDst) before blitting into it,
+        // so a single shared image lets the next frame in flight overwrite the
+        // one the previous frame has not copied out yet, which presents as a
+        // fully zeroed (black) swapchain image.
+        private Image[] _presentEncodeImages = [];
+        private DeviceMemory[] _presentEncodeMemories = [];
         private Extent2D _presentEncodeExtent;
 
-        private bool TryGetPresentEncodeImage(out Image encodeImage)
+        private bool TryGetPresentEncodeImage(uint imageIndex, out Image encodeImage)
         {
             encodeImage = default;
             var encodeFormat = GetSrgbCounterpart(_swapchainFormat);
@@ -159,14 +164,29 @@ internal static unsafe partial class VulkanVideoPresenter
                 return false;
             }
 
-            if (_presentEncodeImage.Handle != 0 &&
+            if (_presentEncodeImages.Length != 0 &&
                 (_presentEncodeExtent.Width != _extent.Width ||
                  _presentEncodeExtent.Height != _extent.Height))
             {
                 DestroyPresentEncodeImage();
             }
 
-            if (_presentEncodeImage.Handle == 0)
+            if (_presentEncodeImages.Length <= imageIndex)
+            {
+                var grown = new Image[_swapchainImages.Length];
+                var grownMemory = new DeviceMemory[_swapchainImages.Length];
+                _presentEncodeImages.CopyTo(grown, 0);
+                _presentEncodeMemories.CopyTo(grownMemory, 0);
+                _presentEncodeImages = grown;
+                _presentEncodeMemories = grownMemory;
+            }
+
+            if (imageIndex >= _presentEncodeImages.Length)
+            {
+                return false;
+            }
+
+            if (_presentEncodeImages[imageIndex].Handle == 0)
             {
                 var imageInfo = new ImageCreateInfo
                 {
@@ -184,11 +204,11 @@ internal static unsafe partial class VulkanVideoPresenter
                     InitialLayout = ImageLayout.Undefined,
                 };
                 Check(
-                    _vk.CreateImage(_device, &imageInfo, null, out _presentEncodeImage),
+                    _vk.CreateImage(_device, &imageInfo, null, out _presentEncodeImages[imageIndex]),
                     "vkCreateImage(present encode)");
                 _vk.GetImageMemoryRequirements(
                     _device,
-                    _presentEncodeImage,
+                    _presentEncodeImages[imageIndex],
                     out var requirements);
                 var allocationInfo = new MemoryAllocateInfo
                 {
@@ -199,35 +219,45 @@ internal static unsafe partial class VulkanVideoPresenter
                         MemoryPropertyFlags.DeviceLocalBit),
                 };
                 Check(
-                    _deviceInfo.AllocateMemory(allocationInfo, out _presentEncodeMemory),
+                    _deviceInfo.AllocateMemory(allocationInfo, out _presentEncodeMemories[imageIndex]),
                     "vkAllocateMemory(present encode)");
                 Check(
-                    _vk.BindImageMemory(_device, _presentEncodeImage, _presentEncodeMemory, 0),
+                    _vk.BindImageMemory(
+                        _device,
+                        _presentEncodeImages[imageIndex],
+                        _presentEncodeMemories[imageIndex],
+                        0),
                     "vkBindImageMemory(present encode)");
                 _presentEncodeExtent = new Extent2D(_extent.Width, _extent.Height);
                 SetDebugName(
                     ObjectType.Image,
-                    _presentEncodeImage.Handle,
-                    "SharpEmu present sRGB-encode image");
+                    _presentEncodeImages[imageIndex].Handle,
+                    $"SharpEmu present sRGB-encode image {imageIndex}");
             }
 
-            encodeImage = _presentEncodeImage;
+            encodeImage = _presentEncodeImages[imageIndex];
             return true;
         }
 
         private void DestroyPresentEncodeImage()
         {
-            if (_presentEncodeImage.Handle != 0)
+            for (var index = 0; index < _presentEncodeImages.Length; index++)
             {
-                _vk.DestroyImage(_device, _presentEncodeImage, null);
-                _presentEncodeImage = default;
+                if (_presentEncodeImages[index].Handle != 0)
+                {
+                    _vk.DestroyImage(_device, _presentEncodeImages[index], null);
+                    _presentEncodeImages[index] = default;
+                }
+
+                if (_presentEncodeMemories[index].Handle != 0)
+                {
+                    _deviceInfo.FreeMemory(_presentEncodeMemories[index]);
+                    _presentEncodeMemories[index] = default;
+                }
             }
 
-            if (_presentEncodeMemory.Handle != 0)
-            {
-                _deviceInfo.FreeMemory(_presentEncodeMemory);
-                _presentEncodeMemory = default;
-            }
+            _presentEncodeImages = [];
+            _presentEncodeMemories = [];
 
             _presentEncodeExtent = default;
         }
@@ -292,7 +322,7 @@ internal static unsafe partial class VulkanVideoPresenter
             if (IsLinearFloatPresentSource(source.Format) &&
                 GetSrgbCounterpart(PresentationTargetFormat) != Format.Undefined)
             {
-                encodeForPresent = TryGetPresentEncodeImage(out encodeImage);
+                encodeForPresent = TryGetPresentEncodeImage(imageIndex, out encodeImage);
             }
 
             var encodeToTransferDst = new ImageMemoryBarrier2
@@ -304,7 +334,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 NewLayout = ImageLayout.TransferDstOptimal,
                 SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
                 DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
-                Image = _presentEncodeImage,
+                Image = encodeImage,
                 SubresourceRange = ColorSubresourceRange(),
             };
             var barriers = stackalloc ImageMemoryBarrier2[3];
