@@ -296,6 +296,21 @@ public static partial class Gen5ShaderTranslator
                 return false;
             }
 
+            // S_CODE_END pads the space after the last instruction. Code placed after the final
+            // S_ENDPGM that ends in a backward branch runs straight into it.
+            if (string.Equals(name, "SCodeEnd", StringComparison.Ordinal))
+            {
+                if (pc < furthestForwardBranchTarget || instructions.Count == 0)
+                {
+                    error = $"code-end-inside-program pc=0x{pc:X} branchTarget=0x{furthestForwardBranchTarget:X}";
+                    return false;
+                }
+
+                program = new Gen5ShaderProgram(address, instructions);
+                termination = ProgramTermination.EndProgram;
+                return true;
+            }
+
             var instructionBytes = checked(sizeDwords * sizeof(uint));
             if (maximumBytes.HasValue && instructionBytes > maximumBytes.Value - pc)
             {
@@ -746,6 +761,7 @@ public static partial class Gen5ShaderTranslator
             0x18 => "SCbranchCdbguser",
             0x19 => "SCbranchCdbgsysOrUser",
             0x1A => "SCbranchCdbgsysAndUser",
+            0x1F => "SCodeEnd",
             0x20 => "SInstPrefetch",
             0x21 => "SClause",
             0x23 => "SWaitcntDepctr",
