@@ -278,9 +278,16 @@ public static partial class ImageRequestBuilders
 
         var viewExtent = new Extent2D(Math.Max(width >> (int)words.MipLevel, 1), Math.Max(height >> (int)words.MipLevel, 1));
         var viewDepth = Math.Max(depth >> (int)words.MipLevel, 1);
-        if (volume && (view.BaseLayer >= viewDepth || view.LayerCount > viewDepth - view.BaseLayer))
+        if (volume && view.BaseLayer < viewDepth && view.LayerCount > viewDepth - view.BaseLayer)
         {
-            throw SubmissionScheduler.Fatal($"The 3D render-target view exceeds the mip depth: base={view.BaseLayer} count={view.LayerCount} depth={viewDepth} mip={words.MipLevel}.");
+            // Titles bind a whole volume with the last slice set to its depth, one past the end;
+            // the color block stops at the last slice of the mip.
+            view = view with { LayerCount = viewDepth - view.BaseLayer, ImageLayers = viewDepth };
+        }
+
+        if (volume && view.BaseLayer >= viewDepth)
+        {
+            throw SubmissionScheduler.Fatal($"The 3D render-target view starts past the mip depth: base={view.BaseLayer} count={view.LayerCount} depth={viewDepth} mip={words.MipLevel}.");
         }
 
         var description = ImageDescription.Create();

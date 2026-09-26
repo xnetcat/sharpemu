@@ -127,6 +127,25 @@ public sealed class ImageRequestBuildersTests : IClassFixture<HeadlessVulkanFixt
     }
 
     [Fact]
+    public void ColorTarget_VolumeViewEndingOnePastTheLastSliceIsClamped()
+    {
+        var resolution = ImageRequestBuilders.ColorTarget(RegisterWords.Color(Base, 32, 32, GuestTileMode.RenderTarget, sliceMax: 32, dimension: 2, depth: 31), 0xF, 0, false);
+
+        Assert.NotNull(resolution);
+        var request = resolution.Value.Request;
+        Assert.Equal(32u, request.Description.Extent.Depth);
+        Assert.Equal(0u, request.View.BaseLayer);
+    }
+
+    [Fact]
+    public void ColorTarget_VolumeViewStartingPastTheLastSliceIsFatal()
+    {
+        using var fatal = new FatalScope();
+        Assert.Throws<SchedulerFatalException>(() => ImageRequestBuilders.ColorTarget(
+            RegisterWords.Color(Base, 32, 32, GuestTileMode.RenderTarget, sliceStart: 32, sliceMax: 32, dimension: 2, depth: 31), 0xF, 0, false));
+    }
+
+    [Fact]
     public void ColorTarget_RejectsUnsupportedRegisterStates()
     {
         using var fatal = new FatalScope();
