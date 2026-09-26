@@ -222,7 +222,9 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
             var d = request.Description;
             Rendering.FrameCommandLog.Write(
                 $"  image {request.Role} 0x{d.Data.Address:X}+0x{d.Data.Size:X} {d.PixelFormat} {d.Type} {d.Extent.Width}x{d.Extent.Height}x{d.Extent.Depth} " +
-                $"layers={d.Resources.Layers} tile={d.TileMode} view={request.View.Type}{(image.IsGpuModified ? " gpu" : string.Empty)}");
+                $"layers={d.Resources.Layers} tile={d.TileMode} view={request.View.Type}{(image.IsGpuModified ? " gpu" : string.Empty)} " +
+                $"slot={result.Index}.{result.Generation} cached={image.Description.PixelFormat}/{image.Description.Extent.Width}x{image.Description.Extent.Height} " +
+                $"mip={request.View.BaseLevel} layer={request.View.BaseLayer}");
         }
         return result;
     }

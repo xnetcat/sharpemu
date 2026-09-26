@@ -114,6 +114,7 @@ public sealed unsafe partial class GuestImageCache
                 var image = _slots[imageIdentifier];
                 if (image.Description.Data.Address == address && image.Backing.Exists && !image.DepthOwner.IsValid)
                 {
+                    Rendering.FrameCommandLog.Write($"  step-snapshot slot={imageIdentifier.Index}.{imageIdentifier.Generation} 0x{address:X}");
                     TryDumpImage(image, stepDirectory, checked((int)sequence));
                 }
             }
