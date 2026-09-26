@@ -827,7 +827,12 @@ public static partial class Gen5ShaderTranslator
         var src0 = word & 0x1FF;
         sizeDwords = src0 is 0xE9 or 0xEA or 0xF9 or 0xFA or 0xFF ? 2u : 1u;
         error = string.Empty;
-        name = opcode switch
+        name = Vop1OpcodeName(opcode);
+        return FinishDecode(name, $"unknown-vop1 op=0x{opcode:X2}", out error);
+    }
+
+    private static string Vop1OpcodeName(uint opcode) =>
+        opcode switch
         {
             0x00 => "VNop",
             0x01 => "VMovB32",
@@ -896,9 +901,6 @@ public static partial class Gen5ShaderTranslator
             _ => string.Empty,
         };
 
-        return FinishDecode(name, $"unknown-vop1 op=0x{opcode:X2}", out error);
-    }
-
     private static bool DecodeVop2(uint word, out string name, out uint sizeDwords, out string error)
     {
         var opcode = (word >> 25) & 0x3F;
@@ -916,7 +918,15 @@ public static partial class Gen5ShaderTranslator
         sizeDwords = opcode is 0x20 or 0x21 or 0x2C or 0x2D or 0x37 or 0x38 ||
             src0 is 0xE9 or 0xEA or 0xF9 or 0xFA or 0xFF ? 2u : 1u;
         error = string.Empty;
-        name = opcode switch
+        name = Vop2OpcodeName(opcode);
+        return FinishDecode(
+            name,
+            $"unknown-vop2 op=0x{opcode:X2} word=0x{word:X8}",
+            out error);
+    }
+
+    private static string Vop2OpcodeName(uint opcode) =>
+        opcode switch
         {
             // Some Gen5 shader streams use the VOP2 opcode-zero form as a
             // padding/no-op instruction. Keep it as VNop so the translator
@@ -978,12 +988,6 @@ public static partial class Gen5ShaderTranslator
             0x3C => "VPkFmacF16",
             _ => string.Empty,
         };
-
-        return FinishDecode(
-            name,
-            $"unknown-vop2 op=0x{opcode:X2} word=0x{word:X8}",
-            out error);
-    }
 
     private static bool DecodeVopc(uint word, out string name, out uint sizeDwords, out string error)
     {
@@ -1315,10 +1319,48 @@ public static partial class Gen5ShaderTranslator
             0x0F5 => "VCmpxNeU64",
             0x0F6 => "VCmpxGeU64",
             0x0F7 => "VCmpxTU64",
-            _ => $"Vop3Raw{opcode:X3}",
+            _ => Vop3PromotedOpcodeName(opcode),
         };
 
         return FinishDecode(name, $"unknown-vop3 op=0x{opcode:X3}", out error);
+    }
+
+    /// <summary>
+    /// Any VOP1 or VOP2 instruction can also be encoded as VOP3 to reach the
+    /// extra control bits (abs/neg/clamp/omod/op_sel). RDNA2 ISA 12.8.1 and
+    /// 12.9.1: the VOP3 opcode is the VOP1 opcode + 0x180 or the VOP2 opcode
+    /// + 0x100. Mapping the whole range keeps one hand-written entry per op
+    /// from being the difference between a shader compiling and the pipeline
+    /// dying.
+    /// </summary>
+    private static string Vop3PromotedOpcodeName(uint opcode)
+    {
+        if (opcode is >= 0x180 and <= 0x1FF)
+        {
+            var vop1 = opcode - 0x180;
+            // These have no VOP3 form: V_READFIRSTLANE_B32 writes an SGPR,
+            // V_SWAP*_B32 take two operands they both write, and the MOVREL ops
+            // need the implicit M0 source the VOP1 operand path adds. Leaving
+            // them opaque rejects them loudly instead of mis-emitting.
+            return vop1 is 0x02 or 0x42 or 0x43 or 0x44 or 0x48 or 0x65 or 0x68
+                ? $"Vop3Raw{opcode:X3}"
+                : NameOrRaw(Vop1OpcodeName(vop1), opcode);
+        }
+
+        if (opcode is >= 0x100 and <= 0x13F)
+        {
+            var vop2 = opcode - 0x100;
+            // The mk/ak forms carry their literal in the instruction stream and
+            // exist only as VOP2; 0x3E/0x3F are the VOPC/VOP1 escape rows.
+            return vop2 is 0x20 or 0x21 or 0x2C or 0x2D or 0x3E or 0x3F
+                ? $"Vop3Raw{opcode:X3}"
+                : NameOrRaw(Vop2OpcodeName(vop2), opcode);
+        }
+
+        return $"Vop3Raw{opcode:X3}";
+
+        static string NameOrRaw(string name, uint opcode) =>
+            name.Length > 0 ? name : $"Vop3Raw{opcode:X3}";
     }
 
     private static bool IsVop3BOpcode(uint opcode) =>

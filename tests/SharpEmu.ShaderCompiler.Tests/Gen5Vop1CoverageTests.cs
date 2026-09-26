@@ -85,6 +85,74 @@ public sealed class Gen5Vop1CoverageTests
         ValidateWhenAvailable(shader.Spirv);
     }
 
+    [Theory]
+    [MemberData(nameof(Float16UnaryFamily))]
+    public void Float16UnaryVop3FormAppliesModifiersAndOpsel(uint opcode, string expectedName)
+    {
+        // op_sel[0] reads the high half of src0, op_sel[3] writes the high half
+        // of the destination; abs/neg/clamp/omod all have to be tolerated too.
+        var (low, high) = Vop3(
+            0x180u + opcode,
+            vdst: 3,
+            src0: 257,
+            operandSelect: 0x9,
+            absolute: 0x1,
+            clamp: true,
+            negate: 0x1,
+            outputModifier: 1);
+        var program = Decode([low, high, SEndpgm]);
+        Assert.Equal(expectedName, program.Instructions[0].Opcode);
+        Assert.Equal(Gen5ShaderEncoding.Vop3, program.Instructions[0].Encoding);
+
+        var request = ResourceTestProgram.Request(program, userDataCount: 0);
+        Assert.True(
+            Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error),
+            error);
+        ValidateWhenAvailable(shader.Spirv);
+    }
+
+    [Theory]
+    // VOP1 promoted to VOP3: the VOP3 opcode is the VOP1 opcode + 0x180.
+    [InlineData(0x1A7u, "VLogF32")]
+    [InlineData(0x1B3u, "VSqrtF32")]
+    [InlineData(0x1A5u, "VExpF32")]
+    [InlineData(0x1AEu, "VRsqF32")]
+    // VOP2 promoted to VOP3: VOP2 opcode + 0x100.
+    [InlineData(0x11Au, "VLshlrevB32")]
+    [InlineData(0x11Bu, "VAndB32")]
+    [InlineData(0x132u, "VAddF16")]
+    [InlineData(0x13Au, "VMinF16")]
+    public void PromotedVop1AndVop2OpcodesDecodeThroughVop3(uint opcode, string expectedName)
+    {
+        var (low, high) = Vop3(opcode, vdst: 2, src0: 257, src1: 258);
+        var program = Decode([low, high, SEndpgm]);
+        Assert.Equal(expectedName, program.Instructions[0].Opcode);
+        Assert.Equal(Gen5ShaderEncoding.Vop3, program.Instructions[0].Encoding);
+
+        var request = ResourceTestProgram.Request(program, userDataCount: 0);
+        Assert.True(
+            Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error),
+            error);
+        ValidateWhenAvailable(shader.Spirv);
+    }
+
+    [Theory]
+    // No VOP3 form: an SGPR destination, two written operands, or an implicit M0
+    // source the VOP3 operand path does not build. These stay opaque so they are
+    // rejected at emission instead of mis-emitted.
+    [InlineData(0x182u)] // V_READFIRSTLANE_B32
+    [InlineData(0x1C2u)] // V_MOVRELD_B32
+    [InlineData(0x1E5u)] // V_SWAP_B32
+    [InlineData(0x1E8u)] // V_SWAPREL_B32
+    [InlineData(0x120u)] // V_MADMK_F32
+    [InlineData(0x12Du)] // V_FMAAK_F32
+    public void OpcodesWithoutAVop3FormStayOpaque(uint opcode)
+    {
+        var (low, high) = Vop3(opcode, vdst: 2, src0: 257, src1: 258);
+        var program = Decode([low, high, SEndpgm]);
+        Assert.StartsWith("Vop3Raw", program.Instructions[0].Opcode, StringComparison.Ordinal);
+    }
+
     [Fact]
     public void Float16ResultsPreserveTheUnselectedDestinationHalf()
     {
