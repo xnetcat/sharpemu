@@ -545,6 +545,18 @@ internal static unsafe partial class VulkanVideoPresenter
                 // The refresh can end the tick; the copy records into the buffer that is current now.
                 var commandBuffer = BeginBatchedGuestCommands();
                 var extent = source.Backing.Extent;
+                if (ShouldTracePresentedGuestImageContentsForDiagnostics())
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] vk.flip_source version={version} addr=0x{displayBuffer.Address:X16} " +
+                        $"slot={imageIdentifier.Index}.{imageIdentifier.Generation} " +
+                        $"extent={extent.Width}x{extent.Height} format={source.Backing.Format} " +
+                        $"registered={source.Registered} gpuModified={source.IsGpuModified} " +
+                        $"cpuDirty={source.IsDefinitelyCpuDirty} maybeCpuDirty={source.IsMaybeCpuDirty} " +
+                        $"bufferModified={source.IsBufferModified} tick={_submitTimeline} " +
+                        $"guestFmt={displayBuffer.PixelFormat} guestSize={displayBuffer.Width}x{displayBuffer.Height} " +
+                        $"tile={displayBuffer.TilingMode}");
+                }
                 snapshot = CreateGuestFlipSnapshot(GetPresentationSnapshotFormat(source.Backing.Format),
                     extent.Width, extent.Height, displayBuffer.Address, version);
                 source.Transition(ImageLayout.TransferSrcOptimal, AccessFlags.TransferReadBit, null, commandBuffer);
@@ -585,9 +597,25 @@ internal static unsafe partial class VulkanVideoPresenter
                 VulkanSynchronization.PipelineBarrier(_vk,
                     commandBuffer, PipelineStageFlags.TransferBit, PipelineStageFlags.AllCommandsBit, 0, 0, null, 0, null, 1, &toShaderRead);
 
-                FlushBatchedGuestCommands();
+                // The tick of this flush, not the shared field: the presenter thread also
+                // writes _submitTimeline, so reading it here can name an older tick that is
+                // already complete and let the blit run before the copy above.
+                var recordingStillCurrent =
+                    commandBuffer.Handle == CurrentRecordingBuffer().Handle && _batchOpen;
+                var captureTick = FlushBatchedGuestCommands();
                 submitted = true;
                 _guestImageVersions.Add(version, snapshot);
+                if (ShouldTracePresentedGuestImageContentsForDiagnostics())
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] vk.flip_queued version={version} " +
+                        $"required={captureTick} shared={_submitTimeline} " +
+                        $"completed={_scheduler.Timeline.CompletedTick} " +
+                        $"shared_stale={(_submitTimeline < captureTick ? 1 : 0)} " +
+                        $"shared_already_ready={(_scheduler.Timeline.CompletedTick >= _submitTimeline ? 1 : 0)} " +
+                        $"recording_current={(recordingStillCurrent ? 1 : 0)} " +
+                        $"queue={_activeGuestQueue.Name}");
+                }
 
                 lock (_gate)
                 {
@@ -602,7 +630,7 @@ internal static unsafe partial class VulkanVideoPresenter
                         GuestImageAddress: displayBuffer.Address,
                         GuestImageVersion: version,
                         IsHdr: VideoOutExports.IsHdrPixelFormat(displayBuffer.PixelFormat),
-                        RequiredTick: _submitTimeline,
+                        RequiredTick: captureTick,
                         FlipRequestId: requestId);
                     _latestPresentation = presentation;
                     _pendingGuestImagePresentations.Enqueue(presentation);
