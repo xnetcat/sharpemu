@@ -29,6 +29,13 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private bool _tracedPresentedSwapchain;
         private bool _swapchainReadbackPending;
+        private VkBuffer _flipSourceProbeBuffer;
+        private DeviceMemory _flipSourceProbeMemory;
+        private nint _flipSourceProbeMapped;
+        private uint _flipSourceProbeWidth;
+        private uint _flipSourceProbeHeight;
+        private const uint FlipSourceProbeSide = 128;
+        private long _swapchainReadbackVersion;
         private long _presentedSwapchainCount;
 
         private void CreateStagingBuffer(ulong size)
@@ -145,11 +152,16 @@ internal static unsafe partial class VulkanVideoPresenter
         // for any dim scene. Encode linear->sRGB by blitting through an sRGB
         // intermediate (sRGB stores encode), then raw-copying the encoded
         // bytes into the same-class UNORM swapchain image.
-        private Image _presentEncodeImage;
-        private DeviceMemory _presentEncodeMemory;
+        // One intermediate per swapchain image: every frame discards the encode
+        // image's contents (Undefined -> TransferDst) before blitting into it,
+        // so a single shared image lets the next frame in flight overwrite the
+        // one the previous frame has not copied out yet, which presents as a
+        // fully zeroed (black) swapchain image.
+        private Image[] _presentEncodeImages = [];
+        private DeviceMemory[] _presentEncodeMemories = [];
         private Extent2D _presentEncodeExtent;
 
-        private bool TryGetPresentEncodeImage(out Image encodeImage)
+        private bool TryGetPresentEncodeImage(uint imageIndex, out Image encodeImage)
         {
             encodeImage = default;
             var encodeFormat = GetSrgbCounterpart(_swapchainFormat);
@@ -158,14 +170,29 @@ internal static unsafe partial class VulkanVideoPresenter
                 return false;
             }
 
-            if (_presentEncodeImage.Handle != 0 &&
+            if (_presentEncodeImages.Length != 0 &&
                 (_presentEncodeExtent.Width != _extent.Width ||
                  _presentEncodeExtent.Height != _extent.Height))
             {
                 DestroyPresentEncodeImage();
             }
 
-            if (_presentEncodeImage.Handle == 0)
+            if (_presentEncodeImages.Length <= imageIndex)
+            {
+                var grown = new Image[_swapchainImages.Length];
+                var grownMemory = new DeviceMemory[_swapchainImages.Length];
+                _presentEncodeImages.CopyTo(grown, 0);
+                _presentEncodeMemories.CopyTo(grownMemory, 0);
+                _presentEncodeImages = grown;
+                _presentEncodeMemories = grownMemory;
+            }
+
+            if (imageIndex >= _presentEncodeImages.Length)
+            {
+                return false;
+            }
+
+            if (_presentEncodeImages[imageIndex].Handle == 0)
             {
                 var imageInfo = new ImageCreateInfo
                 {
@@ -183,11 +210,11 @@ internal static unsafe partial class VulkanVideoPresenter
                     InitialLayout = ImageLayout.Undefined,
                 };
                 Check(
-                    _vk.CreateImage(_device, &imageInfo, null, out _presentEncodeImage),
+                    _vk.CreateImage(_device, &imageInfo, null, out _presentEncodeImages[imageIndex]),
                     "vkCreateImage(present encode)");
                 _vk.GetImageMemoryRequirements(
                     _device,
-                    _presentEncodeImage,
+                    _presentEncodeImages[imageIndex],
                     out var requirements);
                 var allocationInfo = new MemoryAllocateInfo
                 {
@@ -198,35 +225,45 @@ internal static unsafe partial class VulkanVideoPresenter
                         MemoryPropertyFlags.DeviceLocalBit),
                 };
                 Check(
-                    _deviceInfo.AllocateMemory(allocationInfo, out _presentEncodeMemory),
+                    _deviceInfo.AllocateMemory(allocationInfo, out _presentEncodeMemories[imageIndex]),
                     "vkAllocateMemory(present encode)");
                 Check(
-                    _vk.BindImageMemory(_device, _presentEncodeImage, _presentEncodeMemory, 0),
+                    _vk.BindImageMemory(
+                        _device,
+                        _presentEncodeImages[imageIndex],
+                        _presentEncodeMemories[imageIndex],
+                        0),
                     "vkBindImageMemory(present encode)");
                 _presentEncodeExtent = new Extent2D(_extent.Width, _extent.Height);
                 SetDebugName(
                     ObjectType.Image,
-                    _presentEncodeImage.Handle,
-                    "SharpEmu present sRGB-encode image");
+                    _presentEncodeImages[imageIndex].Handle,
+                    $"SharpEmu present sRGB-encode image {imageIndex}");
             }
 
-            encodeImage = _presentEncodeImage;
+            encodeImage = _presentEncodeImages[imageIndex];
             return true;
         }
 
         private void DestroyPresentEncodeImage()
         {
-            if (_presentEncodeImage.Handle != 0)
+            for (var index = 0; index < _presentEncodeImages.Length; index++)
             {
-                _vk.DestroyImage(_device, _presentEncodeImage, null);
-                _presentEncodeImage = default;
+                if (_presentEncodeImages[index].Handle != 0)
+                {
+                    _vk.DestroyImage(_device, _presentEncodeImages[index], null);
+                    _presentEncodeImages[index] = default;
+                }
+
+                if (_presentEncodeMemories[index].Handle != 0)
+                {
+                    _deviceInfo.FreeMemory(_presentEncodeMemories[index]);
+                    _presentEncodeMemories[index] = default;
+                }
             }
 
-            if (_presentEncodeMemory.Handle != 0)
-            {
-                _deviceInfo.FreeMemory(_presentEncodeMemory);
-                _presentEncodeMemory = default;
-            }
+            _presentEncodeImages = [];
+            _presentEncodeMemories = [];
 
             _presentEncodeExtent = default;
         }
@@ -291,7 +328,7 @@ internal static unsafe partial class VulkanVideoPresenter
             if (IsLinearFloatPresentSource(source.Format) &&
                 GetSrgbCounterpart(PresentationTargetFormat) != Format.Undefined)
             {
-                encodeForPresent = TryGetPresentEncodeImage(out encodeImage);
+                encodeForPresent = TryGetPresentEncodeImage(imageIndex, out encodeImage);
             }
 
             var encodeToTransferDst = new ImageMemoryBarrier2
@@ -303,7 +340,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 NewLayout = ImageLayout.TransferDstOptimal,
                 SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
                 DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
-                Image = _presentEncodeImage,
+                Image = encodeImage,
                 SubresourceRange = ColorSubresourceRange(),
             };
             var barriers = stackalloc ImageMemoryBarrier2[3];
@@ -321,6 +358,11 @@ internal static unsafe partial class VulkanVideoPresenter
                 null,
                 encodeForPresent ? 3u : 2u,
                 barriers);
+
+            if (traceDestination)
+            {
+                RecordFlipSourceProbe(source);
+            }
 
             var sourceX = 0u;
             var sourceY = 0u;
@@ -567,6 +609,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     1,
                     &copyRegion);
                 _swapchainReadbackPending = true;
+                _swapchainReadbackVersion = source.FlipVersion;
             }
 
             var sourceToShaderRead = new ImageMemoryBarrier2
@@ -617,6 +660,84 @@ internal static unsafe partial class VulkanVideoPresenter
             EndDebugLabel(_commandBuffer);
         }
 
+        // LOCAL ONLY diagnostic: copy a patch of the flip snapshot that the blit
+        // reads, so a black present can be blamed on the snapshot or on the blit.
+        private void RecordFlipSourceProbe(GuestImageResource source)
+        {
+            var side = Math.Min(FlipSourceProbeSide, Math.Min(source.Width, source.Height));
+            if (side == 0)
+            {
+                return;
+            }
+
+            if (_flipSourceProbeBuffer.Handle == 0)
+            {
+                _flipSourceProbeBuffer = CreateBuffer(
+                    FlipSourceProbeSide * FlipSourceProbeSide * 8,
+                    BufferUsageFlags.TransferDstBit,
+                    MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
+                    out _flipSourceProbeMemory);
+                void* mapped;
+                Check(
+                    _vk.MapMemory(
+                        _device,
+                        _flipSourceProbeMemory,
+                        0,
+                        FlipSourceProbeSide * FlipSourceProbeSide * 8,
+                        0,
+                        &mapped),
+                    "vkMapMemory(flip source probe)");
+                _flipSourceProbeMapped = (nint)mapped;
+            }
+
+            _flipSourceProbeWidth = side;
+            _flipSourceProbeHeight = side;
+            var region = new BufferImageCopy
+            {
+                BufferOffset = 0,
+                ImageSubresource = new ImageSubresourceLayers(ImageAspectFlags.ColorBit, 0, 0, 1),
+                ImageOffset = new Offset3D(
+                    checked((int)((source.Width - side) / 2)),
+                    checked((int)((source.Height - side) / 2)),
+                    0),
+                ImageExtent = new Extent3D(side, side, 1),
+            };
+            _vk.CmdCopyImageToBuffer(
+                _commandBuffer,
+                source.Image,
+                ImageLayout.TransferSrcOptimal,
+                _flipSourceProbeBuffer,
+                1,
+                &region);
+        }
+
+        private void TraceFlipSourceProbe()
+        {
+            if (_flipSourceProbeMapped == 0 || _flipSourceProbeWidth == 0)
+            {
+                return;
+            }
+
+            var texels = checked((int)(_flipSourceProbeWidth * _flipSourceProbeHeight * 4));
+            var values = new ReadOnlySpan<Half>((void*)_flipSourceProbeMapped, texels);
+            var nonzero = 0;
+            var sum = 0.0;
+            for (var index = 0; index < texels; index++)
+            {
+                var value = (float)values[index];
+                if (value != 0f)
+                {
+                    nonzero++;
+                }
+
+                sum += value;
+            }
+
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] vk.flip_source_probe version={_swapchainReadbackVersion} " +
+                $"side={_flipSourceProbeWidth} nonzero={nonzero}/{texels} mean={sum / texels:F4}");
+        }
+
         private void TraceSwapchainReadback()
         {
             _swapchainReadbackPending = false;
@@ -649,7 +770,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
 
                 Console.Error.WriteLine(
-                    $"[LOADER][TRACE] vk.swapchain_image size={_extent.Width}x{_extent.Height} " +
+                    $"[LOADER][TRACE] vk.swapchain_image version={_swapchainReadbackVersion} size={_extent.Width}x{_extent.Height} " +
                     $"format={_swapchainFormat} nonzero_bytes={nonzeroBytes}/{byteCount} " +
                     $"nonblack_pixels={nonblackPixels}/{(ulong)_extent.Width * _extent.Height} " +
                     $"hash=0x{hash:X16}");
