@@ -43,6 +43,25 @@ public sealed class RegisterBanks
         return clone;
     }
 
+    // A bank set restored from a captured case; the replay drives the executor with the same state.
+    public static RegisterBanks Restore(
+        Func<string, Exception> fatal,
+        ContextRegisters context,
+        ShaderProgramRegisters shader,
+        UserConfigRegisters userConfig,
+        uint indexTypeAndSize,
+        uint? compositeDepthSizeXy,
+        UserScalarKind userDataMarker) =>
+        new(fatal)
+        {
+            Context = context,
+            Shader = shader,
+            UserConfig = userConfig,
+            IndexTypeAndSize = indexTypeAndSize,
+            CompositeDepthSizeXy = compositeDepthSizeXy,
+            UserDataMarker = userDataMarker,
+        };
+
     public void Reset()
     {
         Context = new ContextRegisters();

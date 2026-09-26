@@ -221,6 +221,7 @@ public sealed partial class RenderExecutor
         _host.ResetBindings();
         if (capture is not null)
         {
+            capture.SetPacket(in arguments);
             FinishCapture(capture);
         }
     }
@@ -336,6 +337,7 @@ public sealed partial class RenderExecutor
         _host.ResetBindings();
         if (capture is not null)
         {
+            capture.SetPacket(in arguments);
             FinishCapture(capture);
         }
     }

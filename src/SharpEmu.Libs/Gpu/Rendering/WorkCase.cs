@@ -76,6 +76,7 @@ public sealed class WorkCaseStage
     public ulong HeaderAddress { get; set; }
     public uint CodeSizeBytes { get; set; }
     public ulong ContinuationAddress { get; set; }
+    public ulong ContinuationHeaderAddress { get; set; }
     public uint ContinuationSizeBytes { get; set; }
     public ulong UserDataAddress { get; set; }
     public ulong InputSemanticsAddress { get; set; }
@@ -123,6 +124,17 @@ public sealed class WorkCaseDraw
     public bool PrimitiveRestart { get; set; }
     public ulong PacketAddress { get; set; }
     public string OffsetSource { get; set; } = string.Empty;
+
+    // The packet fields as the command stream carried them; the replay drives the executor with
+    // these, because the resolved values above already have the register offsets folded in.
+    public uint PacketOpcode { get; set; }
+    public uint PacketCount { get; set; }
+    public uint PacketInstanceCount { get; set; }
+    public uint PacketFirstVertex { get; set; }
+    public uint PacketFirstInstance { get; set; }
+    public int PacketBaseVertex { get; set; }
+    public ulong PacketIndexAddress { get; set; }
+    public uint PacketIndexTypeAndSize { get; set; }
 }
 
 public sealed class WorkCaseDispatch

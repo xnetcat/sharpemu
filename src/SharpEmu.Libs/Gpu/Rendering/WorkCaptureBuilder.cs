@@ -59,6 +59,41 @@ internal sealed class WorkCaptureBuilder
         _requested.Add((role, address, size));
     }
 
+    // The packet the executor was called with, recorded by the caller once the draw is emitted.
+    public void SetPacket(in GpuCommands.DrawIndexedArguments arguments)
+    {
+        if (Manifest.Draw is not { } draw)
+        {
+            return;
+        }
+
+        draw.PacketAddress = arguments.PacketAddress;
+        draw.PacketOpcode = arguments.Opcode;
+        draw.PacketCount = arguments.IndexCount;
+        draw.PacketInstanceCount = arguments.InstanceCount;
+        draw.PacketBaseVertex = arguments.BaseVertex;
+        draw.PacketFirstInstance = arguments.FirstInstance;
+        draw.PacketIndexAddress = arguments.IndexAddress;
+        draw.PacketIndexTypeAndSize = arguments.IndexTypeAndSize;
+        draw.OffsetSource = arguments.OffsetSource.ToString();
+    }
+
+    public void SetPacket(in GpuCommands.DrawAutoArguments arguments)
+    {
+        if (Manifest.Draw is not { } draw)
+        {
+            return;
+        }
+
+        draw.PacketAddress = arguments.PacketAddress;
+        draw.PacketOpcode = arguments.Opcode;
+        draw.PacketCount = arguments.VertexCount;
+        draw.PacketInstanceCount = arguments.InstanceCount;
+        draw.PacketFirstVertex = arguments.FirstVertex;
+        draw.PacketFirstInstance = arguments.FirstInstance;
+        draw.OffsetSource = arguments.OffsetSource.ToString();
+    }
+
     public bool TryReadUInt64(ulong address, out ulong value)
     {
         Span<byte> bytes = stackalloc byte[sizeof(ulong)];
@@ -123,6 +158,8 @@ internal sealed class WorkCaptureBuilder
             stage.File = WriteBytes($"{label}-0x{registered.CodeAddress:X}.bin", registered.CodeAddress, registered.CodeSizeBytes);
             if (registered.IsFused)
             {
+                stage.ContinuationHeaderAddress = Agc.AgcExports.GetShaderHeaderAddress(registered.ContinuationAddress);
+                AddRange($"{label}-continuation-header", stage.ContinuationHeaderAddress, 0x100);
                 stage.ContinuationFile = WriteBytes(
                     $"{label}-continuation-0x{registered.ContinuationAddress:X}.bin", registered.ContinuationAddress, registered.ContinuationSizeBytes);
             }
