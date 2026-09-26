@@ -33,7 +33,9 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
     private readonly HashSet<ResourceSlotIdentifier> _scheduledReadbacks = new();
     private readonly SortedDictionary<ulong, SurfaceMetadata> _surfaceMetadata = new();
     private ulong _totalUsedMemory;
-    private ulong _collectionStartBytes;
+    // The collector runs after every completed guest submission and titles submit many per frame,
+    // so below this much image memory it would evict textures every frame only to re-upload them.
+    private ulong _collectionStartBytes = 1024 * MiB;
     private ulong _memoryPressureBytes = 1536 * MiB;
     private ulong _criticalMemoryBytes = 3072 * MiB;
     private ulong _collectionTick;
