@@ -1,0 +1,65 @@
+// Copyright (C) 2026 SharpEmu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+using System.Collections.Concurrent;
+using SharpEmu.Libs.Gpu.GpuCommands.Registers;
+
+namespace SharpEmu.Libs.Gpu.Rendering;
+
+// Reports each kind of draw or dispatch the executor drops without running, once per reason and
+// shader. A dropped pass leaves its outputs stale, which shows up much later as wrong colors or
+// missing geometry; this line connects that symptom to the pass that was not executed.
+internal static class DroppedWorkLog
+{
+    private const int MaxLines = 256;
+    private static readonly ConcurrentDictionary<(string Reason, ulong Shader), byte> Seen = new();
+
+    public static void Draw(string reason, RegisterBanks banks)
+    {
+        var shader = banks.Shader;
+        if (!TryClaim(reason, shader.Vertex.ExportAddress ^ (shader.Pixel.Address << 1)))
+        {
+            return;
+        }
+
+        var context = banks.Context;
+        var target = context.ColorTargets[0];
+        Console.Error.WriteLine(
+            $"[GPU][WARN] Dropped draw: reason={reason} stages=0x{context.ShaderStages:X8} " +
+            $"export=0x{shader.Vertex.ExportAddress:X16} geometry=0x{shader.Vertex.GeometryAddress:X16} pixel=0x{shader.Pixel.Address:X16} " +
+            $"target0=0x{target.BaseAddress:X16} {target.Width + 1}x{target.Height + 1}x{target.Depth + 1} layout={target.Layout} " +
+            $"slices={target.SliceStart}..{target.SliceMax} targetMask=0x{context.RenderTargetMask:X8} " +
+            $"shaderMask=0x{context.ShaderInterface.ColorShaderMask:X8}");
+    }
+
+    public static void Dispatch(string reason, ulong shaderAddress, uint groupsX, uint groupsY, uint groupsZ, uint initiator)
+    {
+        if (!TryClaim(reason, shaderAddress))
+        {
+            return;
+        }
+
+        Console.Error.WriteLine(
+            $"[GPU][WARN] Dropped dispatch: reason={reason} shader=0x{shaderAddress:X16} groups={groupsX}x{groupsY}x{groupsZ} initiator=0x{initiator:X8}");
+    }
+
+    // Skipped command blocks: a condition read before the GPU wrote it skips work silently.
+    public static void ConditionalExecute(ulong address, uint value, uint dwords)
+    {
+        if (value == 0 && TryClaim("conditional-execute", address))
+        {
+            Console.Error.WriteLine($"[GPU][WARN] Skipped command block: conditional-execute address=0x{address:X16} value=0 dwords={dwords}");
+        }
+    }
+
+    public static void Predication(ulong address, ulong value, uint condition, bool skip)
+    {
+        if (skip && TryClaim("predication", address))
+        {
+            Console.Error.WriteLine($"[GPU][WARN] Skipped predicated packets: address=0x{address:X16} value=0x{value:X16} condition={condition}");
+        }
+    }
+
+    private static bool TryClaim(string reason, ulong shader) =>
+        Seen.Count < MaxLines && Seen.TryAdd((reason, shader), 0);
+}

@@ -54,6 +54,7 @@ public sealed partial class RenderExecutor
         if (state.ColorCount == 0 && !state.Depth.HasTarget && !state.PixelActive)
         {
             TraceDrawDisposition(banks, in draw, "no-framebuffer");
+            DroppedWorkLog.Draw("no-framebuffer", banks);
             if (RenderTrace.Enabled && RenderTrace.FramebufferSkip())
             {
                 RenderTrace.Write(

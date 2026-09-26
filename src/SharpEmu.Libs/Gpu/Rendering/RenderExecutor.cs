@@ -113,8 +113,15 @@ public sealed partial class RenderExecutor
             return;
         }
 
-        if (!HasValidVertexShader(shader) || IsUnsupportedGeometryStage(banks))
+        if (!HasValidVertexShader(shader))
         {
+            DroppedWorkLog.Draw("no-vertex-export", banks);
+            return;
+        }
+
+        if (IsUnsupportedGeometryStage(banks))
+        {
+            DroppedWorkLog.Draw("unsupported-geometry-stage", banks);
             return;
         }
 
@@ -233,8 +240,15 @@ public sealed partial class RenderExecutor
             return;
         }
 
-        if (!HasValidVertexShader(shader) || IsUnsupportedGeometryStage(banks))
+        if (!HasValidVertexShader(shader))
         {
+            DroppedWorkLog.Draw("no-vertex-export", banks);
+            return;
+        }
+
+        if (IsUnsupportedGeometryStage(banks))
+        {
+            DroppedWorkLog.Draw("unsupported-geometry-stage", banks);
             return;
         }
 
@@ -257,6 +271,7 @@ public sealed partial class RenderExecutor
         if (!ResolveTopology(userConfig, autoDraw: true, out var topology))
         {
             TraceDrawDisposition(banks, in draw, "no-primitive-topology");
+            DroppedWorkLog.Draw("no-primitive-topology", banks);
             _host.ResetBindings();
             return;
         }
