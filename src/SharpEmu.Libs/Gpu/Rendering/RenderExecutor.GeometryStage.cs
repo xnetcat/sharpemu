@@ -20,7 +20,7 @@ public sealed partial class RenderExecutor
     private const uint GeometryStageEnableBit = 1u << 5;
     private const uint PrimitiveGenerationBit = 1u << 13;
     private const uint TessellationStagesMask = 0x7u;
-    private const uint NggPrimitivesPerSubgroup = 21;
+    private const uint GeometryOutputTriangleStrip = 2;
     private const uint NggVerticesPerPrimitive = 3;
     private const uint MaxNggSubgroups = 1u << 16;
 
@@ -61,11 +61,28 @@ public sealed partial class RenderExecutor
         bool indexed)
     {
         var primitiveType = (GuestPrimitiveType)banks.UserConfig.PrimitiveType;
-        if (primitiveType is not (GuestPrimitiveType.TriangleList or GuestPrimitiveType.TriangleStrip))
+        var verticesPerPrimitive = primitiveType switch
+        {
+            GuestPrimitiveType.PointList => 1u,
+            GuestPrimitiveType.LineList or GuestPrimitiveType.LineStrip => 2u,
+            GuestPrimitiveType.TriangleList or GuestPrimitiveType.TriangleStrip => 3u,
+            _ => 0u,
+        };
+        if (verticesPerPrimitive == 0)
         {
             DroppedWorkLog.Draw($"geometry-stage-input-topology-{primitiveType}", banks);
             return false;
         }
+
+        // The replay rasterizes the exported primitives as triangles.
+        var shaderInterface = banks.Context.ShaderInterface;
+        if (shaderInterface.GeometryMaxVerticesOut != 0 && shaderInterface.GeometryOutputPrimitiveType != GeometryOutputTriangleStrip)
+        {
+            DroppedWorkLog.Draw($"geometry-stage-output-topology-{shaderInterface.GeometryOutputPrimitiveType}", banks);
+            return false;
+        }
+
+        var primitivesPerSubgroup = PrimitivesPerSubgroup(shaderInterface, verticesPerPrimitive);
 
         var vertexIds = new uint[vertexCount];
         if (indexed)
@@ -102,11 +119,11 @@ public sealed partial class RenderExecutor
             }
         }
 
-        var strip = primitiveType == GuestPrimitiveType.TriangleStrip;
+        var strip = primitiveType is GuestPrimitiveType.TriangleStrip or GuestPrimitiveType.LineStrip;
         var primitivesPerInstance = strip
-            ? (vertexCount >= NggVerticesPerPrimitive ? vertexCount - 2 : 0)
-            : vertexCount / NggVerticesPerPrimitive;
-        var subgroupsPerInstance = (primitivesPerInstance + NggPrimitivesPerSubgroup - 1) / NggPrimitivesPerSubgroup;
+            ? (vertexCount >= verticesPerPrimitive ? vertexCount - (verticesPerPrimitive - 1) : 0)
+            : vertexCount / verticesPerPrimitive;
+        var subgroupsPerInstance = (primitivesPerInstance + primitivesPerSubgroup - 1) / primitivesPerSubgroup;
         var subgroupCount = (ulong)subgroupsPerInstance * instanceCount;
         if (primitivesPerInstance == 0 || subgroupCount == 0)
         {
@@ -126,7 +143,9 @@ public sealed partial class RenderExecutor
             return false;
         }
 
-        var input = BuildNggInput(AssemblePrimitiveVertices(vertexIds, primitivesPerInstance, strip), primitivesPerInstance, subgroupsPerInstance, instanceCount);
+        var input = BuildNggInput(
+            AssemblePrimitiveVertices(vertexIds, primitivesPerInstance, strip, verticesPerPrimitive),
+            primitivesPerInstance, subgroupsPerInstance, instanceCount, verticesPerPrimitive, primitivesPerSubgroup);
         var recordBytes = subgroupCount * NggRecordLayout.WaveLanes * NggRecordLayout.RecordDwords(paramCount) * sizeof(uint);
         var inputAddress = _host.CreateTransientDeviceBuffer(input, (ulong)input.Length * sizeof(uint));
         var outputAddress = inputAddress == 0 ? 0 : _host.CreateTransientDeviceBuffer([], recordBytes);
@@ -234,17 +253,24 @@ public sealed partial class RenderExecutor
         }
     }
 
-    // The three vertex ids of each input primitive, in order; strip triangles alternate winding.
-    private static uint[] AssemblePrimitiveVertices(uint[] vertexIds, uint primitives, bool strip)
+    // The vertex ids of each input primitive, in order; strip triangles alternate winding.
+    private static uint[] AssemblePrimitiveVertices(uint[] vertexIds, uint primitives, bool strip, uint verticesPerPrimitive)
     {
         if (!strip)
         {
             return vertexIds;
         }
 
-        var assembled = new uint[primitives * NggVerticesPerPrimitive];
+        var assembled = new uint[primitives * verticesPerPrimitive];
         for (var primitive = 0u; primitive < primitives; primitive++)
         {
+            if (verticesPerPrimitive == 2)
+            {
+                assembled[primitive * 2] = vertexIds[primitive];
+                assembled[primitive * 2 + 1] = vertexIds[primitive + 1];
+                continue;
+            }
+
             var odd = (primitive & 1) != 0;
             assembled[primitive * 3] = vertexIds[primitive + (odd ? 1u : 0u)];
             assembled[primitive * 3 + 1] = vertexIds[primitive + (odd ? 0u : 1u)];
@@ -254,10 +280,37 @@ public sealed partial class RenderExecutor
         return assembled;
     }
 
+    // Whole input primitives per emulated 64-lane subgroup: no more than the title configured
+    // (VGT_GS_ONCHIP_CNTL), and few enough that every input vertex and every output vertex the
+    // geometry program may allocate (VGT_GS_MAX_VERT_OUT per primitive) gets its own lane.
+    private static uint PrimitivesPerSubgroup(ShaderInterfaceRegisters shaderInterface, uint verticesPerPrimitive)
+    {
+        var primitives = NggRecordLayout.WaveLanes / verticesPerPrimitive;
+        var maxVerticesOut = shaderInterface.GeometryMaxVerticesOut;
+        if (maxVerticesOut is > 0 and <= NggRecordLayout.WaveLanes)
+        {
+            primitives = Math.Min(primitives, NggRecordLayout.WaveLanes / maxVerticesOut);
+        }
+
+        var configured = shaderInterface.GeometryPrimitivesPerSubgroup;
+        if (configured != 0)
+        {
+            primitives = Math.Min(primitives, configured);
+        }
+
+        return Math.Max(1u, primitives);
+    }
+
     // Per subgroup: gs_tg_info and merged_wave_info, then v0..v8 of each lane. A lane is both
     // export vertex (vertex id in v5, instance id in v8) and geometry primitive (its three
     // vertex slots, each shifted left by two, in v0 and v1; the primitive id in v2).
-    private static uint[] BuildNggInput(uint[] vertexIds, uint primitivesPerInstance, uint subgroupsPerInstance, uint instanceCount)
+    private static uint[] BuildNggInput(
+        uint[] vertexIds,
+        uint primitivesPerInstance,
+        uint subgroupsPerInstance,
+        uint instanceCount,
+        uint verticesPerPrimitive,
+        uint primitivesPerSubgroup)
     {
         var input = new uint[checked((int)((ulong)subgroupsPerInstance * instanceCount * NggRecordLayout.InputGroupDwords))];
         var group = 0;
@@ -265,9 +318,9 @@ public sealed partial class RenderExecutor
         {
             for (var subgroup = 0u; subgroup < subgroupsPerInstance; subgroup++, group++)
             {
-                var firstPrimitive = subgroup * NggPrimitivesPerSubgroup;
-                var primitives = Math.Min(NggPrimitivesPerSubgroup, primitivesPerInstance - firstPrimitive);
-                var vertices = primitives * NggVerticesPerPrimitive;
+                var firstPrimitive = subgroup * primitivesPerSubgroup;
+                var primitives = Math.Min(primitivesPerSubgroup, primitivesPerInstance - firstPrimitive);
+                var vertices = primitives * verticesPerPrimitive;
                 var header = group * (int)NggRecordLayout.InputGroupDwords;
                 input[header] = (vertices << 12) | (primitives << 22);
                 input[header + 1] = vertices | (primitives << 8) | (1u << 28);
@@ -276,15 +329,16 @@ public sealed partial class RenderExecutor
                     var registers = header + (int)(NggRecordLayout.InputHeaderDwords + lane * NggRecordLayout.InputLaneDwords);
                     if (lane < vertices)
                     {
-                        input[registers + 5] = vertexIds[firstPrimitive * NggVerticesPerPrimitive + lane];
+                        input[registers + 5] = vertexIds[firstPrimitive * verticesPerPrimitive + lane];
                         input[registers + 8] = instance;
                     }
 
                     if (lane < primitives)
                     {
-                        var slot = lane * NggVerticesPerPrimitive;
-                        input[registers] = (slot << 2) | ((slot + 1) << 18);
-                        input[registers + 1] = (slot + 2) << 2;
+                        var slot = lane * verticesPerPrimitive;
+                        input[registers] = (slot << 2) |
+                            (verticesPerPrimitive > 1 ? (slot + 1) << 18 : 0);
+                        input[registers + 1] = verticesPerPrimitive > 2 ? (slot + 2) << 2 : 0;
                         input[registers + 2] = firstPrimitive + lane;
                     }
                 }
