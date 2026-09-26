@@ -1318,8 +1318,12 @@ public static class AjmExports
                TryWriteUInt64(ctx, infoAddress + AjmBatchInfoOffsetField, offset + jobSize);
     }
 
-    // AjmBatchError: int error_code; const void* job_addr; uint32_t cmd_offset; const void* job_ra;
-    private const int AjmBatchErrorBytes = 24;
+    // ajm.h: SceAjmBatchError { int iErrorCode; const void *pJobAddress;
+    // unsigned int uiCommandOffset; const void *pJobOriginRa; }. The two pointers
+    // force 8-byte alignment, so the struct is 0x20 bytes (4+4 pad, 8, 4+4 pad, 8)
+    // rather than the 24-byte naive field sum — pJobOriginRa lives at +0x18 and was
+    // left holding stale guest bytes.
+    private const int AjmBatchErrorBytes = 0x20;
 
     private static void ClearAjmBatchError(CpuContext ctx, ulong errorAddress)
     {
