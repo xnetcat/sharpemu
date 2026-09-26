@@ -301,7 +301,9 @@ public sealed partial class GpuCommandInterpreter
                 $"then=0x{thenBuffer:X16}/{thenDwords} else=0x{elseBuffer:X16}/{elseDwords} address=0x{packet.PacketAddress:X16}.");
         }
 
-        _ = WaitOperation.TryCompare(ReadQword(compareAddress), reference, mask, function, out var takeThen);
+        var compared = ReadQword(compareAddress);
+        _ = WaitOperation.TryCompare(compared, reference, mask, function, out var takeThen);
+        Rendering.DroppedWorkLog.Branch(packet.PacketAddress, compareAddress, compared, reference, mask, function, mode, takeThen, thenDwords, elseDwords);
         if (takeThen)
         {
             RunIndirectBuffer(thenBuffer, thenDwords);

@@ -149,6 +149,10 @@ public interface IRenderHost
     // consume the guest buffer directly. Backends without native indirect dispatch return false.
     bool TryDispatchIndirect(ulong argumentsAddress);
 
+    // Diagnostic: waits for the GPU and returns the dispatch arguments it holds at the address,
+    // or null when the host cannot read them back.
+    uint[]? ReadIndirectDispatchArguments(ulong argumentsAddress, uint dwords = 3);
+
     // Orders the buffer writes of the given shader stages before every later access.
     void ShaderWriteBarrier(PipelineStageFlags sourceStages);
 
@@ -163,6 +167,15 @@ public interface IRenderHost
     bool TryRetainTargetlessDraw(GpuCommands.Registers.RegisterBanks banks, GraphicsPrograms programs, in TargetlessDrawArguments arguments);
 
     void MarkGpuWritten(ResourceSlotIdentifier image);
+
+    // A host buffer filled with the given words and zero past them; its device address, or
+    // zero when the host has none. It lives until ReleaseTransientDeviceBuffers is called and
+    // the command buffer recording at that point completes.
+    ulong CreateTransientDeviceBuffer(ReadOnlySpan<uint> contents, ulong byteSize);
+
+    // Retires every transient buffer with the command buffer recording now, which is the last
+    // one that can use them: a preparation may have flushed the batch they were created in.
+    void ReleaseTransientDeviceBuffers();
 
     void ResolveImage(ResourceSlotIdentifier source, uint sourceMip, uint sourceLayer, ResourceSlotIdentifier destination, uint destinationMip, uint destinationLayer);
 

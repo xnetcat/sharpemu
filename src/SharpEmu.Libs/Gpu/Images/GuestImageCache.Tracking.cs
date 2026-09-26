@@ -428,6 +428,7 @@ public sealed partial class GuestImageCache
 
     public void InvalidateMemoryFromGpu(ulong address, ulong size)
     {
+        DbgWriters.GpuBufferWrite(address, size);
         if (!IsValidRange(address, size))
         {
             return;

@@ -6,6 +6,8 @@ using SharpEmu.Libs.Gpu.Scheduling;
 using Silk.NET.Vulkan;
 using ResourceSnapshot = SharpEmu.ShaderCompiler.Resources.ResourceSnapshot;
 
+using SharpEmu.ShaderCompiler;
+
 namespace SharpEmu.Libs.Gpu.Rendering;
 
 public readonly record struct ComputeImageClear(BufferDescriptorWords Descriptor, uint PackedClear, ulong Size);
@@ -31,6 +33,12 @@ public sealed partial class RenderExecutor
         _host.RunPendingOperations();
         var compute = banks.Shader.Compute;
         _host.SetDebugInformation(RecordedOperation.DispatchDirect, submitId, groupsX, groupsY, groupsZ, dispatchInitiator, compute.Address);
+        FrameCommandLog.EndOperation();
+        if (FrameCommandLog.Active)
+        {
+            FrameCommandLog.Write($"Dispatch shader=0x{compute.Address:X} groups={groupsX}x{groupsY}x{groupsZ} initiator=0x{dispatchInitiator:X8} indirect=0x{indirectArgumentsAddress:X}");
+        }
+
         if (compute.Address == 0)
         {
             DroppedWorkLog.Dispatch("no-compute-shader", 0, groupsX, groupsY, groupsZ, dispatchInitiator);
@@ -53,6 +61,11 @@ public sealed partial class RenderExecutor
         var computeProgram = _pipelines.GetComputeProgram(compute, banks.Context.ShaderInterface, dispatchInitiator, groupsX, groupsY, groupsZ);
         if (computeProgram.Consumed)
         {
+            if (FrameCommandLog.Active)
+            {
+                FrameCommandLog.Write("  consumed by an adaptation");
+            }
+
             return;
         }
 
@@ -84,8 +97,18 @@ public sealed partial class RenderExecutor
             return;
         }
 
+        if (FrameCommandLog.Active)
+        {
+            LogComputeResources(input.Stage, program);
+        }
+
         if (indirectArgumentsAddress == 0 && TryConsumeImageClear(input, groupsX, groupsY, groupsZ, dispatchInitiator))
         {
+            if (FrameCommandLog.Active)
+            {
+                FrameCommandLog.Write("  consumed as an image clear");
+            }
+
             _host.ResetBindings();
             return;
         }
@@ -119,6 +142,30 @@ public sealed partial class RenderExecutor
             return;
         }
 
+        if (GpuWorkTrace.Enabled && indirectArgumentsAddress != 0 &&
+            _host.ReadIndirectDispatchArguments(indirectArgumentsAddress) is { } gpuArguments)
+        {
+            GpuWorkTrace.Note($"indirect arguments on the GPU: {gpuArguments[0]}x{gpuArguments[1]}x{gpuArguments[2]} cs=0x{program.Hash:X16}");
+            if (gpuArguments[0] > 65535 || gpuArguments[1] > 65535 || gpuArguments[2] > 65535)
+            {
+                Console.Error.WriteLine(
+                    $"[GPU][ERROR] Indirect dispatch 0x{indirectArgumentsAddress:X} has {gpuArguments[0]}x{gpuArguments[1]}x{gpuArguments[2]} groups: cs=0x{program.Hash:X16} shader=0x{compute.Address:X}");
+            }
+        }
+
+        var debugCapture = program.Bindings is { UsesNggBuffers: true } && indirectArgumentsAddress == 0;
+        if (debugCapture)
+        {
+            // Diagnostic compute capture: one record of debug slots per thread, dumped on release.
+            var threads = (ulong)groupsX * groupsY * groupsZ * input.ThreadsX * input.ThreadsY * input.ThreadsZ;
+            var debugInput = _host.CreateTransientDeviceBuffer([0u], sizeof(uint));
+            var debugOutput = _host.CreateTransientDeviceBuffer([], Math.Max(threads, 1) * NggRecordLayout.RecordDwords(0) * sizeof(uint));
+            Console.Error.WriteLine(
+                $"[GPU][INFO] Debug capture cs=0x{program.Hash:X16} shader=0x{compute.Address:X} groups={groupsX}x{groupsY}x{groupsZ} " +
+                $"threads={input.ThreadsX}x{input.ThreadsY}x{input.ThreadsZ} record_dwords={NggRecordLayout.RecordDwords(0)}");
+            input.Stage = input.Stage with { NggBuffers = (debugInput, debugOutput) };
+        }
+
         _host.EndRendering();
         using (_host.BeginPreparation())
         {
@@ -145,6 +192,11 @@ public sealed partial class RenderExecutor
             }
 
             _host.BindPipeline(PipelineBindPoint.Compute, in pipeline);
+            if (GpuWorkTrace.Enabled)
+            {
+                GpuWorkTrace.Note($"dispatch cs=0x{program.Hash:X16} shader=0x{compute.Address:X} groups={groupsX}x{groupsY}x{groupsZ} indirect=0x{indirectArgumentsAddress:X}{DescribeWrittenBuffers(input.Stage, program)}");
+            }
+
             if (indirectArgumentsAddress == 0 || !_host.TryDispatchIndirect(indirectArgumentsAddress))
             {
                 _host.Dispatch(groupsX, groupsY, groupsZ);
@@ -153,6 +205,41 @@ public sealed partial class RenderExecutor
         }
 
         _host.ResetBindings();
+        if (debugCapture)
+        {
+            _host.ReleaseTransientDeviceBuffers();
+        }
+
+        if (GpuWorkTrace.WatchedAddresses.Any(address => WritesAddress(input.Stage, program, address)))
+        {
+            foreach (var watched in GpuWorkTrace.WatchedAddresses)
+            {
+                if (_host.ReadIndirectDispatchArguments(watched, 16) is { } words)
+                {
+                    Console.Error.WriteLine(
+                        $"[GPU][INFO] Watched 0x{watched:X} after cs=0x{program.Hash:X16} shader=0x{compute.Address:X} groups={groupsX}x{groupsY}x{groupsZ}: " +
+                        string.Join(' ', words.Select(static word => $"{word:X8}")));
+                }
+            }
+        }
+    }
+
+    private static bool WritesAddress(ShaderStageResources stage, ShaderProgramInfo program, ulong address)
+    {
+        var descriptors = stage.Resources.Buffers;
+        for (var i = 0; i < program.Buffers.Length && i < descriptors.Length; i++)
+        {
+            if (program.Buffers[i].Written && descriptors[i].Length >= 4)
+            {
+                var descriptor = BufferDescriptorWords.From(descriptors[i]);
+                if (address >= descriptor.Address && address - descriptor.Address < (descriptor.Footprint() ?? 0))
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
     }
 
     // The dispatch counts threads; the host counts groups of the shader's thread size.
@@ -306,5 +393,38 @@ public sealed partial class RenderExecutor
         }
 
         return true;
+    }
+
+    private static string DescribeWrittenBuffers(ShaderStageResources stage, ShaderProgramInfo program)
+    {
+        var text = new System.Text.StringBuilder();
+        var descriptors = stage.Resources.Buffers;
+        for (var i = 0; i < program.Buffers.Length && i < descriptors.Length; i++)
+        {
+            if (program.Buffers[i].Written && descriptors[i].Length >= 4)
+            {
+                var descriptor = BufferDescriptorWords.From(descriptors[i]);
+                text.Append($" writes=0x{descriptor.Address:X}+0x{descriptor.Footprint() ?? 0:X}");
+            }
+        }
+
+        return text.ToString();
+    }
+
+    private static void LogComputeResources(ShaderStageResources stage, ShaderProgramInfo program)
+    {
+        FrameCommandLog.Write(
+            $"  program hash=0x{program.Hash:X16} buffers={program.Buffers.Length} images={program.Images.Length} deviceAddresses={program.UsesDeviceAddresses}");
+        var descriptors = stage.Resources.Buffers;
+        for (var i = 0; i < program.Buffers.Length && i < descriptors.Length; i++)
+        {
+            if (!program.Buffers[i].Written || descriptors[i].Length < 4)
+            {
+                continue;
+            }
+
+            var descriptor = BufferDescriptorWords.From(descriptors[i]);
+            FrameCommandLog.Write($"  written buffer {i} 0x{descriptor.Address:X}+0x{descriptor.Footprint() ?? 0:X} stride={descriptor.Stride}");
+        }
     }
 }

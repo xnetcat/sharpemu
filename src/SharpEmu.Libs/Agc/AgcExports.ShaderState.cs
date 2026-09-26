@@ -130,11 +130,73 @@ public static partial class AgcExports
             _shaderHeadersByCode[codeAddress] = headerAddress;
         }
 
-        TryRegisterEmbeddedFusedProgram(ctx, codeAddress, headerAddress);
+        if (!TryRegisterEmbeddedFusedProgram(ctx, codeAddress, headerAddress))
+        {
+            PairSeparateFusedHalves(ctx, codeAddress, headerAddress);
+        }
+        if (Environment.GetEnvironmentVariable("SHARPEMU_LOG_AGC_SHADER_TYPES") == "1" &&
+            TryReadByte(ctx, headerAddress + ShaderTypeOffset, out var createdType) && createdType is not (ComputeShaderType or PsShaderType))
+        {
+            TryReadUInt32(ctx, headerAddress + ShaderSizeOffset, out var createdSize);
+            var headerBytes = new byte[ShaderStructBytes];
+            _ = ctx.Memory.TryRead(headerAddress, headerBytes);
+            Console.Error.WriteLine($"[LOADER][INFO] agc.create_shader_type code=0x{codeAddress:X} header=0x{headerAddress:X} type={createdType} size=0x{createdSize:X} bytes={Convert.ToHexString(headerBytes)}");
+            var listingDirectory = Environment.GetEnvironmentVariable("SHARPEMU_SHADER_SPIRV_DUMP_DIR");
+            if (listingDirectory is not null && createdType is GsFrontShaderType or GsBackShaderType or HsFrontShaderType or HsBackShaderType)
+            {
+                Directory.CreateDirectory(listingDirectory);
+                var listing = SharpEmu.ShaderCompiler.Gen5ShaderTranslator.TryDecodeProgram(ctx, codeAddress, out var decoded, out var decodeError)
+                    ? decoded.Instructions.Select(static instruction =>
+                        $"0x{instruction.Pc:X4} {string.Join('_', instruction.Words.Select(static word => word.ToString("X8")))} {instruction.Opcode} " +
+                        $"{string.Join(',', instruction.Destinations)} <- {string.Join(',', instruction.Sources)} {instruction.Control}")
+                    : [$"decode failed: {decodeError}"];
+                File.WriteAllLines(Path.Combine(listingDirectory, $"created-{codeAddress:X}-type{createdType}.ir.txt"), listing);
+            }
+        }
 
         TraceCreateShader(destinationAddress, headerAddress, codeAddress, "ok");
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    private static readonly ConditionalWeakTable<object, Stack<(ulong Code, ulong Header, byte Type)>> _unpairedFusedFronts = new();
+
+    // Titles that fuse the halves in their own code upload each half separately and never tell
+    // the driver which back half follows a front half; the front jumps to it through a register
+    // the fuse step fills. Each back half continues the front half created most recently.
+    private static void PairSeparateFusedHalves(CpuContext ctx, ulong codeAddress, ulong headerAddress)
+    {
+        if (!TryReadByte(ctx, headerAddress + ShaderTypeOffset, out var type) ||
+            type is not (GsFrontShaderType or HsFrontShaderType or GsBackShaderType or HsBackShaderType))
+        {
+            return;
+        }
+
+        var fronts = _unpairedFusedFronts.GetValue(ctx.Memory, static _ => new());
+        lock (fronts)
+        {
+            if (type is GsFrontShaderType or HsFrontShaderType)
+            {
+                if (!Gen5ShaderTranslator.TryGetFusedProgramParts(ctx, codeAddress, out _, out _))
+                {
+                    fronts.Push((codeAddress, headerAddress, type));
+                }
+
+                return;
+            }
+
+            var frontType = type == GsBackShaderType ? GsFrontShaderType : HsFrontShaderType;
+            if (!fronts.TryPeek(out var front) || front.Type != frontType)
+            {
+                Console.Error.WriteLine($"[LOADER][WARN] agc.fused_back_unpaired code=0x{codeAddress:X16} type={type}");
+                return;
+            }
+
+            fronts.Pop();
+            Gen5ShaderTranslator.RegisterFusedProgram(ctx, front.Code, front.Header, codeAddress, headerAddress);
+            Console.Error.WriteLine(
+                $"[LOADER][INFO] agc.fused_halves_paired entry=0x{front.Code:X16} continuation=0x{codeAddress:X16} type={frontType}");
+        }
     }
 
     /// <summary>

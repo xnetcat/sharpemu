@@ -73,6 +73,24 @@ public readonly record struct ShaderStageResources(ShaderProgramInfo? Program, R
 
     public DispatchThreadLimits? ThreadLimits { get; init; }
 
+    // The input and output record buffers of an emulated NGG geometry stage, as device addresses.
+    public (ulong Input, ulong Output)? NggBuffers { get; init; }
+
+    public void WriteNggBuffers(Span<uint> shaderData)
+    {
+        if (Program?.Bindings is not { UsesNggBuffers: true } layout) return;
+        if (NggBuffers is not { } buffers || shaderData.Length != layout.ShaderDataDwordCount)
+        {
+            throw SubmissionScheduler.Fatal("The emulated geometry stage has no record buffers or invalid shader data.");
+        }
+
+        var offset = (int)layout.NggBuffersDword;
+        shaderData[offset] = (uint)buffers.Input;
+        shaderData[offset + 1] = (uint)(buffers.Input >> 32);
+        shaderData[offset + 2] = (uint)buffers.Output;
+        shaderData[offset + 3] = (uint)(buffers.Output >> 32);
+    }
+
     public void WriteDispatchThreadLimits(Span<uint> shaderData)
     {
         if (Program?.Bindings is not { UsesDispatchThreadLimits: true } layout) return;

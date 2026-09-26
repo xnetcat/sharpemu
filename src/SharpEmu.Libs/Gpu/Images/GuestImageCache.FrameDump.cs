@@ -23,20 +23,31 @@ public sealed unsafe partial class GuestImageCache
     private static int _frameDumpCount;
     private long _frameDumpTriggerCheck;
     private ulong _previousFlipTick;
+    private string? _frameDumpDirectory;
 
     // Called under the cache lock when the display surface of a flip is looked up.
     private void DumpFrameImagesIfRequested()
     {
         var frameStart = _previousFlipTick;
         _previousFlipTick = _scheduler.CurrentTick;
-        if (!IsFrameDumpRequested())
+        // A request first records the commands of the next frame, then dumps what that frame used.
+        if (_frameDumpDirectory is null)
         {
+            if (IsFrameDumpRequested())
+            {
+                _frameDumpDirectory = Path.Combine(
+                    Environment.GetEnvironmentVariable("SHARPEMU_DUMP_FRAME_DIR") ?? "frame-dump",
+                    $"frame-{Interlocked.Increment(ref _frameDumpCount):D2}");
+                Rendering.FrameCommandLog.Start(_frameDumpDirectory);
+            }
+
             return;
         }
 
-        var directory = Path.Combine(
-            Environment.GetEnvironmentVariable("SHARPEMU_DUMP_FRAME_DIR") ?? "frame-dump",
-            $"frame-{Interlocked.Increment(ref _frameDumpCount):D2}");
+        var directory = _frameDumpDirectory;
+        _frameDumpDirectory = null;
+        Rendering.FrameCommandLog.Write("Flip");
+        Rendering.FrameCommandLog.Stop();
         Directory.CreateDirectory(directory);
         var sequence = 0;
         var dumped = 0;
@@ -106,6 +117,12 @@ public sealed unsafe partial class GuestImageCache
         _scheduler.EndRendering();
         image.DownloadToBuffer([copy], buffer.Handle, 0, size);
         var path = Path.Combine(directory, name + ".raw");
+        var guestBytes = new byte[description.Data.Size];
+        if (_backing.TryReadBacking(description.Data.Address, guestBytes))
+        {
+            File.WriteAllBytes(Path.Combine(directory, name + ".guest"), guestBytes);
+        }
+
         _scheduler.QueuePriorityCompletionAction(() =>
         {
             buffer.Invalidate(0, size);

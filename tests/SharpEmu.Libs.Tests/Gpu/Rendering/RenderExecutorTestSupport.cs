@@ -326,6 +326,8 @@ internal sealed class RecordingRenderHost : IRenderHost
 
     public bool TryDispatchIndirect(ulong argumentsAddress) => false;
 
+    public uint[]? ReadIndirectDispatchArguments(ulong argumentsAddress, uint dwords = 3) => null;
+
     public void ShaderWriteBarrier(PipelineStageFlags sourceStages) => Calls.Add($"write_barrier {sourceStages}");
 
     public void ShaderWriteHazardBarrier() => Calls.Add("write_hazard_barrier");
@@ -354,6 +356,14 @@ internal sealed class RecordingRenderHost : IRenderHost
     }
 
     public void MarkGpuWritten(ResourceSlotIdentifier image) => Calls.Add($"mark_written {image.Index}");
+
+    public ulong CreateTransientDeviceBuffer(ReadOnlySpan<uint> contents, ulong byteSize)
+    {
+        Calls.Add($"transient_buffer {contents.Length} {byteSize}");
+        return 0;
+    }
+
+    public void ReleaseTransientDeviceBuffers() => Calls.Add("release_transient_buffers");
 
     public void ResolveImage(ResourceSlotIdentifier source, uint sourceMip, uint sourceLayer, ResourceSlotIdentifier destination, uint destinationMip, uint destinationLayer) =>
         Calls.Add($"resolve {source.Index}:{sourceMip}:{sourceLayer} -> {destination.Index}:{destinationMip}:{destinationLayer}");

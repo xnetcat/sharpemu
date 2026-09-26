@@ -131,6 +131,11 @@ public sealed class ShaderCompileRequest
     public IReadOnlyDictionary<int, uint> WrittenRangeSlotByMemoryIndex { get; }
 
     public uint WaveSize { get; init; } = 32;
+
+    // How this program takes part in an emulated NGG geometry stage, and the parameter
+    // exports each vertex record of that stage carries.
+    public NggEmulationMode NggMode { get; init; }
+    public uint NggParamCount { get; init; }
     public uint ScratchDwords { get; init; }
     public bool EnableGraphicsSubgroupOperations { get; init; } = true;
     public Gen5ComputeSystemRegisters? ComputeSystemRegisters { get; init; }
@@ -158,4 +163,40 @@ public sealed class ShaderCompileRequest
     public uint ThreadCountX { get; init; } = UnboundedThreadCount;
     public uint ThreadCountY { get; init; } = UnboundedThreadCount;
     public uint ThreadCountZ { get; init; } = UnboundedThreadCount;
+}
+
+// A merged export and geometry stage runs as a compute workgroup that stores its exports to a
+// record buffer (Compute); a vertex program then reads those records back for rasterization (Replay).
+public enum NggEmulationMode
+{
+    None,
+    Compute,
+    Replay,
+    // Diagnostic: an ordinary compute program that also stores the NGG debug slots of every
+    // thread to the output buffer (SHARPEMU_DEBUG_COMPUTE_HASH).
+    Debug,
+}
+
+// The record layout both emulation programs share, in dwords per exported lane.
+public static class NggRecordLayout
+{
+    public const uint WaveLanes = 64;
+    public const uint PrimitiveDword = 0;
+    public const uint Position0Dword = 4;
+    public const uint Position1Dword = 8;
+    public const uint FirstParamDword = 12;
+    public const uint InputHeaderDwords = 4;
+    public const uint InputLaneDwords = 9;
+    public const uint InputGroupDwords = InputHeaderDwords + WaveLanes * InputLaneDwords;
+
+    // Diagnostic: SHARPEMU_NGG_DEBUG_PCS lists program counters (hex) after which every lane
+    // stores registers into DebugSlotDwords-dword slots appended to its record.
+    public const uint DebugSlotDwords = 16;
+    public static readonly uint[] DebugPcs = (Environment.GetEnvironmentVariable("SHARPEMU_NGG_DEBUG_PCS") ?? string.Empty)
+        .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+        .Select(static value => Convert.ToUInt32(value.Replace("0x", string.Empty, StringComparison.OrdinalIgnoreCase), 16))
+        .ToArray();
+
+    public static uint RecordDwords(uint paramCount) =>
+        FirstParamDword + 4 * paramCount + (uint)DebugPcs.Length * DebugSlotDwords;
 }

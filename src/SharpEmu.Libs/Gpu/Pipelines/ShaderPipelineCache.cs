@@ -76,7 +76,8 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         ShaderInterfaceRegisters shaderInterface,
         ContextRegisters context,
         ReadOnlySpan<ColorComponentMap> targetExportMapping,
-        bool pixelActive)
+        bool pixelActive,
+        uint? nggReplayParamCount = null)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramPreparation);
         var vertexSource = PrepareSource(
@@ -139,7 +140,13 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
 
             if (!TryPrepareProgram(
                 vertexSource,
-                new StageCompileOptions { VertexInfo = vertexInfo, RequiredVertexOutputCount = (int)attributeCount },
+                new StageCompileOptions
+                {
+                    VertexInfo = vertexInfo,
+                    RequiredVertexOutputCount = (int)attributeCount,
+                    NggMode = nggReplayParamCount is null ? NggEmulationMode.None : NggEmulationMode.Replay,
+                    NggParamCount = nggReplayParamCount ?? 0,
+                },
                 ref pushDataCursor,
                 out vertexProgram,
                 out vertexStage))
@@ -273,6 +280,12 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         return null;
     }
 
+    private static readonly ulong? DebugComputeHash =
+        ulong.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_DEBUG_COMPUTE_HASH")?.Replace("0x", "", StringComparison.OrdinalIgnoreCase),
+            System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture, out var debugHash)
+            ? debugHash
+            : null;
+
     public ComputeProgram GetComputeProgram(
         ComputeStageRegisters compute,
         ShaderInterfaceRegisters shaderInterface,
@@ -303,7 +316,47 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
             var pushDataCursor = 0u;
             if (!TryPrepareProgram(
                 source,
-                new StageCompileOptions { ComputeInfo = input, ComputeSystemRegisters = systemRegisters },
+                new StageCompileOptions
+                {
+                    ComputeInfo = input,
+                    ComputeSystemRegisters = systemRegisters,
+                    NggMode = DebugComputeHash == source.Hash ? NggEmulationMode.Debug : NggEmulationMode.None,
+                },
+                ref pushDataCursor,
+                out handle,
+                out stage))
+            {
+                return new ComputeProgram { Available = false };
+            }
+        }
+
+        input.Stage = stage;
+        return new ComputeProgram { Program = handle, Input = input };
+    }
+
+    public ComputeProgram GetNggComputeProgram(VertexStageRegisters vertex, out uint paramCount)
+    {
+        using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramPreparation);
+        var source = PrepareSource(
+            vertex.ExportAddress, ShaderStage.Compute, "geometry", vertex.GeometryUserScalars, vertex.GeometryResource2.UserScalarCount,
+            probeWrittenRegisters: true, VertexUserDataBase);
+        paramCount = NggReplayProgram.ParamCount(_programs.Decode(source));
+        var input = new ComputeInputInfo
+        {
+            ThreadsX = NggRecordLayout.WaveLanes,
+            ThreadsY = 1,
+            ThreadsZ = 1,
+            WaveSize = NggRecordLayout.WaveLanes,
+            ThreadIdCount = 1,
+        };
+        ShaderProgram handle;
+        ShaderStageResources stage;
+        lock (_gate)
+        {
+            var pushDataCursor = 0u;
+            if (!TryPrepareProgram(
+                source,
+                new StageCompileOptions { ComputeInfo = input, NggMode = NggEmulationMode.Compute, NggParamCount = paramCount },
                 ref pushDataCursor,
                 out handle,
                 out stage))

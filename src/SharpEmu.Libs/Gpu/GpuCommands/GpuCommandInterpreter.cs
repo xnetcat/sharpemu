@@ -136,6 +136,11 @@ public sealed partial class GpuCommandInterpreter
 
         if (execution.IsEmpty && dwordCount != 0)
         {
+            if (Rendering.FrameCommandLog.Active || LogBuffers)
+            {
+                LogBuffer($"Buffer submit queue={QueueId} 0x{address:X}+0x{dwordCount * 4:X}");
+            }
+
             execution.Push(new PacketCursor(address, dwordCount, ringChunkBase: address));
         }
 
@@ -169,6 +174,11 @@ public sealed partial class GpuCommandInterpreter
         }
 
         var stopDepth = execution.Depth;
+        if (Rendering.FrameCommandLog.Active || LogBuffers)
+        {
+            LogBuffer($"Buffer call queue={QueueId} 0x{address:X}+0x{dwordCount * 4:X}");
+        }
+
         execution.Push(new PacketCursor(address, dwordCount, ringChunkBase: address));
         RunPackets(execution, stopDepth);
     }
@@ -177,12 +187,29 @@ public sealed partial class GpuCommandInterpreter
     private void ChainToBuffer(ulong address, uint dwordCount, bool followedChunkAdvance = false)
     {
         var execution = RequireExecution();
+        if (Rendering.FrameCommandLog.Active || LogBuffers)
+        {
+            LogBuffer($"Buffer chain queue={QueueId} 0x{address:X}+0x{dwordCount * 4:X}");
+        }
+
         execution.Pop();
         execution.Push(new PacketCursor(address, dwordCount, ringChunkBase: address, followedChunkAdvance));
         _chainRequested = true;
     }
 
     public void Suspend() => RequireExecution().Suspended = true;
+
+    // SHARPEMU_LOG_COMMAND_BUFFERS=1 prints every command buffer range the interpreter runs.
+    private static readonly bool LogBuffers = Environment.GetEnvironmentVariable("SHARPEMU_LOG_COMMAND_BUFFERS") == "1";
+
+    private static void LogBuffer(string line)
+    {
+        Rendering.FrameCommandLog.Write(line);
+        if (LogBuffers)
+        {
+            Console.Error.WriteLine($"[GPU][BUFFER] {line}");
+        }
+    }
 
     private PacketCursorStack RequireExecution() =>
         _execution ?? throw _host.Fatal($"No command stream is running: queue={QueueId}.");
@@ -251,6 +278,11 @@ public sealed partial class GpuCommandInterpreter
 
             if (PacketHeader.IsPredicated(header) && PredicateSkip)
             {
+                if (Rendering.FrameCommandLog.Active)
+                {
+                    Rendering.FrameCommandLog.Write($"  pkt 0x{packetAddress:X} op=0x{PacketHeader.Opcode(header):X2} len={length} SKIPPED-PREDICATE");
+                }
+
                 cursor.Offset += length;
                 execution.MadeProgress = true;
                 continue;
@@ -265,6 +297,12 @@ public sealed partial class GpuCommandInterpreter
             }
 
             var payload = ReadPayload(cursorIndex, packetAddress, length - 1);
+            if (Rendering.FrameCommandLog.Active)
+            {
+                Rendering.FrameCommandLog.Write(
+                    $"  pkt 0x{packetAddress:X} op=0x{opcode:X2} len={length} {string.Join(' ', payload[..Math.Min(payload.Length, 6)].ToArray().Select(static value => value.ToString("X8")))}");
+            }
+
             var packet = new PacketContext(header & ~1u, packetAddress, offset, remaining, total);
             var consumed = handler(this, in packet, payload) + 1;
             if (consumed > remaining)

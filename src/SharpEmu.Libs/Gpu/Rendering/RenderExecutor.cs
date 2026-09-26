@@ -102,6 +102,7 @@ public sealed partial class RenderExecutor
         var userConfig = banks.UserConfig;
         var shader = banks.Shader;
         _host.SetDebugInformation(RecordedOperation.DrawIndex, submitId, arguments.IndexCount, 0, 1, arguments.InstanceCount, arguments.IndexAddress);
+        FrameCommandLog.Draw("DrawIndexed", arguments.IndexCount, arguments.InstanceCount, banks, arguments.PacketAddress);
         if (arguments.IndexCount == 0 || arguments.InstanceCount == 0)
         {
             return;
@@ -121,7 +122,15 @@ public sealed partial class RenderExecutor
 
         if (IsUnsupportedGeometryStage(banks))
         {
+            if (IsEmulatableGeometryStage(banks) &&
+                TryEmulateGeometryStage(submitId, banks, arguments.PacketAddress, arguments.IndexCount, arguments.InstanceCount, 0,
+                    arguments.IndexAddress, arguments.IndexTypeAndSize, arguments.BaseVertex, indexed: true))
+            {
+                return;
+            }
+
             DroppedWorkLog.Draw("unsupported-geometry-stage", banks);
+            CompileDroppedGeometryPrograms(banks);
             return;
         }
 
@@ -229,6 +238,7 @@ public sealed partial class RenderExecutor
         var userConfig = banks.UserConfig;
         var shader = banks.Shader;
         _host.SetDebugInformation(RecordedOperation.DrawIndexAuto, submitId, arguments.VertexCount, 0, arguments.FirstVertex, arguments.InstanceCount, arguments.FirstInstance);
+        FrameCommandLog.Draw("DrawAuto", arguments.VertexCount, arguments.InstanceCount, banks, arguments.PacketAddress);
         if (arguments.VertexCount == 0 || arguments.InstanceCount == 0)
         {
             return;
@@ -246,9 +256,17 @@ public sealed partial class RenderExecutor
             return;
         }
 
-        if (IsUnsupportedGeometryStage(banks))
+        if (_nggReplay is null && IsUnsupportedGeometryStage(banks))
         {
+            if (IsEmulatableGeometryStage(banks) &&
+                TryEmulateGeometryStage(submitId, banks, arguments.PacketAddress, arguments.VertexCount, arguments.InstanceCount,
+                    arguments.FirstVertex, 0, 0, 0, indexed: false))
+            {
+                return;
+            }
+
             DroppedWorkLog.Draw("unsupported-geometry-stage", banks);
+            CompileDroppedGeometryPrograms(banks);
             return;
         }
 
@@ -268,7 +286,8 @@ public sealed partial class RenderExecutor
             return;
         }
 
-        if (!ResolveTopology(userConfig, autoDraw: true, out var topology))
+        var topology = PrimitiveTopology.TriangleList;
+        if (_nggReplay is null && !ResolveTopology(userConfig, autoDraw: true, out topology))
         {
             TraceDrawDisposition(banks, in draw, "no-primitive-topology");
             DroppedWorkLog.Draw("no-primitive-topology", banks);
@@ -301,14 +320,14 @@ public sealed partial class RenderExecutor
 
         TraceDrawState(submitId, banks, in draw, in state);
         var indirect = arguments.OffsetSource == DrawOffsetSource.IndirectArguments;
-        var vertexOffset = indirect
+        var vertexOffset = indirect || _nggReplay is not null
             ? (int)arguments.FirstVertex
             : ResolveVertexOffset(userConfig.IndexOffset, vertexInput) + (int)arguments.FirstVertex;
         var emission = new DrawEmission(
             false,
             0,
             (uint)vertexOffset,
-            indirect ? arguments.FirstInstance : ResolveInstanceOffset(vertexInput));
+            indirect || _nggReplay is not null ? arguments.FirstInstance : ResolveInstanceOffset(vertexInput));
         RecordDraw(submitId, banks, in draw, ref state, topology, in emission, default, primitiveRestart: false, setBindDebug: false, setAutoDebug: true);
         _host.ResetBindings();
     }
@@ -401,6 +420,43 @@ public sealed partial class RenderExecutor
         }
 
         return 0;
+    }
+
+    private static readonly bool LogDroppedGeometry = Environment.GetEnvironmentVariable("SHARPEMU_LOG_DROPPED_GEOMETRY") == "1";
+    private static readonly bool CompileDroppedGeometry = Environment.GetEnvironmentVariable("SHARPEMU_COMPILE_DROPPED_GEOMETRY") == "1";
+    private readonly HashSet<ulong> _compiledDroppedGeometry = new();
+
+    // Diagnostic: compiles the programs of a dropped geometry-stage draw once, so the shader dump
+    // shows what the pipeline would need.
+    private void CompileDroppedGeometryPrograms(RegisterBanks banks)
+    {
+        if (!(CompileDroppedGeometry || LogDroppedGeometry) || !_compiledDroppedGeometry.Add(banks.Shader.Vertex.ExportAddress ^ (banks.Shader.Pixel.Address << 1)))
+        {
+            return;
+        }
+
+        var vertex = banks.Shader.Vertex;
+        var scalars = vertex.GeometryUserScalars;
+        var shaderInterface = banks.Context.ShaderInterface;
+        Console.Error.WriteLine(
+            $"[GPU][INFO] Dropped geometry draw: export=0x{vertex.ExportAddress:X} header=0x{Agc.AgcExports.GetShaderHeaderAddress(vertex.ExportAddress):X} " +
+            $"geometry=0x{vertex.GeometryAddress:X} legacy=0x{vertex.LegacyVertexAddress:X} maxOut={shaderInterface.GeometryMaxVerticesOut} outPrim={shaderInterface.GeometryOutputPrimitiveType} " +
+            $"subgroup=0x{shaderInterface.PrimitiveShaderSubgroupControl:X} maxOutSub=0x{shaderInterface.MaxOutputPerSubgroup:X} userCount={vertex.GeometryResource2.UserScalarCount} " +
+            $"user=[{string.Join(' ', scalars.Values.Take((int)scalars.Count).Select(static v => v.ToString("X8")))}]");
+        if (!CompileDroppedGeometry)
+        {
+            return;
+        }
+
+        try
+        {
+            var state = DrawState.Create();
+            ResolveShaderPrograms(banks, ref state);
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine($"[GPU][WARN] Dropped geometry program compile failed: {exception.Message}");
+        }
     }
 
     private static bool HasValidVertexShader(ShaderProgramRegisters shader) => shader.Vertex.ExportAddress != 0;
@@ -585,7 +641,12 @@ public sealed partial class RenderExecutor
             context.ShaderInterface,
             context,
             targetExportMapping,
-            state.PixelActive);
+            state.PixelActive,
+            _nggReplay?.ParamCount);
+        if (_nggReplay is { } replay && state.Programs.Available)
+        {
+            state.Programs.VertexInput.Stage = state.Programs.VertexInput.Stage with { NggBuffers = (replay.Input, replay.Output) };
+        }
     }
 
     [System.Runtime.CompilerServices.InlineArray(RenderingState.ColorAttachmentCapacity)]
@@ -596,6 +657,13 @@ public sealed partial class RenderExecutor
 
     private static void TraceDrawState(ulong submitId, RegisterBanks banks, in DrawCall draw, in DrawState state)
     {
+        if (FrameCommandLog.Active)
+        {
+            FrameCommandLog.Write(
+                $"  programs vs=0x{state.Programs.VertexInput.Stage.Program?.Hash ?? 0:X16} ps=0x{(state.PixelActive ? state.Programs.PixelInput.Stage.Program?.Hash ?? 0 : 0):X16} " +
+                $"colors={state.ColorCount} depth={state.Depth.HasTarget} pixelActive={state.PixelActive}");
+        }
+
         if (!RenderTrace.Enabled)
         {
             return;

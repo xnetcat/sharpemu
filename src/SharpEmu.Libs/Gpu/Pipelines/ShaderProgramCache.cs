@@ -38,6 +38,8 @@ public sealed class StageCompileOptions
     public uint PixelInputAddress { get; init; }
     public ComputeInputInfo? ComputeInfo { get; init; }
     public Gen5ComputeSystemRegisters? ComputeSystemRegisters { get; init; }
+    public NggEmulationMode NggMode { get; init; }
+    public uint NggParamCount { get; init; }
 }
 
 // The key of a program entry: what the emitter reads besides the resource specialization.
@@ -278,16 +280,27 @@ internal sealed class ShaderProgramCache
                 StageStaticKey.Build(options.ComputeInfo ?? throw new ArgumentException("The compute lookup has no compute input info."), _staticState);
                 break;
         }
+
+        if (options.NggMode != NggEmulationMode.None)
+        {
+            _staticState.Add(0x4E474700u | (uint)options.NggMode);
+            _staticState.Add(options.NggParamCount);
+        }
     }
 
     private ProgramSourceEntry CreateEntry(ShaderSource source, StageCompileOptions options)
     {
         var program = Decode(source);
+        if (options.NggMode == NggEmulationMode.Replay)
+        {
+            program = NggReplayProgram.Build(program, options.NggParamCount);
+        }
+
         var dumpPlanning = CompiledShaderDump.ShouldWrite(source.Address);
         if (dumpPlanning) ShaderPlanningDump.WriteInput(source, program);
         EmbeddedVertexFetchPlan? fetch = null;
         ShaderVertexInput[] vertexInputs = [];
-        if (source.Stage == ShaderStage.Vertex && options.VertexInfo is { FetchEmbedded: true } vertexInfo)
+        if (source.Stage == ShaderStage.Vertex && options.NggMode == NggEmulationMode.None && options.VertexInfo is { FetchEmbedded: true } vertexInfo)
         {
             fetch = EmbeddedVertexFetchDetector.Detect(
                 program,
@@ -460,7 +473,8 @@ internal sealed class ShaderProgramCache
                 ShaderCompileRequest.RequiresFlattenedTable(plan, resources),
                 BindingLayout.ReadsShaderBase(program),
                 pushDataCursor,
-                usesDispatchThreadLimits: source.Stage == ShaderStage.Compute && options.ComputeInfo!.DispatchThreadDimensions);
+                usesDispatchThreadLimits: source.Stage == ShaderStage.Compute && options.ComputeInfo!.DispatchThreadDimensions,
+                usesNggBuffers: options.NggMode != NggEmulationMode.None);
         }
         catch (ResourcePlanException exception)
         {
@@ -473,6 +487,7 @@ internal sealed class ShaderProgramCache
             specialization, request, pushDataCursor, _nextProgramId + 1);
         if (!_compiler.TryCompileProgram(request, out var compiled, out var error) || compiled is null)
         {
+            CompiledShaderDump.WriteRejected(source.Label, source.Address, source.Hash, program, error);
             throw new ShaderProgramRejectedException($"The shader program cannot be compiled: stage={source.Label} hash=0x{source.Hash:X16} shader=0x{source.Address:X16} error={error}.");
         }
 
@@ -534,6 +549,8 @@ internal sealed class ShaderProgramCache
                     EnableGraphicsSubgroupOperations = enableGraphicsSubgroups,
                     RequiredVertexOutputCount = options.RequiredVertexOutputCount,
                     VertexInputs = entry.VertexInputs,
+                    NggMode = options.NggMode,
+                    NggParamCount = options.NggParamCount,
                     PositionExportControl = info.PositionExportControl,
                     ClipSpace = new ShaderClipSpaceTransform(
                         info.ClipSpace.Enabled,
@@ -575,6 +592,8 @@ internal sealed class ShaderProgramCache
                     TraceDeviceAddressFaults = SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.TraceEnabled,
                     ScratchDwords = info.ScratchDwords,
                     ComputeSystemRegisters = options.ComputeSystemRegisters,
+                    NggMode = options.NggMode,
+                    NggParamCount = options.NggParamCount,
                     LocalSizeX = Math.Max(info.ThreadsX, 1),
                     LocalSizeY = Math.Max(info.ThreadsY, 1),
                     LocalSizeZ = Math.Max(info.ThreadsZ, 1),
@@ -688,6 +707,26 @@ internal static class CompiledShaderDump
 
         Directory.CreateDirectory(directory);
         return Path.Combine(directory, $"{shaderAddress:X16}-{hash:X16}.{stage}");
+    }
+
+    // A program the compiler rejects keeps its decoded listing, so the failing instruction can be read.
+    public static void WriteRejected(string stage, ulong shaderAddress, ulong hash, Gen5ShaderProgram program, string? error)
+    {
+        if (!ShouldWrite(shaderAddress)) return;
+        var lines = new List<string>(program.Instructions.Count + 3)
+        {
+            $"address=0x{program.Address:X16}",
+            $"rejected: {error}",
+            "pc words opcode destinations <- sources control",
+        };
+        foreach (var instruction in program.Instructions)
+        {
+            lines.Add(
+                $"0x{instruction.Pc:X4} {string.Join('_', instruction.Words.Select(static word => $"{word:X8}"))} {instruction.Opcode} " +
+                $"{string.Join(',', instruction.Destinations)} <- {string.Join(',', instruction.Sources)} {instruction.Control}");
+        }
+
+        File.WriteAllLines($"{GetBasePath(stage, shaderAddress, hash)}.rejected.ir.txt", lines);
     }
 
     public static void Write(string stage, ulong shaderAddress, ulong hash, IGuestCompiledShader shader, Gen5ShaderProgram program)

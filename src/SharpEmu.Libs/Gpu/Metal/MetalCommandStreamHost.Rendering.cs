@@ -521,6 +521,7 @@ internal sealed partial class MetalCommandStreamHost : IRenderHost, IShaderPipel
         }
 
         stage.WriteDispatchThreadLimits(shaderData);
+        stage.WriteNggBuffers(shaderData);
         prepared.ShaderData = shaderData;
         if (RenderTrace.Enabled && RenderTrace.Pipeline())
         {
@@ -1136,6 +1137,13 @@ internal sealed partial class MetalCommandStreamHost : IRenderHost, IShaderPipel
         _ = image;
     }
 
+    // The Metal backend has no device-address buffers; emulated geometry stages are skipped.
+    ulong IRenderHost.CreateTransientDeviceBuffer(ReadOnlySpan<uint> contents, ulong byteSize) => 0;
+
+    void IRenderHost.ReleaseTransientDeviceBuffers()
+    {
+    }
+
     void IRenderHost.ResolveImage(ResourceSlotIdentifier source, uint sourceMip, uint sourceLayer, ResourceSlotIdentifier destination, uint destinationMip, uint destinationLayer)
     {
         _ = (sourceMip, sourceLayer, destinationMip, destinationLayer);
@@ -1148,6 +1156,8 @@ internal sealed partial class MetalCommandStreamHost : IRenderHost, IShaderPipel
     }
 
     bool IRenderHost.TryDispatchIndirect(ulong argumentsAddress) => false;
+
+    uint[]? IRenderHost.ReadIndirectDispatchArguments(ulong argumentsAddress, uint dwords) => null;
 
     void IRenderHost.CopyDepthStencilImage(ResourceSlotIdentifier source, ResourceSlotIdentifier destination, in SubresourceRange range, in Extent3D extent, ImageAspectFlags aspects)
     {

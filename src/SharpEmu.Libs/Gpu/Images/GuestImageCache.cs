@@ -216,6 +216,14 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
 
         image.LastAccessTick = _scheduler.CurrentTick;
         TouchImage(image);
+        DbgWriters.Log(request, image);
+        if (Rendering.FrameCommandLog.Active)
+        {
+            var d = request.Description;
+            Rendering.FrameCommandLog.Write(
+                $"  image {request.Role} 0x{d.Data.Address:X}+0x{d.Data.Size:X} {d.PixelFormat} {d.Type} {d.Extent.Width}x{d.Extent.Height}x{d.Extent.Depth} " +
+                $"layers={d.Resources.Layers} tile={d.TileMode} view={request.View.Type}{(image.IsGpuModified ? " gpu" : string.Empty)}");
+        }
         return result;
     }
 
@@ -475,5 +483,42 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         }
 
         return imageIdentifier;
+    }
+}
+
+internal static class DbgWriters
+{
+    private static readonly bool Enabled = Environment.GetEnvironmentVariable("SHARPEMU_DBG_WRITERS") == "1";
+    private static readonly HashSet<(ulong, Format, uint, uint, uint, ImageRole)> Seen = new();
+
+    public static void Log(in ImageRequest request, CachedImage image)
+    {
+        var r = request.Description;
+        if (!Enabled) return;
+        var key = (r.Data.Address, r.PixelFormat, r.Extent.Width, r.Extent.Height, r.Extent.Depth, request.Role);
+        lock (Seen) { if (!Seen.Add(key)) return; }
+        Console.Error.WriteLine(
+            $"[DBGWRITER] {request.Role} 0x{r.Data.Address:X}+0x{r.Data.Size:X} {r.PixelFormat} {r.Type} {r.Extent.Width}x{r.Extent.Height}x{r.Extent.Depth} " +
+            $"layers={r.Resources.Layers} tile={r.TileMode} view={request.View.Type}");
+    }
+
+    private static readonly HashSet<(ulong, ulong, uint)> SeenRejected = new();
+
+    public static void Rejected(SharpEmu.Libs.Gpu.GpuCommands.Registers.RegisterBanks banks, uint slot)
+    {
+        if (!Enabled) return;
+        var words = banks.Context.ColorTargets[slot];
+        if (words.BaseAddress == 0) return;
+        lock (SeenRejected) { if (!SeenRejected.Add((banks.Shader.Pixel.Address, words.BaseAddress, slot))) return; }
+        Console.Error.WriteLine($"[DBGWRITER] RejectedCB slot={slot} pixel=0x{banks.Shader.Pixel.Address:X} mask=0x{banks.Context.RenderTargetMask:X8} {words}");
+    }
+
+    private static readonly HashSet<(ulong, ulong)> SeenBuffer = new();
+
+    public static void GpuBufferWrite(ulong address, ulong size)
+    {
+        if (!Enabled || size < 0x1000) return;
+        lock (SeenBuffer) { if (SeenBuffer.Count > 4000 || !SeenBuffer.Add((address, size))) return; }
+        Console.Error.WriteLine($"[DBGWRITER] GpuBuffer 0x{address:X}+0x{size:X}");
     }
 }

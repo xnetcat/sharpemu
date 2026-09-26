@@ -59,6 +59,8 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
         return value;
     }
 
+    private const ulong HangReportNanoseconds = 10_000_000_000;
+
     public bool TryWaitTimeline(ulong tick, out string failure)
     {
         var semaphore = _timeline;
@@ -72,7 +74,17 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
         Result result;
         using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.GpuCompletionWait))
         {
-            result = _vk.WaitSemaphores(_device, &waitInfo, ulong.MaxValue);
+            // A tick that never completes is a GPU hang; say so once it has taken 10 seconds.
+            result = _vk.WaitSemaphores(_device, &waitInfo, HangReportNanoseconds);
+            if (result == Result.Timeout)
+            {
+                ulong completed = 0;
+                _vk.GetSemaphoreCounterValue(_device, _timeline, &completed);
+                Console.Error.WriteLine(
+                    $"[GPU][ERROR] GPU tick {tick} has not completed after {HangReportNanoseconds / 1_000_000_000}s (completed tick {completed}); the GPU may be hung.");
+                GpuWorkTrace.Report(completed + 1);
+                result = _vk.WaitSemaphores(_device, &waitInfo, ulong.MaxValue);
+            }
         }
         failure = result.ToString();
         return result == Result.Success;

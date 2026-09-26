@@ -202,7 +202,7 @@ public static partial class Gen5SpirvTranslator
                 _interfaces.Add(_runtimeBufferBiases);
             }
 
-            if (info.UsesDeviceAddresses)
+            if (info.UsesDeviceAddresses || request.NggMode != NggEmulationMode.None)
             {
                 _module.AddCapability(SpirvCapability.PhysicalStorageBufferAddresses);
                 _module.SetPhysicalStorageBuffer64MemoryModel();

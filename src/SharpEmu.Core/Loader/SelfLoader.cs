@@ -308,6 +308,7 @@ public sealed class SelfLoader : ISelfLoader
                 programHeaders,
                 imageBase,
                 totalImageSize);
+            GuestProbes.Install(patchableMemory, imageBase, totalImageSize);
         }
 
         Console.WriteLine($"[LOADER] ELF e_entry: 0x{elfHeader.EntryPoint:X16}");

@@ -56,6 +56,11 @@ public sealed partial class RenderExecutor
 
     private static void TraceDrawDisposition(RegisterBanks banks, in DrawCall draw, string reason)
     {
+        if (FrameCommandLog.Active)
+        {
+            FrameCommandLog.Write($"  disposition: {reason}");
+        }
+
         if (!RenderTrace.Enabled)
         {
             return;

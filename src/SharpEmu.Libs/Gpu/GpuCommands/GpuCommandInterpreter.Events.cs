@@ -196,9 +196,27 @@ public sealed partial class GpuCommandInterpreter
         return packet.Length - 1;
     }
 
-    internal uint PushMarkerPacket(in PacketContext packet, ReadOnlySpan<uint> payload) => packet.Length - 1;
+    internal uint PushMarkerPacket(in PacketContext packet, ReadOnlySpan<uint> payload)
+    {
+        if (Rendering.FrameCommandLog.Active)
+        {
+            var bytes = System.Runtime.InteropServices.MemoryMarshal.AsBytes(payload);
+            var end = bytes.IndexOf((byte)0);
+            Rendering.FrameCommandLog.Write($"Marker push \"{System.Text.Encoding.UTF8.GetString(end < 0 ? bytes : bytes[..end])}\"");
+        }
 
-    internal uint PopMarkerPacket(in PacketContext packet, ReadOnlySpan<uint> payload) => packet.Length - 1;
+        return packet.Length - 1;
+    }
+
+    internal uint PopMarkerPacket(in PacketContext packet, ReadOnlySpan<uint> payload)
+    {
+        if (Rendering.FrameCommandLog.Active)
+        {
+            Rendering.FrameCommandLog.Write("Marker pop");
+        }
+
+        return packet.Length - 1;
+    }
 
     internal uint FlipPacket(in PacketContext packet, ReadOnlySpan<uint> payload)
     {

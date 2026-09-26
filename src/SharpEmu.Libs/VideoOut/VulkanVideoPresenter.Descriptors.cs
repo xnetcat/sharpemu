@@ -239,6 +239,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             stage.WriteDispatchThreadLimits(shaderData);
+            stage.WriteNggBuffers(shaderData);
             prepared.ShaderData = shaderData;
             if (layout.Find(DescriptorBindingKind.GlobalDataShare) is not null)
             {
@@ -398,6 +399,13 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             memoryOffset = (uint)adjustment;
+            if (GpuWorkTrace.WatchedAddresses.FirstOrDefault(candidate => candidate >= address && candidate - address < size) is var watched && watched != 0)
+            {
+                Console.Error.WriteLine(
+                    $"[GPU][INFO] Watched 0x{watched:X} bound: buffer={slot} hash=0x{program.Hash:X16} handle=0x{buffer.Handle.Handle:X} cpu=0x{buffer.CpuAddress:X}+0x{buffer.Size:X} " +
+                    $"offset=0x{offset:X} range=0x{address:X}+0x{size:X} requested=0x{requested:X} written={resource.Written} formatted={resource.Formatted} id={bufferIdentifier.Index}");
+            }
+
             if (resource.Formatted && resource.Written)
             {
                 _imageCache.InvalidateMemoryFromGpu(address, size);
@@ -479,6 +487,11 @@ internal static unsafe partial class VulkanVideoPresenter
                 var size = ClampMappedSize(range.Base, range.Size);
                 if (range.Written)
                 {
+                    if (Gpu.Rendering.FrameCommandLog.Active)
+                    {
+                        Gpu.Rendering.FrameCommandLog.Write($"  written device range 0x{range.Base:X}+0x{size:X}");
+                    }
+
                     _ = _bufferCache.ObtainBuffer(range.Base, size, isWritten: true);
                 }
                 else

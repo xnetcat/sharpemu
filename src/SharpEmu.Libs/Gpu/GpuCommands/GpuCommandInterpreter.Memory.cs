@@ -108,6 +108,16 @@ public sealed partial class GpuCommandInterpreter
             throw _host.Fatal($"The DMA destination selector is not supported: selector=0x{destinationSelect:X2} destination=0x{destination:X16}.");
         }
 
+        if (Environment.GetEnvironmentVariable("SHARPEMU_DBG_WRITERS") == "1" && byteCount >= 0x1000)
+        {
+            Console.Error.WriteLine($"[DBGWRITER] Dma dst=0x{destination:X}+0x{byteCount:X} src={(sourceSelect == 2 ? "fill" : "0x" + sourceOrImmediate.ToString("X"))}");
+        }
+
+        if (Rendering.FrameCommandLog.Active)
+        {
+            Rendering.FrameCommandLog.Write($"Dma dst=0x{destination:X}+0x{byteCount:X} src={(sourceSelect == 2 ? "fill" : "0x" + sourceOrImmediate.ToString("X"))}");
+        }
+
         if (sourceSelect == 2)
         {
             _host.FillBuffer(destination, byteCount, (uint)sourceOrImmediate, destinationIsGds);

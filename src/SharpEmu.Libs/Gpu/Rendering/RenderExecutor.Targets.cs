@@ -33,6 +33,7 @@ public sealed partial class RenderExecutor
 
             if (ColorTargetResolver.Resolve(context, slot, DrawLayerOffset, ignoreTargetMask: false, out var resolvedSlot) is not { } resolution)
             {
+                DbgWriters.Rejected(banks, slot);
                 continue;
             }
 
@@ -51,6 +52,14 @@ public sealed partial class RenderExecutor
         }
 
         state.PixelActive = HasActivePixelShader(banks);
+        if (state.ColorCount == 0 && !state.Depth.HasTarget && !state.PixelActive &&
+            banks.Shader.Pixel.Address != 0 && PixelShaderWritesMemory(banks, ref state))
+        {
+            // A pixel shader without targets still runs for its image and buffer stores; UE bakes
+            // its color-grading volume this way.
+            state.PixelActive = true;
+        }
+
         if (state.ColorCount == 0 && !state.Depth.HasTarget && !state.PixelActive)
         {
             TraceDrawDisposition(banks, in draw, "no-framebuffer");
@@ -66,6 +75,15 @@ public sealed partial class RenderExecutor
         }
 
         return true;
+    }
+
+    private bool PixelShaderWritesMemory(RegisterBanks banks, ref DrawState state)
+    {
+        state.PixelActive = true;
+        ResolveShaderPrograms(banks, ref state);
+        state.PixelActive = false;
+        var stage = state.Programs.PixelInput.Stage;
+        return stage.Program is { } program && (WritesStorageImage(program) || HasBufferWrites(stage));
     }
 
     // Color control mode 3 resolves slot 0 into slot 1 instead of drawing; true consumes the draw.

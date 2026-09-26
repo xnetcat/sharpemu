@@ -342,7 +342,14 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
 
     public uint DispatchThreadLimitsDword => MemoryOffsetDword + (MemoryOffsetCount + 3) / 4;
 
-    public uint ShaderDataDwordCount => DispatchThreadLimitsDword + (UsesDispatchThreadLimits ? 3u : 0u);
+    // Emulated geometry stages read their input and output buffer device addresses here.
+    public bool UsesNggBuffers { get; init; }
+
+    public uint NggBuffersDword => DispatchThreadLimitsDword + (UsesDispatchThreadLimits ? 3u : 0u);
+
+    public uint ShaderDataDwordCount => NggBuffersDword + (UsesNggBuffers ? NggBufferDwordCount : 0u);
+
+    public const uint NggBufferDwordCount = 4;
 
     public bool UsesPushData => PushDataStartDword != PushData.NoStart;
 
@@ -548,12 +555,14 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
         bool usesFlattenedTable,
         bool usesShaderBase,
         uint pushDataStartDword = 0,
-        bool usesDispatchThreadLimits = false)
+        bool usesDispatchThreadLimits = false,
+        bool usesNggBuffers = false)
     {
         var shaderBaseDword = usesShaderBase ? (uint)userDataRegisters.Count : NoShaderBase;
         var memoryOffsetDword = (uint)userDataRegisters.Count + (usesShaderBase ? ShaderBaseDwordCount : 0);
         var memoryOffsetCount = (uint)info.Buffers.Count;
-        var shaderDataDwords = memoryOffsetDword + (memoryOffsetCount + 3) / 4 + (usesDispatchThreadLimits ? 3u : 0u);
+        var shaderDataDwords = memoryOffsetDword + (memoryOffsetCount + 3) / 4 + (usesDispatchThreadLimits ? 3u : 0u) +
+            (usesNggBuffers ? NggBufferDwordCount : 0u);
         var pushStart = PushData.StartFor(pushDataStartDword, shaderDataDwords);
         var descriptors = new List<DescriptorBinding>();
         if (info.Buffers.Count != 0)
@@ -631,6 +640,7 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
             MemoryOffsetDword = memoryOffsetDword,
             MemoryOffsetCount = memoryOffsetCount,
             UsesDispatchThreadLimits = usesDispatchThreadLimits,
+            UsesNggBuffers = usesNggBuffers,
             UserDataRegisters = userDataRegisters,
             Descriptors = descriptors,
         };
@@ -644,6 +654,7 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
         MemoryOffsetDword == other.MemoryOffsetDword &&
         MemoryOffsetCount == other.MemoryOffsetCount &&
         UsesDispatchThreadLimits == other.UsesDispatchThreadLimits &&
+        UsesNggBuffers == other.UsesNggBuffers &&
         UserDataRegisters.SequenceEqual(other.UserDataRegisters) &&
         Descriptors.Count == other.Descriptors.Count &&
         Descriptors.Zip(other.Descriptors).All(pair => pair.First.Kind == pair.Second.Kind && pair.First.Resources.SequenceEqual(pair.Second.Resources));
@@ -672,7 +683,7 @@ public static class BindingLayoutValidator
             throw new ResourcePlanException("Only a compute shader can use dispatch thread limits.");
         }
 
-        var expected = BindingLayout.Allocate(info, userDataRegisters, usesGlobalDataShare, usesFlattenedTable, usesShaderBase, layout.AllocationCursor, layout.UsesDispatchThreadLimits);
+        var expected = BindingLayout.Allocate(info, userDataRegisters, usesGlobalDataShare, usesFlattenedTable, usesShaderBase, layout.AllocationCursor, layout.UsesDispatchThreadLimits, layout.UsesNggBuffers);
         if (!expected.Equals(layout))
         {
             throw new ResourcePlanException(

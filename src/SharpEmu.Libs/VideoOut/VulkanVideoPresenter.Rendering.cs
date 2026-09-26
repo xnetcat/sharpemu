@@ -807,10 +807,45 @@ internal static unsafe partial class VulkanVideoPresenter
             CountDraw();
         }
 
+        public uint[]? ReadIndirectDispatchArguments(ulong argumentsAddress, uint dwords = 3)
+        {
+            var size = (ulong)dwords * sizeof(uint);
+            EndRendering();
+            using var readback = new GpuBuffer(_deviceInfo, _scheduler, GpuBufferUsage.Download, 0, BufferUsageFlags.TransferDstBit, Math.Max(size, 16));
+            var (buffer, offset) = _bufferCache.ObtainBuffer(argumentsAddress, size, false);
+            Console.Error.WriteLine(
+                $"[GPU][INFO] Reading back 0x{argumentsAddress:X}: handle=0x{buffer.Handle.Handle:X} cpu=0x{buffer.CpuAddress:X}+0x{buffer.Size:X} offset=0x{offset:X} {_bufferCache.DescribeDirtyState(argumentsAddress, size)} gpu_modified={_bufferCache.HasGpuDirtyBytes(argumentsAddress, size)}");
+            var command = BeginBatchedGuestCommands();
+            RecordMemoryBarrier(PipelineStageFlags.AllCommandsBit, PipelineStageFlags.TransferBit, AccessFlags.MemoryWriteBit, AccessFlags.TransferReadBit);
+            var copy = new BufferCopy { SrcOffset = offset, DstOffset = 0, Size = size };
+            _vk.CmdCopyBuffer(command, buffer.Handle, readback.Handle, 1, &copy);
+            FlushBatchedGuestCommands();
+            WaitForAllGuestSubmissions();
+            if (!readback.IsCoherent)
+            {
+                readback.Invalidate(0, readback.Size);
+            }
+
+            var mapped = readback.Mapped;
+            var words = new uint[dwords];
+            for (var index = 0; index < words.Length; index++)
+            {
+                words[index] = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(mapped[(index * sizeof(uint))..]);
+            }
+
+            return words;
+        }
+
         public bool TryDispatchIndirect(ulong argumentsAddress)
         {
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawRecording);
+            var dirtyState = GpuWorkTrace.Enabled ? _bufferCache.DescribeDirtyState(argumentsAddress, 3u * sizeof(uint)) : null;
             var (buffer, offset) = _bufferCache.ObtainBuffer(argumentsAddress, 3u * sizeof(uint), false);
+            if (dirtyState is not null)
+            {
+                GpuWorkTrace.Note($"indirect arguments 0x{argumentsAddress:X} {dirtyState} source={(ReferenceEquals(buffer, _bufferCache.GetUtilityBuffer(GpuBufferUsage.Stream)) ? "stream-upload" : "cached")}");
+            }
+
             var command = BeginBatchedGuestCommands();
             var barrier = new BufferMemoryBarrier2
             {
@@ -906,6 +941,56 @@ internal static unsafe partial class VulkanVideoPresenter
         }
 
         public void MarkGpuWritten(ResourceSlotIdentifier image) => _imageCache.MarkGpuWritten(image);
+
+        private int _transientBufferDumps;
+        private readonly List<GpuBuffer> _transientBuffers = new();
+
+        public ulong CreateTransientDeviceBuffer(ReadOnlySpan<uint> contents, ulong byteSize)
+        {
+            byteSize = Math.Max(byteSize, (ulong)contents.Length * sizeof(uint));
+            var buffer = new GpuBuffer(
+                _deviceInfo, _scheduler, GpuBufferUsage.Upload, 0,
+                BufferUsageFlags.StorageBufferBit | BufferUsageFlags.ShaderDeviceAddressBit, Math.Max(byteSize, 16));
+            var mapped = buffer.Mapped;
+            mapped.Clear();
+            System.Runtime.InteropServices.MemoryMarshal.AsBytes(contents).CopyTo(mapped);
+            if (!buffer.IsCoherent)
+            {
+                buffer.Flush(0, buffer.Size);
+            }
+
+            _transientBuffers.Add(buffer);
+            return buffer.DeviceAddress;
+        }
+
+        public void ReleaseTransientDeviceBuffers()
+        {
+            if (_transientBuffers.Count != 0 && Environment.GetEnvironmentVariable("SHARPEMU_LOG_GEOMETRY_RESOURCES") == "1")
+            {
+                Console.Error.WriteLine($"[GPU][INFO] Transient buffers x{_transientBuffers.Count} retire with tick {_scheduler.CurrentTick}");
+            }
+
+            var dumpDirectory = Environment.GetEnvironmentVariable("SHARPEMU_TRANSIENT_BUFFER_DUMP_DIR");
+            foreach (var buffer in _transientBuffers)
+            {
+                if (dumpDirectory is not null && Interlocked.Increment(ref _transientBufferDumps) <= 64)
+                {
+                    var path = Path.Combine(dumpDirectory, $"transient-{_transientBufferDumps:D3}-{buffer.Size}.bin");
+                    _scheduler.QueueCompletionAction(() =>
+                    {
+                        Directory.CreateDirectory(dumpDirectory);
+                        File.WriteAllBytes(path, buffer.Mapped.ToArray());
+                        buffer.Dispose();
+                    });
+                }
+                else
+                {
+                    _scheduler.QueueCompletionAction(buffer.Dispose);
+                }
+            }
+
+            _transientBuffers.Clear();
+        }
 
         public void ResolveImage(ResourceSlotIdentifier source, uint sourceMip, uint sourceLayer, ResourceSlotIdentifier destination, uint destinationMip, uint destinationLayer)
         {

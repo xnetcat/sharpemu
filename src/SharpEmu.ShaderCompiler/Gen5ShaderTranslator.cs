@@ -19,6 +19,17 @@ public static partial class Gen5ShaderTranslator
     private const uint MaximumDeclaredShaderSizeBytes = 1024 * 1024;
     private static readonly ConditionalWeakTable<object, FusedProgramRegistry> _fusedProgramsByMemory = new();
 
+    // Wrappers around one guest memory share its fused registrations.
+    private static object CanonicalMemory(object memory)
+    {
+        while (memory is ICpuMemoryWrapper wrapper)
+        {
+            memory = wrapper.Inner;
+        }
+
+        return memory;
+    }
+
     private sealed class FusedProgramRegistry
     {
         public object Gate { get; } = new();
@@ -49,7 +60,7 @@ public static partial class Gen5ShaderTranslator
             return;
         }
 
-        var registry = _fusedProgramsByMemory.GetValue(ctx.Memory, static _ => new FusedProgramRegistry());
+        var registry = _fusedProgramsByMemory.GetValue(CanonicalMemory(ctx.Memory), static _ => new FusedProgramRegistry());
         lock (registry.Gate)
         {
             registry.FusedPrograms[entryAddress] = new FusedShaderParts(
@@ -66,7 +77,7 @@ public static partial class Gen5ShaderTranslator
         out ulong continuationAddress,
         out ulong continuationHeaderAddress)
     {
-        var registry = _fusedProgramsByMemory.GetValue(ctx.Memory, static _ => new FusedProgramRegistry());
+        var registry = _fusedProgramsByMemory.GetValue(CanonicalMemory(ctx.Memory), static _ => new FusedProgramRegistry());
         FusedShaderParts? parts;
         lock (registry.Gate)
         {
@@ -104,7 +115,7 @@ public static partial class Gen5ShaderTranslator
         out string error)
     {
         ValidateDppControlVectors();
-        var registry = _fusedProgramsByMemory.GetValue(ctx.Memory, static _ => new FusedProgramRegistry());
+        var registry = _fusedProgramsByMemory.GetValue(CanonicalMemory(ctx.Memory), static _ => new FusedProgramRegistry());
         FusedShaderParts? fusedParts;
         lock (registry.Gate)
         {
@@ -151,9 +162,11 @@ public static partial class Gen5ShaderTranslator
             return false;
         }
 
-        if (parts.ContinuationAddress <= entryAddress ||
-            parts.ContinuationAddress - entryAddress > uint.MaxValue ||
-            ((parts.ContinuationAddress - entryAddress) & (sizeof(uint) - 1)) != 0)
+        // Halves uploaded apart are joined after the entry segment: their branches are relative.
+        var adjacent = parts.ContinuationAddress > entryAddress &&
+            parts.ContinuationAddress - entryAddress <= uint.MaxValue &&
+            ((parts.ContinuationAddress - entryAddress) & (sizeof(uint) - 1)) == 0;
+        if (!adjacent && (parts.ContinuationAddress & (sizeof(uint) - 1)) != 0)
         {
             error = $"invalid-fused-layout entry=0x{entryAddress:X} " +
                 $"continuation=0x{parts.ContinuationAddress:X}";
@@ -193,7 +206,9 @@ public static partial class Gen5ShaderTranslator
             return false;
         }
 
-        var continuationPc = checked((uint)(parts.ContinuationAddress - entryAddress));
+        var continuationPc = adjacent
+            ? checked((uint)(parts.ContinuationAddress - entryAddress))
+            : (entrySize + 0xFFu) & ~0xFFu;
         var instructions = new List<Gen5ShaderInstruction>(
             entryProgram.Instructions.Count + continuationProgram.Instructions.Count);
         instructions.AddRange(entryProgram.Instructions.Take(entryProgram.Instructions.Count - 1));

@@ -31,6 +31,7 @@ public sealed partial class GpuCommandInterpreter
             instanceCount = InstanceCount;
         }
 
+        LogGeometryStageRegisters();
         _host.DrawIndexed(SubmitId, new DrawIndexedArguments(packetAddress, opcode, indexCount, indexAddress, IndexTypeAndSize, instanceCount, baseVertex, firstInstance, offsetSource));
     }
 
@@ -47,6 +48,7 @@ public sealed partial class GpuCommandInterpreter
             instanceCount = InstanceCount;
         }
 
+        LogGeometryStageRegisters();
         _host.DrawAuto(SubmitId, new DrawAutoArguments(packetAddress, opcode, vertexCount, instanceCount, firstVertex, firstInstance, offsetSource));
     }
 
@@ -346,5 +348,23 @@ public sealed partial class GpuCommandInterpreter
         {
             throw _host.Fatal($"The packet header is not supported: header=0x{packet.Header:X8} expected=0x{header:X8} address=0x{packet.PacketAddress:X16}.");
         }
+    }
+
+    private static readonly bool LogGeometryRegisters = Environment.GetEnvironmentVariable("SHARPEMU_LOG_DROPPED_GEOMETRY") == "1";
+    private readonly HashSet<ulong> _loggedGeometryRegisters = new();
+
+    // Diagnostic: the raw geometry-stage shader registers of the first draw of each export program.
+    private void LogGeometryStageRegisters()
+    {
+        if (!LogGeometryRegisters || TypedRegisters.Context.ShaderStages == 0x02002000 ||
+            !_loggedGeometryRegisters.Add(TypedRegisters.Shader.Vertex.ExportAddress))
+        {
+            return;
+        }
+
+        var values = Registers.Shader.Where(static entry => entry.Key is >= 0x80 and < 0xD0)
+            .OrderBy(static entry => entry.Key)
+            .Select(static entry => $"{entry.Key:X3}={entry.Value:X8}");
+        Console.Error.WriteLine($"[GPU][INFO] Geometry-stage SH registers stages=0x{TypedRegisters.Context.ShaderStages:X8}: {string.Join(' ', values)}");
     }
 }

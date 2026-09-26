@@ -16,6 +16,11 @@ internal static class DroppedWorkLog
 
     public static void Draw(string reason, RegisterBanks banks)
     {
+        if (FrameCommandLog.Active)
+        {
+            FrameCommandLog.Write($"  dropped: {reason}");
+        }
+
         var shader = banks.Shader;
         if (!TryClaim(reason, shader.Vertex.ExportAddress ^ (shader.Pixel.Address << 1)))
         {
@@ -34,6 +39,11 @@ internal static class DroppedWorkLog
 
     public static void Dispatch(string reason, ulong shaderAddress, uint groupsX, uint groupsY, uint groupsZ, uint initiator)
     {
+        if (FrameCommandLog.Active)
+        {
+            FrameCommandLog.Write($"  dropped: {reason}");
+        }
+
         if (!TryClaim(reason, shaderAddress))
         {
             return;
@@ -57,6 +67,26 @@ internal static class DroppedWorkLog
         if (skip && TryClaim("predication", address))
         {
             Console.Error.WriteLine($"[GPU][WARN] Skipped predicated packets: address=0x{address:X16} value=0x{value:X16} condition={condition}");
+        }
+    }
+
+    // A branch that skips its then-buffer drops every pass inside it; the compare value is read
+    // when the packet is parsed, so a flag the GPU writes later is seen as its old value.
+    public static void Branch(
+        ulong packet, ulong compareAddress, ulong value, ulong reference, ulong mask, uint function, uint mode,
+        bool takeThen, uint thenDwords, uint elseDwords)
+    {
+        var line = $"branch packet=0x{packet:X} compare=0x{compareAddress:X} value=0x{value:X} reference=0x{reference:X} " +
+            $"mask=0x{mask:X} function={function} mode={mode} took={(takeThen ? "then" : mode == 2 ? "else" : "none")} " +
+            $"then={thenDwords} else={elseDwords}";
+        if (FrameCommandLog.Active)
+        {
+            FrameCommandLog.Write(line);
+        }
+
+        if (!takeThen && TryClaim("branch", packet))
+        {
+            Console.Error.WriteLine($"[GPU][WARN] Skipped command block: {line}");
         }
     }
 

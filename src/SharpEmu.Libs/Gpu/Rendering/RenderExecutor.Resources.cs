@@ -271,6 +271,13 @@ public sealed partial class RenderExecutor
             SetDrawDebugPhase(submitId, in draw, 0x500);
         }
 
+        if (GpuWorkTrace.Enabled)
+        {
+            GpuWorkTrace.Note(
+                $"draw vs=0x{vertexInput.Stage.Program?.Hash ?? 0:X16}@0x{banks.Shader.Vertex.ExportAddress:X} " +
+                $"ps=0x{(state.PixelActive ? pixelInput.Stage.Program?.Hash ?? 0 : 0):X16}@0x{banks.Shader.Pixel.Address:X} count={draw.Count}x{draw.InstanceCount}");
+        }
+
         EmitDraw(banks.UserConfig, vertexInput, in draw, in emission);
         if (setAutoDebug)
         {

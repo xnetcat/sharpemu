@@ -241,6 +241,10 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         return (buffer, buffer.Offset(guestAddress));
     }
 
+    // Diagnostic: the CPU and GPU dirty state of a range.
+    public string DescribeDirtyState(ulong guestAddress, ulong size) =>
+        $"gpu_dirty={_tracker.HasGpuDirtyPages(guestAddress, size)} cpu_dirty={_tracker.HasCpuDirtyPages(guestAddress, size)}";
+
     public (GpuBuffer Buffer, ulong Offset) ObtainBufferForImage(ulong guestAddress, ulong size)
     {
         if (!IsValidRange(guestAddress, size))

@@ -1033,6 +1033,10 @@ public static partial class Gen5SpirvTranslator
             {
                 StoreV(5, Load(_uintType, _vertexIndexInput), guardWithExec: false);
                 StoreV(8, Load(_uintType, _instanceIndexInput), guardWithExec: false);
+                if (_request.NggMode == NggEmulationMode.Replay)
+                {
+                    EmitNggReplayInitialState(Load(_uintType, _vertexIndexInput));
+                }
 
                 // Give every declared param output a defined starting value.
                 // Outputs the program actually exports overwrite this; the
@@ -1114,6 +1118,17 @@ public static partial class Gen5SpirvTranslator
                 }
 
                 Store(_programActive, invocationInBounds);
+
+                if (_request.NggMode == NggEmulationMode.Compute)
+                {
+                    EmitNggComputeInitialState(
+                        _module.AddInstruction(SpirvOp.CompositeExtract, _uintType, localId, 0u),
+                        _module.AddInstruction(SpirvOp.CompositeExtract, _uintType, workGroupId, 0u));
+                }
+                else if (_request.NggMode == NggEmulationMode.Debug)
+                {
+                    EmitComputeDebugInitialState(localId, workGroupId);
+                }
 
                 if (_request.ComputeSystemRegisters is { } registers)
                 {
@@ -1268,6 +1283,11 @@ public static partial class Gen5SpirvTranslator
                 {
                     error = $"pc=0x{instruction.Pc:X} {instruction.Opcode}: {error}";
                     return false;
+                }
+
+                if (_request.NggMode is NggEmulationMode.Compute or NggEmulationMode.Debug)
+                {
+                    EmitNggDebugCapture(instruction.Pc);
                 }
 
                 CapturePixelVgprs(instruction);
@@ -5234,6 +5254,11 @@ public static partial class Gen5SpirvTranslator
             {
                 error = "missing export sources";
                 return false;
+            }
+
+            if (_request.NggMode == NggEmulationMode.Compute)
+            {
+                return EmitNggExportStore(instruction, export);
             }
 
             if (_stage == Gen5SpirvStage.Pixel)

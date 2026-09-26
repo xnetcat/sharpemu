@@ -60,7 +60,12 @@ public interface IShaderPipelineProvider
         ShaderInterfaceRegisters shaderInterface,
         ContextRegisters context,
         ReadOnlySpan<ColorComponentMap> targetExportMapping,
-        bool pixelActive);
+        bool pixelActive,
+        uint? nggReplayParamCount = null);
+
+    // The merged export and geometry program of the bound vertex stage as an emulating compute
+    // program, and the parameter exports its vertex records carry.
+    ComputeProgram GetNggComputeProgram(VertexStageRegisters vertex, out uint paramCount);
 
     PipelineHandle CreateGraphicsPipeline(
         ReadOnlySpan<ColorTargetState> colors,
