@@ -259,6 +259,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         if (hasData)
         {
             RefreshFromGuest(imageIdentifier, request);
+            MergeMipTailBlock(image);
         }
 
         switch (request.Role)
@@ -376,6 +377,69 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         }
 
         return image.GetOrCreateView(request.View);
+    }
+
+    // GFX10 packs the mips smaller than half a swizzle block into one block at the start of the chain.
+    // A title can write that block through a single-level view the size of the block (Unity's
+    // screen-space reflection blur writes mips 3 and up that way), which the cache keeps as its own
+    // image; copy each tail mip out of it before the chain is read.
+    private void MergeMipTailBlock(CachedImage chain)
+    {
+        ref var description = ref chain.Description;
+        if (description.Resources.Levels <= 1 || description.IsBlock || description.IsDepth || description.Samples > 1 ||
+            description.Resources.Layers != 1 || description.IsVolume ||
+            !Agc.GnmTiling.TryGetBlockElementDimensions((uint)description.TileMode, (int)description.BytesPerBlock, out var blockWidth, out var blockHeight))
+        {
+            return;
+        }
+
+        foreach (var candidateIdentifier in FindImagesInRange(description.Data.Address, 1, pageOverlap: false))
+        {
+            var block = _slots[candidateIdentifier];
+            ref var blockDescription = ref block.Description;
+            if (ReferenceEquals(block, chain) || blockDescription.Data.Address != description.Data.Address ||
+                blockDescription.Resources.Levels != 1 || blockDescription.Resources.Layers != 1 ||
+                blockDescription.Extent.Width != (uint)blockWidth || blockDescription.Extent.Height != (uint)blockHeight ||
+                blockDescription.BytesPerBlock != description.BytesPerBlock || blockDescription.TileMode != description.TileMode ||
+                !block.IsGpuModified || !block.Backing.Exists || block.GpuWriteSequence <= chain.MergedTailSequence)
+            {
+                continue;
+            }
+
+            if (!Agc.GnmTiling.TryGetMipChainPlacement(
+                    (uint)description.TileMode,
+                    (int)description.Extent.Width,
+                    (int)description.Extent.Height,
+                    (int)description.BytesPerBlock,
+                    description.Resources.Levels,
+                    out var placements,
+                    out _))
+            {
+                return;
+            }
+
+            for (var mip = 0; mip < placements.Length && mip < chain.Backing.MipLevels; mip++)
+            {
+                var placement = placements[mip];
+                if (!placement.InMipTail ||
+                    placement.TailElementX + placement.ElementsWide > blockWidth ||
+                    placement.TailElementY + placement.ElementsHigh > blockHeight)
+                {
+                    continue;
+                }
+
+                chain.CopyRegionFrom(
+                    block,
+                    (uint)placement.TailElementX,
+                    (uint)placement.TailElementY,
+                    (uint)mip,
+                    (uint)placement.ElementsWide,
+                    (uint)placement.ElementsHigh);
+            }
+
+            chain.MergedTailSequence = block.GpuWriteSequence;
+            return;
+        }
     }
 
     public void MarkGpuWritten(ResourceSlotIdentifier imageIdentifier)
