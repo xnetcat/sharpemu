@@ -4,6 +4,7 @@
 namespace SharpEmu.Libs.VideoOut;
 
 using SharpEmu.HLE.GpuMemory;
+using System.Diagnostics;
 using SharpEmu.Libs.Gpu;
 using SharpEmu.Libs.Gpu.Images;
 using SharpEmu.Libs.Gpu.Pipelines;
@@ -54,6 +55,8 @@ internal static unsafe partial class VulkanVideoPresenter
         }
 
         private readonly Dictionary<ulong, ShaderModule> _shaderModules = new();
+        private readonly Dictionary<ulong, int> _shaderModuleSpirvBytes = new();
+        private long _pipelineCreationMilliseconds;
         private KhrPushDescriptor _pushDescriptorApi = null!;
         private uint _maxPushDescriptors;
         private SampleCountFlags _noAttachmentSampleCounts;
@@ -121,7 +124,29 @@ internal static unsafe partial class VulkanVideoPresenter
             var module = CreateShaderModule(shader.Payload);
             SetDebugName(ObjectType.ShaderModule, module.Handle, $"SharpEmu {stage} 0x{hash:X16}");
             _shaderModules.Add(programId, module);
+            _shaderModuleSpirvBytes[module.Handle] = shader.Payload.Length;
             return module.Handle;
+        }
+
+        // The Metal shader compiler can spend seconds on one translated program and the
+        // command stream cannot advance while it does, so a slow creation is reported with
+        // the SPIR-V size that produced it.
+        private const long SlowPipelineCreationMilliseconds = 250;
+
+        private int SpirvBytesOf(ulong moduleHandle) =>
+            _shaderModuleSpirvBytes.TryGetValue(moduleHandle, out var bytes) ? bytes : -1;
+
+        private void ReportPipelineCreation(long elapsedMilliseconds, string kind, string stages, string spirv)
+        {
+            Interlocked.Add(ref _pipelineCreationMilliseconds, elapsedMilliseconds);
+            if (elapsedMilliseconds < SlowPipelineCreationMilliseconds)
+            {
+                return;
+            }
+
+            Console.Error.WriteLine(
+                $"[GPU][WARN] Slow pipeline creation: kind={kind} {stages} spirv_bytes={spirv} " +
+                $"ms={elapsedMilliseconds} total_s={Interlocked.Read(ref _pipelineCreationMilliseconds) / 1000.0:F1}");
         }
 
         private void CreateBarycentricPipeline()
@@ -714,7 +739,17 @@ internal static unsafe partial class VulkanVideoPresenter
                         PDynamicState = &dynamicState,
                         Layout = layout,
                     };
+                    var graphicsStart = Stopwatch.GetTimestamp();
                     Check(_vk.CreateGraphicsPipelines(_device, _pipelineCache, 1, &pipelineInfo, null, out var pipeline), "vkCreateGraphicsPipelines(rendering)");
+                    ReportPipelineCreation(
+                        (long)Stopwatch.GetElapsedTime(graphicsStart).TotalMilliseconds,
+                        "graphics",
+                        $"vs=0x{description.VertexStage.Hash:X16} ps=0x{description.PixelStage?.Hash ?? 0:X16}",
+                        string.Join(
+                            '/',
+                            Enumerable
+                                .Range(0, (int)stageCount)
+                                .Select(index => SpirvBytesOf(shaderStages[index].Module.Handle))));
                     MarkPipelineCacheDirty();
                     Interlocked.Increment(ref _perfPipelineCreations);
                     SetDebugName(
@@ -760,7 +795,13 @@ internal static unsafe partial class VulkanVideoPresenter
                     Stage = stageInfo,
                     Layout = layout,
                 };
+                var computeStart = Stopwatch.GetTimestamp();
                 Check(_vk.CreateComputePipelines(_device, _pipelineCache, 1, &pipelineInfo, null, out pipeline), "vkCreateComputePipelines(rendering)");
+                ReportPipelineCreation(
+                    (long)Stopwatch.GetElapsedTime(computeStart).TotalMilliseconds,
+                    "compute",
+                    $"cs=0x{description.Stage.Hash:X16}",
+                    SpirvBytesOf(computeModule.Handle).ToString());
                 MarkPipelineCacheDirty();
                 Interlocked.Increment(ref _perfPipelineCreations);
                 SetDebugName(ObjectType.Pipeline, pipeline.Handle, $"SharpEmu compute cs=0x{description.Stage.Hash:X16}");
