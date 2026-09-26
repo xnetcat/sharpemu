@@ -589,7 +589,9 @@ internal static unsafe partial class VulkanVideoPresenter
             };
             _vk.GetPhysicalDeviceProperties2(_physicalDevice, &properties2);
             SetNativeSubgroupCapabilities(subgroup.SubgroupSize, subgroup.SupportedStages);
-            _maxPushDescriptors = pushDescriptorProperties.MaxPushDescriptors;
+            // MoltenVK reports a zero OpArrayLength for storage buffers bound through push
+            // descriptors, which turns every bounds-checked load into zero and drops every store.
+            _maxPushDescriptors = IsDeviceExtensionAvailable(PortabilitySubsetExtensionName) ? 0 : pushDescriptorProperties.MaxPushDescriptors;
             _noAttachmentSampleCounts = properties.Limits.FramebufferNoAttachmentsSampleCounts;
             _maxComputeWorkGroupCountX = properties.Limits.MaxComputeWorkGroupCount[0];
             _maxComputeWorkGroupCountY = properties.Limits.MaxComputeWorkGroupCount[1];
