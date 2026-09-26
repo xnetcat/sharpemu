@@ -566,8 +566,16 @@ public static partial class Gen5SpirvTranslator
                             GetFloatSource(instruction, 1),
                             GetFloatSource(instruction, 2)));
                     break;
-                // D.f16 = S0.f16 * S1.f16 + D.f16
+                // D.f16 = S0.f16 * S1.f16 + D.f16. The accumulator is the same
+                // destination half op_sel[3] selects for the result.
                 case "VFmacF16":
+                {
+                    var accumulatorBits = LoadV(destination);
+                    if (((instruction.Control as Gen5Vop3Control)?.OperandSelect & 8) != 0)
+                    {
+                        accumulatorBits = ShiftRightLogical(accumulatorBits, UInt(16));
+                    }
+
                     result = EmitFloat16Result(
                         instruction,
                         destination,
@@ -578,8 +586,9 @@ public static partial class Gen5SpirvTranslator
                             GetFloat16Source(instruction, 1),
                             Bitcast(
                                 _floatType,
-                                EmitHalfToFloat(BitwiseAnd(LoadV(destination), UInt(0xFFFF))))));
+                                EmitHalfToFloat(BitwiseAnd(accumulatorBits, UInt(0xFFFF))))));
                     break;
+                }
                 case "VFmaF16":
                     result = EmitFloat16Result(
                         instruction,
