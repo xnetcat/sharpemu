@@ -5760,7 +5760,12 @@ public static partial class KernelMemoryCompatExports
         return TryWriteCompat(ctx, address, bytes);
     }
 
+    // One transaction for the whole batch: every entry would otherwise hand the GPU worker
+    // its own mapping change and wait for the GPU to drain before it could run.
     private static int KernelBatchMapCore(CpuContext ctx, int flags)
+        => RunMappingTransaction(() => KernelBatchMapTransaction(ctx, flags));
+
+    private static int KernelBatchMapTransaction(CpuContext ctx, int flags)
     {
         var entriesAddress = ctx[CpuRegister.Rdi];
         var entryCount = unchecked((int)ctx[CpuRegister.Rsi]);
