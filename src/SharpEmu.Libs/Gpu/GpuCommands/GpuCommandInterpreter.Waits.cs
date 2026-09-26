@@ -42,16 +42,15 @@ public sealed partial class GpuCommandInterpreter
         }
     }
 
+    // The wait bit is PredicationZPassWaitOp: 0 (kWaitForQueryResults) stalls the command
+    // processor until the results arrive, 1 (kDoNotPredicateIfQueryResultsNotReady) never
+    // stalls and leaves the tagged packets unpredicated while the results are outstanding.
     internal void SetPredication(uint condition, uint operation, uint waitOperation, ulong address)
     {
-        if (waitOperation != 0)
-        {
-            _host.FlushAndWait();
-        }
-
         switch (operation)
         {
             case 0:
+                // Clearing predication reads no memory, so no GPU result can be outstanding.
                 PredicateSkip = false;
                 break;
             case 3:
@@ -61,6 +60,16 @@ public sealed partial class GpuCommandInterpreter
                     throw _host.Fatal("The predication address is zero.");
                 }
 
+                if (waitOperation != 0)
+                {
+                    // The results are outstanding while work is queued behind this packet, and
+                    // the game asked for the packets to run unpredicated in that case.
+                    PredicateSkip = false;
+                    DroppedWorkLog.Predication(address, 0, condition, false);
+                    break;
+                }
+
+                _host.FlushAndWait();
                 var value = ReadQword(address);
                 PredicateSkip = condition switch
                 {

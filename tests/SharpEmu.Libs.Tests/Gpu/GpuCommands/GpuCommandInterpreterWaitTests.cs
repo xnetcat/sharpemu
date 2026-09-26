@@ -169,14 +169,24 @@ public sealed class GpuCommandInterpreterWaitTests
         var skipped = CreateInstanceCountPacket(2);
         skipped[0] |= 1u;
 
-        var newLayout = StreamRunner.Packet(PacketOpcode.SetPredication, (3u << 16) | (1u << 8) | (1u << 12), StreamRunner.Low(Label), StreamRunner.High(Label));
-        runner.Run(newLayout, skipped);
+        // kWaitForQueryResults (0) drains the GPU and predicates on the label.
+        var waitingLayout = StreamRunner.Packet(PacketOpcode.SetPredication, (3u << 16) | (1u << 8), StreamRunner.Low(Label), StreamRunner.High(Label));
+        runner.Run(waitingLayout, skipped);
         Assert.Equal(new[] { "flush_and_wait" }, runner.Host.Calls);
         Assert.True(runner.Interpreter.PredicateSkip);
         Assert.Equal(1u, runner.Interpreter.InstanceCount);
 
+        // kDoNotPredicateIfQueryResultsNotReady (1) never drains and never skips.
+        runner.Host.Calls.Clear();
+        var nonWaitingLayout = StreamRunner.Packet(PacketOpcode.SetPredication, (3u << 16) | (1u << 8) | (1u << 12), StreamRunner.Low(Label), StreamRunner.High(Label));
+        runner.Run(nonWaitingLayout, skipped);
+        Assert.Empty(runner.Host.Calls);
+        Assert.False(runner.Interpreter.PredicateSkip);
+        Assert.Equal(2u, runner.Interpreter.InstanceCount);
+
         var oldLayout = StreamRunner.Packet(PacketOpcode.SetPredication, StreamRunner.Low(Label), StreamRunner.High(Label) | (3u << 16));
         runner.Run(oldLayout, skipped);
+        Assert.Equal(new[] { "flush_and_wait" }, runner.Host.Calls);
         Assert.False(runner.Interpreter.PredicateSkip);
         Assert.Equal(2u, runner.Interpreter.InstanceCount);
 
