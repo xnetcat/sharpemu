@@ -1134,8 +1134,10 @@ public sealed partial class ScalarValueGraph
                 case "VMovB32":
                     return Source(0);
                 case "VAddI32":
+                case "VAddNcI32":
                     return Binary(ScalarOperation.IAdd32, Source(0), Source(1));
                 case "VSubI32":
+                case "VSubNcI32":
                     return Binary(ScalarOperation.ISub32, Source(0), Source(1));
                 case "VSubrevI32":
                     return Binary(ScalarOperation.ISub32, Source(1), Source(0));

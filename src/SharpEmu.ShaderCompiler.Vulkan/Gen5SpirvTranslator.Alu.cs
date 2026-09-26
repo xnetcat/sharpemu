@@ -996,20 +996,291 @@ public static partial class Gen5SpirvTranslator
                     break;
                 case "VAddI32":
                 case "VAddU32":
+                case "VAddNcI32":
                     result = EmitIntegerBinary(instruction, SpirvOp.IAdd);
                     break;
                 case "VAddNcU16":
+                case "VAddNcI16":
                     result = EmitInteger16Binary(
                         instruction,
                         destination,
                         SpirvOp.IAdd);
                     break;
+                case "VSubNcU16":
+                case "VSubNcI16":
+                    result = EmitInteger16Binary(
+                        instruction,
+                        destination,
+                        SpirvOp.ISub);
+                    break;
+                case "VMulLoU16":
+                    result = EmitInteger16Binary(
+                        instruction,
+                        destination,
+                        SpirvOp.IMul);
+                    break;
+                // 16-bit shifts take their count from the low 4 bits of src0 and
+                // the value from src1 (RDNA2 ISA opcodes 775/776/788).
+                case "VLshlrevB16":
+                case "VLshrrevB16":
+                case "VAshrrevI16":
+                {
+                    var shift = BitwiseAnd(
+                        GetUnsignedInteger16Source(instruction, 0),
+                        UInt(15));
+                    var value = instruction.Opcode == "VAshrrevI16"
+                        ? Bitcast(_uintType, GetSignedInteger16Source(instruction, 1))
+                        : GetUnsignedInteger16Source(instruction, 1);
+                    result = EmitInteger16Result(
+                        instruction,
+                        destination,
+                        instruction.Opcode switch
+                        {
+                            "VLshlrevB16" => ShiftLeftLogical(value, shift),
+                            "VLshrrevB16" => ShiftRightLogical(value, shift),
+                            _ => Bitcast(
+                                _uintType,
+                                _module.AddInstruction(
+                                    SpirvOp.ShiftRightArithmetic,
+                                    _intType,
+                                    Bitcast(_intType, value),
+                                    shift)),
+                        });
+                    break;
+                }
+                case "VMinU16":
+                case "VMaxU16":
+                    result = EmitInteger16Result(
+                        instruction,
+                        destination,
+                        Ext(
+                            instruction.Opcode == "VMinU16" ? 38u : 41u,
+                            _uintType,
+                            GetUnsignedInteger16Source(instruction, 0),
+                            GetUnsignedInteger16Source(instruction, 1)));
+                    break;
+                case "VMinI16":
+                case "VMaxI16":
+                    result = EmitInteger16Result(
+                        instruction,
+                        destination,
+                        Bitcast(
+                            _uintType,
+                            Ext(
+                                instruction.Opcode == "VMinI16" ? 39u : 42u,
+                                _intType,
+                                GetSignedInteger16Source(instruction, 0),
+                                GetSignedInteger16Source(instruction, 1))));
+                    break;
+                case "VMin3U16":
+                case "VMax3U16":
+                case "VMed3U16":
+                    result = EmitInteger16Result(
+                        instruction,
+                        destination,
+                        EmitIntegerTriple(
+                            instruction.Opcode[..4],
+                            _uintType,
+                            38,
+                            41,
+                            GetUnsignedInteger16Source(instruction, 0),
+                            GetUnsignedInteger16Source(instruction, 1),
+                            GetUnsignedInteger16Source(instruction, 2)));
+                    break;
+                case "VMin3I16":
+                case "VMax3I16":
+                case "VMed3I16":
+                    result = EmitInteger16Result(
+                        instruction,
+                        destination,
+                        Bitcast(
+                            _uintType,
+                            EmitIntegerTriple(
+                                instruction.Opcode[..4],
+                                _intType,
+                                39,
+                                42,
+                                GetSignedInteger16Source(instruction, 0),
+                                GetSignedInteger16Source(instruction, 1),
+                                GetSignedInteger16Source(instruction, 2))));
+                    break;
+                case "VMin3F16":
+                case "VMax3F16":
+                case "VMed3F16":
+                {
+                    var first = GetFloat16Source(instruction, 0);
+                    var second = GetFloat16Source(instruction, 1);
+                    var third = GetFloat16Source(instruction, 2);
+                    result = EmitFloat16Result(
+                        instruction,
+                        destination,
+                        instruction.Opcode[..4] switch
+                        {
+                            "VMin" => NanIgnoringMinMax(
+                                37,
+                                NanIgnoringMinMax(37, first, second),
+                                third),
+                            "VMax" => NanIgnoringMinMax(
+                                40,
+                                NanIgnoringMinMax(40, first, second),
+                                third),
+                            _ => NanIgnoringMinMax(
+                                40,
+                                NanIgnoringMinMax(37, first, second),
+                                NanIgnoringMinMax(
+                                    37,
+                                    NanIgnoringMinMax(40, first, second),
+                                    third)),
+                        });
+                    break;
+                }
+                // D.u16 = S0.u16 * S1.u16 + S2.u16 (the signed form only differs
+                // in the saturation this translator does not model).
+                case "VMadU16":
+                case "VMadI16":
+                    result = EmitInteger16Result(
+                        instruction,
+                        destination,
+                        IAdd(
+                            _module.AddInstruction(
+                                SpirvOp.IMul,
+                                _uintType,
+                                GetUnsignedInteger16Source(instruction, 0),
+                                GetUnsignedInteger16Source(instruction, 1)),
+                            GetUnsignedInteger16Source(instruction, 2)));
+                    break;
+                // D.i32 = S0.i16 * S1.i16 + S2.i32
+                case "VMadI32I16":
+                    result = Bitcast(
+                        _uintType,
+                        _module.AddInstruction(
+                            SpirvOp.IAdd,
+                            _intType,
+                            _module.AddInstruction(
+                                SpirvOp.IMul,
+                                _intType,
+                                GetSignedInteger16Source(instruction, 0),
+                                GetSignedInteger16Source(instruction, 1)),
+                            Bitcast(_intType, GetRawSource(instruction, 2))));
+                    break;
+                // D[31:16] = S1.f16, D[15:0] = S0.f16
+                case "VPackB32F16":
+                    result = BitwiseOr(
+                        EmitFloatToHalf(
+                            Bitcast(_uintType, GetFloat16Source(instruction, 0))),
+                        ShiftLeftLogical(
+                            EmitFloatToHalf(
+                                Bitcast(_uintType, GetFloat16Source(instruction, 1))),
+                            UInt(16)));
+                    break;
+                case "VCvtPknormI16F16":
+                case "VCvtPknormU16F16":
+                {
+                    var isSignedPack = instruction.Opcode == "VCvtPknormI16F16";
+                    result = BitwiseOr(
+                        NormalizedHalfToShort(instruction, 0, isSignedPack),
+                        ShiftLeftLogical(
+                            NormalizedHalfToShort(instruction, 1, isSignedPack),
+                            UInt(16)));
+                    break;
+                }
+                case "VPermB32":
+                    result = EmitBytePermute(instruction);
+                    break;
+                // S0 = quotient, S1 = denominator, S2 = numerator. The fixup only
+                // replaces the quotient for the special cases the divide cannot
+                // express; otherwise it re-applies the sign.
+                case "VDivFixupF16":
+                {
+                    var quotient = GetFloat16Source(instruction, 0);
+                    var denominator = GetFloat16Source(instruction, 1);
+                    var numerator = GetFloat16Source(instruction, 2);
+                    result = EmitFloat16Result(
+                        instruction,
+                        destination,
+                        EmitDivideFixup(quotient, denominator, numerator));
+                    break;
+                }
+                case "VDivFixupF32":
+                    result = EmitFloatResult(
+                        instruction,
+                        EmitDivideFixup(
+                            GetFloatSource(instruction, 0),
+                            GetFloatSource(instruction, 1),
+                            GetFloatSource(instruction, 2)));
+                    break;
+                // V_FMA_LEGACY_F32 is V_FMA_F32 with the pre-IEEE rule that a zero
+                // multiplicand forces a zero product.
+                case "VFmaLegacyF32":
+                {
+                    var legacyFirst = GetFloatSource(instruction, 0);
+                    var legacySecond = GetFloatSource(instruction, 1);
+                    var legacyProduct = _module.AddInstruction(
+                        SpirvOp.Select,
+                        _floatType,
+                        _module.AddInstruction(
+                            SpirvOp.LogicalOr,
+                            _boolType,
+                            _module.AddInstruction(
+                                SpirvOp.FOrdEqual,
+                                _boolType,
+                                legacyFirst,
+                                Float(0)),
+                            _module.AddInstruction(
+                                SpirvOp.FOrdEqual,
+                                _boolType,
+                                legacySecond,
+                                Float(0))),
+                        Float(0),
+                        _module.AddInstruction(
+                            SpirvOp.FMul,
+                            _floatType,
+                            legacyFirst,
+                            legacySecond));
+                    result = EmitFloatResult(
+                        instruction,
+                        _module.AddInstruction(
+                            SpirvOp.FAdd,
+                            _floatType,
+                            legacyProduct,
+                            GetFloatSource(instruction, 2)));
+                    break;
+                }
+                // D.i = S0.i24 * S1.i24 + S2.i
+                case "VMadI32I24":
+                {
+                    var mad24Left = _module.AddInstruction(
+                        SpirvOp.BitFieldSExtract,
+                        _intType,
+                        Bitcast(_intType, GetRawSource(instruction, 0)),
+                        UInt(0),
+                        UInt(24));
+                    var mad24Right = _module.AddInstruction(
+                        SpirvOp.BitFieldSExtract,
+                        _intType,
+                        Bitcast(_intType, GetRawSource(instruction, 1)),
+                        UInt(0),
+                        UInt(24));
+                    result = Bitcast(
+                        _uintType,
+                        _module.AddInstruction(
+                            SpirvOp.IAdd,
+                            _intType,
+                            _module.AddInstruction(
+                                SpirvOp.IMul,
+                                _intType,
+                                mad24Left,
+                                mad24Right),
+                            Bitcast(_intType, GetRawSource(instruction, 2))));
+                    break;
+                }
                 case "VAddcU32":
                 case "VAddCoCiU32":
                     result = EmitAddWithCarry(instruction);
                     break;
                 case "VSubI32":
                 case "VSubU32":
+                case "VSubNcI32":
                     result = EmitIntegerBinary(instruction, SpirvOp.ISub);
                     break;
                 case "VSubrevI32":
@@ -1306,6 +1577,38 @@ public static partial class Gen5SpirvTranslator
                             _uintType,
                             ShiftRightLogical64(
                                 shifted,
+                                _module.Constant64(_ulongType, 32))));
+                    break;
+                }
+                case "VLshlrevB64":
+                case "VAshrrevI64":
+                {
+                    // Source 0 supplies the shift count; source 1 is the pair.
+                    var wideShift = _module.AddInstruction(
+                        SpirvOp.UConvert,
+                        _ulongType,
+                        BitwiseAnd(GetRawSource(instruction, 0), UInt(63)));
+                    var wideValue = GetRawSource64(instruction, 1);
+                    var wideResult = instruction.Opcode == "VLshlrevB64"
+                        ? ShiftLeftLogical64(wideValue, wideShift)
+                        : Bitcast(
+                            _ulongType,
+                            _module.AddInstruction(
+                                SpirvOp.ShiftRightArithmetic,
+                                _longType,
+                                Bitcast(_longType, wideValue),
+                                wideShift));
+                    result = _module.AddInstruction(
+                        SpirvOp.UConvert,
+                        _uintType,
+                        wideResult);
+                    StoreV(
+                        destination + 1,
+                        _module.AddInstruction(
+                            SpirvOp.UConvert,
+                            _uintType,
+                            ShiftRightLogical64(
+                                wideResult,
                                 _module.Constant64(_ulongType, 32))));
                     break;
                 }
@@ -1717,10 +2020,37 @@ public static partial class Gen5SpirvTranslator
 
                     break;
                 case "VPkAddI16":
-                    result = EmitPackedI16Arithmetic(instruction, subtract: false);
-                    break;
+                case "VPkAddU16":
                 case "VPkSubI16":
-                    result = EmitPackedI16Arithmetic(instruction, subtract: true);
+                case "VPkSubU16":
+                case "VPkMulLoU16":
+                case "VPkLshlrevB16":
+                case "VPkLshrrevB16":
+                case "VPkAshrrevI16":
+                case "VPkMaxI16":
+                case "VPkMinI16":
+                case "VPkMaxU16":
+                case "VPkMinU16":
+                case "VPkMadI16":
+                case "VPkMadU16":
+                    if (!TryEmitPackedInteger16(instruction, out result, out error))
+                    {
+                        return false;
+                    }
+
+                    break;
+                case "VDot2F32F16":
+                case "VDot2I32I16":
+                case "VDot2U32U16":
+                case "VDot4I32I8":
+                case "VDot4U32U8":
+                case "VDot8I32I4":
+                case "VDot8U32U4":
+                    if (!TryEmitDotProduct(instruction, out result, out error))
+                    {
+                        return false;
+                    }
+
                     break;
                 case "VPkFmacF16":
                     result = EmitPackedF16Fmac(instruction, destination);
@@ -1925,36 +2255,236 @@ public static partial class Gen5SpirvTranslator
             return true;
         }
 
-        // V_PK_ADD/SUB_I16 operates on the selected 16-bit halves of src0 and
-        // src1. The packed integer result is modulo 16 bits in each lane; the
-        // signed and unsigned forms therefore share the same bit-level
-        // implementation.
-        private uint EmitPackedI16Arithmetic(Gen5ShaderInstruction instruction, bool subtract)
+        /// <summary>
+        /// The packed 16-bit integer VOP3P ops. Each result half is computed from
+        /// the source half op_sel (low lane) or op_sel_hi (high lane) picks. Integer
+        /// lanes take no neg modifiers, so only the selection applies.
+        /// </summary>
+        private bool TryEmitPackedInteger16(
+            Gen5ShaderInstruction instruction,
+            out uint result,
+            out string error)
         {
-            var control = (Gen5Vop3pControl)instruction.Control!;
-            var left = GetRawSource(instruction, 0);
-            var right = GetRawSource(instruction, 1);
-            uint Arithmetic(uint a, uint b) => subtract ? ISubU(a, b) : IAdd(a, b);
-
-            uint SelectHalf(uint value, uint mask, int source)
+            result = 0;
+            error = string.Empty;
+            if (instruction.Control is not Gen5Vop3pControl control)
             {
-                return ((mask >> source) & 1) != 0
-                    ? ShiftRightLogical(value, UInt(16))
-                    : value;
+                error = $"missing vop3p control for {instruction.Opcode}";
+                return false;
             }
 
-            var low = BitwiseAnd(
-                Arithmetic(
-                    BitwiseAnd(SelectHalf(left, control.OpSelMask, 0), UInt(0xFFFF)),
-                    BitwiseAnd(SelectHalf(right, control.OpSelMask, 1), UInt(0xFFFF))),
-                UInt(0xFFFF));
-            var high = BitwiseAnd(
-                Arithmetic(
-                    BitwiseAnd(SelectHalf(left, control.OpSelHiMask, 0), UInt(0xFFFF)),
-                    BitwiseAnd(SelectHalf(right, control.OpSelHiMask, 1), UInt(0xFFFF))),
-                UInt(0xFFFF));
-            return BitwiseOr(low, ShiftLeftLogical(high, UInt(16)));
+            var low = EmitPackedInteger16Lane(instruction, control, highLane: false);
+            var high = EmitPackedInteger16Lane(instruction, control, highLane: true);
+            result = BitwiseOr(
+                BitwiseAnd(low, UInt(0xFFFF)),
+                ShiftLeftLogical(BitwiseAnd(high, UInt(0xFFFF)), UInt(16)));
+            return true;
         }
+
+        private uint EmitPackedInteger16Lane(
+            Gen5ShaderInstruction instruction,
+            Gen5Vop3pControl control,
+            bool highLane)
+        {
+            var opcode = instruction.Opcode;
+            var isSigned = opcode is "VPkAshrrevI16" or "VPkMaxI16" or "VPkMinI16" or
+                "VPkAddI16" or "VPkSubI16" or "VPkMadI16";
+
+            uint Operand(int index)
+            {
+                var raw = GetRawSource(instruction, index);
+                var selectMask = highLane ? control.OpSelHiMask : control.OpSelMask;
+                var half = ((selectMask >> index) & 1) != 0
+                    ? ShiftRightLogical(raw, UInt(16))
+                    : raw;
+                half = BitwiseAnd(half, UInt(0xFFFF));
+                return isSigned
+                    ? Bitcast(
+                        _uintType,
+                        _module.AddInstruction(
+                            SpirvOp.BitFieldSExtract,
+                            _intType,
+                            Bitcast(_intType, half),
+                            UInt(0),
+                            UInt(16)))
+                    : half;
+            }
+
+            // The reverse shifts take their count from source 0 and the value from
+            // source 1, and only the low 4 bits of the count are used.
+            switch (opcode)
+            {
+                case "VPkLshlrevB16":
+                    return ShiftLeftLogical(
+                        Operand(1),
+                        BitwiseAnd(Operand(0), UInt(15)));
+                case "VPkLshrrevB16":
+                    return ShiftRightLogical(
+                        BitwiseAnd(Operand(1), UInt(0xFFFF)),
+                        BitwiseAnd(Operand(0), UInt(15)));
+                case "VPkAshrrevI16":
+                    return Bitcast(
+                        _uintType,
+                        _module.AddInstruction(
+                            SpirvOp.ShiftRightArithmetic,
+                            _intType,
+                            Bitcast(_intType, Operand(1)),
+                            BitwiseAnd(Operand(0), UInt(15))));
+                case "VPkAddI16" or "VPkAddU16":
+                    return IAdd(Operand(0), Operand(1));
+                case "VPkSubI16" or "VPkSubU16":
+                    return ISubU(Operand(0), Operand(1));
+                case "VPkMulLoU16":
+                    return _module.AddInstruction(
+                        SpirvOp.IMul,
+                        _uintType,
+                        Operand(0),
+                        Operand(1));
+                case "VPkMinU16":
+                    return Ext(38, _uintType, Operand(0), Operand(1));
+                case "VPkMaxU16":
+                    return Ext(41, _uintType, Operand(0), Operand(1));
+                case "VPkMinI16":
+                    return Bitcast(
+                        _uintType,
+                        Ext(
+                            39,
+                            _intType,
+                            Bitcast(_intType, Operand(0)),
+                            Bitcast(_intType, Operand(1))));
+                case "VPkMaxI16":
+                    return Bitcast(
+                        _uintType,
+                        Ext(
+                            42,
+                            _intType,
+                            Bitcast(_intType, Operand(0)),
+                            Bitcast(_intType, Operand(1))));
+                default:
+                    // V_PK_MAD_I16 / _U16: S0 * S1 + S2 in the 16-bit domain.
+                    return IAdd(
+                        _module.AddInstruction(
+                            SpirvOp.IMul,
+                            _uintType,
+                            Operand(0),
+                            Operand(1)),
+                        Operand(2));
+            }
+        }
+
+        /// <summary>
+        /// The VOP3P dot products: sum of element-wise products of two packed
+        /// vectors plus the src2 accumulator. op_sel/op_sel_hi only apply to the
+        /// 16-bit forms, where they pick which half feeds each element.
+        /// </summary>
+        private bool TryEmitDotProduct(
+            Gen5ShaderInstruction instruction,
+            out uint result,
+            out string error)
+        {
+            result = 0;
+            error = string.Empty;
+            if (instruction.Control is not Gen5Vop3pControl control)
+            {
+                error = $"missing vop3p control for {instruction.Opcode}";
+                return false;
+            }
+
+            if (instruction.Opcode == "VDot2F32F16")
+            {
+                // D.f32 = S0[15:0] * S1[15:0] + S0[31:16] * S1[31:16] + S2.f32
+                var lowProduct = _module.AddInstruction(
+                    SpirvOp.FMul,
+                    _floatType,
+                    EmitPackedF16Operand(instruction, control, 0, highLane: false),
+                    EmitPackedF16Operand(instruction, control, 1, highLane: false));
+                var highProduct = _module.AddInstruction(
+                    SpirvOp.FMul,
+                    _floatType,
+                    EmitPackedF16Operand(instruction, control, 0, highLane: true),
+                    EmitPackedF16Operand(instruction, control, 1, highLane: true));
+                var sum = _module.AddInstruction(
+                    SpirvOp.FAdd,
+                    _floatType,
+                    _module.AddInstruction(SpirvOp.FAdd, _floatType, lowProduct, highProduct),
+                    Bitcast(_floatType, GetRawSource(instruction, 2)));
+                result = Bitcast(_uintType, control.Clamp
+                    ? Ext(43, _floatType, sum, Float(0), Float(1))
+                    : sum);
+                return true;
+            }
+
+            var (elements, width, isSigned) = instruction.Opcode switch
+            {
+                "VDot2I32I16" => (2u, 16u, true),
+                "VDot2U32U16" => (2u, 16u, false),
+                "VDot4I32I8" => (4u, 8u, true),
+                "VDot4U32U8" => (4u, 8u, false),
+                "VDot8I32I4" => (8u, 4u, true),
+                _ => (8u, 4u, false),
+            };
+
+            var first = GetRawSource(instruction, 0);
+            var second = GetRawSource(instruction, 1);
+            // op_sel routes a 16-bit half into each element of the 2-wide forms;
+            // the narrower forms always read the whole dword.
+            if (width == 16)
+            {
+                // Element 0 uses op_sel, element 1 uses op_sel_hi.
+                first = PackedDotSource(first, control, 0);
+                second = PackedDotSource(second, control, 1);
+            }
+
+            var accumulator = GetRawSource(instruction, 2);
+            for (var element = 0u; element < elements; element++)
+            {
+                var offset = UInt(element * width);
+                var left = ExtractElement(first, offset, width, isSigned);
+                var right = ExtractElement(second, offset, width, isSigned);
+                accumulator = IAdd(
+                    accumulator,
+                    _module.AddInstruction(SpirvOp.IMul, _uintType, left, right));
+            }
+
+            result = accumulator;
+            return true;
+        }
+
+        // For the 2-wide 16-bit dot products op_sel selects which half of the
+        // operand supplies element 0 and op_sel_hi which supplies element 1, so
+        // rebuild a dword whose halves are the selected ones.
+        private uint PackedDotSource(
+            uint raw,
+            Gen5Vop3pControl control,
+            int index)
+        {
+            var low = ((control.OpSelMask >> index) & 1) != 0
+                ? ShiftRightLogical(raw, UInt(16))
+                : raw;
+            var high = ((control.OpSelHiMask >> index) & 1) != 0
+                ? ShiftRightLogical(raw, UInt(16))
+                : raw;
+            return BitwiseOr(
+                BitwiseAnd(low, UInt(0xFFFF)),
+                ShiftLeftLogical(BitwiseAnd(high, UInt(0xFFFF)), UInt(16)));
+        }
+
+        private uint ExtractElement(uint value, uint offset, uint width, bool isSigned) =>
+            isSigned
+                ? Bitcast(
+                    _uintType,
+                    _module.AddInstruction(
+                        SpirvOp.BitFieldSExtract,
+                        _intType,
+                        Bitcast(_intType, value),
+                        offset,
+                        UInt(width)))
+                : _module.AddInstruction(
+                    SpirvOp.BitFieldUExtract,
+                    _uintType,
+                    value,
+                    offset,
+                    UInt(width));
 
         // V_FMA_MIX_F32 / _MIXLO_F16 / _MIXHI_F16 (VOP3P opcodes 0x20 / 0x21 /
         // 0x22). Unlike the packed v_pk_* ops these compute a single f32
@@ -5026,6 +5556,209 @@ public static partial class Gen5SpirvTranslator
                     field,
                     _module.Constant(_intType, 0),
                     _module.Constant(_intType, 255)));
+        }
+
+        /// <summary>min3/max3/med3 over three integers of one signedness.</summary>
+        private uint EmitIntegerTriple(
+            string kind,
+            uint type,
+            uint minimum,
+            uint maximum,
+            uint first,
+            uint second,
+            uint third) => kind switch
+        {
+            "VMin" => Ext(minimum, type, Ext(minimum, type, first, second), third),
+            "VMax" => Ext(maximum, type, Ext(maximum, type, first, second), third),
+            // med3 = max(min(a, b), min(max(a, b), c))
+            _ => Ext(
+                maximum,
+                type,
+                Ext(minimum, type, first, second),
+                Ext(minimum, type, Ext(maximum, type, first, second), third)),
+        };
+
+        /// <summary>One f16 source converted to a packed snorm16 or unorm16 field.</summary>
+        private uint NormalizedHalfToShort(
+            Gen5ShaderInstruction instruction,
+            int sourceIndex,
+            bool isSigned)
+        {
+            var value = GetFloat16Source(instruction, sourceIndex);
+            value = _module.AddInstruction(
+                SpirvOp.Select,
+                _floatType,
+                _module.AddInstruction(SpirvOp.IsNan, _boolType, value),
+                Float(0),
+                value);
+            var bounded = Ext(43, _floatType, value, Float(isSigned ? -1 : 0), Float(1));
+            var scaled = Ext(
+                2,
+                _floatType,
+                _module.AddInstruction(
+                    SpirvOp.FMul,
+                    _floatType,
+                    bounded,
+                    Float(isSigned ? 32767 : 65535)));
+            return BitwiseAnd(
+                isSigned
+                    ? Bitcast(
+                        _uintType,
+                        _module.AddInstruction(SpirvOp.ConvertFToS, _intType, scaled))
+                    : _module.AddInstruction(SpirvOp.ConvertFToU, _uintType, scaled),
+                UInt(0xFFFF));
+        }
+
+        /// <summary>
+        /// V_PERM_B32: each destination byte is selected from the eight bytes of
+        /// {S0, S1} (byte 0 is S1's LSB), with selectors 8-11 replicating a sign
+        /// bit, 12 giving 0x00 and 13 or above giving 0xFF.
+        /// </summary>
+        private uint EmitBytePermute(Gen5ShaderInstruction instruction)
+        {
+            var high = GetRawSource(instruction, 0);
+            var low = GetRawSource(instruction, 1);
+            var selectors = GetRawSource(instruction, 2);
+            uint SourceByte(uint index) =>
+                BitwiseAnd(
+                    ShiftRightLogical(index < 4 ? low : high, UInt((index & 3) * 8)),
+                    UInt(0xFF));
+            uint SignByte(uint index) =>
+                SelectU(
+                    IsNotZero(BitwiseAnd(SourceByte(index), UInt(0x80))),
+                    UInt(0xFF),
+                    UInt(0));
+
+            uint result = 0;
+            for (var lane = 0u; lane < 4; lane++)
+            {
+                var selector = BitwiseAnd(
+                    ShiftRightLogical(selectors, UInt(lane * 8)),
+                    UInt(0xFF));
+                // Built innermost-first: start from the >= 13 case and fold the
+                // lower selectors over it.
+                var value = UInt(0xFF);
+                value = SelectU(Equal(selector, 12), UInt(0), value);
+                for (var index = 11u; index >= 8; index--)
+                {
+                    value = SelectU(
+                        Equal(selector, index),
+                        SignByte((index - 8) * 2 + 1),
+                        value);
+                }
+
+                for (var index = 0u; index < 8; index++)
+                {
+                    value = SelectU(Equal(selector, index), SourceByte(index), value);
+                }
+
+                var placed = ShiftLeftLogical(value, UInt(lane * 8));
+                result = lane == 0 ? placed : BitwiseOr(result, placed);
+            }
+
+            return result;
+        }
+
+        /// <summary>
+        /// V_DIV_FIXUP_*: replace the quotient for the cases a raw divide cannot
+        /// express, otherwise re-apply the sign of denominator XOR numerator.
+        /// </summary>
+        private uint EmitDivideFixup(uint quotient, uint denominator, uint numerator)
+        {
+            var denominatorSign = IsNotZero(
+                BitwiseAnd(Bitcast(_uintType, denominator), UInt(0x8000_0000)));
+            var numeratorSign = IsNotZero(
+                BitwiseAnd(Bitcast(_uintType, numerator), UInt(0x8000_0000)));
+            var negativeResult = _module.AddInstruction(
+                SpirvOp.LogicalNotEqual,
+                _boolType,
+                denominatorSign,
+                numeratorSign);
+
+            var magnitude = Ext(4, _floatType, quotient);
+            var signedQuotient = _module.AddInstruction(
+                SpirvOp.Select,
+                _floatType,
+                negativeResult,
+                _module.AddInstruction(SpirvOp.FNegate, _floatType, magnitude),
+                magnitude);
+            var signedZero = _module.AddInstruction(
+                SpirvOp.Select,
+                _floatType,
+                negativeResult,
+                Float(-0.0f),
+                Float(0));
+            var signedInfinity = _module.AddInstruction(
+                SpirvOp.Select,
+                _floatType,
+                negativeResult,
+                Bitcast(_floatType, UInt(0xFF80_0000)),
+                Bitcast(_floatType, UInt(0x7F80_0000)));
+            var quietNan = Bitcast(_floatType, UInt(0x7FC0_0000));
+
+            var denominatorIsZero = _module.AddInstruction(
+                SpirvOp.FOrdEqual, _boolType, denominator, Float(0));
+            var numeratorIsZero = _module.AddInstruction(
+                SpirvOp.FOrdEqual, _boolType, numerator, Float(0));
+            var denominatorIsInfinite = _module.AddInstruction(
+                SpirvOp.IsInf, _boolType, denominator);
+            var numeratorIsInfinite = _module.AddInstruction(
+                SpirvOp.IsInf, _boolType, numerator);
+
+            // Folded bottom-up so the earliest ISA case wins.
+            var value = signedQuotient;
+            value = _module.AddInstruction(
+                SpirvOp.Select,
+                _floatType,
+                _module.AddInstruction(
+                    SpirvOp.LogicalOr,
+                    _boolType,
+                    denominatorIsInfinite,
+                    numeratorIsZero),
+                signedZero,
+                value);
+            value = _module.AddInstruction(
+                SpirvOp.Select,
+                _floatType,
+                _module.AddInstruction(
+                    SpirvOp.LogicalOr,
+                    _boolType,
+                    denominatorIsZero,
+                    numeratorIsInfinite),
+                signedInfinity,
+                value);
+            value = _module.AddInstruction(
+                SpirvOp.Select,
+                _floatType,
+                _module.AddInstruction(
+                    SpirvOp.LogicalAnd,
+                    _boolType,
+                    denominatorIsInfinite,
+                    numeratorIsInfinite),
+                quietNan,
+                value);
+            value = _module.AddInstruction(
+                SpirvOp.Select,
+                _floatType,
+                _module.AddInstruction(
+                    SpirvOp.LogicalAnd,
+                    _boolType,
+                    denominatorIsZero,
+                    numeratorIsZero),
+                quietNan,
+                value);
+            value = _module.AddInstruction(
+                SpirvOp.Select,
+                _floatType,
+                _module.AddInstruction(SpirvOp.IsNan, _boolType, denominator),
+                quietNan,
+                value);
+            return _module.AddInstruction(
+                SpirvOp.Select,
+                _floatType,
+                _module.AddInstruction(SpirvOp.IsNan, _boolType, numerator),
+                quietNan,
+                value);
         }
 
         private uint EmitFloat16Unary(
