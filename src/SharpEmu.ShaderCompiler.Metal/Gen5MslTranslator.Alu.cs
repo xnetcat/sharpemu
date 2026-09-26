@@ -1064,11 +1064,12 @@ public static partial class Gen5MslTranslator
                     return TryEmitScalarCompareK(instruction, destination, immediate, out error);
                 }
 
+                var current = ScalarExpression(destination);
                 var value = instruction.Opcode switch
                 {
                     "SMovkI32" => FormatUInt(immediate),
-                    "SAddkI32" => $"({ScalarExpression(destination)} + {FormatUInt(immediate)})",
-                    "SMulkI32" => $"({ScalarExpression(destination)} * {FormatUInt(immediate)})",
+                    "SAddkI32" => $"({current} + {FormatUInt(immediate)})",
+                    "SMulkI32" => $"({current} * {FormatUInt(immediate)})",
                     _ => string.Empty,
                 };
                 if (value.Length == 0)
@@ -1077,7 +1078,17 @@ public static partial class Gen5MslTranslator
                     return false;
                 }
 
-                StoreScalar(destination, Temp("uint", value));
+                var stored = Temp("uint", value);
+                // RDNA2 ISA: S_ADDK_I32 writes SCC = signed overflow, exactly like
+                // S_ADD_I32. S_MOVK_I32 and S_MULK_I32 leave SCC alone.
+                if (instruction.Opcode == "SAddkI32")
+                {
+                    var addend = FormatUInt(immediate);
+                    Line(
+                        $"scc = ((~({current} ^ {addend}) & ({current} ^ {stored})) >> 31) != 0u;");
+                }
+
+                StoreScalar(destination, stored);
                 return true;
             }
 

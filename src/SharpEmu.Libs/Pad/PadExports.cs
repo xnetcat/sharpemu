@@ -169,6 +169,23 @@ public static class PadExports
         return ctx.SetReturn(0);
     }
 
+    // pad.h: int scePadResetOrientation(int32_t handle) — "Reset device orientation
+    // to identity." ReadPadData already reports the identity quaternion
+    // (x=y=z=0, w=1.0 at data+0x18), so there is no accumulated orientation to
+    // clear; only the handle needs validating.
+    [SysAbiExport(
+        Nid = "rIZnR6eSpvk",
+        ExportName = "scePadResetOrientation",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libScePad")]
+    public static int PadResetOrientation(CpuContext ctx)
+    {
+        var handle = unchecked((int)ctx[CpuRegister.Rdi]);
+        return IsPrimaryPadHandle(handle)
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn(OrbisPadErrorInvalidHandle);
+    }
+
     [SysAbiExport(
         Nid = "vDLMoJLde8I",
         ExportName = "scePadSetTiltCorrectionState",
