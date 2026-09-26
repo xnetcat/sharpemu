@@ -4,7 +4,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using SharpEmu.Libs.Gpu.GpuCommands.Registers;
-using ResourceSnapshot = SharpEmu.ShaderCompiler.Resources.ResourceSnapshot;
 
 namespace SharpEmu.Libs.Gpu.Rendering;
 
@@ -185,16 +184,4 @@ public sealed class WorkCaseManifest
     public List<string> Truncated { get; set; } = [];
 
     public ulong CapturedBytes { get; set; }
-
-    public WorkCaseStage? StageOf(ulong codeAddress) => Stages.Find(stage => stage.CodeAddress == codeAddress);
-
-    // The stage resources as the shader compiler consumes them.
-    public static ResourceSnapshot SnapshotOf(WorkCaseStage stage) => new()
-    {
-        Buffers = stage.Buffers,
-        Images = stage.Images,
-        Samplers = stage.Samplers,
-        FlattenedResourceTable = stage.FlattenedResourceTable,
-        UserData = stage.UserData,
-    };
 }

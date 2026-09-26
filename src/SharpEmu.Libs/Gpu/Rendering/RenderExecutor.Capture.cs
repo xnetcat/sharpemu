@@ -65,14 +65,13 @@ public sealed partial class RenderExecutor
             builder.AddRange("vertex-fetch", buffer.Address, buffer.Size);
         }
 
-        if (indexSource.Enabled && indexSource.HostData is null)
+        if (indexSource.Enabled)
         {
             builder.AddRange("index-buffer", indexSource.Address, indexSource.Size);
-        }
-        else if (indexSource.Enabled)
-        {
-            builder.Note("the index data was rewritten on the host before the draw; the case carries the guest bytes only");
-            builder.AddRange("index-buffer", indexSource.Address, indexSource.Size);
+            if (indexSource.HostData is not null)
+            {
+                builder.Note("the index data was rewritten on the host before the draw; the case carries the guest bytes only");
+            }
         }
 
         foreach (ref readonly var color in BoundColors(ref state))

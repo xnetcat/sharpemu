@@ -126,7 +126,8 @@ internal static class WorkCapture
             return fallback;
         }
 
-        return TryParseUnsigned(text, out var value) && value != 0 ? value : fallback;
+        // One range is read into a single array, so the budget cannot exceed what one can hold.
+        return TryParseUnsigned(text, out var value) && value != 0 ? Math.Min(value, int.MaxValue) : fallback;
     }
 
     private static bool TryParseUnsigned(string text, out ulong value)
