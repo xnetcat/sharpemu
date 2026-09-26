@@ -118,6 +118,15 @@ public static class NpWebApi2Exports
         return ctx.SetReturn(0);
     }
 
+    // Titles call this every frame to expire requests that ran past their timeout. No request
+    // is ever in flight here, so there is nothing to expire.
+    [SysAbiExport(
+        Nid = "3Tt9zL3tkoc",
+        ExportName = "sceNpWebApi2CheckTimeout",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNpWebApi2")]
+    public static int NpWebApi2CheckTimeout(CpuContext ctx) => ctx.SetReturn(0);
+
     private static int CreateLibraryContextId()
     {
         var handle = Interlocked.Increment(ref _nextLibraryContextHandle);
