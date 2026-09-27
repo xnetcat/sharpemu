@@ -81,13 +81,13 @@ public sealed class ImportTrampolineAbiTests
 
     private static unsafe byte[] CreateTrampolineBytes()
     {
+        // GetUninitializedObject skips the field initializers, so every reference
+        // field the emitter touches has to be supplied here. 6e9c703 added the
+        // per-index trampoline cache; without it the emitter dereferences null.
         var backend = (DirectExecutionBackend)RuntimeHelpers.GetUninitializedObject(
             typeof(DirectExecutionBackend));
-        var trampolineList = typeof(DirectExecutionBackend).GetField(
-            "_importHandlerTrampolines",
-            BindingFlags.Instance | BindingFlags.NonPublic);
-        Assert.NotNull(trampolineList);
-        trampolineList.SetValue(backend, new List<nint>());
+        SetPrivateField(backend, "_importHandlerTrampolines", new List<nint>());
+        SetPrivateField(backend, "_importHandlerTrampolineByIndex", new Dictionary<int, nint>());
 
         var createTrampoline = typeof(DirectExecutionBackend).GetMethod(
             "CreateImportHandlerTrampoline",
@@ -104,6 +104,15 @@ public sealed class ImportTrampolineAbiTests
         {
             Assert.True(HostMemory.Free((void*)trampoline, 0, HostMemory.MEM_RELEASE));
         }
+    }
+
+    private static void SetPrivateField(DirectExecutionBackend backend, string name, object value)
+    {
+        var field = typeof(DirectExecutionBackend).GetField(
+            name,
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.True(field is not null, $"DirectExecutionBackend has no field '{name}'.");
+        field!.SetValue(backend, value);
     }
 
     private static void AssertContains(ReadOnlySpan<byte> code, ReadOnlySpan<byte> expected)
