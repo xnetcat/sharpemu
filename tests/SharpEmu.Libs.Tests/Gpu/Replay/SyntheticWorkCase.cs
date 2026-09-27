@@ -31,6 +31,28 @@ internal static class SyntheticWorkCase
     private const ulong HeaderBytes = 0x60;
     private const ulong ShaderSizeOffset = 0x44;
     private const ulong UserDataOffset = 0x08;
+    private const ulong InputSemanticsOffset = 0x30;
+    private const ulong InputSemanticsCountOffset = 0x50;
+
+    // The embedded vertex fetch: the header's user data block names two user scalar registers, those
+    // registers hold pointers, and only following them reaches the attribute and buffer tables. The
+    // two tables sit in granules of their own so a case can drop one and prove it is load bearing.
+    private const ulong VertexDirectOffsets = 0x2_1000_2400;
+    private const ulong VertexSemantics = 0x2_1000_2800;
+    private const ulong VertexAttributeTable = 0x2_1004_0000;
+    private const ulong VertexBufferTable = 0x2_1008_0000;
+    private const ulong VertexStream = 0x2_100C_0000;
+    private const int BufferTableRegister = 0;
+    private const int AttributeTableRegister = 2;
+    private const uint DirectResourceCount = 11;
+    private const uint DirectResourceVertexBufferTable = 8;
+    private const uint DirectResourceVertexAttributeTable = 10;
+    private const ushort IllegalDirectOffset = 0xFFFF;
+    private const uint VertexStride = 8;
+    private const uint VertexCount = 3;
+    private const uint Float2Format = 64;
+
+    public const string AttributeTableRole = "vertex-attribute-table";
 
     // The fullscreen triangle of the vertex index: x = (index & 1) * 4 - 1, y = (index >> 1) * 4 - 1,
     // so the three vertices at (-1,-1), (3,-1) and (-1,3) cover the whole viewport. The translated
@@ -62,8 +84,9 @@ internal static class SyntheticWorkCase
         0xBF810000,             // s_endpgm
     ];
 
-    // Writes the case and returns its directory.
-    public static string Write(string root)
+    // Writes the case and returns its directory. With vertexTables the vertex stage fetches through
+    // the pointer tables its user scalars name, which is the shape a real game's base pass has.
+    public static string Write(string root, bool vertexTables = false)
     {
         Directory.CreateDirectory(root);
         var manifest = new WorkCaseManifest
@@ -83,9 +106,16 @@ internal static class SyntheticWorkCase
                 PacketInstanceCount = 1,
                 OffsetSource = nameof(DrawOffsetSource.Packet),
             },
-            Banks = new WorkCaseBanks { Context = Context(), Shader = Shader(), UserConfig = UserConfig() },
+            Banks = new WorkCaseBanks { Context = Context(), Shader = Shader(vertexTables), UserConfig = UserConfig() },
         };
-        manifest.Stages.Add(Stage("Vertex", 0x1111_2222_3333_4444, VertexCode, VertexHeader, VertexUserData, VertexProgram, "vertex.bin"));
+        var vertexStage = Stage("Vertex", 0x1111_2222_3333_4444, VertexCode, VertexHeader, VertexUserData, VertexProgram, "vertex.bin");
+        if (vertexTables)
+        {
+            vertexStage.InputSemanticsAddress = VertexSemantics;
+            vertexStage.InputSemanticsCount = 1;
+        }
+
+        manifest.Stages.Add(vertexStage);
         manifest.Stages.Add(Stage("Pixel", 0x5555_6666_7777_8888, PixelCode, PixelHeader, PixelUserData, PixelProgram, "pixel.bin"));
         manifest.Targets.Add(new WorkCaseTarget
         {
@@ -101,8 +131,18 @@ internal static class SyntheticWorkCase
         File.WriteAllBytes(Path.Combine(root, "vertex.bin"), Bytes(VertexProgram));
         File.WriteAllBytes(Path.Combine(root, "pixel.bin"), Bytes(PixelProgram));
         AddRange(root, manifest, "vertex-code", VertexCode, Bytes(VertexProgram));
-        AddRange(root, manifest, "vertex-header", VertexHeader, Header((uint)VertexProgram.Length * sizeof(uint), VertexUserData));
-        AddRange(root, manifest, "vertex-user-data", VertexUserData, new byte[0x40]);
+        AddRange(root, manifest, "vertex-header", VertexHeader,
+            Header((uint)VertexProgram.Length * sizeof(uint), VertexUserData, vertexTables ? VertexSemantics : 0, vertexTables ? 1u : 0u));
+        AddRange(root, manifest, "vertex-user-data", VertexUserData, vertexTables ? VertexUserDataBlock() : new byte[0x40]);
+        if (vertexTables)
+        {
+            AddRange(root, manifest, "vertex-direct-offsets", VertexDirectOffsets, DirectOffsets());
+            AddRange(root, manifest, "vertex-input-semantics", VertexSemantics, Words(2u << 16));
+            AddRange(root, manifest, AttributeTableRole, VertexAttributeTable, Words(0u));
+            AddRange(root, manifest, "vertex-buffer-table", VertexBufferTable, BufferTable());
+            AddRange(root, manifest, "vertex-stream", VertexStream, Triangle());
+        }
+
         AddRange(root, manifest, "pixel-code", PixelCode, Bytes(PixelProgram));
         AddRange(root, manifest, "pixel-header", PixelHeader, Header((uint)PixelProgram.Length * sizeof(uint), PixelUserData));
         AddRange(root, manifest, "pixel-user-data", PixelUserData, new byte[0x40]);
@@ -164,13 +204,66 @@ internal static class SyntheticWorkCase
         return context;
     }
 
-    private static ShaderProgramRegisters Shader()
+    private static ShaderProgramRegisters Shader(bool vertexTables = false)
     {
         var shader = new ShaderProgramRegisters();
         shader.Vertex.ExportAddress = VertexCode;
         shader.Pixel.Address = PixelCode;
+        if (vertexTables)
+        {
+            // The two table pointers, as a game's command stream writes them into the user scalars.
+            var scalars = shader.Vertex.GeometryUserScalars;
+            scalars.Set((uint)BufferTableRegister, unchecked((uint)VertexBufferTable), UserScalarKind.Unknown);
+            scalars.Set((uint)BufferTableRegister + 1, (uint)(VertexBufferTable >> 32), UserScalarKind.Unknown);
+            scalars.Set((uint)AttributeTableRegister, unchecked((uint)VertexAttributeTable), UserScalarKind.Unknown);
+            scalars.Set((uint)AttributeTableRegister + 1, (uint)(VertexAttributeTable >> 32), UserScalarKind.Unknown);
+        }
+
         return shader;
     }
+
+    // The user data block: a pointer to the direct resource offsets and how many of them there are.
+    private static byte[] VertexUserDataBlock()
+    {
+        var block = new byte[0x40];
+        BinaryPrimitives.WriteUInt64LittleEndian(block, VertexDirectOffsets);
+        BinaryPrimitives.WriteUInt16LittleEndian(block.AsSpan(0x2C), (ushort)DirectResourceCount);
+        return block;
+    }
+
+    // One user scalar register per direct resource type; every type but the two tables is illegal.
+    private static byte[] DirectOffsets()
+    {
+        var offsets = new byte[DirectResourceCount * sizeof(ushort)];
+        for (var type = 0u; type < DirectResourceCount; type++)
+        {
+            var register = type switch
+            {
+                DirectResourceVertexBufferTable => (ushort)BufferTableRegister,
+                DirectResourceVertexAttributeTable => (ushort)AttributeTableRegister,
+                _ => IllegalDirectOffset,
+            };
+            BinaryPrimitives.WriteUInt16LittleEndian(offsets.AsSpan((int)type * sizeof(ushort)), register);
+        }
+
+        return offsets;
+    }
+
+    // One float2 vertex buffer descriptor, the layout the device gate already renders from.
+    private static byte[] BufferTable() => Words(
+        unchecked((uint)VertexStream),
+        (uint)(VertexStream >> 32) | (VertexStride << 16),
+        VertexCount,
+        Float2Format << 12);
+
+    private static byte[] Triangle() => Bytes(
+    [
+        0xBF800000, 0xBF800000, // (-1, -1)
+        0x40400000, 0xBF800000, // ( 3, -1)
+        0xBF800000, 0x40400000, // (-1,  3)
+    ]);
+
+    private static byte[] Words(params uint[] words) => Bytes(words);
 
     private static UserConfigRegisters UserConfig() => new() { PrimitiveType = (uint)GuestPrimitiveType.TriangleList };
 
@@ -189,11 +282,13 @@ internal static class SyntheticWorkCase
         manifest.CapturedBytes += (ulong)bytes.Length;
     }
 
-    private static byte[] Header(uint codeSize, ulong userDataAddress)
+    private static byte[] Header(uint codeSize, ulong userDataAddress, ulong inputSemanticsAddress = 0, uint inputSemanticsCount = 0)
     {
         var header = new byte[HeaderBytes];
         BinaryPrimitives.WriteUInt32LittleEndian(header.AsSpan((int)ShaderSizeOffset), codeSize);
         BinaryPrimitives.WriteUInt64LittleEndian(header.AsSpan((int)UserDataOffset), userDataAddress);
+        BinaryPrimitives.WriteUInt64LittleEndian(header.AsSpan((int)InputSemanticsOffset), inputSemanticsAddress);
+        BinaryPrimitives.WriteUInt32LittleEndian(header.AsSpan((int)InputSemanticsCountOffset), inputSemanticsCount);
         return header;
     }
 

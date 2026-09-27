@@ -174,6 +174,12 @@ internal sealed class WorkCaptureBuilder
             WorkCapture.AddShaderMetadata(this, source);
         }
 
+        // Whatever preparing this program read, wherever its user scalars pointed.
+        foreach (var (address, size) in WorkCapture.ShaderReads(codeAddress))
+        {
+            AddRange($"{label}-program-read", address, size);
+        }
+
         AddDescriptorRanges(label, program, resources);
         Manifest.Stages.Add(stage);
     }
@@ -258,6 +264,23 @@ internal sealed class WorkCaptureBuilder
 
         Note($"the image at 0x{words.BaseAddress:X} has no modeled size; 0x{WorkCapture.ImageCap:X} bytes were taken");
         return WorkCapture.ImageCap;
+    }
+
+    // The guest ranges the resolvers read for this draw or dispatch: the vertex attribute and buffer
+    // tables, the input semantics and the fetch data, wherever the user scalars pointed them.
+    public void AddResolutionReads()
+    {
+        var count = 0;
+        foreach (var (address, size) in WorkCapture.ResolutionReads())
+        {
+            AddRange("resolve-read", address, size);
+            count++;
+        }
+
+        if (count == 0)
+        {
+            Note("no resolution reads were recorded; a case may be missing the tables the program resolves through");
+        }
     }
 
     // Downloads a bound host image; the file appears once the queued copy completes.

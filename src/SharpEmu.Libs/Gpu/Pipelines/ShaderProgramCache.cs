@@ -193,8 +193,10 @@ internal sealed class ShaderProgramCache
         {
             UserData = source.UserData,
             ShaderBase = source.Address,
-            ReadMemory = _host.TryReadGuestWord,
-            ReadCleanMemory = _host.TryReadCleanGuestWord,
+            // The specialization reads resource tables through the host, not the CpuContext; a capture
+            // needs those ranges as much as the ones the resolvers read.
+            ReadMemory = WorkCapture.Recording(_host.TryReadGuestWord),
+            ReadCleanMemory = WorkCapture.Recording(_host.TryReadCleanGuestWord),
             ComputeState = source.Stage == ShaderStage.Compute && options.ComputeInfo is { } computeState
                 ? new ComputeSelectorState(computeState.WaveSize, Math.Max(computeState.ThreadsX, 1),
                     Math.Max(computeState.ThreadsY, 1), Math.Max(computeState.ThreadsZ, 1), computeState.DispatchThreadDimensions,

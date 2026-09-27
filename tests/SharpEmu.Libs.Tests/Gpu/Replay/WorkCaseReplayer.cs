@@ -46,6 +46,9 @@ public static class WorkCaseReplayer
     internal static WorkCaseReplayResult Replay(HeadlessVulkan vulkan, string caseDirectory, WorkCaseReplayOptions options)
     {
         var manifest = WorkCase.Read(caseDirectory);
+        // The emulator ends a fatal by killing the process; a replay turns it into an exception so
+        // the tool can say which range a case is missing.
+        using var fatal = new Scheduling.FatalScope();
         var output = options.OutputDirectory ?? Path.Combine(caseDirectory, "replay");
         Directory.CreateDirectory(output);
         var result = new WorkCaseReplayResult
@@ -79,10 +82,17 @@ public static class WorkCaseReplayer
         {
             presenter.Run(() => Execute(executor, manifest, banks));
             presenter.Run(() => presenter.InvokeMethod("FlushBatchedGuestCommands"));
-            harness.Finish();
+        }
+        catch (Exception exception)
+        {
+            // A case that is missing a range the resolvers read fails here. Report which one instead
+            // of taking the process down: the whole point of a case is to be looked at.
+            result.Notes.Add($"the work did not run: {exception.Message}");
+            Console.Error.WriteLine($"[REPLAY][ERROR] {result.Notes[^1]}");
         }
         finally
         {
+            Attempt(harness.Finish, result, "finishing the submission");
             GuestGpuMemoryHook.Attach(null);
         }
 
@@ -91,13 +101,34 @@ public static class WorkCaseReplayer
             ? pipelines.ComputePipelineCount != 0
             : pipelines.GraphicsPipelineCount != 0;
         WriteShaderListings(context, manifest, output, result, options);
-        ReadBackTargets(presenter, caseDirectory, manifest, output, result);
-        DumpWrittenBuffers(harness, manifest, output, result);
-        harness.Shutdown();
+        if (result.Recorded)
+        {
+            ReadBackTargets(presenter, caseDirectory, manifest, output, result);
+            DumpWrittenBuffers(harness, manifest, output, result);
+        }
+        else
+        {
+            result.Notes.Add("no target was read back: the case did not reach the device");
+        }
+
+        Attempt(harness.Shutdown, result, "shutting the stores down");
         // The stores write every GPU-modified image back on shutdown, so this is the memory the game
         // would read after the pass.
         DumpTargetMemory(harness, manifest, output, result);
         return result;
+    }
+
+    // Teardown after a failed replay must not hide the failure that caused it.
+    private static void Attempt(Action work, WorkCaseReplayResult result, string what)
+    {
+        try
+        {
+            work();
+        }
+        catch (Exception exception)
+        {
+            result.Notes.Add($"{what} failed: {exception.Message}");
+        }
     }
 
     // Drives the executor with the packet the case recorded, so the same path runs as in the game.

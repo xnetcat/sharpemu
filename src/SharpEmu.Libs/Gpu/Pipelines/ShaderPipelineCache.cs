@@ -32,6 +32,9 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
 
     public ShaderPipelineCache(CpuContext context, IShaderPipelineHost host, IGuestGpuBackend compiler, ShaderHeaderRegistry registry)
     {
+        // With a capture armed the graphics path reads guest memory through a recorder, so a case
+        // carries every table a program reached through its user scalars without listing them here.
+        context = WorkCapture.RecordingContext(context);
         _context = context;
         _host = host;
         _registry = registry;
@@ -94,6 +97,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         uint? nggReplayParamCount = null)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramPreparation);
+        WorkCapture.BeginResolution();
         var vertexSource = PrepareSource(
             vertex.ExportAddress, ShaderStage.Vertex, "vertex", vertex.GeometryUserScalars, vertex.GeometryResource2.UserScalarCount,
             probeWrittenRegisters: true, VertexUserDataBase);
@@ -309,6 +313,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         uint dimensionZ)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramPreparation);
+        WorkCapture.BeginResolution();
         var source = PrepareSource(compute.Address, ShaderStage.Compute, "compute", compute.UserScalars, compute.UserScalarCount, probeWrittenRegisters: false, userDataBase: 0);
         var input = ComputeStageInputResolver.Resolve(compute, source.Registered, dispatchInitiator, !_host.ComputeWave64Supported, dimensionX, dimensionY, dimensionZ);
         var systemRegisters = DecodeComputeSystemRegisters(compute);
@@ -386,6 +391,9 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
     private bool TryPrepareProgram(ShaderSource source, StageCompileOptions options, ref uint pushDataCursor,
         out ShaderProgram program, out ShaderStageResources stage)
     {
+        // Preparing a program reads its code and the tables its resource plan resolves, and only the
+        // first draw that uses it does so; the reads are kept per program, not per draw.
+        using var readScope = WorkCapture.BeginShaderReads(source.Address);
         if (_programs.TryGetProgram(source, options, _strictShaders, ref pushDataCursor, out program, out stage, out var rejection))
             return true;
 

@@ -28,7 +28,7 @@ public readonly record struct CapturedImageBytes(string Format, uint Width, uint
 //
 // Every check behind the enabled flag is a static readonly read, so a run without the variable set
 // does no work at all.
-internal static class WorkCapture
+internal static partial class WorkCapture
 {
     private const ulong DefaultByteBudget = 512UL * 1024 * 1024;
     private const ulong PerImageByteCap = 128UL * 1024 * 1024;
