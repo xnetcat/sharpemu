@@ -1,6 +1,8 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using System;
+using System.Threading;
 using static SharpEmu.Libs.Gpu.GpuCommands.Registers.ShaderRegisterOffset;
 
 namespace SharpEmu.Libs.Gpu.GpuCommands.Registers;
@@ -34,7 +36,7 @@ internal static partial class RegisterWriters
             direct[SpiShaderUserDataGs0 + slot] = GeometryUserScalarsPacket;
             direct[SpiShaderUserDataHs0 + slot] = HullUserScalarsPacket;
             indirect[SpiShaderUserDataPs0 + slot] = static (banks, offset, value) => UserScalarEntry(banks, banks.Shader.Pixel.UserScalars, offset - SpiShaderUserDataPs0, value);
-            indirect[SpiShaderUserDataGs0 + slot] = static (banks, offset, value) => UserScalarEntry(banks, banks.Shader.Vertex.GeometryUserScalars, offset - SpiShaderUserDataGs0, value);
+            indirect[SpiShaderUserDataGs0 + slot] = static (banks, offset, value) => { UserScalarEntry(banks, banks.Shader.Vertex.GeometryUserScalars, offset - SpiShaderUserDataGs0, value); TraceUserData("GS-indirect", offset - SpiShaderUserDataGs0, value, banks.Shader.Vertex.GeometryUserScalars.Count); };
             indirect[SpiShaderUserDataHs0 + slot] = static (banks, offset, value) => UserScalarEntry(banks, banks.Shader.Vertex.HullUserScalars, offset - SpiShaderUserDataHs0, value);
             // The legacy vertex and export user scalars are stored so a title that writes them does not stop.
             indirect[SpiShaderUserDataVs0 + slot] = static (banks, offset, value) => UserScalarEntry(banks, banks.Shader.Vertex.LegacyVertexUserScalars, offset - SpiShaderUserDataVs0, value);
@@ -111,6 +113,29 @@ internal static partial class RegisterWriters
     private static uint ComputeUserScalarsPacket(RegisterBanks banks, in PacketContext packet, uint offset, ReadOnlySpan<uint> values) =>
         UserScalarsPacket(banks, in packet, offset, values, banks.Shader.Compute.UserScalars, ComputeUserData0, ComputeUserScalarCount);
 
+    // SHARPEMU_LOG_SH_USERDATA=1 traces the tail user-data slots of every stage, in write order, so
+    // a shader that reads a slot the guest has not written yet can be told apart from one whose write
+    // we dropped. Only slots 28.. are traced: those are where SILENT HILL's NGG geometry program
+    // finds the address pair it dereferences (s38:s39 = slots 30 and 31).
+    private static readonly bool LogUserData =
+        Environment.GetEnvironmentVariable("SHARPEMU_LOG_SH_USERDATA") == "1";
+
+    internal static bool LogUserDataEnabled => LogUserData;
+
+    private static long _userDataWriteSequence;
+
+    internal static void TraceUserData(string bank, uint slot, uint value, uint count)
+    {
+        if (!LogUserData || slot < 28)
+        {
+            return;
+        }
+
+        Console.Error.WriteLine(
+            $"[GPU][USERDATA] seq={Interlocked.Increment(ref _userDataWriteSequence)} bank={bank} " +
+            $"slot={slot} value=0x{value:X8} count_after={count}");
+    }
+
     // The marker of the preceding packet applies to every scalar of this packet, then clears.
     private static uint UserScalarsPacket(
         RegisterBanks banks, in PacketContext packet, uint offset, ReadOnlySpan<uint> values, UserScalarRegisters target, uint first, uint capacity)
@@ -124,11 +149,20 @@ internal static partial class RegisterWriters
         for (var index = 0u; index < values.Length; index++)
         {
             target.Set(slot + index, values[(int)index], banks.UserDataMarker);
+            TraceUserData(BankName(first), slot + index, values[(int)index], target.Count);
         }
 
         banks.UserDataMarker = UserScalarKind.Unknown;
         return (uint)values.Length;
     }
+
+    private static string BankName(uint first) =>
+        first == SpiShaderUserDataGs0 ? "GS"
+        : first == SpiShaderUserDataPs0 ? "PS"
+        : first == SpiShaderUserDataHs0 ? "HS"
+        : first == SpiShaderUserDataEs0 ? "ES"
+        : first == SpiShaderUserDataVs0 ? "VS"
+        : first == ComputeUserData0 ? "CS" : "??";
 
     private static void UserScalarEntry(RegisterBanks banks, UserScalarRegisters target, uint index, uint value)
     {

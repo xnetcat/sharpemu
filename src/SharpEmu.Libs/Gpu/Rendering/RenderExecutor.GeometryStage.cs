@@ -136,6 +136,16 @@ public sealed partial class RenderExecutor
             return false;
         }
 
+        if (SharpEmu.Libs.Gpu.GpuCommands.Registers.RegisterWriters.LogUserDataEnabled)
+        {
+            var gs = banks.Shader.Vertex.GeometryUserScalars;
+            Console.Error.WriteLine(
+                $"[GPU][USERDATA] NGG dispatch shader=0x{banks.Shader.Vertex.ExportAddress:X16} " +
+                $"declared={banks.Shader.Vertex.GeometryResource2.UserScalarCount} count={gs.Count} " +
+                $"s36:s37=0x{((ulong)gs.Values[29] << 32) | gs.Values[28]:X16} " +
+                $"s38:s39=0x{((ulong)gs.Values[31] << 32) | gs.Values[30]:X16}");
+        }
+
         var compute = _pipelines.GetNggComputeProgram(banks.Shader.Vertex, out var paramCount);
         if (!compute.Available)
         {
