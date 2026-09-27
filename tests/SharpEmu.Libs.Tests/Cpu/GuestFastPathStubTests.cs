@@ -16,10 +16,14 @@ namespace SharpEmu.Libs.Tests.Cpu;
 /// the wrong value, clobbers a caller-saved-only contract, or unbalances the
 /// stack fails here instead of in a game.
 /// </summary>
-[Collection("GuestFastPathStubs")]
+[Collection("GuestFastPath")]
 public sealed unsafe class GuestFastPathStubTests
 {
     private const ulong RaxSentinel = 0x1122334455667788UL;
+
+    // pthread_key_create hands out keys from 1 upwards; stay above anything a
+    // test that drives the real exports can reach.
+    private const int KeyBase = 700;
 
     [Fact]
     public void SelfStub_ReturnsTheBoundGuestThreadHandle()
@@ -65,18 +69,18 @@ public sealed unsafe class GuestFastPathStubTests
         var handle = NewHandle();
         harness.Bind(handle);
 
-        Assert.Equal(0UL, harness.Call(7));
+        Assert.Equal(0UL, harness.Call(KeyBase + 7));
 
-        GuestFastPath.SetSpecific(handle, 7, 0xDEADBEEFCAFEF00DUL);
+        GuestFastPath.SetSpecific(handle, KeyBase + 7, 0xDEADBEEFCAFEF00DUL);
         GuestFastPath.SetSpecific(handle, GuestFastPath.TlsSlotCount - 1, 0x55UL);
 
-        Assert.Equal(0xDEADBEEFCAFEF00DUL, harness.Call(7));
+        Assert.Equal(0xDEADBEEFCAFEF00DUL, harness.Call(KeyBase + 7));
         Assert.Equal(0x55UL, harness.Call((ulong)(GuestFastPath.TlsSlotCount - 1)));
-        Assert.Equal(0UL, harness.Call(8));
+        Assert.Equal(0UL, harness.Call(KeyBase + 8));
 
         // pthread_key_delete must make the key read back unset everywhere.
-        GuestFastPath.ClearKeyEverywhere(7);
-        Assert.Equal(0UL, harness.Call(7));
+        GuestFastPath.ClearKeyEverywhere(KeyBase + 7);
+        Assert.Equal(0UL, harness.Call(KeyBase + 7));
     }
 
     [Fact]
@@ -105,7 +109,7 @@ public sealed unsafe class GuestFastPathStubTests
         using var harness = new StubHarness(DirectExecutionBackend.GuestFastPathStub.PthreadGetspecific);
         harness.Bind(0);
 
-        Assert.Equal(RaxSentinel, harness.Call(3));
+        Assert.Equal(RaxSentinel, harness.Call(KeyBase + 3));
     }
 
     [Fact]
@@ -123,18 +127,18 @@ public sealed unsafe class GuestFastPathStubTests
         var hostHandle = NewHandle();
         harness.Bind(0);
         harness.BindHost(hostHandle);
-        GuestFastPath.SetSpecific(hostHandle, 6, 0x777UL);
+        GuestFastPath.SetSpecific(hostHandle, KeyBase + 6, 0x777UL);
 
-        Assert.Equal(0x777UL, harness.Call(6));
+        Assert.Equal(0x777UL, harness.Call(KeyBase + 6));
 
         // A guest thread bound on top owns the table while it runs, and the host
         // handle comes back when it unbinds.
         var guestHandle = NewHandle();
-        GuestFastPath.SetSpecific(guestHandle, 6, 0x888UL);
+        GuestFastPath.SetSpecific(guestHandle, KeyBase + 6, 0x888UL);
         harness.Bind(guestHandle);
-        Assert.Equal(0x888UL, harness.Call(6));
+        Assert.Equal(0x888UL, harness.Call(KeyBase + 6));
         harness.Bind(0);
-        Assert.Equal(0x777UL, harness.Call(6));
+        Assert.Equal(0x777UL, harness.Call(KeyBase + 6));
     }
 
     [Fact]
@@ -165,17 +169,17 @@ public sealed unsafe class GuestFastPathStubTests
         using var harness = new StubHarness(DirectExecutionBackend.GuestFastPathStub.PthreadGetspecific);
         var first = NewHandle();
         var second = NewHandle();
-        GuestFastPath.SetSpecific(first, 2, 0x1111UL);
-        GuestFastPath.SetSpecific(second, 2, 0x2222UL);
+        GuestFastPath.SetSpecific(first, KeyBase + 2, 0x1111UL);
+        GuestFastPath.SetSpecific(second, KeyBase + 2, 0x2222UL);
 
         harness.Bind(first);
-        Assert.Equal(0x1111UL, harness.Call(2));
+        Assert.Equal(0x1111UL, harness.Call(KeyBase + 2));
 
         harness.Bind(second);
-        Assert.Equal(0x2222UL, harness.Call(2));
+        Assert.Equal(0x2222UL, harness.Call(KeyBase + 2));
 
         harness.Bind(first);
-        Assert.Equal(0x1111UL, harness.Call(2));
+        Assert.Equal(0x1111UL, harness.Call(KeyBase + 2));
     }
 
     /// <summary>
@@ -197,11 +201,11 @@ public sealed unsafe class GuestFastPathStubTests
         using var getspecific = new StubHarness(DirectExecutionBackend.GuestFastPathStub.PthreadGetspecific);
         var handle = NewHandle();
         self.Bind(handle);
-        GuestFastPath.SetSpecific(handle, 4, 0x99UL);
+        GuestFastPath.SetSpecific(handle, KeyBase + 4, 0x99UL);
 
         var selfNanos = MeasureNanosPerCall(self, 0);
         getspecific.Bind(handle);
-        var getspecificNanos = MeasureNanosPerCall(getspecific, 4);
+        var getspecificNanos = MeasureNanosPerCall(getspecific, KeyBase + 4);
 
         Assert.True(
             selfNanos < 500,
