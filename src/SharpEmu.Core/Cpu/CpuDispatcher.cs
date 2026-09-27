@@ -302,8 +302,6 @@ public sealed class CpuDispatcher : ICpuDispatcher, IDisposable
         debugHook?.OnFrameEnter(debugFrame!);
 
         _nativeCpuBackend ??= new DirectExecutionBackend(_moduleManager);
-        // Code patches go through the backing alias, which nothing reprotects behind their back.
-        DirectExecutionBackend.UseGuestBacking(_virtualMemory as IGuestBackedSpace);
         // Let backend stall reports reference the same frame as entry.
         (_nativeCpuBackend as DirectExecutionBackend)?.SetActiveDebugFrame(debugFrame);
         if (_nativeCpuBackend.TryExecute(
