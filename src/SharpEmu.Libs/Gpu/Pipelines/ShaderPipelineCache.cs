@@ -48,8 +48,15 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
     private static uint[] UserData(UserScalarRegisters registers, uint declaredCount, bool probeWrittenRegisters, ulong shaderAddress, string label)
     {
         var count = declaredCount;
-        if (count == 0 && probeWrittenRegisters)
+        if (probeWrittenRegisters && registers.Count > count)
         {
+            // A merged NGG geometry program reads past the user-SGPR count its resource register
+            // declares: SILENT HILL's geometry shader 0x80BB12DEB34BFB24 declares 12 and takes a
+            // buffer resource out of s[20:23] at pc 0x38, and the same program is seen with a
+            // different declared count from one draw to the next. The registers the guest actually
+            // wrote are all in the bank, so the high-water mark is the honest window - seeding one
+            // the shader never reads costs nothing, while seeding one short makes every value
+            // derived from it undefined and rejects the whole resource plan.
             count = registers.Count;
         }
 
