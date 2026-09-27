@@ -30,7 +30,11 @@ public sealed class CommandStreamQueue
     public const int QueueCount = 1 + ComputeQueueCount;
     public const int AllBlockedRetryMilliseconds = 100;
     // The hardware lets one suspend point be in flight; a second one waits for the first.
-    public const int MaxBoundariesInFlight = 1;
+    // 0 makes the suspend point drain the queue, the way it did before.
+    public static readonly int MaxBoundariesInFlight =
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_SUSPEND_POINT_DEPTH"), out var depth) && depth >= 0
+            ? depth
+            : 1;
 
     private readonly ICommandStreamHost _host;
     private readonly object _gate = new();
@@ -224,7 +228,7 @@ public sealed class CommandStreamQueue
             }
 
             _graphicsDone = true;
-            if (!_accepting)
+            if (!_accepting || MaxBoundariesInFlight == 0)
             {
                 // Shutdown: no slice will run a queued boundary, so drain as before.
                 while (_outcome == IdleOutcome.Completed && (_processing || _submissionCount != 0))
