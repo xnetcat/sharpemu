@@ -1424,7 +1424,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			num2++;
 			num++;
 		}
-		Console.Error.WriteLine($"[LOADER][INFO] Setup {num2}/{importStubs.Count} import stubs (direct bridge, lle_redirects={num3})");
+		Console.Error.WriteLine($"[LOADER][INFO] Setup {num2}/{importStubs.Count} import stubs (direct bridge, lle_redirects={num3}, patch_route {PatchRouteReport})");
 		return num2 == importStubs.Count;
 	}
 
@@ -2572,39 +2572,81 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	// to read-execute while it is still writing, so every patch runs under one gate.
 	private static readonly object ImportStubPatchGate = new();
 
-	private unsafe bool PatchImportStub(nint address, nint trampoline)
+	// The guest address space that mapped the modules. HostMemory keeps its own region registry and
+	// does not see what PhysicalVirtualMemory mapped, so VirtualProtect can report success on a
+	// region it only thinks it knows and leave the following write facing a page it may not touch -
+	// an AccessViolation on the first patch into a freshly loaded module. Writing through the
+	// manager that owns the mapping uses that manager's own protection bookkeeping instead.
+	private static IVirtualMemory? _patchMemory;
+
+	internal static void UseGuestMemory(IVirtualMemory? memory) => Volatile.Write(ref _patchMemory, memory);
+
+	private static long _patchesThroughOwner;
+	private static long _patchesThroughProtect;
+	private static long _patchesRefused;
+
+	internal static string PatchRouteReport =>
+		$"owner={Interlocked.Read(ref _patchesThroughOwner)} unprotect={Interlocked.Read(ref _patchesThroughProtect)} " +
+		$"refused={Interlocked.Read(ref _patchesRefused)}";
+
+	private static unsafe bool TryWriteGuestCode(nint address, ReadOnlySpan<byte> code, string what)
 	{
+		var memory = Volatile.Read(ref _patchMemory);
+		if (memory is not null && memory.TryWrite((ulong)address, code))
+		{
+			Interlocked.Increment(ref _patchesThroughOwner);
+			return true;
+		}
+
+		// The owning manager could not place it; describe what the other registry believes before
+		// writing blind, so a failure names the mapping instead of dying inside a memmove.
+		var known = VirtualQuery((void*)address, out var information, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) != 0;
+		if (!known || information.State != MEM_COMMIT)
+		{
+			Interlocked.Increment(ref _patchesRefused);
+			Console.Error.WriteLine(
+				$"[LOADER][ERROR] {what} at 0x{address:X16} has no writable mapping: owner={(memory is null ? "none" : "refused")} " +
+				$"queried={known} base=0x{information.BaseAddress:X16} size=0x{information.RegionSize:X} " +
+				$"state=0x{information.State:X} protect=0x{information.Protect:X} allocProtect=0x{information.AllocationProtect:X}");
+			return false;
+		}
+
+		Interlocked.Increment(ref _patchesThroughProtect);
 		lock (ImportStubPatchGate)
 		{
-			return PatchImportStubLocked(address, trampoline);
+			return PatchImportStubLocked(address, code, what);
 		}
 	}
 
-	private unsafe bool PatchImportStubLocked(nint address, nint trampoline)
+	private unsafe bool PatchImportStub(nint address, nint trampoline)
+	{
+		Span<byte> code = stackalloc byte[16];
+		code[0] = 0x48;
+		code[1] = 0xB8;
+		BinaryPrimitives.WriteInt64LittleEndian(code[2..], trampoline);
+		code[10] = 0xFF;
+		code[11] = 0xE0;
+		code[12..].Fill(0x90);
+		return TryWriteGuestCode(address, code, "import stub");
+	}
+
+	private static unsafe bool PatchImportStubLocked(nint address, ReadOnlySpan<byte> code, string what)
 	{
 		uint flNewProtect = default(uint);
-		if (!VirtualProtect((void*)address, 16u, 64u, &flNewProtect))
+		if (!VirtualProtect((void*)address, (nuint)code.Length, 64u, &flNewProtect))
 		{
-			Console.Error.WriteLine($"[LOADER][ERROR] VirtualProtect failed for import stub at 0x{address:X16}");
+			Console.Error.WriteLine($"[LOADER][ERROR] VirtualProtect failed for {what} at 0x{address:X16}");
 			return false;
 		}
 		try
 		{
-			*(sbyte*)address = 72;
-			*(sbyte*)(address + 1) = -72;
-			*(long*)(address + 2) = trampoline;
-			*(sbyte*)(address + 10) = -1;
-			*(sbyte*)(address + 11) = -32;
-			*(sbyte*)(address + 12) = -112;
-			*(sbyte*)(address + 13) = -112;
-			*(sbyte*)(address + 14) = -112;
-			*(sbyte*)(address + 15) = -112;
+			code.CopyTo(new Span<byte>((void*)address, code.Length));
 			return true;
 		}
 		finally
 		{
-			VirtualProtect((void*)address, 16u, flNewProtect, &flNewProtect);
-			FlushInstructionCache(GetCurrentProcess(), (void*)address, 16u);
+			VirtualProtect((void*)address, (nuint)code.Length, flNewProtect, &flNewProtect);
+			FlushInstructionCache(GetCurrentProcess(), (void*)address, (nuint)code.Length);
 		}
 	}
 
@@ -3771,8 +3813,16 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private static unsafe bool WriteTlsInstruction(nint address, ReadOnlySpan<byte> replacement)
 	{
-		// Guest threads patch their TLS sites as they first reach them; two sites on one page would
-		// otherwise race the unprotect/restore pair exactly like the import stubs.
+		// Guest threads patch their TLS sites as they first reach them, so this takes the same route
+		// as an import stub: the owning memory manager first, the unprotect pair behind the gate as
+		// the fallback, and a named refusal rather than a blind write into an unmapped page.
+		var memory = Volatile.Read(ref _patchMemory);
+		if (memory is not null && memory.TryWrite((ulong)address, replacement))
+		{
+			Interlocked.Increment(ref _patchesThroughOwner);
+			return true;
+		}
+
 		lock (ImportStubPatchGate)
 		{
 			return WriteTlsInstructionLocked(address, replacement);
