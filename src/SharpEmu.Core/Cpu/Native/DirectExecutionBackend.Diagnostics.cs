@@ -88,6 +88,14 @@ public sealed partial class DirectExecutionBackend
 					return $"{kvp.Key}: {cores:F2}cores {seconds:F1}s n={callCount} {perCallUs:F2}us/call";
 				});
 			System.Console.Error.WriteLine($"[PERF][HLE] cost: {string.Join(" | ", top)}");
+
+			if (SharpEmu.HLE.GuestFastPath.Enabled)
+			{
+				var fastPath = SharpEmu.HLE.GuestFastPath.SnapshotCounters();
+				System.Console.Error.WriteLine(
+					$"[PERF][HLE] fast_path: self_hits={fastPath.SelfHits} " +
+					$"getspecific_hits={fastPath.GetspecificHits} blocks={fastPath.Blocks}");
+			}
 		}
 	}
 

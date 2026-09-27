@@ -95,7 +95,7 @@ public sealed unsafe class GuestFastPathStubTests
     }
 
     [Fact]
-    public void GetspecificStub_FallsBackWhenNoGuestThreadIsBound()
+    public void GetspecificStub_FallsBackWhenNoThreadIsBound()
     {
         if (!CanRunStubs())
         {
@@ -106,6 +106,52 @@ public sealed unsafe class GuestFastPathStubTests
         harness.Bind(0);
 
         Assert.Equal(RaxSentinel, harness.Call(3));
+    }
+
+    [Fact]
+    public void GetspecificStub_AnswersOnAHostThreadWithNoGuestThreadBound()
+    {
+        if (!CanRunStubs())
+        {
+            return;
+        }
+
+        // The primary execution thread has no guest thread handle, and
+        // KernelPthreadState answers it from its own synthetic handle; the stub
+        // has to read that thread's values rather than bail.
+        using var harness = new StubHarness(DirectExecutionBackend.GuestFastPathStub.PthreadGetspecific);
+        var hostHandle = NewHandle();
+        harness.Bind(0);
+        harness.BindHost(hostHandle);
+        GuestFastPath.SetSpecific(hostHandle, 6, 0x777UL);
+
+        Assert.Equal(0x777UL, harness.Call(6));
+
+        // A guest thread bound on top owns the table while it runs, and the host
+        // handle comes back when it unbinds.
+        var guestHandle = NewHandle();
+        GuestFastPath.SetSpecific(guestHandle, 6, 0x888UL);
+        harness.Bind(guestHandle);
+        Assert.Equal(0x888UL, harness.Call(6));
+        harness.Bind(0);
+        Assert.Equal(0x777UL, harness.Call(6));
+    }
+
+    [Fact]
+    public void SelfStub_StaysOnTheManagedPathForHostThreads()
+    {
+        if (!CanRunStubs())
+        {
+            return;
+        }
+
+        // pthread_self registers an unbound thread's CPU context with the guest
+        // scheduler, so a host thread must never be answered by the stub.
+        using var harness = new StubHarness(DirectExecutionBackend.GuestFastPathStub.PthreadSelf);
+        harness.Bind(0);
+        harness.BindHost(NewHandle());
+
+        Assert.Equal(RaxSentinel, harness.Call(0));
     }
 
     [Fact]
@@ -221,6 +267,8 @@ public sealed unsafe class GuestFastPathStubTests
         public StubHarness(DirectExecutionBackend.GuestFastPathStub kind)
         {
             var key = BlockTlsKey;
+            // xunit reuses host threads, and the bindings are thread-local.
+            GuestFastPath.UnbindCurrentThread();
 
             _page = (byte*)HostMemory.Alloc(
                 null,
@@ -265,6 +313,8 @@ public sealed unsafe class GuestFastPathStubTests
 
         public void Bind(ulong guestThreadHandle) => GuestFastPath.BindGuestThread(guestThreadHandle);
 
+        public void BindHost(ulong hostThreadHandle) => GuestFastPath.BindHostThread(hostThreadHandle);
+
         public ulong Call(ulong argument)
         {
             *_argumentSlot = argument;
@@ -273,7 +323,7 @@ public sealed unsafe class GuestFastPathStubTests
 
         public void Dispose()
         {
-            GuestFastPath.BindGuestThread(0);
+            GuestFastPath.UnbindCurrentThread();
             NativeMemory.Free(_argumentSlot);
             _ = HostMemory.Free(_page, 0, HostMemory.MEM_RELEASE);
         }

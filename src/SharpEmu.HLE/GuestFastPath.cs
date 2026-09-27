@@ -30,11 +30,26 @@ namespace SharpEmu.HLE;
 /// </summary>
 public static unsafe class GuestFastPath
 {
-    /// <summary>Byte offset of the bound guest thread handle inside the block (0 = fast path disarmed).</summary>
-    public const int BlockThreadHandleOffset = 0;
+    /// <summary>
+    /// Byte offset of the guest thread handle pthread_self must answer with.
+    /// Only ever a real guest thread handle: for a host thread with no guest
+    /// thread bound, pthread_self has to reach the managed export (it registers
+    /// the thread's CPU context with the scheduler), so the slot stays zero.
+    /// </summary>
+    public const int BlockSelfHandleOffset = 0;
 
-    /// <summary>Byte offset of the pointer to the bound guest thread's pthread-specific value table.</summary>
+    /// <summary>
+    /// Byte offset of the pointer to the pthread-specific value table of the
+    /// thread handle KernelPthreadState would report - the bound guest thread,
+    /// or the host thread's own synthetic handle when none is bound.
+    /// </summary>
     public const int BlockTlsValuesOffset = 8;
+
+    /// <summary>Byte offset of the pthread_self fast-path hit counter.</summary>
+    public const int BlockSelfHitsOffset = 16;
+
+    /// <summary>Byte offset of the pthread_getspecific fast-path hit counter.</summary>
+    public const int BlockGetspecificHitsOffset = 32;
 
     /// <summary>Size of the per-host-thread block. One cache line, room for future fast-path state.</summary>
     public const int BlockSize = 64;
@@ -52,11 +67,17 @@ public static unsafe class GuestFastPath
     /// <summary>Values for keys at or above <see cref="TlsSlotCount"/>; effectively never used.</summary>
     private static readonly ConcurrentDictionary<ulong, ConcurrentDictionary<int, ulong>> TlsOverflow = new();
 
+    private static readonly List<nint> Blocks = new();
+    private static readonly object BlocksGate = new();
+
     private static Action<nint>? _publishBlock;
     private static volatile bool _enabled;
 
     [ThreadStatic]
     private static nint _block;
+
+    [ThreadStatic]
+    private static ulong _hostThreadHandle;
 
     [ThreadStatic]
     private static ulong _cachedTableHandle;
@@ -85,7 +106,7 @@ public static unsafe class GuestFastPath
         var block = _block;
         if (block != 0)
         {
-            *(ulong*)(block + BlockThreadHandleOffset) = 0;
+            *(ulong*)(block + BlockSelfHandleOffset) = 0;
             *(nint*)(block + BlockTlsValuesOffset) = 0;
         }
     }
@@ -93,7 +114,8 @@ public static unsafe class GuestFastPath
     /// <summary>
     /// Publishes <paramref name="guestThreadHandle"/> (and its pthread TLS
     /// table) as the guest thread bound to the calling host thread. Pass 0 to
-    /// disarm, which forces every stub back onto the managed gateway.
+    /// unbind, which leaves pthread_self on the managed gateway and falls the
+    /// value table back to the host thread's own pthread storage.
     /// </summary>
     public static void BindGuestThread(ulong guestThreadHandle)
     {
@@ -108,11 +130,70 @@ public static unsafe class GuestFastPath
             return;
         }
 
-        // Disarm first: a stub must never pair one thread's handle with another
-        // thread's value table, not even for the instructions in between.
-        *(ulong*)(block + BlockThreadHandleOffset) = 0;
-        *(nint*)(block + BlockTlsValuesOffset) = guestThreadHandle == 0 ? 0 : GetOrCreateTable(guestThreadHandle);
-        *(ulong*)(block + BlockThreadHandleOffset) = guestThreadHandle;
+        // Clear the self handle first so a stub can never answer with a handle
+        // that no longer owns this host thread.
+        *(ulong*)(block + BlockSelfHandleOffset) = 0;
+        var tlsHandle = guestThreadHandle != 0 ? guestThreadHandle : _hostThreadHandle;
+        *(nint*)(block + BlockTlsValuesOffset) = tlsHandle == 0 ? 0 : GetOrCreateTable(tlsHandle);
+        *(ulong*)(block + BlockSelfHandleOffset) = guestThreadHandle;
+    }
+
+    /// <summary>
+    /// Records the calling host thread's own pthread handle - the one
+    /// KernelPthreadState reports when no guest thread is bound - so
+    /// pthread_getspecific can be answered on threads the guest scheduler does
+    /// not own (the primary execution thread among them).
+    /// </summary>
+    public static void BindHostThread(ulong hostThreadHandle)
+    {
+        if (!_enabled || hostThreadHandle == 0)
+        {
+            return;
+        }
+
+        _hostThreadHandle = hostThreadHandle;
+        var block = EnsureBlock();
+        if (block == 0 || *(ulong*)(block + BlockSelfHandleOffset) != 0)
+        {
+            // A bound guest thread owns the value table while it runs.
+            return;
+        }
+
+        *(nint*)(block + BlockTlsValuesOffset) = GetOrCreateTable(hostThreadHandle);
+    }
+
+    /// <summary>
+    /// Drops every fast-path binding for the calling host thread, so each stub
+    /// falls back to the managed gateway until the thread is bound again.
+    /// </summary>
+    public static void UnbindCurrentThread()
+    {
+        _hostThreadHandle = 0;
+        var block = _block;
+        if (block != 0)
+        {
+            *(ulong*)(block + BlockSelfHandleOffset) = 0;
+            *(nint*)(block + BlockTlsValuesOffset) = 0;
+        }
+    }
+
+    /// <summary>Fast-path hit counts summed over every host thread, for diagnostics.</summary>
+    public static (long SelfHits, long GetspecificHits, int Blocks) SnapshotCounters()
+    {
+        long selfHits = 0;
+        long getspecificHits = 0;
+        int blocks;
+        lock (BlocksGate)
+        {
+            blocks = Blocks.Count;
+            foreach (var block in Blocks)
+            {
+                selfHits += *(long*)(block + BlockSelfHitsOffset);
+                getspecificHits += *(long*)(block + BlockGetspecificHitsOffset);
+            }
+        }
+
+        return (selfHits, getspecificHits, blocks);
     }
 
     /// <summary>Address of the calling host thread's block; allocates it on first use.</summary>
@@ -126,6 +207,11 @@ public static unsafe class GuestFastPath
 
         block = (nint)NativeMemory.AllocZeroed(BlockSize);
         _block = block;
+        lock (BlocksGate)
+        {
+            Blocks.Add(block);
+        }
+
         _publishBlock?.Invoke(block);
         return block;
     }
@@ -295,9 +381,13 @@ public static unsafe class GuestFastPath
         }
 
         var block = _block;
-        if (block != 0 && *(ulong*)(block + BlockThreadHandleOffset) == threadHandle)
+        if (block != 0 && *(ulong*)(block + BlockSelfHandleOffset) == threadHandle)
         {
-            *(ulong*)(block + BlockThreadHandleOffset) = 0;
+            *(ulong*)(block + BlockSelfHandleOffset) = 0;
+            *(nint*)(block + BlockTlsValuesOffset) = 0;
+        }
+        else if (block != 0 && _hostThreadHandle == threadHandle)
+        {
             *(nint*)(block + BlockTlsValuesOffset) = 0;
         }
 

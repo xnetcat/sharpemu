@@ -183,21 +183,21 @@ public sealed unsafe partial class DirectExecutionBackend
 		switch (kind)
 		{
 			case GuestFastPathStub.PthreadSelf:
-				// mov rax, [rax + ThreadHandleOffset]
-				Emit(0x48, 0x8B, 0x40, checked((byte)GuestFastPath.BlockThreadHandleOffset));
-				// test rax, rax / je slow: no guest thread bound here.
-				Emit(0x48, 0x85, 0xC0);
+				// cmp qword [rax + SelfHandleOffset], 0 / je slow: no guest
+				// thread bound here, and a host thread's pthread_self has to
+				// reach the managed export for its scheduler registration.
+				Emit(0x48, 0x83, 0x78, checked((byte)GuestFastPath.BlockSelfHandleOffset), 0x00);
 				EmitJumpToSlowPath();
+				// inc qword [rax + SelfHitsOffset]
+				Emit(0x48, 0xFF, 0x40, checked((byte)GuestFastPath.BlockSelfHitsOffset));
+				// mov rax, [rax + SelfHandleOffset]
+				Emit(0x48, 0x8B, 0x40, checked((byte)GuestFastPath.BlockSelfHandleOffset));
 				break;
 
 			case GuestFastPathStub.PthreadGetspecific:
-				// cmp qword [rax + ThreadHandleOffset], 0 / je slow
-				Emit(0x48, 0x83, 0x78, checked((byte)GuestFastPath.BlockThreadHandleOffset), 0x00);
-				EmitJumpToSlowPath();
-				// mov rax, [rax + TlsValuesOffset]
-				Emit(0x48, 0x8B, 0x40, checked((byte)GuestFastPath.BlockTlsValuesOffset));
-				// test rax, rax / je slow: thread has no value table yet.
-				Emit(0x48, 0x85, 0xC0);
+				// cmp qword [rax + TlsValuesOffset], 0 / je slow: this thread
+				// has no value table published.
+				Emit(0x48, 0x83, 0x78, checked((byte)GuestFastPath.BlockTlsValuesOffset), 0x00);
 				EmitJumpToSlowPath();
 				// cmp rdi, TlsSlotCount / jae slow. An out-of-range or
 				// sign-extended negative key is answered by the managed path,
@@ -205,7 +205,10 @@ public sealed unsafe partial class DirectExecutionBackend
 				Emit(0x48, 0x81, 0xFF);
 				code.AddRange(BitConverter.GetBytes(GuestFastPath.TlsSlotCount));
 				EmitBranchToSlowPath(0x73);
-				// mov rax, [rax + rdi*8]
+				// inc qword [rax + GetspecificHitsOffset]
+				Emit(0x48, 0xFF, 0x40, checked((byte)GuestFastPath.BlockGetspecificHitsOffset));
+				// mov rax, [rax + TlsValuesOffset] / mov rax, [rax + rdi*8]
+				Emit(0x48, 0x8B, 0x40, checked((byte)GuestFastPath.BlockTlsValuesOffset));
 				Emit(0x48, 0x8B, 0x04, 0xF8);
 				break;
 
