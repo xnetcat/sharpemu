@@ -278,6 +278,7 @@ public static class GuestThreadExecution
         GpuMemory.GpuMemoryAccessProfile.InitializeCurrentThread();
         var previous = _currentGuestThreadHandle;
         _currentGuestThreadHandle = threadHandle;
+        GuestFastPath.BindGuestThread(threadHandle);
         _pendingBlockReason = null;
         _pendingBlockContinuationValid = false;
         _pendingBlockContinuation = default;
@@ -299,6 +300,7 @@ public static class GuestThreadExecution
     public static void RestoreGuestThread(ulong previousThreadHandle)
     {
         _currentGuestThreadHandle = previousThreadHandle;
+        GuestFastPath.BindGuestThread(previousThreadHandle);
         _pendingBlockReason = null;
         _pendingBlockContinuationValid = false;
         _pendingBlockContinuation = default;

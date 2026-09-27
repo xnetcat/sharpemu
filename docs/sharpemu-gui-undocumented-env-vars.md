@@ -52,6 +52,7 @@ These variables change how the emulator operates.
 | --- | --- | --- | --- |
 | `SHARPEMU_AGC_VERSION13_DEFAULTS` | text (`legacy`, `generic` or `0`) | Selects the register defaults for AGC version 13 requests. The default uses the version 11 compact tables. The values `legacy`, `generic` and `0` use the older generic layout. | `AgcExports.Init.cs` |
 | `SHARPEMU_DISABLE_LLE_LIBC` | `1` | Stops the use of the guest libc module for libc exports. The emulator then uses its HLE handlers for these exports. | `DirectExecutionBackend.cs` |
+| `SHARPEMU_HLE_FAST_PATH` | `0` | Set to `0` to stop the native fast-path stubs for `pthread_self` and `pthread_getspecific`, so those imports use the managed HLE gateway again. The stubs are on by default on macOS x64 and are off on any run that traces imports or pthreads. | `DirectExecutionBackend.FastPath.cs` |
 | `SHARPEMU_HOLD_FIRST_FLIP_MS` | number | Stops the thread that submits the flip for this number of milliseconds on one guest flip. The range is 0 to 60000 and the default is 0 (off). `SHARPEMU_HOLD_FLIP_NUMBER` selects the flip. | `VideoOutExports.cs` |
 | `SHARPEMU_HOLD_FLIP_NUMBER` | number | Selects the guest flip that `SHARPEMU_HOLD_FIRST_FLIP_MS` holds. The minimum is 1 and the default is 1 (the first flip). | `VideoOutExports.cs` |
 | `SHARPEMU_IGNORE_GUEST_EXCEPTIONS` | `1` | `sceKernelRaiseException` returns OK and does not call the installed guest exception handler. Default is off. | `KernelExceptionCompatExports.cs` |

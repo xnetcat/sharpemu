@@ -1433,6 +1433,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	{
 		Console.Error.WriteLine($"[LOADER][INFO] Setting up {importStubs.Count} import stubs...");
 		ClearImportHandlerTrampolines();
+		ConfigureGuestFastPath();
 		_importEntries = new ImportStubEntry[importStubs.Count];
 		HashSet<ulong> hashSet = new HashSet<ulong>(importStubs.Keys);
 		int num = 0;
@@ -1499,6 +1500,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				LastError = "Failed to create import trampoline for NID " + text2;
 				return false;
 			}
+			if (TryCreateGuestFastPathStub(text2, num5, out var fastPathStub))
+			{
+				num5 = fastPathStub;
+			}
 			if (_logAllImports)
 			{
 				Console.Error.WriteLine($"[LOADER][DEBUG] SetupImportStubs: Trampoline for {text2} -> 0x{num5:X16}");
@@ -1511,7 +1516,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			num2++;
 			num++;
 		}
-		Console.Error.WriteLine($"[LOADER][INFO] Setup {num2}/{importStubs.Count} import stubs (direct bridge, lle_redirects={num3})");
+		Console.Error.WriteLine($"[LOADER][INFO] Setup {num2}/{importStubs.Count} import stubs (direct bridge, lle_redirects={num3}, fast_path_stubs={_guestFastPathStubCount})");
 		return num2 == importStubs.Count;
 	}
 
@@ -1595,6 +1600,11 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 				var importIndex = currentEntries.Length + i;
 				var trampoline = CreateImportHandlerTrampoline(importIndex);
+				if (trampoline != 0 &&
+					TryCreateGuestFastPathStub(nid, trampoline, out var runtimeFastPathStub))
+				{
+					trampoline = runtimeFastPathStub;
+				}
 				if (trampoline == 0 || !PatchImportStub((nint)(long)address, trampoline))
 				{
 					error = $"failed to install runtime import trampoline at 0x{address:X16}";
