@@ -1716,6 +1716,9 @@ public static partial class KernelMemoryCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
+        var aprCallStart = System.Diagnostics.Stopwatch.GetTimestamp();
+        Interlocked.Increment(ref _aprResolveCalls);
+        Interlocked.Add(ref _aprResolvePaths, (long)count);
         for (ulong i = 0; i < count; i++)
         {
             if (idsAddress != 0 &&
@@ -1776,8 +1779,35 @@ public static partial class KernelMemoryCompatExports
             }
         }
 
+        ReportAprResolveCost(aprCallStart);
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    // Path resolution is the single largest HLE cost of a Bluepoint-style resource
+    // streamer, so the call count, the paths those calls carry and the time they take
+    // are reported together: the average paths per call decides whether the per-call
+    // or the per-path work is worth attacking.
+    private static long _aprResolveCalls;
+    private static long _aprResolvePaths;
+    private static long _aprResolveTicks;
+    private static long _aprResolveReported;
+
+    private static void ReportAprResolveCost(long startTimestamp)
+    {
+        var ticks = Interlocked.Add(ref _aprResolveTicks, System.Diagnostics.Stopwatch.GetTimestamp() - startTimestamp);
+        var calls = Interlocked.Read(ref _aprResolveCalls);
+        if (calls - Interlocked.Read(ref _aprResolveReported) < 1024)
+        {
+            return;
+        }
+
+        Interlocked.Exchange(ref _aprResolveReported, calls);
+        var paths = Interlocked.Read(ref _aprResolvePaths);
+        var seconds = (double)ticks / System.Diagnostics.Stopwatch.Frequency;
+        Console.Error.WriteLine(
+            $"[LOADER][INFO] apr_resolve: calls={calls} paths={paths} paths_per_call={(double)paths / Math.Max(calls, 1):F1} " +
+            $"total_s={seconds:F1} us_per_path={(seconds * 1e6) / Math.Max(paths, 1):F1}");
     }
 
 
