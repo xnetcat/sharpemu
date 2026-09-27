@@ -4769,18 +4769,25 @@ public static partial class KernelMemoryCompatExports
     // i.e. in sceKernelAprResolveFilepathsToIdsAndFileSizes). Memoize the mapping and
     // drop it whenever the mount table changes, which is the only input that can
     // change an already-computed answer.
-    // Only /app0 is memoized. It is the read-only game image, it carries every
-    // streamed asset, and its root is one environment variable that the entry is
-    // checked against, so a host configuration change cannot serve a stale answer.
+    // Each entry records the mount-root configuration it was computed under, so a
+    // host configuration change cannot serve a stale answer.
     private static readonly ConcurrentDictionary<string, (string Root, string Path)> _resolvedGuestPaths =
         new(StringComparer.Ordinal);
     private const int ResolvedGuestPathCacheLimit = 1 << 20;
 
     internal static void InvalidateResolvedGuestPaths() => _resolvedGuestPaths.Clear();
 
-    private static bool IsApp0GuestPath(string guestPath) =>
-        guestPath.StartsWith("/app0/", StringComparison.OrdinalIgnoreCase) ||
-        guestPath.StartsWith("app0/", StringComparison.OrdinalIgnoreCase);
+    // Every mount root a built-in branch can use. Resolution depends on nothing else
+    // that changes at runtime (the mount table clears the cache itself), so a memoized
+    // answer stays valid exactly as long as this token does.
+    private static string RootConfigurationToken() =>
+        string.Concat(
+            Environment.GetEnvironmentVariable("SHARPEMU_APP0_DIR"), "|",
+            Environment.GetEnvironmentVariable("SHARPEMU_HOSTAPP_DIR"), "|",
+            Environment.GetEnvironmentVariable("SHARPEMU_DEVLOG_APP_DIR"), "|",
+            Environment.GetEnvironmentVariable("SHARPEMU_TEMP0_DIR"), "|",
+            Environment.GetEnvironmentVariable("SHARPEMU_DOWNLOAD0_DIR"), "|",
+            Environment.GetEnvironmentVariable("SHARPEMU_SAVEDATA_DIR"));
 
     public static string ResolveGuestPath(string guestPath)
     {
@@ -4789,11 +4796,9 @@ public static partial class KernelMemoryCompatExports
             return guestPath;
         }
 
-        var app0Root = IsApp0GuestPath(guestPath) ? ResolveApp0Root() : null;
-        var memoizable = !string.IsNullOrWhiteSpace(app0Root);
-        if (memoizable &&
-            _resolvedGuestPaths.TryGetValue(guestPath, out var memoized) &&
-            string.Equals(memoized.Root, app0Root, StringComparison.Ordinal))
+        var roots = RootConfigurationToken();
+        if (_resolvedGuestPaths.TryGetValue(guestPath, out var memoized) &&
+            string.Equals(memoized.Root, roots, StringComparison.Ordinal))
         {
             return memoized.Path;
         }
@@ -4801,11 +4806,9 @@ public static partial class KernelMemoryCompatExports
         var resolved = ResolveGuestPathUncached(guestPath);
         // Only a successful resolution is memoized: a denial is a containment
         // decision about the host filesystem's current shape, so it stays live.
-        if (memoizable &&
-            !string.IsNullOrEmpty(resolved) &&
-            _resolvedGuestPaths.Count < ResolvedGuestPathCacheLimit)
+        if (!string.IsNullOrEmpty(resolved) && _resolvedGuestPaths.Count < ResolvedGuestPathCacheLimit)
         {
-            _resolvedGuestPaths[guestPath] = (app0Root!, resolved);
+            _resolvedGuestPaths[guestPath] = (roots, resolved);
         }
 
         return resolved;
