@@ -18,14 +18,44 @@ public sealed unsafe partial class GuestImageCache
         double.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_DUMP_FRAME_AT"), out var seconds) ? seconds : -1;
 
     private static readonly string? FrameDumpTrigger = Environment.GetEnvironmentVariable("SHARPEMU_DUMP_FRAME_TRIGGER");
-    private static readonly long FrameDumpStart = Stopwatch.GetTimestamp();
+
+    // Seconds count from when the process started, not from when this class was first touched: the
+    // GPU cache is only built once a game reaches its first image, tens of seconds in, which made
+    // SHARPEMU_DUMP_FRAME_AT mean a different moment in every run and miss the phase it was aimed at.
+    private static readonly DateTime FrameDumpStart = ProcessStartTime();
+
+    private static DateTime ProcessStartTime()
+    {
+        try
+        {
+            using var process = System.Diagnostics.Process.GetCurrentProcess();
+            return process.StartTime.ToUniversalTime();
+        }
+        catch (Exception)
+        {
+            return DateTime.UtcNow;
+        }
+    }
+
     private static int _frameDumped;
     private static int _frameDumpCount;
     private long _frameDumpTriggerCheck;
     private ulong _previousFlipTick;
     private string? _frameDumpDirectory;
 
-    // Called under the cache lock when the display surface of a flip is looked up.
+    // Called by the presenter for every flip the guest submits, before anything that could skip it.
+    public void NoteFlip()
+    {
+        if (FrameDumpAt < 0 && FrameDumpTrigger is null)
+        {
+            return;
+        }
+
+        using var held = _lock.Hold();
+        DumpFrameImagesIfRequested();
+    }
+
+    // Called under the cache lock, once per flip.
     private void DumpFrameImagesIfRequested()
     {
         var frameStart = _previousFlipTick;
@@ -123,7 +153,7 @@ public sealed unsafe partial class GuestImageCache
 
     private bool IsFrameDumpRequested()
     {
-        if (FrameDumpAt >= 0 && Stopwatch.GetElapsedTime(FrameDumpStart).TotalSeconds >= FrameDumpAt &&
+        if (FrameDumpAt >= 0 && (DateTime.UtcNow - FrameDumpStart).TotalSeconds >= FrameDumpAt &&
             Interlocked.Exchange(ref _frameDumped, 1) == 0)
         {
             return true;
