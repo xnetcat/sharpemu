@@ -90,8 +90,7 @@ public sealed class KernelBackedMemoryTests
     public void ReservationLetsPendingGpuReadsFinishBeforeTakingMappingLocks(bool replaceMapping)
     {
         using var test = new BackedKernelMemory();
-        const ulong address = 0x1026C00000;
-        test.Reserve(0x10000, address);
+        var address = ReserveApertureRange(test, 0x10000);
         SetPrtAperture(test, address, 0x10000);
         using var memory = new GuestGpuMemory(test.Memory);
         GuestGpuMemoryHook.Attach(memory);
@@ -121,6 +120,24 @@ public sealed class KernelBackedMemoryTests
             GuestGpuMemoryHook.Attach(null);
             SetPrtAperture(test, address, 0);
         }
+    }
+
+    // The PRT aperture is the band the kernel hands out for mapped ranges.
+    // Which address inside it the host can actually take is a property of the
+    // process, not of the emulator: a fixed reservation has to land on exactly
+    // the address it asks for, and in an osx-x64 test host the low part of the
+    // band is already owned by the runtime, so a hardcoded 0x1026C00000 fails
+    // there for every one of these tests. Let the allocator pick a free range
+    // and check it stayed in the band the test is about.
+    private const ulong PrtApertureStart = 0x10_0000_0000;
+    private const ulong PrtApertureEnd = 0xFC_0000_0000;
+
+    private static ulong ReserveApertureRange(BackedKernelMemory test, ulong size)
+    {
+        var address = test.Reserve(size);
+        Assert.InRange(address, PrtApertureStart, PrtApertureEnd - size);
+        Assert.Equal(0UL, address % 0x4000);
+        return address;
     }
 
     private sealed class PendingReadRelay(Action readPendingImage) : IGpuQueueRelay
@@ -154,8 +171,7 @@ public sealed class KernelBackedMemoryTests
     {
         using var test = new BackedKernelMemory();
         var previousPool = KernelMemoryCompatExports.SetFlexibleBackingForTests(new FlexibleBackingPool(0x4000000, 0x4000000));
-        const ulong address = 0x1026C00000;
-        test.Reserve(0x10000, address);
+        var address = ReserveApertureRange(test, 0x10000);
         SetPrtAperture(test, address, 0x10000);
         using var memory = new GuestGpuMemory(test.Memory);
         GuestGpuMemoryHook.Attach(memory);
