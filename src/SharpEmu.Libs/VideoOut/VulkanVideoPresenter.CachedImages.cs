@@ -898,6 +898,11 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private void DestroyGuestImage(GuestImageResource resource)
         {
+            if (TryPoolFlipSnapshot(resource))
+            {
+                return;
+            }
+
             if (resource.Image.Handle != 0)
             {
                 _vk.DestroyImage(_device, resource.Image, null);
