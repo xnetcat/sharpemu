@@ -1801,6 +1801,9 @@ public static partial class KernelMemoryCompatExports
     private static long _aprReadTicks;
     private static long _aprPathTicks;
     private static long _aprRegisterTicks;
+    private static long _pathTokenTicks;
+    private static long _pathUncachedTicks;
+    private static long _pathCacheMisses;
 
     private static void ReportAprResolveCost(long startTimestamp)
     {
@@ -1822,7 +1825,10 @@ public static partial class KernelMemoryCompatExports
             $"size_negative={Interlocked.Read(ref _aprSizeNegativeHits)} " +
             $"read_s={(double)Interlocked.Read(ref _aprReadTicks) / System.Diagnostics.Stopwatch.Frequency:F1} " +
             $"path_s={(double)Interlocked.Read(ref _aprPathTicks) / System.Diagnostics.Stopwatch.Frequency:F1} " +
-            $"register_s={(double)Interlocked.Read(ref _aprRegisterTicks) / System.Diagnostics.Stopwatch.Frequency:F1}");
+            $"register_s={(double)Interlocked.Read(ref _aprRegisterTicks) / System.Diagnostics.Stopwatch.Frequency:F1} " +
+            $"token_s={(double)Interlocked.Read(ref _pathTokenTicks) / System.Diagnostics.Stopwatch.Frequency:F1} " +
+            $"uncached_s={(double)Interlocked.Read(ref _pathUncachedTicks) / System.Diagnostics.Stopwatch.Frequency:F1} " +
+            $"path_miss={Interlocked.Read(ref _pathCacheMisses)}");
     }
 
 
@@ -4803,14 +4809,19 @@ public static partial class KernelMemoryCompatExports
             return guestPath;
         }
 
+        var tokenStart = System.Diagnostics.Stopwatch.GetTimestamp();
         var roots = RootConfigurationToken();
+        Interlocked.Add(ref _pathTokenTicks, System.Diagnostics.Stopwatch.GetTimestamp() - tokenStart);
         if (_resolvedGuestPaths.TryGetValue(guestPath, out var memoized) &&
             string.Equals(memoized.Root, roots, StringComparison.Ordinal))
         {
             return memoized.Path;
         }
 
+        Interlocked.Increment(ref _pathCacheMisses);
+        var uncachedStart = System.Diagnostics.Stopwatch.GetTimestamp();
         var resolved = ResolveGuestPathUncached(guestPath);
+        Interlocked.Add(ref _pathUncachedTicks, System.Diagnostics.Stopwatch.GetTimestamp() - uncachedStart);
         // Only a successful resolution is memoized: a denial is a containment
         // decision about the host filesystem's current shape, so it stays live.
         if (!string.IsNullOrEmpty(resolved) &&

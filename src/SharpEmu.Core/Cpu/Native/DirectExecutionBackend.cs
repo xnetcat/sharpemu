@@ -982,6 +982,39 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	}
 
 	[ThreadStatic] private static bool _signalStackReported;
+	private static int _unrecoveredFaultReports;
+	[ThreadStatic] private static ulong _lastGuestStackPointer;
+
+	// Where an unrecovered fault landed. The runtime prints "Stack overflow" for any
+	// guard-page hit it attributes to a managed thread, so the address has to be
+	// placed against this thread's real stack before the report is believed.
+	internal unsafe static void ReportUnrecoveredFault(int signal, ulong rip, ulong rsp, ulong faultAddress)
+	{
+		if (Interlocked.Increment(ref _unrecoveredFaultReports) > 8 || !OperatingSystem.IsMacOS())
+		{
+			return;
+		}
+
+		byte probe = 0;
+		var here = (nint)(&probe);
+		var self = MacPthreadSelf();
+		var top = MacPthreadStackAddress(self);
+		var size = (nint)MacPthreadStackSize(self);
+		var limit = top - size;
+		var fault = (nint)faultAddress;
+		var stackPointer = (nint)rsp;
+		string Where(nint address) =>
+			address >= limit && address <= top ? "executor-stack"
+				: address >= limit - (16 * 1024 * 1024) && address < limit ? "below-executor-stack"
+				: "elsewhere";
+
+		Console.Error.WriteLine(
+			$"[LOADER][ERROR] Unrecovered fault: sig={signal} rip=0x{rip:X16} rsp=0x{rsp:X16} fault=0x{faultAddress:X16} " +
+			$"stack=[0x{limit:X}..0x{top:X}] size={size} handler_rsp~0x{here:X} " +
+			$"fault_in={Where(fault)} rsp_in={Where(stackPointer)} guest_rsp=0x{_lastGuestStackPointer:X16} " +
+			$"thread='{Thread.CurrentThread.Name}'");
+		Console.Error.Flush();
+	}
 
 	// Called from the POSIX signal handler. Reports once per thread when the handler
 	// is entered on a stack the runtime does not know about, or with less than 1 MiB
@@ -6141,6 +6174,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			reason = "guest thread stack pointer is zero";
 			return GuestNativeCallExitReason.Exception;
 		}
+
+		_lastGuestStackPointer = context[CpuRegister.Rsp];
 		const uint stubSize = 512u;
 		void* ptr = VirtualAlloc(null, stubSize, 12288u, 4u);
 		if (ptr == null)
