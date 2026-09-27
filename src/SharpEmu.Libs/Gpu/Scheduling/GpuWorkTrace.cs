@@ -30,6 +30,21 @@ public static class GpuWorkTrace
     public static Action<int>? RecordBreadcrumb { get; set; }
     public static Func<int>? ReadBreadcrumb { get; set; }
 
+    // Records host work (tiling, fault processing) the same way as guest dispatches.
+    public static void Traced(string work, Action record)
+    {
+        if (!Enabled)
+        {
+            record();
+            return;
+        }
+
+        var id = Note(work);
+        Breadcrumb(-id);
+        record();
+        Breadcrumb(id);
+    }
+
     public static void Breadcrumb(int id)
     {
         if (Enabled && id != 0)

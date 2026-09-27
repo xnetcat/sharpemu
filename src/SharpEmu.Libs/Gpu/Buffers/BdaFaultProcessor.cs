@@ -216,7 +216,7 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
         var set = _sets[_currentArea];
         vk.CmdBindDescriptorSets(command, PipelineBindPoint.Compute, _pipelineLayout, 0, 1, &set, 0, null);
         var threads = _pageCount / 32;
-        vk.CmdDispatch(command, (uint)((threads + 63) / 64), 1, 1);
+        Scheduling.GpuWorkTrace.Traced($"bda fault scan threads={threads}", () => vk.CmdDispatch(command, (uint)((threads + 63) / 64), 1, 1));
         VulkanSynchronization.PipelineBarrier(vk,
             command, PipelineStageFlags.ComputeShaderBit, PipelineStageFlags.AllCommandsBit, DependencyFlags.ByRegionBit,
             0, null, 1, &postBarrier, 0, null);

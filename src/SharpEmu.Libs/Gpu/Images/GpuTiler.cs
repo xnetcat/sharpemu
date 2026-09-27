@@ -522,7 +522,9 @@ public sealed unsafe class GpuTiler : IDisposable
             infos[2] = new DescriptorBufferInfo(dispatch.ArgumentsBuffer, dispatch.ArgumentsOffset, TileTransferArguments.Size);
             BindDescriptorSet(command, WriteDescriptorSet(infos, 2));
             vk.CmdBindPipeline(command, PipelineBindPoint.Compute, GetPipeline(dispatch.PipelineSlot));
-            vk.CmdDispatch(command, (dispatch.Arguments.Width + 7) / 8, (dispatch.Arguments.Height + 7) / 8, dispatch.Arguments.Depth);
+            var arguments = dispatch.Arguments;
+            Scheduling.GpuWorkTrace.Traced($"tiler slot={dispatch.PipelineSlot} {arguments.Width}x{arguments.Height}x{arguments.Depth} pitch={arguments.PitchBytes} slice={arguments.SliceBytes}",
+                () => vk.CmdDispatch(command, (arguments.Width + 7) / 8, (arguments.Height + 7) / 8, arguments.Depth));
         }
 
         barriers[1].SrcAccessMask = AccessFlags2.ShaderWriteBit;
@@ -733,7 +735,10 @@ public sealed unsafe class GpuTiler : IDisposable
                     PitchBytes = (uint)layout.SourceRowStride,
                     SliceBytes = (uint)layout.TargetRowStride,
                 });
-                vk.CmdDispatch(command, (uint)groupsX, rows, 1);
+                var linearGroups = (uint)groupsX;
+                var linearRows = rows;
+                Scheduling.GpuWorkTrace.Traced($"tiler linear groups={linearGroups}x{linearRows} width={layout.Width}",
+                    () => vk.CmdDispatch(command, linearGroups, linearRows, 1));
                 row += rows;
             }
         }
@@ -771,7 +776,7 @@ public sealed unsafe class GpuTiler : IDisposable
         vk.CmdBindPipeline(command, PipelineBindPoint.Compute, _swapBgra16);
         BindDescriptorSet(command, WriteDescriptorSet(infos, -1));
         PushArguments(command, new TileTransferArguments { SourceBase = inputBinding.Base, DestinationBase = outputBinding.Base, Width = pixels });
-        vk.CmdDispatch(command, (pixels + 63) / 64, 1, 1);
+        Scheduling.GpuWorkTrace.Traced($"tiler swap-bgra16 pixels={pixels}", () => vk.CmdDispatch(command, (pixels + 63) / 64, 1, 1));
         barriers[1].SrcAccessMask = AccessFlags2.ShaderWriteBit;
         barriers[1].DstAccessMask = AccessFlags2.TransferReadBit;
         VulkanSynchronization.PipelineBarrier(vk,command, PipelineStageFlags.ComputeShaderBit, PipelineStageFlags.TransferBit, 0, 0, null, 1, barriers + 1, 0, null);
