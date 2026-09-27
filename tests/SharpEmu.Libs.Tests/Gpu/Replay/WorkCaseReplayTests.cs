@@ -87,13 +87,20 @@ public sealed class WorkCaseReplayTests : IClassFixture<HeadlessVulkanFixture>
             Assert.True(complete.Recorded, complete.Describe());
             Assert.Equal(0, complete.DroppedWork);
 
-            // Drop the attribute table the vertex header reaches through a user scalar pointer.
-            var manifest = WorkCase.Read(caseDirectory);
+            // A copy without the attribute table the vertex header reaches through a user scalar
+            // pointer; the complete case stays on disk for the capture side to be checked against.
+            var brokenDirectory = Path.Combine(root, "without-attribute-table");
+            Directory.CreateDirectory(brokenDirectory);
+            foreach (var file in Directory.EnumerateFiles(caseDirectory))
+            {
+                File.Copy(file, Path.Combine(brokenDirectory, Path.GetFileName(file)));
+            }
+
+            var manifest = WorkCase.Read(brokenDirectory);
             Assert.Equal(1, manifest.Memory.RemoveAll(range => range.Role == SyntheticWorkCase.AttributeTableRole));
-            File.WriteAllText(Path.Combine(caseDirectory, WorkCase.ManifestName),
+            File.WriteAllText(Path.Combine(brokenDirectory, WorkCase.ManifestName),
                 System.Text.Json.JsonSerializer.Serialize(manifest, WorkCase.Json));
-            var broken = WorkCaseReplayer.Replay(_vulkan, caseDirectory,
-                new WorkCaseReplayOptions { OutputDirectory = Path.Combine(root, "replay-broken") });
+            var broken = WorkCaseReplayer.Replay(_vulkan, brokenDirectory, new WorkCaseReplayOptions());
             Assert.False(broken.Recorded, broken.Describe());
             Assert.Contains(broken.Notes, note => note.Contains("vertex attribute table is unreadable", StringComparison.Ordinal));
         }

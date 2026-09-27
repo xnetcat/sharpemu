@@ -86,9 +86,16 @@ public static class WorkCaseReplayer
         catch (Exception exception)
         {
             // A case that is missing a range the resolvers read fails here. Report which one instead
-            // of taking the process down: the whole point of a case is to be looked at.
-            result.Notes.Add($"the work did not run: {exception.Message}");
+            // of taking the process down: the whole point of a case is to be looked at. An exception
+            // that is not a reported fatal carries its type and stack, because then it is a bug here.
+            result.Notes.Add(exception is Scheduling.SchedulerFatalException
+                ? $"the work did not run: {exception.Message}"
+                : $"the work did not run: {exception.GetType().Name}: {exception.Message}");
             Console.Error.WriteLine($"[REPLAY][ERROR] {result.Notes[^1]}");
+            if (exception is not Scheduling.SchedulerFatalException)
+            {
+                Console.Error.WriteLine(exception.StackTrace);
+            }
         }
         finally
         {
