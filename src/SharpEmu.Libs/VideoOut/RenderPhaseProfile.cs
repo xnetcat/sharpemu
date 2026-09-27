@@ -464,6 +464,7 @@ internal static class RenderPhaseProfile
 
         ReportImageUploads();
         SharpEmu.Libs.Gpu.Scheduling.GpuWaitProfile.Report();
+        SharpEmu.Libs.Gpu.Scheduling.SubmitSiteProfile.Report();
         BufferUploadProfile.Report();
         SharpEmu.ShaderCompiler.Resources.ResourceMaterializationProfile.WriteReport();
         SharpEmu.Libs.Diagnostics.AgcRegisterPacketProfile.WriteReport();

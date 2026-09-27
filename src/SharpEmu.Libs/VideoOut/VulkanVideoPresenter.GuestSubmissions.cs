@@ -67,6 +67,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             using var profile = RenderPhaseProfile.Measure(RenderPhaseProfile.Phase.QueueSubmit);
+            SharpEmu.Libs.Gpu.Scheduling.SubmitSiteProfile.Record();
             return _scheduler.Flush();
         }
 
