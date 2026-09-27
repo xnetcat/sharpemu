@@ -164,6 +164,9 @@ internal sealed partial class MetalCommandStreamHost : IRenderHost, IShaderPipel
 
     bool IShaderPipelineHost.GraphicsSubgroupOperationsEnabled => true;
 
+    // The Metal backend runs no f16 conversion probe, so it keeps the exact emulation.
+    bool IShaderPipelineHost.NativeHalfConversionExact => false;
+
     RenderHostLimits IShaderPipelineHost.Limits => new(MaxDimension, MaxDimension, MaxDimension, MaxDimension);
 
     SampleCountFlags IShaderPipelineHost.NoAttachmentSampleCounts =>

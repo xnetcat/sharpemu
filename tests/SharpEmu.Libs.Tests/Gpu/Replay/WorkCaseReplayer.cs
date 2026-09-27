@@ -60,6 +60,9 @@ public static class WorkCaseReplayer
         var backing = BackingHeadroom + manifest.Memory.Aggregate(0ul, static (total, range) => total + range.Size);
         using var presenter = new PresenterUnderTest(vulkan, backingBytes: backing);
         presenter.LoadRenderingCommands();
+        // The real device setup probes f16 conversion before compiling anything; a replay must
+        // translate the same way the game would, so it runs the same one-time probe.
+        presenter.Run(() => presenter.InvokeMethod("ProbeNativeHalfConversion"));
         var harness = presenter.Harness;
         RestoreMemory(harness, caseDirectory, manifest, result);
 

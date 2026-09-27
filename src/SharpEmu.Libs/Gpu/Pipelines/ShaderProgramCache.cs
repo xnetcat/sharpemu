@@ -559,6 +559,7 @@ internal sealed class ShaderProgramCache
         BindingLayout layout)
     {
         var enableGraphicsSubgroups = _host.GraphicsSubgroupOperationsEnabled;
+        var nativeHalfConversion = _host.NativeHalfConversionExact;
         switch (source.Stage)
         {
             case ShaderStage.Vertex:
@@ -570,6 +571,7 @@ internal sealed class ShaderProgramCache
                     TraceDeviceAddressFaults = SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.TraceEnabled,
                     ScratchDwords = info.ScratchDwords,
                     EnableGraphicsSubgroupOperations = enableGraphicsSubgroups,
+                    NativeHalfConversionExact = nativeHalfConversion,
                     RequiredVertexOutputCount = options.RequiredVertexOutputCount,
                     VertexInputs = entry.VertexInputs,
                     NggMode = options.NggMode,
@@ -597,6 +599,7 @@ internal sealed class ShaderProgramCache
                     TraceDeviceAddressFaults = SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.TraceEnabled,
                     ScratchDwords = info.ScratchDwords,
                     EnableGraphicsSubgroupOperations = enableGraphicsSubgroups,
+                    NativeHalfConversionExact = nativeHalfConversion,
                     PixelOutputs = options.PixelOutputs,
                     PixelInputEnable = options.PixelInputEnable,
                     PixelCustomInterpolationMask = info.CustomInterpolationMask,
@@ -614,6 +617,7 @@ internal sealed class ShaderProgramCache
                     WaveSize = info.WaveSize,
                     TraceDeviceAddressFaults = SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.TraceEnabled,
                     ScratchDwords = info.ScratchDwords,
+                    NativeHalfConversionExact = nativeHalfConversion,
                     ComputeSystemRegisters = options.ComputeSystemRegisters,
                     NggMode = options.NggMode,
                     NggParamCount = options.NggParamCount,
