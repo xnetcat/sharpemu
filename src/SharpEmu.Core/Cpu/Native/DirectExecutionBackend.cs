@@ -907,10 +907,47 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		return *(ulong*)((byte*)contextRecord + offset);
 	}
 
+	// Guest code that calls back into the host, and host code that calls back into
+	// the guest, nest on the host thread's stack. Unbounded nesting exhausts it
+	// (a managed "Stack overflow" abort with no usable trace), so the depth and
+	// the stack it has consumed are reported before that happens.
+	[ThreadStatic] private static int _guestEntryDepth;
+	[ThreadStatic] private static nint _guestEntryStackBase;
+
 	private unsafe static ulong CallNativeEntry(void* entry)
 	{
 		var nativeEntry = (delegate* unmanaged[Cdecl]<ulong>)entry;
-		return nativeEntry();
+		var depth = ++_guestEntryDepth;
+		try
+		{
+			ReportGuestEntryDepth(depth);
+			return nativeEntry();
+		}
+		finally
+		{
+			_guestEntryDepth = depth - 1;
+		}
+	}
+
+	private unsafe static void ReportGuestEntryDepth(int depth)
+	{
+		byte probe = 0;
+		var here = (nint)(&probe);
+		if (depth <= 1)
+		{
+			_guestEntryStackBase = here;
+			return;
+		}
+
+		// Powers of two only: the report must not itself become the hot path.
+		if (depth < 16 || (depth & (depth - 1)) != 0)
+		{
+			return;
+		}
+
+		Console.Error.WriteLine(
+			$"[LOADER][WARN] Guest re-entry depth={depth} host_stack_used={_guestEntryStackBase - here} " +
+			$"thread='{Thread.CurrentThread.Name}'");
 	}
 
 	private unsafe static void WriteCtxU64(void* contextRecord, int offset, ulong value)
