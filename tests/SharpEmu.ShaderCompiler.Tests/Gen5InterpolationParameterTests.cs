@@ -108,10 +108,10 @@ public sealed class Gen5InterpolationParameterTests
     }
 
     [Fact]
-    public void FrontFaceAndAncillary_ReadTheirBuiltIns()
+    public void PixelSystemInputs_ReadTheirBuiltIns()
     {
         Assert.True(Gen5SpirvTranslator.TryCompileProgram(
-            Request(0, false, inputs: 0x3002, opcode: "VInterpP2F32"), out var shader, out var error), error);
+            Request(0, false, inputs: 0xF002, opcode: "VInterpP2F32"), out var shader, out var error), error);
         var instructions = Instructions(shader.Spirv);
         var builtIns = instructions
             .Where(instruction => instruction.Opcode == SpirvOp.Decorate &&
@@ -119,6 +119,7 @@ public sealed class Gen5InterpolationParameterTests
             .Select(instruction => instruction.Operands[2]).ToArray();
         Assert.Contains((uint)SpirvBuiltIn.FrontFacing, builtIns);
         Assert.Contains((uint)SpirvBuiltIn.Layer, builtIns);
+        Assert.Contains((uint)SpirvBuiltIn.SampleMask, builtIns);
         Assert.Contains(instructions, instruction => instruction.Opcode == SpirvOp.ShiftLeftLogical);
         ValidateWhenAvailable(shader.Spirv);
     }

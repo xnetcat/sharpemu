@@ -278,6 +278,7 @@ public enum SpirvBuiltIn : uint
     SubgroupSize = 36,
     SubgroupLocalInvocationId = 41,
     SampleId = 18,
+    SampleMask = 20,
     FragDepth = 22,
 }
 

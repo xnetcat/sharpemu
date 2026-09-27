@@ -15,6 +15,7 @@ public static partial class Gen5SpirvTranslator
         private uint _interpolationSampleId;
         private uint _frontFacingInput;
         private uint _ancillaryLayerInput;
+        private uint _sampleMaskInput;
         private const uint InterpolateAtCentroid = 76;
         private const uint InterpolateAtSample = 77;
         private const uint InterpolateAtOffset = 78;
@@ -117,6 +118,15 @@ public static partial class Gen5SpirvTranslator
                 _module.AddDecoration(_ancillaryLayerInput, SpirvDecoration.Flat);
                 _interfaces.Add(_ancillaryLayerInput);
             }
+            if ((enabledInputs & (1u << 14)) != 0)
+            {
+                var maskArray = _module.TypeArray(_intType, 1);
+                _sampleMaskInput = _module.AddGlobalVariable(
+                    _module.TypePointer(SpirvStorageClass.Input, maskArray), SpirvStorageClass.Input);
+                _module.AddDecoration(_sampleMaskInput, SpirvDecoration.BuiltIn, (uint)SpirvBuiltIn.SampleMask);
+                _module.AddDecoration(_sampleMaskInput, SpirvDecoration.Flat);
+                _interfaces.Add(_sampleMaskInput);
+            }
         }
 
         // Front facing reads as 1.0f and back facing as 0, which satisfies both the float greater-than
@@ -126,6 +136,25 @@ public static partial class Gen5SpirvTranslator
 
         private uint LoadAncillaryInput() =>
             ShiftLeftLogical(Load(_uintType, _ancillaryLayerInput), UInt(16));
+
+        private uint LoadSampleCoverageInput()
+        {
+            var element = _module.AddInstruction(SpirvOp.AccessChain,
+                _module.TypePointer(SpirvStorageClass.Input, _intType), _sampleMaskInput, UInt(0));
+            return Bitcast(_uintType, Load(_intType, element));
+        }
+
+        // POS_FIXED_PT holds the integer pixel position: x in bits [15:0] and y in bits [31:16].
+        private uint LoadFixedPointPositionInput(uint fragCoord)
+        {
+            var x = _module.AddInstruction(SpirvOp.ConvertFToU, _uintType,
+                _module.AddInstruction(SpirvOp.CompositeExtract, _floatType, fragCoord, 0));
+            var y = _module.AddInstruction(SpirvOp.ConvertFToU, _uintType,
+                _module.AddInstruction(SpirvOp.CompositeExtract, _floatType, fragCoord, 1));
+            return _module.AddInstruction(SpirvOp.BitwiseOr, _uintType,
+                _module.AddInstruction(SpirvOp.BitwiseAnd, _uintType, x, UInt(0xFFFF)),
+                ShiftLeftLogical(y, UInt(16)));
+        }
 
         private void EmitPixelSystemInput(int bit, uint value, ref uint vgpr)
         {
