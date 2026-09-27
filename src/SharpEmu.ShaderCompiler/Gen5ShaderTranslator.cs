@@ -940,7 +940,7 @@ public static partial class Gen5ShaderTranslator
         }
 
         var src0 = word & 0x1FF;
-        sizeDwords = opcode is 0x20 or 0x21 or 0x2C or 0x2D ||
+        sizeDwords = opcode is 0x20 or 0x21 or 0x2C or 0x2D or 0x37 or 0x38 ||
             src0 is 0xE9 or 0xEA or 0xF9 or 0xFA or 0xFF ? 2u : 1u;
         error = string.Empty;
         name = Vop2OpcodeName(opcode);
@@ -955,6 +955,7 @@ public static partial class Gen5ShaderTranslator
         {
             0x01 => "VCndmaskB32",
             0x02 => "VDot2cF32F16",
+            0x06 => "VFmacLegacyF32",
             0x03 => "VAddF32",
             0x04 => "VSubF32",
             0x05 => "VSubrevF32",
@@ -963,6 +964,7 @@ public static partial class Gen5ShaderTranslator
             0x09 => "VMulI32I24",
             0x0A => "VMulHiI32I24",
             0x0B => "VMulU32U24",
+            0x0D => "VDot4cI32I8",
             0x0C => "VMulHiU32U24",
             0x0F => "VMinF32",
             0x10 => "VMaxF32",
@@ -1003,9 +1005,12 @@ public static partial class Gen5ShaderTranslator
             0x34 => "VSubrevF16",
             0x35 => "VMulF16",
             0x36 => "VFmacF16",
+            0x37 => "VFmaMkF16",
+            0x38 => "VFmaAkF16",
             0x39 => "VMaxF16",
             0x3A => "VMinF16",
             0x3B => "VLdexpF16",
+            0x3C => "VPkFmacF16",
             _ => string.Empty,
         };
 
@@ -1375,7 +1380,8 @@ public static partial class Gen5ShaderTranslator
             var vop2 = opcode - 0x100;
             // The mk/ak forms carry their literal in the instruction stream and
             // exist only as VOP2; 0x3E/0x3F are the VOPC/VOP1 escape rows.
-            return vop2 is 0x20 or 0x21 or 0x2C or 0x2D or 0x3E or 0x3F
+            return vop2 is 0x02 or 0x0D or 0x20 or 0x21 or 0x2C or 0x2D or 0x37 or 0x38 or
+                0x3C or 0x3E or 0x3F
                 ? $"Vop3Raw{opcode:X3}"
                 : NameOrRaw(Vop2OpcodeName(vop2), opcode);
         }
@@ -2298,7 +2304,7 @@ public static partial class Gen5ShaderTranslator
                         Gen5Operand.Source(word & 0x1FF, literal),
                         Gen5Operand.Vector((word >> 9) & 0xFF),
                     ];
-                    if ((opcode is "VMadMkF32" or "VFmaMkF32") && literal.HasValue)
+                    if ((opcode is "VMadMkF32" or "VFmaMkF32" or "VFmaMkF16") && literal.HasValue)
                     {
                         sources =
                         [
@@ -2307,7 +2313,7 @@ public static partial class Gen5ShaderTranslator
                             sources[1],
                         ];
                     }
-                    else if ((opcode is "VMadAkF32" or "VFmaAkF32") && literal.HasValue)
+                    else if ((opcode is "VMadAkF32" or "VFmaAkF32" or "VFmaAkF16") && literal.HasValue)
                     {
                         sources =
                         [

@@ -37,7 +37,10 @@ public sealed class Gen5IsaTableGapTests
         0x8000_0000u | (opcode << 23) | (sdst << 16) | (ssrc1 << 8) | ssrc0;
 
     [Theory]
+    [InlineData(0x06u, "VFmacLegacyF32")]
     [InlineData(0x07u, "VMulLegacyF32")]
+    [InlineData(0x0Du, "VDot4cI32I8")]
+    [InlineData(0x3Cu, "VPkFmacF16")]
     [InlineData(0x0Au, "VMulHiI32I24")]
     [InlineData(0x36u, "VFmacF16")]
     [InlineData(0x3Bu, "VLdexpF16")]
@@ -93,6 +96,45 @@ public sealed class Gen5IsaTableGapTests
         var program = Gen5Vop1CoverageTests.Decode([Sop1(opcode, 2, 4), SEndpgm]);
         Assert.Equal(expectedName, program.Instructions[0].Opcode);
         Assert.Equal(Gen5ShaderEncoding.Sop1, program.Instructions[0].Encoding);
+
+        var request = ResourceTestProgram.Request(program, userDataCount: 0);
+        Assert.True(
+            Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error),
+            error);
+        Gen5Vop1CoverageTests.ValidateWhenAvailable(shader.Spirv);
+    }
+
+    [Fact]
+    public void Float16FmaLiteralFormsDecodeWithTheirLiteralOperand()
+    {
+        // V_FMAMK_F16 (0x37): D.f16 = S0.f16 * K.f16 + S1.f16, so the decoder puts
+        // the literal between the two register sources.
+        var mk = Gen5Vop1CoverageTests.Decode(
+            [(0x37u << 25) | (2u << 17) | (1u << 9) | 256u, 0xDEAD4400u, SEndpgm]);
+        Assert.Equal("VFmaMkF16", mk.Instructions[0].Opcode);
+        Assert.Equal(3, mk.Instructions[0].Sources.Count);
+        Assert.Equal(Gen5OperandKind.LiteralConstant, mk.Instructions[0].Sources[1].Kind);
+        Assert.Equal(0xDEAD4400u, mk.Instructions[0].Sources[1].Value);
+
+        // V_FMAAK_F16 (0x38): D.f16 = S0.f16 * S1.f16 + K.f16, literal last.
+        var ak = Gen5Vop1CoverageTests.Decode(
+            [(0x38u << 25) | (3u << 17) | (1u << 9) | 256u, 0xBEEF4400u, SEndpgm]);
+        Assert.Equal("VFmaAkF16", ak.Instructions[0].Opcode);
+        Assert.Equal(3, ak.Instructions[0].Sources.Count);
+        Assert.Equal(Gen5OperandKind.LiteralConstant, ak.Instructions[0].Sources[2].Kind);
+        Assert.Equal(0xBEEF4400u, ak.Instructions[0].Sources[2].Value);
+    }
+
+    [Fact]
+    public void SilentHillFmaakFloat16WordDecodesAndCompiles()
+    {
+        // The exact word Silent Hill dies on: pixel shader 0xE3CF062DC905BE5D,
+        // "unknown-vop2 op=0x38 word=0x700608F5". src0 is the inline constant
+        // -2.0 (245), src1 is v4 and the destination is v3.
+        var program = Gen5Vop1CoverageTests.Decode([0x700608F5u, 0x00003C00u, SEndpgm]);
+        Assert.Equal("VFmaAkF16", program.Instructions[0].Opcode);
+        Assert.Equal(Gen5OperandKind.EncodedConstant, program.Instructions[0].Sources[0].Kind);
+        Assert.Equal(245u, program.Instructions[0].Sources[0].Value);
 
         var request = ResourceTestProgram.Request(program, userDataCount: 0);
         Assert.True(

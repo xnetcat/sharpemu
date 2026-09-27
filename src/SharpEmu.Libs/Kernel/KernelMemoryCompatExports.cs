@@ -1716,6 +1716,9 @@ public static partial class KernelMemoryCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
+        var aprCallStart = System.Diagnostics.Stopwatch.GetTimestamp();
+        Interlocked.Increment(ref _aprResolveCalls);
+        Interlocked.Add(ref _aprResolvePaths, (long)count);
         for (ulong i = 0; i < count; i++)
         {
             if (idsAddress != 0 &&
@@ -1725,13 +1728,17 @@ public static partial class KernelMemoryCompatExports
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
             }
 
+            var aprReadStart = System.Diagnostics.Stopwatch.GetTimestamp();
             if (!TryResolveAprFilepath(ctx, pathListAddress, i, out var guestPath))
             {
                 KernelRuntimeCompatExports.TrySetErrno(ctx, Efault);
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
             }
 
+            Interlocked.Add(ref _aprReadTicks, System.Diagnostics.Stopwatch.GetTimestamp() - aprReadStart);
+            var aprResolveStart = System.Diagnostics.Stopwatch.GetTimestamp();
             var hostPath = ResolveGuestPath(guestPath);
+            Interlocked.Add(ref _aprPathTicks, System.Diagnostics.Stopwatch.GetTimestamp() - aprResolveStart);
             if (!TryGetAprFileSize(hostPath, out var fileSize))
             {
                 // Stop at the first miss and report its index.
@@ -1756,7 +1763,9 @@ public static partial class KernelMemoryCompatExports
                 return -1;
             }
 
+            var aprRegisterStart = System.Diagnostics.Stopwatch.GetTimestamp();
             var fileId = AmprFileRegistry.RegisterAprResolvedPath(guestPath, hostPath);
+            Interlocked.Add(ref _aprRegisterTicks, System.Diagnostics.Stopwatch.GetTimestamp() - aprRegisterStart);
             if (_logIo)
             {
                 LogIoTrace("apr_resolve", guestPath, $"host='{hostPath}' index={i} count={count} id=0x{fileId:X8} size={fileSize}");
@@ -1776,8 +1785,44 @@ public static partial class KernelMemoryCompatExports
             }
         }
 
+        ReportAprResolveCost(aprCallStart);
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    // Path resolution is the single largest HLE cost of a Bluepoint-style resource
+    // streamer, so the call count, the paths those calls carry and the time they take
+    // are reported together: the average paths per call decides whether the per-call
+    // or the per-path work is worth attacking.
+    private static long _aprResolveCalls;
+    private static long _aprResolvePaths;
+    private static long _aprResolveTicks;
+    private static long _aprResolveReported;
+    private static long _aprReadTicks;
+    private static long _aprPathTicks;
+    private static long _aprRegisterTicks;
+
+    private static void ReportAprResolveCost(long startTimestamp)
+    {
+        var ticks = Interlocked.Add(ref _aprResolveTicks, System.Diagnostics.Stopwatch.GetTimestamp() - startTimestamp);
+        var calls = Interlocked.Read(ref _aprResolveCalls);
+        if (calls - Interlocked.Read(ref _aprResolveReported) < 1024)
+        {
+            return;
+        }
+
+        Interlocked.Exchange(ref _aprResolveReported, calls);
+        var paths = Interlocked.Read(ref _aprResolvePaths);
+        var seconds = (double)ticks / System.Diagnostics.Stopwatch.Frequency;
+        Console.Error.WriteLine(
+            $"[LOADER][INFO] apr_resolve: calls={calls} paths={paths} paths_per_call={(double)paths / Math.Max(calls, 1):F1} " +
+            $"total_s={seconds:F1} us_per_path={(seconds * 1e6) / Math.Max(paths, 1):F1} " +
+            $"size_cache={Interlocked.Read(ref _aprSizeCacheHits)} size_dir={Interlocked.Read(ref _aprSizeDirectoryHits)} " +
+            $"size_stat={Interlocked.Read(ref _aprSizeStatHits)} size_miss={Interlocked.Read(ref _aprSizeMisses)} " +
+            $"size_negative={Interlocked.Read(ref _aprSizeNegativeHits)} " +
+            $"read_s={(double)Interlocked.Read(ref _aprReadTicks) / System.Diagnostics.Stopwatch.Frequency:F1} " +
+            $"path_s={(double)Interlocked.Read(ref _aprPathTicks) / System.Diagnostics.Stopwatch.Frequency:F1} " +
+            $"register_s={(double)Interlocked.Read(ref _aprRegisterTicks) / System.Diagnostics.Stopwatch.Frequency:F1}");
     }
 
 
@@ -4724,18 +4769,32 @@ public static partial class KernelMemoryCompatExports
     // i.e. in sceKernelAprResolveFilepathsToIdsAndFileSizes). Memoize the mapping and
     // drop it whenever the mount table changes, which is the only input that can
     // change an already-computed answer.
-    // Only /app0 is memoized. It is the read-only game image, it carries every
-    // streamed asset, and its root is one environment variable that the entry is
-    // checked against, so a host configuration change cannot serve a stale answer.
+    // Each entry records the mount-root configuration it was computed under, so a
+    // host configuration change cannot serve a stale answer.
     private static readonly ConcurrentDictionary<string, (string Root, string Path)> _resolvedGuestPaths =
         new(StringComparer.Ordinal);
     private const int ResolvedGuestPathCacheLimit = 1 << 20;
+    // ConcurrentDictionary.Count takes every bucket lock, which on a path resolved by
+    // a dozen guest threads at once costs far more than the resolution it guards.
+    private static int _resolvedGuestPathCount;
 
-    internal static void InvalidateResolvedGuestPaths() => _resolvedGuestPaths.Clear();
+    internal static void InvalidateResolvedGuestPaths()
+    {
+        _resolvedGuestPaths.Clear();
+        Interlocked.Exchange(ref _resolvedGuestPathCount, 0);
+    }
 
-    private static bool IsApp0GuestPath(string guestPath) =>
-        guestPath.StartsWith("/app0/", StringComparison.OrdinalIgnoreCase) ||
-        guestPath.StartsWith("app0/", StringComparison.OrdinalIgnoreCase);
+    // Every mount root a built-in branch can use. Resolution depends on nothing else
+    // that changes at runtime (the mount table clears the cache itself), so a memoized
+    // answer stays valid exactly as long as this token does.
+    private static string RootConfigurationToken() =>
+        string.Concat(
+            Environment.GetEnvironmentVariable("SHARPEMU_APP0_DIR"), "|",
+            Environment.GetEnvironmentVariable("SHARPEMU_HOSTAPP_DIR"), "|",
+            Environment.GetEnvironmentVariable("SHARPEMU_DEVLOG_APP_DIR"), "|",
+            Environment.GetEnvironmentVariable("SHARPEMU_TEMP0_DIR"), "|",
+            Environment.GetEnvironmentVariable("SHARPEMU_DOWNLOAD0_DIR"), "|",
+            Environment.GetEnvironmentVariable("SHARPEMU_SAVEDATA_DIR"));
 
     public static string ResolveGuestPath(string guestPath)
     {
@@ -4744,11 +4803,9 @@ public static partial class KernelMemoryCompatExports
             return guestPath;
         }
 
-        var app0Root = IsApp0GuestPath(guestPath) ? ResolveApp0Root() : null;
-        var memoizable = !string.IsNullOrWhiteSpace(app0Root);
-        if (memoizable &&
-            _resolvedGuestPaths.TryGetValue(guestPath, out var memoized) &&
-            string.Equals(memoized.Root, app0Root, StringComparison.Ordinal))
+        var roots = RootConfigurationToken();
+        if (_resolvedGuestPaths.TryGetValue(guestPath, out var memoized) &&
+            string.Equals(memoized.Root, roots, StringComparison.Ordinal))
         {
             return memoized.Path;
         }
@@ -4756,11 +4813,11 @@ public static partial class KernelMemoryCompatExports
         var resolved = ResolveGuestPathUncached(guestPath);
         // Only a successful resolution is memoized: a denial is a containment
         // decision about the host filesystem's current shape, so it stays live.
-        if (memoizable &&
-            !string.IsNullOrEmpty(resolved) &&
-            _resolvedGuestPaths.Count < ResolvedGuestPathCacheLimit)
+        if (!string.IsNullOrEmpty(resolved) &&
+            Volatile.Read(ref _resolvedGuestPathCount) < ResolvedGuestPathCacheLimit &&
+            _resolvedGuestPaths.TryAdd(guestPath, (roots, resolved)))
         {
-            _resolvedGuestPaths[guestPath] = (app0Root!, resolved);
+            Interlocked.Increment(ref _resolvedGuestPathCount);
         }
 
         return resolved;
@@ -6855,6 +6912,24 @@ public static partial class KernelMemoryCompatExports
         return TryWriteHostPathStat(ctx, statAddress, hostPath, isDirectory);
     }
 
+    // /app0 is the read-only game image, so a path that is not in it now will not
+    // appear later. Remembering the absent ones turns a repeated pair of host stats
+    // on the (slow, external) game volume into a dictionary probe; Demon's Souls
+    // resolves tens of thousands of paths per boot and misses are the common case.
+    private static readonly ConcurrentDictionary<string, byte> _aprMissingImagePaths = new(HostFsPath.Comparer);
+    private static long _aprSizeCacheHits;
+    private static long _aprSizeDirectoryHits;
+    private static long _aprSizeStatHits;
+    private static long _aprSizeMisses;
+    private static long _aprSizeNegativeHits;
+
+    private static bool IsUnderApp0(string cachePath)
+    {
+        var app0Root = ResolveApp0Root();
+        return !string.IsNullOrWhiteSpace(app0Root) &&
+            cachePath.StartsWith(Path.TrimEndingDirectorySeparator(app0Root) + Path.DirectorySeparatorChar, HostFsPath.Comparison);
+    }
+
     private static bool TryGetAprFileSize(string hostPath, out ulong size)
     {
         size = 0;
@@ -6871,7 +6946,14 @@ public static partial class KernelMemoryCompatExports
 
         if (_aprFileSizeCache.TryGetValue(cachePath, out size))
         {
+            Interlocked.Increment(ref _aprSizeCacheHits);
             return true;
+        }
+
+        if (_aprMissingImagePaths.ContainsKey(cachePath))
+        {
+            Interlocked.Increment(ref _aprSizeNegativeHits);
+            return false;
         }
 
         // One directory listing returns every file's size; titles resolve whole asset
@@ -6891,6 +6973,7 @@ public static partial class KernelMemoryCompatExports
 
             if (_aprFileSizeCache.TryGetValue(cachePath, out size))
             {
+                Interlocked.Increment(ref _aprSizeDirectoryHits);
                 return true;
             }
         }
@@ -6903,11 +6986,18 @@ public static partial class KernelMemoryCompatExports
                 var length = fileInfo.Length;
                 size = length < 0 ? 0UL : unchecked((ulong)length);
                 _aprFileSizeCache.TryAdd(cachePath, size);
+                Interlocked.Increment(ref _aprSizeStatHits);
                 return true;
             }
 
             if (!new DirectoryInfo(cachePath).Exists)
             {
+                Interlocked.Increment(ref _aprSizeMisses);
+                if (IsUnderApp0(cachePath))
+                {
+                    _aprMissingImagePaths.TryAdd(cachePath, 0);
+                }
+
                 return false;
             }
 

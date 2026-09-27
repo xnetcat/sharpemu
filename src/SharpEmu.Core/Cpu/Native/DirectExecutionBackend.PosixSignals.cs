@@ -330,6 +330,12 @@ public sealed unsafe partial class DirectExecutionBackend
 		pointers.ExceptionRecord = &record;
 		pointers.ContextRecord = contextRecord;
 
+		// The handler runs on the faulting thread's stack (no SA_ONSTACK), and the
+		// managed work below it needs real headroom. Report once per thread when the
+		// handler is entered with the interrupted RSP outside that stack, which is
+		// what makes the runtime abort with a bare "Stack overflow".
+		ReportSignalStackPosition(signal, ReadCtxU64(contextRecord, CTX_RSP));
+
 		int traceIndex = _posixSignalWarmup ? 0 : Interlocked.Increment(ref _posixSignalTraceCount);
 		bool traceSignal = traceIndex > 0 && (traceIndex <= 16 || traceIndex % 1024 == 0 ||
 			string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_POSIX_SIGNALS"), "1", StringComparison.Ordinal));

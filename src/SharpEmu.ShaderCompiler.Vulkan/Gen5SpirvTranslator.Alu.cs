@@ -589,7 +589,13 @@ public static partial class Gen5SpirvTranslator
                                 EmitHalfToFloat(BitwiseAnd(accumulatorBits, UInt(0xFFFF))))));
                     break;
                 }
+                // The mk/ak forms carry an f16 literal in the low half of the
+                // instruction-stream dword; the decoder normalises its position,
+                // so all three are fma(src0, src1, src2) and GetFloat16Source
+                // reads the literal's low 16 bits as the f16 pattern.
                 case "VFmaF16":
+                case "VFmaMkF16":
+                case "VFmaAkF16":
                     result = EmitFloat16Result(
                         instruction,
                         destination,
@@ -973,6 +979,81 @@ public static partial class Gen5SpirvTranslator
                             GetFloatSource(instruction, 1),
                             GetFloatSource(instruction, 2)));
                     break;
+                // VOP2 accumulate forms: the third operand is the destination.
+                // V_FMAC_LEGACY_F32 follows the DX9 rule that 0 * x is 0.
+                case "VFmacLegacyF32":
+                {
+                    var accFirst = GetFloatSource(instruction, 0);
+                    var accSecond = GetFloatSource(instruction, 1);
+                    var accProduct = _module.AddInstruction(
+                        SpirvOp.Select,
+                        _floatType,
+                        _module.AddInstruction(
+                            SpirvOp.LogicalOr,
+                            _boolType,
+                            _module.AddInstruction(
+                                SpirvOp.FOrdEqual, _boolType, accFirst, Float(0)),
+                            _module.AddInstruction(
+                                SpirvOp.FOrdEqual, _boolType, accSecond, Float(0))),
+                        Float(0),
+                        _module.AddInstruction(
+                            SpirvOp.FMul, _floatType, accFirst, accSecond));
+                    result = EmitFloatResult(
+                        instruction,
+                        _module.AddInstruction(
+                            SpirvOp.FAdd,
+                            _floatType,
+                            accProduct,
+                            Bitcast(_floatType, LoadV(destination))));
+                    break;
+                }
+                // D.i32 = sum over four signed bytes of S0 * S1, plus D.i32.
+                case "VDot4cI32I8":
+                {
+                    var dotLeft = GetRawSource(instruction, 0);
+                    var dotRight = GetRawSource(instruction, 1);
+                    var dotSum = LoadV(destination);
+                    for (var element = 0u; element < 4; element++)
+                    {
+                        dotSum = IAdd(
+                            dotSum,
+                            _module.AddInstruction(
+                                SpirvOp.IMul,
+                                _uintType,
+                                ExtractElement(dotLeft, UInt(element * 8), 8, isSigned: true),
+                                ExtractElement(dotRight, UInt(element * 8), 8, isSigned: true)));
+                    }
+
+                    result = dotSum;
+                    break;
+                }
+                // D.f16_lo = S0.lo * S1.lo + D.lo, and the same for the high half.
+                // The VOP2 form has no op_sel, so each lane reads its own half.
+                case "VPkFmacF16":
+                {
+                    var packedDestination = LoadV(destination);
+                    uint Lane(bool high)
+                    {
+                        uint Half(uint raw) => Bitcast(
+                            _floatType,
+                            EmitHalfToFloat(
+                                BitwiseAnd(
+                                    high ? ShiftRightLogical(raw, UInt(16)) : raw,
+                                    UInt(0xFFFF))));
+                        return EmitFloatToHalf(
+                            Bitcast(
+                                _uintType,
+                                Ext(
+                                    50,
+                                    _floatType,
+                                    Half(GetRawSource(instruction, 0)),
+                                    Half(GetRawSource(instruction, 1)),
+                                    Half(packedDestination))));
+                    }
+
+                    result = BitwiseOr(Lane(high: false), ShiftLeftLogical(Lane(high: true), UInt(16)));
+                    break;
+                }
                 // V_FMA_LEGACY_F32 is V_FMA_F32 with the pre-IEEE rule that a zero
                 // multiplicand forces a zero product.
                 case "VFmaLegacyF32":
