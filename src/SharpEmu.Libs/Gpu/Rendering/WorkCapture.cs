@@ -24,13 +24,13 @@ public readonly record struct CapturedImageBytes(string Format, uint Width, uint
 //                                                     the Nth match (the first by default)
 //   SHARPEMU_CAPTURE_DIR=<dir>                        where the case directories go (./work-capture)
 //   SHARPEMU_CAPTURE_LIMIT=<count>                    how many cases one run may write (8)
-//   SHARPEMU_CAPTURE_MAX_BYTES=<bytes>                the guest-memory budget of one case (64 MiB)
+//   SHARPEMU_CAPTURE_MAX_BYTES=<bytes>                the guest-memory budget of one case (512 MiB: a 4K MRT base pass needs ~0x30000000)
 //
 // Every check behind the enabled flag is a static readonly read, so a run without the variable set
 // does no work at all.
 internal static class WorkCapture
 {
-    private const ulong DefaultByteBudget = 64UL * 1024 * 1024;
+    private const ulong DefaultByteBudget = 512UL * 1024 * 1024;
     private const ulong PerImageByteCap = 16UL * 1024 * 1024;
 
     // What the header chains carry beyond their own words: the user data block and the direct

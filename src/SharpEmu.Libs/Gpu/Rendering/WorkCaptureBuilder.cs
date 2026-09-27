@@ -295,7 +295,9 @@ internal sealed class WorkCaptureBuilder
     public void Complete()
     {
         System.IO.Directory.CreateDirectory(Directory);
-        foreach (var (role, address, size) in Merge())
+        // Smallest ranges first: programs, headers and constant data are a few KiB and a case is
+        // useless without them, while a 4K render target alone can spend most of the budget.
+        foreach (var (role, address, size) in Merge().OrderBy(static range => range.Item3))
         {
             if (Manifest.CapturedBytes >= _budget)
             {
