@@ -29,6 +29,7 @@ public sealed partial class RenderExecutor
 
     public void Dispatch(ulong submitId, RegisterBanks banks, uint groupsX, uint groupsY, uint groupsZ, uint dispatchInitiator, ulong indirectArgumentsAddress = 0)
     {
+        GpuWorkTrace.MaybeSleepAtEntry();
         if (!_host.IsRecording)
         {
             throw _host.Fatal("A dispatch has no recording command buffer.");

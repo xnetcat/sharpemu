@@ -86,6 +86,18 @@ public static class GpuWorkTrace
         }
     }
 
+    private static readonly bool SleepAtEntry = Environment.GetEnvironmentVariable("SHARPEMU_DIAG_SLEEP_AT") == "entry";
+
+    // Dispatch entry, before preparation: sleeps here instead of at the note when so configured.
+    public static void MaybeSleepAtEntry()
+    {
+        if (SleepAtEntry && _armedCountdown == 1)
+        {
+            _armedCountdown = 0;
+            Thread.Sleep(200);
+        }
+    }
+
     private static void MaybeSleep()
     {
         if (_armedCountdown > 0 && --_armedCountdown == 0)
