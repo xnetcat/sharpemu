@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using System.Collections.Concurrent;
+using System.Runtime.CompilerServices;
 using SharpEmu.Libs.Gpu.GpuCommands.Registers;
 
 namespace SharpEmu.Libs.Gpu.Rendering;
@@ -11,8 +12,12 @@ namespace SharpEmu.Libs.Gpu.Rendering;
 // missing geometry; this line connects that symptom to the pass that was not executed.
 internal static class DroppedWorkLog
 {
-    private const int MaxLines = 256;
+    // The budget is per reason: one noisy reason (a predicate the GPU never wrote fires once per
+    // buffer address) used to consume the whole global budget and silence every other reason,
+    // which is exactly the information a black frame needs.
+    private const int MaxLinesPerReason = 64;
     private static readonly ConcurrentDictionary<(string Reason, ulong Shader), byte> Seen = new();
+    private static readonly ConcurrentDictionary<string, StrongBox<int>> Budgets = new();
     private static long _dropped;
 
     // Every dropped draw and dispatch of the run, including the ones the report deduplicated. A
@@ -71,6 +76,12 @@ internal static class DroppedWorkLog
 
     public static void Predication(ulong address, ulong value, uint condition, bool skip)
     {
+        if (FrameCommandLog.Active)
+        {
+            FrameCommandLog.Write(
+                $"predication address=0x{address:X} value=0x{value:X} condition={condition} {(skip ? "SKIP" : "run")}");
+        }
+
         if (skip && TryClaim("predication", address))
         {
             Console.Error.WriteLine($"[GPU][WARN] Skipped predicated packets: address=0x{address:X16} value=0x{value:X16} condition={condition}");
@@ -97,6 +108,14 @@ internal static class DroppedWorkLog
         }
     }
 
-    private static bool TryClaim(string reason, ulong shader) =>
-        Seen.Count < MaxLines && Seen.TryAdd((reason, shader), 0);
+    private static bool TryClaim(string reason, ulong shader)
+    {
+        if (!Seen.TryAdd((reason, shader), 0))
+        {
+            return false;
+        }
+
+        var budget = Budgets.GetOrAdd(reason, static _ => new StrongBox<int>());
+        return Interlocked.Increment(ref budget.Value) <= MaxLinesPerReason;
+    }
 }
