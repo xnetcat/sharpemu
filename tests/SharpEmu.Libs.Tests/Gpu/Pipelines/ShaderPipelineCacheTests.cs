@@ -243,6 +243,30 @@ public sealed class ShaderPipelineCacheTests : IDisposable
     }
 
     [Fact]
+    public void TryCreateComputePipeline_ReportsTheHostCompileAndCachesTheResult()
+    {
+        var guest = new PipelineTestGuest();
+        var cache = new ShaderPipelineCache(guest.Context, guest.Host, guest.Compiler, guest.Registry);
+        var input = ComputeProgram().Input;
+        var program = new ShaderProgram(7, 1);
+        guest.Host.PendingComputeCompiles[program.Id] = 2;
+
+        Assert.False(cache.TryCreateComputePipeline(input, program, out _));
+        Assert.False(cache.TryCreateComputePipeline(input, program, out _));
+        Assert.Empty(guest.Host.ComputePipelines);
+        Assert.Equal(0, cache.ComputePipelineCount);
+
+        Assert.True(cache.TryCreateComputePipeline(input, program, out var ready));
+        Assert.Single(guest.Host.ComputePipelines);
+
+        // The cached pipeline is served without asking the host again.
+        Assert.True(cache.TryCreateComputePipeline(input, program, out var cached));
+        Assert.Equal(ready, cached);
+        Assert.Single(guest.Host.ComputePipelines);
+        Assert.Equal(1, cache.ComputePipelineCount);
+    }
+
+    [Fact]
     public void GraphicsPipelines_AreCachedByTheirKey()
     {
         var guest = new PipelineTestGuest();

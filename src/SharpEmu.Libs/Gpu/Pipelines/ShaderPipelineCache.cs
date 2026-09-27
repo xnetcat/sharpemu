@@ -656,4 +656,37 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
             return created;
         }
     }
+
+    public bool TryCreateComputePipeline(ComputeInputInfo input, ShaderProgram program, out PipelineHandle handle)
+    {
+        using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.PipelineCreation);
+        handle = default;
+        if (!program.IsValid)
+        {
+            throw SubmissionScheduler.Fatal("The dispatch has no compute program.");
+        }
+
+        var stage = input.Stage.Program ?? throw SubmissionScheduler.Fatal("The compute stage has no program.");
+        var key = new ComputePipelineKey(program.Id);
+        lock (_gate)
+        {
+            if (_computePipelines.TryGetValue(key, out var cached))
+            {
+                handle = cached;
+                return true;
+            }
+
+            if (!_host.TryCreateComputePipeline(
+                    new ComputePipelineDescription { Input = input, Program = program, Stage = stage },
+                    out var created))
+            {
+                return false;
+            }
+
+            _computePipelines.Add(key, created);
+            ShaderCacheCounters.CountComputePipeline();
+            handle = created;
+            return true;
+        }
+    }
 }
