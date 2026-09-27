@@ -610,15 +610,23 @@ public static partial class Gen5ShaderTranslator
         {
             0x03 => "SMovB32",
             0x04 => "SMovB64",
+            0x05 => "SCmovB32",
+            0x06 => "SCmovB64",
             0x07 => "SNotB32",
             0x08 => "SNotB64",
             0x09 => "SWqmB32",
             0x0A => "SWqmB64",
             0x0B => "SBrevB32",
+            0x0D => "SBcnt0I32B32",
             0x0F => "SBcnt1I32B32",
             0x10 => "SBcnt1I32B64",
+            0x11 => "SFF0I32B32",
             0x13 => "SFF1I32B32",
             0x14 => "SFF1I32B64",
+            0x15 => "SFlbitI32B32",
+            0x17 => "SFlbitI32",
+            0x19 => "SSextI32I8",
+            0x1A => "SSextI32I16",
             0x1B => "SBitset0B32",
             0x1D => "SBitset1B32",
             0x1F => "SGetpcB64",
@@ -701,7 +709,7 @@ public static partial class Gen5ShaderTranslator
             0x28 => "SBfeI32",
             0x29 => "SBfeU64",
             0x2A => "SBfeI64",
-            0x2D => "SAbsdiffI32",
+            0x2C => "SAbsdiffI32",
             0x2E => "SLshl1AddU32",
             0x2F => "SLshl2AddU32",
             0x30 => "SLshl3AddU32",
@@ -824,11 +832,21 @@ public static partial class Gen5ShaderTranslator
         var src0 = word & 0x1FF;
         sizeDwords = src0 is 0xE9 or 0xEA or 0xF9 or 0xFA or 0xFF ? 2u : 1u;
         error = string.Empty;
-        name = opcode switch
+        name = Vop1OpcodeName(opcode);
+        return FinishDecode(name, $"unknown-vop1 op=0x{opcode:X2}", out error);
+    }
+
+    private static string Vop1OpcodeName(uint opcode) =>
+        opcode switch
         {
             0x00 => "VNop",
             0x01 => "VMovB32",
             0x02 => "VReadfirstlaneB32",
+            // The f64 converts and rounding ops decode so a shader that uses
+            // them reports the actual instruction; neither back end has an f64
+            // domain, so they are rejected at emission instead of decode.
+            0x03 => "VCvtI32F64",
+            0x04 => "VCvtF64I32",
             0x05 => "VCvtF32I32",
             0x06 => "VCvtF32U32",
             0x07 => "VCvtU32F32",
@@ -838,10 +856,19 @@ public static partial class Gen5ShaderTranslator
             0x0C => "VCvtRpiI32F32",
             0x0D => "VCvtFlrI32F32",
             0x0E => "VCvtOffF32I4",
+            0x0F => "VCvtF32F64",
+            0x10 => "VCvtF64F32",
             0x11 => "VCvtF32Ubyte0",
             0x12 => "VCvtF32Ubyte1",
             0x13 => "VCvtF32Ubyte2",
             0x14 => "VCvtF32Ubyte3",
+            0x15 => "VCvtU32F64",
+            0x16 => "VCvtF64U32",
+            0x17 => "VTruncF64",
+            0x18 => "VCeilF64",
+            0x19 => "VRndneF64",
+            0x1A => "VFloorF64",
+            0x1B => "VPipeflush",
             0x20 => "VFractF32",
             0x21 => "VTruncF32",
             0x22 => "VCeilF32",
@@ -859,17 +886,45 @@ public static partial class Gen5ShaderTranslator
             0x38 => "VBfrevB32",
             0x39 => "VFfbhU32",
             0x3A => "VFfblB32",
+            0x3B => "VFfbhI32",
+            0x3C => "VFrexpExpI32F64",
+            0x3D => "VFrexpMantF64",
+            0x3E => "VFractF64",
+            0x3F => "VFrexpExpI32F32",
+            0x40 => "VFrexpMantF32",
+            0x41 => "VClrexcp",
             0x42 => "VMovreldB32",
             0x43 => "VMovrelsB32",
             0x44 => "VMovrelsdB32",
             0x48 => "VMovrelsd2B32",
+            // VOP1 opcodes 0x50-0x61 are the f16 unary family (RDNA2 ISA table
+            // 13.3.2, opcodes 80-97 in decimal). Every one of them writes a
+            // 16-bit result into the VGPR half selected by VOP3 op_sel[3].
+            0x50 => "VCvtF16U16",
+            0x51 => "VCvtF16I16",
             0x52 => "VCvtU16F16",
+            0x53 => "VCvtI16F16",
+            0x54 => "VRcpF16",
+            0x55 => "VSqrtF16",
             0x56 => "VRsqF16",
+            0x57 => "VLogF16",
+            0x58 => "VExpF16",
+            0x59 => "VFrexpMantF16",
+            0x5A => "VFrexpExpI16F16",
+            0x5B => "VFloorF16",
+            0x5C => "VCeilF16",
+            0x5D => "VTruncF16",
+            0x5E => "VRndneF16",
+            0x5F => "VFractF16",
+            0x60 => "VSinF16",
+            0x61 => "VCosF16",
+            0x62 => "VSatPkU8I16",
+            0x63 => "VCvtNormI16F16",
+            0x64 => "VCvtNormU16F16",
+            0x65 => "VSwapB32",
+            0x68 => "VSwaprelB32",
             _ => string.Empty,
         };
-
-        return FinishDecode(name, $"unknown-vop1 op=0x{opcode:X2}", out error);
-    }
 
     private static bool DecodeVop2(uint word, out string name, out uint sizeDwords, out string error)
     {
@@ -888,7 +943,15 @@ public static partial class Gen5ShaderTranslator
         sizeDwords = opcode is 0x20 or 0x21 or 0x2C or 0x2D ||
             src0 is 0xE9 or 0xEA or 0xF9 or 0xFA or 0xFF ? 2u : 1u;
         error = string.Empty;
-        name = opcode switch
+        name = Vop2OpcodeName(opcode);
+        return FinishDecode(
+            name,
+            $"unknown-vop2 op=0x{opcode:X2} word=0x{word:X8}",
+            out error);
+    }
+
+    private static string Vop2OpcodeName(uint opcode) =>
+        opcode switch
         {
             0x01 => "VCndmaskB32",
             0x02 => "VDot2cF32F16",
@@ -896,7 +959,9 @@ public static partial class Gen5ShaderTranslator
             0x04 => "VSubF32",
             0x05 => "VSubrevF32",
             0x08 => "VMulF32",
+            0x07 => "VMulLegacyF32",
             0x09 => "VMulI32I24",
+            0x0A => "VMulHiI32I24",
             0x0B => "VMulU32U24",
             0x0C => "VMulHiU32U24",
             0x0F => "VMinF32",
@@ -937,16 +1002,12 @@ public static partial class Gen5ShaderTranslator
             0x33 => "VSubF16",
             0x34 => "VSubrevF16",
             0x35 => "VMulF16",
+            0x36 => "VFmacF16",
             0x39 => "VMaxF16",
             0x3A => "VMinF16",
+            0x3B => "VLdexpF16",
             _ => string.Empty,
         };
-
-        return FinishDecode(
-            name,
-            $"unknown-vop2 op=0x{opcode:X2} word=0x{word:X8}",
-            out error);
-    }
 
     private static bool DecodeVopc(uint word, out string name, out uint sizeDwords, out string error)
     {
@@ -1009,6 +1070,7 @@ public static partial class Gen5ShaderTranslator
             0x8C => "VCmpGtI16",
             0x8D => "VCmpNeI16",
             0x8E => "VCmpGeI16",
+            0x8F => "VCmpClassF16",
             0x98 => "VCmpxClassF32",
             0x90 => "VCmpxFI32",
             0x91 => "VCmpxLtI32",
@@ -1024,6 +1086,7 @@ public static partial class Gen5ShaderTranslator
             0x9C => "VCmpxGtI16",
             0x9D => "VCmpxNeI16",
             0x9E => "VCmpxGeI16",
+            0x9F => "VCmpxClassF16",
             0xA0 => "VCmpFI64",
             0xA1 => "VCmpLtI64",
             0xA2 => "VCmpEqI64",
@@ -1032,6 +1095,12 @@ public static partial class Gen5ShaderTranslator
             0xA5 => "VCmpNeI64",
             0xA6 => "VCmpGeI64",
             0xA7 => "VCmpTI64",
+            0xA9 => "VCmpLtU16",
+            0xAA => "VCmpEqU16",
+            0xAB => "VCmpLeU16",
+            0xAC => "VCmpGtU16",
+            0xAD => "VCmpNeU16",
+            0xAE => "VCmpGeU16",
             0xB0 => "VCmpxFI64",
             0xB1 => "VCmpxLtI64",
             0xB2 => "VCmpxEqI64",
@@ -1040,6 +1109,12 @@ public static partial class Gen5ShaderTranslator
             0xB5 => "VCmpxNeI64",
             0xB6 => "VCmpxGeI64",
             0xB7 => "VCmpxTI64",
+            0xB9 => "VCmpxLtU16",
+            0xBA => "VCmpxEqU16",
+            0xBB => "VCmpxLeU16",
+            0xBC => "VCmpxGtU16",
+            0xBD => "VCmpxNeU16",
+            0xBE => "VCmpxGeU16",
             0xC0 => "VCmpFU32",
             0xC1 => "VCmpLtU32",
             0xC2 => "VCmpEqU32",
@@ -1209,10 +1284,48 @@ public static partial class Gen5ShaderTranslator
             0x372 => "VOr3U32",
             0x377 => "VPermlane16B32",
             0x378 => "VPermlanex16B32",
-            _ => $"Vop3Raw{opcode:X3}",
+            _ => Vop3PromotedOpcodeName(opcode),
         };
 
         return FinishDecode(name, $"unknown-vop3 op=0x{opcode:X3}", out error);
+    }
+
+    /// <summary>
+    /// Any VOP1 or VOP2 instruction can also be encoded as VOP3 to reach the
+    /// extra control bits (abs/neg/clamp/omod/op_sel). RDNA2 ISA 12.8.1 and
+    /// 12.9.1: the VOP3 opcode is the VOP1 opcode + 0x180 or the VOP2 opcode
+    /// + 0x100. Mapping the whole range keeps one hand-written entry per op
+    /// from being the difference between a shader compiling and the pipeline
+    /// dying.
+    /// </summary>
+    private static string Vop3PromotedOpcodeName(uint opcode)
+    {
+        if (opcode is >= 0x180 and <= 0x1FF)
+        {
+            var vop1 = opcode - 0x180;
+            // These have no VOP3 form: V_READFIRSTLANE_B32 writes an SGPR,
+            // V_SWAP*_B32 take two operands they both write, and the MOVREL ops
+            // need the implicit M0 source the VOP1 operand path adds. Leaving
+            // them opaque rejects them loudly instead of mis-emitting.
+            return vop1 is 0x02 or 0x42 or 0x43 or 0x44 or 0x48 or 0x65 or 0x68
+                ? $"Vop3Raw{opcode:X3}"
+                : NameOrRaw(Vop1OpcodeName(vop1), opcode);
+        }
+
+        if (opcode is >= 0x100 and <= 0x13F)
+        {
+            var vop2 = opcode - 0x100;
+            // The mk/ak forms carry their literal in the instruction stream and
+            // exist only as VOP2; 0x3E/0x3F are the VOPC/VOP1 escape rows.
+            return vop2 is 0x20 or 0x21 or 0x2C or 0x2D or 0x3E or 0x3F
+                ? $"Vop3Raw{opcode:X3}"
+                : NameOrRaw(Vop2OpcodeName(vop2), opcode);
+        }
+
+        return $"Vop3Raw{opcode:X3}";
+
+        static string NameOrRaw(string name, uint opcode) =>
+            name.Length > 0 ? name : $"Vop3Raw{opcode:X3}";
     }
 
     private static bool IsVop3BOpcode(uint opcode) =>

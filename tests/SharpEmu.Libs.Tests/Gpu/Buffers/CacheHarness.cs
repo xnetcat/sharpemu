@@ -200,6 +200,36 @@ internal sealed class CacheHarness : IDisposable
         return address;
     }
 
+    // A mapping must satisfy both the host view granularity and the guest page the ledger counts in.
+    public ulong MappingGranularity => Math.Max(_views.Granularity, GuestMemoryLayout.GuestPage);
+
+    // A backed view at an exact guest address, rounded out to that granularity. The replay of a
+    // captured case needs this: every descriptor in the case names the address the game used.
+    // Puts a mapped range under the page watcher; a replay does this after it has filled the range,
+    // so the bytes it restored do not look like guest writes the caches must chase.
+    public void RegisterGuestRange(ulong address, ulong size, GuestPageProtection protection) =>
+        Gpu.Register(address, size, protection);
+
+    public bool TryMapBackedAt(ulong address, ulong size, GuestPageProtection protection, out ulong mappedAddress, out ulong mappedSize, bool register = true)
+    {
+        var granule = MappingGranularity;
+        mappedAddress = address & ~(granule - 1);
+        mappedSize = HostViewTestSupport.AlignUp(address + size - mappedAddress, granule);
+        if (!Memory.TryHoldRange(mappedAddress, mappedSize) ||
+            !Memory.TryMapBacked(mappedAddress, mappedSize, _nextBackingOffset, protection, out _))
+        {
+            return false;
+        }
+
+        _nextBackingOffset += mappedSize;
+        if (register)
+        {
+            Gpu.Register(mappedAddress, mappedSize, protection);
+        }
+
+        return true;
+    }
+
     // Two backed granules around one that stays a bare hole: registered, but without backing.
     public (ulong First, ulong Granule, ulong Last) MapBackedSandwich()
     {

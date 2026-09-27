@@ -14,8 +14,30 @@ public static partial class Gen5SpirvTranslator
             out string error)
         {
             error = string.Empty;
-            if (instruction.Opcode == "VNop")
+            // V_PIPEFLUSH flushes the VALU destination cache and V_CLREXCP clears
+            // the wave's exception state; neither is observable here.
+            if (instruction.Opcode is "VNop" or "VPipeflush" or "VClrexcp")
             {
+                return true;
+            }
+
+            if (instruction.Opcode == "VSwapB32")
+            {
+                if (instruction.Destinations.Count == 0 ||
+                    instruction.Destinations[0].Kind != Gen5OperandKind.VectorRegister ||
+                    instruction.Sources.Count == 0 ||
+                    instruction.Sources[0].Kind != Gen5OperandKind.VectorRegister)
+                {
+                    error = "VSwapB32 expects two VGPR operands";
+                    return false;
+                }
+
+                var swapDestination = instruction.Destinations[0].Value;
+                var swapSource = instruction.Sources[0].Value;
+                var previousDestination = LoadV(swapDestination);
+                var previousSource = LoadV(swapSource);
+                StoreV(swapDestination, previousSource);
+                StoreV(swapSource, previousDestination);
                 return true;
             }
 
@@ -150,7 +172,9 @@ public static partial class Gen5SpirvTranslator
                     result = ConvertFloatToUnsignedSaturated(GetFloatSource(instruction, 0));
                     break;
                 case "VCvtU16F16":
+                case "VCvtI16F16":
                 {
+                    var isSigned = instruction.Opcode == "VCvtI16F16";
                     var source = GetFloat16Source(instruction, 0);
                     var sourceIsNan = _module.AddInstruction(
                         SpirvOp.IsNan,
@@ -162,12 +186,105 @@ public static partial class Gen5SpirvTranslator
                         sourceIsNan,
                         Float(0),
                         source);
-                    var bounded = Ext(43, _floatType, source, Float(0), Float(65535));
-                    result = BitwiseAnd(
-                        _module.AddInstruction(SpirvOp.ConvertFToU, _uintType, bounded),
-                        UInt(0xFFFF));
+                    var bounded = isSigned
+                        ? Ext(43, _floatType, source, Float(-32768), Float(32767))
+                        : Ext(43, _floatType, source, Float(0), Float(65535));
+                    var converted = isSigned
+                        ? Bitcast(
+                            _uintType,
+                            _module.AddInstruction(SpirvOp.ConvertFToS, _intType, bounded))
+                        : _module.AddInstruction(SpirvOp.ConvertFToU, _uintType, bounded);
+                    result = EmitInteger16Result(instruction, destination, converted);
                     break;
                 }
+                case "VCvtF16U16":
+                    result = EmitFloat16Result(
+                        instruction,
+                        destination,
+                        _module.AddInstruction(
+                            SpirvOp.ConvertUToF,
+                            _floatType,
+                            GetUnsignedInteger16Source(instruction, 0)));
+                    break;
+                case "VCvtF16I16":
+                    result = EmitFloat16Result(
+                        instruction,
+                        destination,
+                        _module.AddInstruction(
+                            SpirvOp.ConvertSToF,
+                            _floatType,
+                            GetSignedInteger16Source(instruction, 0)));
+                    break;
+                case "VRcpF16":
+                    result = EmitFloat16Result(
+                        instruction,
+                        destination,
+                        _module.AddInstruction(
+                            SpirvOp.FDiv,
+                            _floatType,
+                            Float(1),
+                            GetFloat16Source(instruction, 0)));
+                    break;
+                case "VSqrtF16":
+                    result = EmitFloat16Unary(instruction, destination, 31);
+                    break;
+                case "VLogF16":
+                    result = EmitFloat16Unary(instruction, destination, 30);
+                    break;
+                case "VExpF16":
+                    result = EmitFloat16Unary(instruction, destination, 29);
+                    break;
+                case "VFloorF16":
+                    result = EmitFloat16Unary(instruction, destination, 8);
+                    break;
+                case "VCeilF16":
+                    result = EmitFloat16Unary(instruction, destination, 9);
+                    break;
+                case "VTruncF16":
+                    result = EmitFloat16Unary(instruction, destination, 3);
+                    break;
+                case "VRndneF16":
+                    result = EmitFloat16Unary(instruction, destination, 2);
+                    break;
+                case "VFractF16":
+                    result = EmitFloat16Unary(instruction, destination, 10);
+                    break;
+                // GCN trigonometry takes revolutions, so prescale by Tau exactly
+                // like VSinF32/VCosF32 do.
+                case "VSinF16":
+                case "VCosF16":
+                    result = EmitFloat16Result(
+                        instruction,
+                        destination,
+                        Ext(
+                            instruction.Opcode == "VSinF16" ? 13u : 14u,
+                            _floatType,
+                            _module.AddInstruction(
+                                SpirvOp.FMul,
+                                _floatType,
+                                GetFloat16Source(instruction, 0),
+                                Float(MathF.Tau))));
+                    break;
+                // The f16 source is widened to f32 first, and a widened half is
+                // always normal, zero, Inf or NaN, so f32 frexp answers both forms.
+                case "VFrexpMantF16":
+                    result = EmitFloat16Result(
+                        instruction,
+                        destination,
+                        Bitcast(
+                            _floatType,
+                            EmitFrexpFloat32(
+                                Bitcast(_uintType, GetFloat16Source(instruction, 0)),
+                                wantExponent: false)));
+                    break;
+                case "VFrexpExpI16F16":
+                    result = EmitInteger16Result(
+                        instruction,
+                        destination,
+                        EmitFrexpFloat32(
+                            Bitcast(_uintType, GetFloat16Source(instruction, 0)),
+                            wantExponent: true));
+                    break;
                 case "VCvtI32F32":
                 case "VCvtRpiI32F32":
                 case "VCvtFlrI32F32":
@@ -271,6 +388,50 @@ public static partial class Gen5SpirvTranslator
                         instruction,
                         Ext(30, _floatType, GetFloatSource(instruction, 0)));
                     break;
+                case "VLdexpF16":
+                    result = EmitFloat16Result(
+                        instruction,
+                        destination,
+                        Ext(
+                            53,
+                            _floatType,
+                            GetFloat16Source(instruction, 0),
+                            Bitcast(_intType, GetRawSource(instruction, 1))));
+                    break;
+                // V_MUL_LEGACY_F32 differs from V_MUL_F32 only in the pre-IEEE
+                // rule that 0 * anything is 0.
+                case "VMulLegacyF32":
+                {
+                    var legacyLeft = GetFloatSource(instruction, 0);
+                    var legacyRight = GetFloatSource(instruction, 1);
+                    var product = _module.AddInstruction(
+                        SpirvOp.FMul,
+                        _floatType,
+                        legacyLeft,
+                        legacyRight);
+                    var eitherIsZero = _module.AddInstruction(
+                        SpirvOp.LogicalOr,
+                        _boolType,
+                        _module.AddInstruction(
+                            SpirvOp.FOrdEqual,
+                            _boolType,
+                            legacyLeft,
+                            Float(0)),
+                        _module.AddInstruction(
+                            SpirvOp.FOrdEqual,
+                            _boolType,
+                            legacyRight,
+                            Float(0)));
+                    result = EmitFloatResult(
+                        instruction,
+                        _module.AddInstruction(
+                            SpirvOp.Select,
+                            _floatType,
+                            eitherIsZero,
+                            Float(0),
+                            product));
+                    break;
+                }
                 case "VLdexpF32":
                     result = EmitFloatResult(
                         instruction,
@@ -405,6 +566,20 @@ public static partial class Gen5SpirvTranslator
                             GetFloatSource(instruction, 1),
                             GetFloatSource(instruction, 2)));
                     break;
+                // D.f16 = S0.f16 * S1.f16 + D.f16
+                case "VFmacF16":
+                    result = EmitFloat16Result(
+                        instruction,
+                        destination,
+                        Ext(
+                            50,
+                            _floatType,
+                            GetFloat16Source(instruction, 0),
+                            GetFloat16Source(instruction, 1),
+                            Bitcast(
+                                _floatType,
+                                EmitHalfToFloat(BitwiseAnd(LoadV(destination), UInt(0xFFFF))))));
+                    break;
                 case "VFmaF16":
                     result = EmitFloat16Result(
                         instruction,
@@ -491,6 +666,81 @@ public static partial class Gen5SpirvTranslator
                         UInt(uint.MaxValue));
                     break;
                 }
+                // V_FFBH_I32 counts the bits below the MSB that match the sign
+                // bit and returns -1 when they all do, which is exactly GLSL
+                // FindSMsb mirrored about bit 31.
+                case "VFfbhI32":
+                {
+                    var source = GetRawSource(instruction, 0);
+                    var msb = Ext(74, _intType, Bitcast(_intType, source));
+                    result = SelectU(
+                        _module.AddInstruction(
+                            SpirvOp.IEqual,
+                            _boolType,
+                            msb,
+                            _module.Constant(_intType, unchecked((uint)-1))),
+                        UInt(uint.MaxValue),
+                        ISubU(UInt(31), Bitcast(_uintType, msb)));
+                    break;
+                }
+                case "VFrexpMantF32":
+                    result = EmitFloatResult(
+                        instruction,
+                        Bitcast(
+                            _floatType,
+                            EmitFrexpFloat32(
+                                Bitcast(_uintType, GetFloatSource(instruction, 0)),
+                                wantExponent: false)));
+                    break;
+                case "VFrexpExpI32F32":
+                    result = EmitFrexpFloat32(
+                        Bitcast(_uintType, GetFloatSource(instruction, 0)),
+                        wantExponent: true);
+                    break;
+                // D.u32 = {16'b0, sat8(S.i[31:16]), sat8(S.i[15:0])}
+                case "VSatPkU8I16":
+                {
+                    var source = GetRawSource(instruction, 0);
+                    var low = SaturateSigned16ToUnsigned8(source, 0);
+                    var high = SaturateSigned16ToUnsigned8(source, 16);
+                    result = BitwiseOr(low, ShiftLeftLogical(high, UInt(8)));
+                    break;
+                }
+                case "VCvtNormI16F16":
+                case "VCvtNormU16F16":
+                {
+                    var isSigned = instruction.Opcode == "VCvtNormI16F16";
+                    var source = GetFloat16Source(instruction, 0);
+                    source = _module.AddInstruction(
+                        SpirvOp.Select,
+                        _floatType,
+                        _module.AddInstruction(SpirvOp.IsNan, _boolType, source),
+                        Float(0),
+                        source);
+                    var bounded = Ext(
+                        43,
+                        _floatType,
+                        source,
+                        Float(isSigned ? -1 : 0),
+                        Float(1));
+                    var scaled = Ext(
+                        2,
+                        _floatType,
+                        _module.AddInstruction(
+                            SpirvOp.FMul,
+                            _floatType,
+                            bounded,
+                            Float(isSigned ? 32767 : 65535)));
+                    result = EmitInteger16Result(
+                        instruction,
+                        destination,
+                        isSigned
+                            ? Bitcast(
+                                _uintType,
+                                _module.AddInstruction(SpirvOp.ConvertFToS, _intType, scaled))
+                            : _module.AddInstruction(SpirvOp.ConvertFToU, _uintType, scaled));
+                    break;
+                }
                 case "VFfblB32":
                     result = Bitcast(
                         _uintType,
@@ -574,6 +824,38 @@ public static partial class Gen5SpirvTranslator
                         ShiftRightLogical64(
                             product,
                             _module.Constant64(_ulongType, 32)));
+                    break;
+                }
+                // D.i = (S0.i24 * S1.i24) >> 32
+                case "VMulHiI32I24":
+                {
+                    var narrowLeft = _module.AddInstruction(
+                        SpirvOp.BitFieldSExtract,
+                        _intType,
+                        Bitcast(_intType, GetRawSource(instruction, 0)),
+                        UInt(0),
+                        UInt(24));
+                    var narrowRight = _module.AddInstruction(
+                        SpirvOp.BitFieldSExtract,
+                        _intType,
+                        Bitcast(_intType, GetRawSource(instruction, 1)),
+                        UInt(0),
+                        UInt(24));
+                    var narrowProduct = _module.AddInstruction(
+                        SpirvOp.IMul,
+                        _longType,
+                        _module.AddInstruction(SpirvOp.SConvert, _longType, narrowLeft),
+                        _module.AddInstruction(SpirvOp.SConvert, _longType, narrowRight));
+                    result = Bitcast(
+                        _uintType,
+                        _module.AddInstruction(
+                            SpirvOp.SConvert,
+                            _intType,
+                            _module.AddInstruction(
+                                SpirvOp.ShiftRightArithmetic,
+                                _longType,
+                                narrowProduct,
+                                _module.Constant64(_longType, 32))));
                     break;
                 }
                 case "VMulHiI32":
@@ -1660,10 +1942,19 @@ public static partial class Gen5SpirvTranslator
             error = string.Empty;
             uint condition = _module.ConstantBool(false);
             var opcode = instruction.Opcode;
-            if (opcode is "VCmpClassF32" or "VCmpxClassF32")
+            var isClassCompare = opcode is
+                "VCmpClassF32" or "VCmpxClassF32" or "VCmpClassF16" or "VCmpxClassF16";
+            if (isClassCompare)
             {
-                var source = GetFloatSource(instruction, 0);
-                var raw = GetRawSource(instruction, 0);
+                // The f16 form widens its source first, so the only differences
+                // are where the sign bit lives and the smallest-normal threshold.
+                var isHalfClass = opcode.EndsWith("F16", StringComparison.Ordinal);
+                var source = isHalfClass
+                    ? GetFloat16Source(instruction, 0)
+                    : GetFloatSource(instruction, 0);
+                var raw = isHalfClass
+                    ? Bitcast(_uintType, source)
+                    : GetRawSource(instruction, 0);
                 var mask = GetRawSource(instruction, 1);
                 var negative = IsNotZero(BitwiseAnd(raw, UInt(0x8000_0000)));
                 var positive = _module.AddInstruction(
@@ -1688,7 +1979,10 @@ public static partial class Gen5SpirvTranslator
                     SpirvOp.FOrdLessThan,
                     _boolType,
                     absolute,
-                    Bitcast(_floatType, UInt(0x0080_0000)));
+                    // 2**-14 is the smallest normal f16; 0x00800000 is f32's.
+                    isHalfClass
+                        ? Float(6.103515625e-05f)
+                        : Bitcast(_floatType, UInt(0x0080_0000)));
                 var subnormal = _module.AddInstruction(
                     SpirvOp.LogicalAnd,
                     _boolType,
@@ -1835,7 +2129,7 @@ public static partial class Gen5SpirvTranslator
 
                 condition = _module.AddInstruction(operation, _boolType, left, right);
             }
-            else if (opcode is not ("VCmpClassF32" or "VCmpxClassF32") &&
+            else if (!isClassCompare &&
                      opcode.EndsWith("F32", StringComparison.Ordinal))
             {
                 var left = GetFloatSource(instruction, 0);
@@ -1864,7 +2158,7 @@ public static partial class Gen5SpirvTranslator
 
                 condition = _module.AddInstruction(operation, _boolType, left, right);
             }
-            else if (opcode is not ("VCmpClassF32" or "VCmpxClassF32"))
+            else if (!isClassCompare)
             {
                 var compare64 = opcode.EndsWith("U64", StringComparison.Ordinal) ||
                     opcode.EndsWith("I64", StringComparison.Ordinal);
@@ -1875,6 +2169,13 @@ public static partial class Gen5SpirvTranslator
                     ? GetRawSource64(instruction, 1)
                     : GetRawSource(instruction, 1);
                 var signed16 = opcode.EndsWith("I16", StringComparison.Ordinal);
+                var unsigned16 = opcode.EndsWith("U16", StringComparison.Ordinal);
+                if (unsigned16)
+                {
+                    left = BitwiseAnd(left, UInt(0xFFFF));
+                    right = BitwiseAnd(right, UInt(0xFFFF));
+                }
+
                 var signed = signed16 ||
                     opcode.EndsWith("I32", StringComparison.Ordinal) ||
                     opcode.EndsWith("I64", StringComparison.Ordinal);
@@ -1914,8 +2215,14 @@ public static partial class Gen5SpirvTranslator
                     "VCmpEqU32" or "VCmpxEqU32" => SpirvOp.IEqual,
                     "VCmpNeI32" or "VCmpxNeI32" or
                     "VCmpNeU32" or "VCmpxNeU32" => SpirvOp.INotEqual,
-                    "VCmpEqI16" or "VCmpxEqI16" => SpirvOp.IEqual,
-                    "VCmpNeI16" or "VCmpxNeI16" => SpirvOp.INotEqual,
+                    "VCmpEqI16" or "VCmpxEqI16" or
+                    "VCmpEqU16" or "VCmpxEqU16" => SpirvOp.IEqual,
+                    "VCmpNeI16" or "VCmpxNeI16" or
+                    "VCmpNeU16" or "VCmpxNeU16" => SpirvOp.INotEqual,
+                    "VCmpLtU16" or "VCmpxLtU16" => SpirvOp.ULessThan,
+                    "VCmpLeU16" or "VCmpxLeU16" => SpirvOp.ULessThanEqual,
+                    "VCmpGtU16" or "VCmpxGtU16" => SpirvOp.UGreaterThan,
+                    "VCmpGeU16" or "VCmpxGeU16" => SpirvOp.UGreaterThanEqual,
                     "VCmpNeU64" or "VCmpxNeU64" or
                     "VCmpNeI64" or "VCmpxNeI64" => SpirvOp.INotEqual,
                     "VCmpLtI16" or "VCmpxLtI16" => SpirvOp.SLessThan,
@@ -2230,6 +2537,66 @@ public static partial class Gen5SpirvTranslator
                     result = _module.AddInstruction(SpirvOp.BitCount, _uintType, left);
                     StoreS(destination, result);
                     Store(_scc, IsNotZero(result));
+                    return true;
+                case "SBcnt0I32B32":
+                    result = _module.AddInstruction(
+                        SpirvOp.BitCount,
+                        _uintType,
+                        _module.AddInstruction(SpirvOp.Not, _uintType, left));
+                    StoreS(destination, result);
+                    Store(_scc, IsNotZero(result));
+                    return true;
+                case "SFF0I32B32":
+                    // First zero from the LSB: the first set bit of the inverse.
+                    result = Ext(
+                        73,
+                        _uintType,
+                        _module.AddInstruction(SpirvOp.Not, _uintType, left));
+                    StoreS(destination, result);
+                    return true;
+                case "SFlbitI32B32":
+                {
+                    // Zeros before the first one from the MSB, -1 when there are none.
+                    var msb = Ext(75, _uintType, left);
+                    result = SelectU(
+                        IsNotZero(left),
+                        ISubU(UInt(31), msb),
+                        UInt(uint.MaxValue));
+                    StoreS(destination, result);
+                    return true;
+                }
+                case "SFlbitI32":
+                {
+                    // Bits below bit 31 that match the sign bit; -1 when all do.
+                    var msb = Ext(74, _intType, Bitcast(_intType, left));
+                    result = SelectU(
+                        _module.AddInstruction(
+                            SpirvOp.IEqual,
+                            _boolType,
+                            msb,
+                            _module.Constant(_intType, unchecked((uint)-1))),
+                        UInt(uint.MaxValue),
+                        ISubU(UInt(31), Bitcast(_uintType, msb)));
+                    StoreS(destination, result);
+                    return true;
+                }
+                case "SSextI32I8":
+                case "SSextI32I16":
+                    result = Bitcast(
+                        _uintType,
+                        _module.AddInstruction(
+                            SpirvOp.BitFieldSExtract,
+                            _intType,
+                            Bitcast(_intType, left),
+                            UInt(0),
+                            UInt(instruction.Opcode == "SSextI32I8" ? 8u : 16u)));
+                    StoreS(destination, result);
+                    return true;
+                case "SCmovB32":
+                    // Writes only when SCC is set, and never updates SCC.
+                    StoreS(
+                        destination,
+                        SelectU(Load(_boolType, _scc), left, LoadS(destination)));
                     return true;
                 case "SFF1I32B32":
                     result = Ext(73, _uintType, left);
@@ -2976,6 +3343,19 @@ public static partial class Gen5SpirvTranslator
             else if (instruction.Opcode == "SNotB64")
             {
                 value = _module.AddInstruction(SpirvOp.Not, _ulongType, left);
+            }
+            else if (instruction.Opcode == "SCmovB64")
+            {
+                // Writes only when SCC is set, and never updates SCC.
+                StoreS64(
+                    destination,
+                    _module.AddInstruction(
+                        SpirvOp.Select,
+                        _ulongType,
+                        Load(_boolType, _scc),
+                        left,
+                        LoadS64(destination)));
+                return true;
             }
             else
             {
@@ -3811,6 +4191,138 @@ public static partial class Gen5SpirvTranslator
                     BitwiseAnd(current, UInt(0xFFFF_0000)),
                     low16);
         }
+
+        /// <summary>
+        /// Writes a 16-bit integer result into the VGPR half selected by VOP3
+        /// op_sel[3], preserving the other half. Integer results take no output
+        /// modifier or clamp.
+        /// </summary>
+        private uint EmitInteger16Result(
+            Gen5ShaderInstruction instruction,
+            uint destination,
+            uint value)
+        {
+            var control = instruction.Control as Gen5Vop3Control;
+            var low16 = BitwiseAnd(value, UInt(0xFFFF));
+            var current = LoadV(destination);
+            return ((control?.OperandSelect ?? 0) & 8) != 0
+                ? BitwiseOr(
+                    BitwiseAnd(current, UInt(0x0000_FFFF)),
+                    ShiftLeftLogical(low16, UInt(16)))
+                : BitwiseOr(
+                    BitwiseAnd(current, UInt(0xFFFF_0000)),
+                    low16);
+        }
+
+        /// <summary>Reads the op_sel-selected 16-bit half as a zero-extended uint.</summary>
+        private uint GetUnsignedInteger16Source(
+            Gen5ShaderInstruction instruction,
+            int sourceIndex)
+        {
+            var raw = GetRawSource(
+                instruction,
+                sourceIndex,
+                applySdwaIntegerModifiers: false);
+            if (instruction.Control is Gen5Vop3Control control &&
+                (control.OperandSelect & (1u << sourceIndex)) != 0)
+            {
+                raw = ShiftRightLogical(raw, UInt(16));
+            }
+
+            return BitwiseAnd(raw, UInt(0xFFFF));
+        }
+
+        /// <summary>Reads the op_sel-selected 16-bit half as a sign-extended int.</summary>
+        private uint GetSignedInteger16Source(
+            Gen5ShaderInstruction instruction,
+            int sourceIndex) =>
+            _module.AddInstruction(
+                SpirvOp.BitFieldSExtract,
+                _intType,
+                Bitcast(_intType, GetUnsignedInteger16Source(instruction, sourceIndex)),
+                UInt(0),
+                UInt(16));
+
+        /// <summary>
+        /// frexp on an f32 bit pattern: either the significand in [0.5, 1.0) with
+        /// the sign kept, or the integer exponent. Inf/NaN pass the input through
+        /// and report exponent 0; zero stays zero. Subnormals are normalised, so
+        /// this is also correct for a widened f16 (which is never subnormal).
+        /// </summary>
+        private uint EmitFrexpFloat32(uint bits, bool wantExponent)
+        {
+            var absolute = BitwiseAnd(bits, UInt(0x7FFF_FFFF));
+            var isInfinityNan = UCmp(
+                SpirvOp.UGreaterThanEqual,
+                absolute,
+                UInt(0x7F80_0000));
+            var isZero = Equal(absolute, 0);
+            var mantissa = BitwiseAnd(absolute, UInt(0x7F_FFFF));
+            var isSubnormal = UCmp(SpirvOp.ULessThan, absolute, UInt(0x80_0000));
+            // FindUMsb of (mantissa | 1) stays defined for a zero mantissa; that
+            // lane is discarded by the isZero select below.
+            var highBit = Ext(75, _uintType, BitwiseOr(mantissa, UInt(1)));
+            if (wantExponent)
+            {
+                // A subnormal is 1.f * 2**(highBit - 149), so frexp's exponent is
+                // highBit - 148; a normal's is its exponent field - 126.
+                var exponent = SelectU(
+                    isSubnormal,
+                    ISubU(highBit, UInt(148)),
+                    ISubU(ShiftRightLogical(absolute, UInt(23)), UInt(126)));
+                return SelectU(
+                    _module.AddInstruction(
+                        SpirvOp.LogicalOr,
+                        _boolType,
+                        isInfinityNan,
+                        isZero),
+                    UInt(0),
+                    exponent);
+            }
+
+            // Shifting the subnormal mantissa up drops its leading one past bit
+            // 22, which is exactly the implicit bit a normal significand has.
+            var normalised = SelectU(
+                isSubnormal,
+                BitwiseAnd(
+                    ShiftLeftLogical(mantissa, ISubU(UInt(23), highBit)),
+                    UInt(0x7F_FFFF)),
+                mantissa);
+            var significand = BitwiseOr(
+                BitwiseOr(BitwiseAnd(bits, UInt(0x8000_0000)), UInt(126u << 23)),
+                normalised);
+            return SelectU(
+                isInfinityNan,
+                bits,
+                SelectU(isZero, bits, significand));
+        }
+
+        private uint SaturateSigned16ToUnsigned8(uint source, uint shift)
+        {
+            var field = _module.AddInstruction(
+                SpirvOp.BitFieldSExtract,
+                _intType,
+                Bitcast(_intType, source),
+                UInt(shift),
+                UInt(16));
+            return Bitcast(
+                _uintType,
+                Ext(
+                    45,
+                    _intType,
+                    field,
+                    _module.Constant(_intType, 0),
+                    _module.Constant(_intType, 255)));
+        }
+
+        private uint EmitFloat16Unary(
+            Gen5ShaderInstruction instruction,
+            uint destination,
+            uint operation) =>
+            EmitFloat16Result(
+                instruction,
+                destination,
+                Ext(operation, _floatType, GetFloat16Source(instruction, 0)));
 
         private enum CubeCoordinate
         {

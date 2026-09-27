@@ -166,6 +166,9 @@ public sealed partial class RenderExecutor
             input.Stage = input.Stage with { NggBuffers = (debugInput, debugOutput) };
         }
 
+        var capture = WorkCapture.Enabled
+            ? BeginDispatchCapture(submitId, banks, input, groupsX, groupsY, groupsZ, dispatchInitiator, indirectArgumentsAddress)
+            : null;
         _host.EndRendering();
         using (_host.BeginPreparation())
         {
@@ -208,6 +211,11 @@ public sealed partial class RenderExecutor
         if (debugCapture)
         {
             _host.ReleaseTransientDeviceBuffers();
+        }
+
+        if (capture is not null)
+        {
+            FinishCapture(capture);
         }
 
         if (GpuWorkTrace.WatchedAddresses.Any(address => WritesAddress(input.Stage, program, address)))
