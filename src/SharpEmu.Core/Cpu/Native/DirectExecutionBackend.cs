@@ -929,6 +929,18 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 	}
 
+	[DllImport("libSystem.dylib", EntryPoint = "pthread_self")]
+	private static extern nint MacPthreadSelf();
+
+	[DllImport("libSystem.dylib", EntryPoint = "pthread_get_stackaddr_np")]
+	private static extern nint MacPthreadStackAddress(nint thread);
+
+	[DllImport("libSystem.dylib", EntryPoint = "pthread_get_stacksize_np")]
+	private static extern nuint MacPthreadStackSize(nint thread);
+
+	[ThreadStatic] private static nint _guestEntryStackLimit;
+	[ThreadStatic] private static nint _guestEntryLowWater;
+
 	private unsafe static void ReportGuestEntryDepth(int depth)
 	{
 		byte probe = 0;
@@ -936,11 +948,30 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		if (depth <= 1)
 		{
 			_guestEntryStackBase = here;
-			return;
+		}
+
+		if (_guestEntryStackLimit == 0 && OperatingSystem.IsMacOS())
+		{
+			// pthread_get_stackaddr_np returns the HIGH end of the stack.
+			var self = MacPthreadSelf();
+			_guestEntryStackLimit = MacPthreadStackAddress(self) - (nint)MacPthreadStackSize(self);
+			_guestEntryLowWater = here;
+			Console.Error.WriteLine(
+				$"[LOADER][INFO] Guest executor stack: thread='{Thread.CurrentThread.Name}' " +
+				$"size={MacPthreadStackSize(self)} headroom={here - _guestEntryStackLimit}");
+		}
+
+		// Report the stack low-water mark whenever it drops by another quarter.
+		if (_guestEntryStackLimit != 0 && here < _guestEntryLowWater - (64 * 1024))
+		{
+			_guestEntryLowWater = here;
+			Console.Error.WriteLine(
+				$"[LOADER][WARN] Guest executor stack headroom={here - _guestEntryStackLimit} depth={depth} " +
+				$"thread='{Thread.CurrentThread.Name}'");
 		}
 
 		// Powers of two only: the report must not itself become the hot path.
-		if (depth < 16 || (depth & (depth - 1)) != 0)
+		if (depth < 8 || (depth & (depth - 1)) != 0)
 		{
 			return;
 		}

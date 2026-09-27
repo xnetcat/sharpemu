@@ -835,8 +835,9 @@ internal static unsafe partial class VulkanVideoPresenter
             public required bool UsesPushDescriptors;
             public required ulong Hash;
             public required int SpirvBytes;
-            public required Task<Pipeline> Compile;
+            public Task<Pipeline> Compile = Task.FromResult(default(Pipeline));
             public long StartTimestamp;
+            public long CompileMilliseconds;
         }
 
         private readonly Dictionary<ulong, PendingComputePipeline> _pendingComputePipelines = new();
@@ -874,9 +875,9 @@ internal static unsafe partial class VulkanVideoPresenter
                 _pendingComputePipelines.Remove(key);
                 var compiled = pending.Compile.GetAwaiter().GetResult();
                 ReportPipelineCreation(
-                    (long)Stopwatch.GetElapsedTime(pending.StartTimestamp).TotalMilliseconds,
+                    Interlocked.Read(ref pending.CompileMilliseconds),
                     "compute-async",
-                    $"cs=0x{pending.Hash:X16}",
+                    $"cs=0x{pending.Hash:X16} waited_ms={(long)Stopwatch.GetElapsedTime(pending.StartTimestamp).TotalMilliseconds}",
                     pending.SpirvBytes.ToString());
                 MarkPipelineCacheDirty();
                 Interlocked.Increment(ref _perfPipelineCreations);
@@ -916,26 +917,30 @@ internal static unsafe partial class VulkanVideoPresenter
                 Hash = description.Stage.Hash,
                 SpirvBytes = SpirvBytesOf(computeModule.Handle),
                 StartTimestamp = Stopwatch.GetTimestamp(),
-                Compile = Task.Factory.StartNew(
-                    () =>
-                    {
-                        // Each compile blocks its thread inside the Metal compiler service,
-                        // so the number in flight is bounded instead of one thread per
-                        // program the frame happens to touch.
-                        _computeCompileSlots.Wait();
-                        try
-                        {
-                            return CompileComputePipeline(vk, device, cache, computeModule, layout);
-                        }
-                        finally
-                        {
-                            _computeCompileSlots.Release();
-                        }
-                    },
-                    CancellationToken.None,
-                    TaskCreationOptions.LongRunning,
-                    TaskScheduler.Default),
             };
+            started.Compile = Task.Factory.StartNew(
+                () =>
+                {
+                    // Each compile blocks its thread inside the Metal compiler service,
+                    // so the number in flight is bounded instead of one thread per
+                    // program the frame happens to touch.
+                    _computeCompileSlots.Wait();
+                    var compileStart = Stopwatch.GetTimestamp();
+                    try
+                    {
+                        return CompileComputePipeline(vk, device, cache, computeModule, layout);
+                    }
+                    finally
+                    {
+                        Interlocked.Exchange(
+                            ref started.CompileMilliseconds,
+                            (long)Stopwatch.GetElapsedTime(compileStart).TotalMilliseconds);
+                        _computeCompileSlots.Release();
+                    }
+                },
+                CancellationToken.None,
+                TaskCreationOptions.LongRunning,
+                TaskScheduler.Default);
             _pendingComputePipelines.Add(key, started);
             return false;
         }
