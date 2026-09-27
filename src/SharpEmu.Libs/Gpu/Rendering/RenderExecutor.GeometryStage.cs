@@ -28,7 +28,8 @@ public sealed partial class RenderExecutor
     private static readonly string? DrainAroundNggMode = Environment.GetEnvironmentVariable("SHARPEMU_DIAG_DRAIN_AROUND_NGG");
     private static readonly bool DrainBeforeNgg = DrainAroundNggMode is "1" or "pre";
     private static readonly bool DrainAfterNgg = DrainAroundNggMode is "1" or "post";
-    private static readonly bool FlushAfterNgg = DrainAroundNggMode is "flush" or "flushsleep";
+    private static readonly bool FlushAfterNgg = DrainAroundNggMode is "flush" or "flushsleep" or "sleepdraw";
+    private static readonly bool SleepAfterReplayDraw = DrainAroundNggMode is "sleepdraw";
     private static readonly bool SleepAfterNgg = DrainAroundNggMode is "flushsleep";
     private static readonly bool EventAfterNgg = DrainAroundNggMode is "event";
 
@@ -172,6 +173,10 @@ public sealed partial class RenderExecutor
         {
             // After the replay draw: the batch recording now is the last to read the records.
             _host.ReleaseTransientDeviceBuffers();
+            if (SleepAfterReplayDraw)
+            {
+                Thread.Sleep(200);
+            }
         }
 
         return true;
