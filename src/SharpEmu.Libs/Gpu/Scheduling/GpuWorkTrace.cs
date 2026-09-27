@@ -58,6 +58,20 @@ public static class GpuWorkTrace
     // The tick the host records into now.
     public static Func<ulong>? CurrentTick { get; set; }
 
+    public static void NoteTick(ulong tick, string work)
+    {
+        if (!Enabled)
+        {
+            return;
+        }
+
+        lock (Gate)
+        {
+            Entries[_next] = (tick, work, 0);
+            _next = (_next + 1) % Capacity;
+        }
+    }
+
     public static int Note(string work)
     {
         if (!Enabled || CurrentTick is not { } tick)

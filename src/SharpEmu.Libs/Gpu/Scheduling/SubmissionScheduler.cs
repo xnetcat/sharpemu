@@ -452,6 +452,11 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
                 submitted = _device.TrySubmit(buffer, submit, out failure);
             }
 
+            if (GpuWorkTrace.Enabled)
+            {
+                GpuWorkTrace.NoteTick(tick, $"submit recorded_tick={CurrentTick} waits={submit.WaitCount} signals={submit.SignalCount} thread={Environment.CurrentManagedThreadId} ok={submitted}");
+            }
+
             if (submitted && _completed is { } completed)
             {
                 _priority.Enqueue(new TickWork(() => completed(tick), tick));
