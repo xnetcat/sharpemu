@@ -894,6 +894,36 @@ internal static unsafe partial class VulkanVideoPresenter
                 AccessFlags.MemoryReadBit | AccessFlags.MemoryWriteBit,
                 AccessFlags.ShaderReadBit | AccessFlags.ShaderWriteBit);
 
+        private Event _computeCompletionEvent;
+
+        public void ComputeCompletionDependency()
+        {
+            EndRendering();
+            var command = new CommandBuffer(_scheduler.Current.Handle);
+            if (_computeCompletionEvent.Handle == 0)
+            {
+                var info = new EventCreateInfo { SType = StructureType.EventCreateInfo };
+                Event created;
+                if (_vk.CreateEvent(_device, &info, null, &created) != Result.Success)
+                {
+                    throw SubmissionScheduler.Fatal("vkCreateEvent failed for the compute completion dependency.");
+                }
+
+                _computeCompletionEvent = created;
+            }
+
+            var ev = _computeCompletionEvent;
+            var barrier = new MemoryBarrier
+            {
+                SType = StructureType.MemoryBarrier,
+                SrcAccessMask = AccessFlags.ShaderWriteBit | AccessFlags.ShaderReadBit,
+                DstAccessMask = AccessFlags.MemoryReadBit | AccessFlags.MemoryWriteBit,
+            };
+            _vk.CmdSetEvent(command, ev, PipelineStageFlags.ComputeShaderBit);
+            _vk.CmdWaitEvents(command, 1, &ev, PipelineStageFlags.ComputeShaderBit, PipelineStageFlags.AllCommandsBit, 1, &barrier, 0, null, 0, null);
+            _vk.CmdResetEvent(command, ev, PipelineStageFlags.AllCommandsBit);
+        }
+
         public void ShaderAccessBarrier() =>
             RecordMemoryBarrier(
                 PipelineStageFlags.ComputeShaderBit,

@@ -160,6 +160,10 @@ public interface IRenderHost
 
     void ShaderAccessBarrier();
 
+    // Makes every later command wait on the GPU until the earlier compute work has finished, with a
+    // dependency the driver enforces between command encoders (not only a pipeline barrier).
+    void ComputeCompletionDependency() => ShaderAccessBarrier();
+
     // Clears the bound color targets to one colour in place of the draw.
     void ClearColorTargets(ReadOnlySpan<ColorTargetState> targets, SolidColorClear clear);
 
