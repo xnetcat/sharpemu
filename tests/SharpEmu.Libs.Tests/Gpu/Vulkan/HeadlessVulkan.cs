@@ -49,7 +49,7 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
         "VK_KHR_push_descriptor",
     ];
 
-    // The push descriptor limit of the device; the render host pushes sets that fit it.
+    // The push descriptor limit the render host may use on this device (none on MoltenVK).
     public uint MaxPushDescriptors
     {
         get
@@ -57,7 +57,7 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
             var pushDescriptors = new PhysicalDevicePushDescriptorPropertiesKHR { SType = StructureType.PhysicalDevicePushDescriptorPropertiesKhr };
             var properties = new PhysicalDeviceProperties2 { SType = StructureType.PhysicalDeviceProperties2, PNext = &pushDescriptors };
             Vk.GetPhysicalDeviceProperties2(Physical, &properties);
-            return pushDescriptors.MaxPushDescriptors;
+            return SharpEmu.Libs.Gpu.Vulkan.VulkanPushDescriptorPolicy.UsableCount(Vk, Physical, pushDescriptors.MaxPushDescriptors);
         }
     }
 
