@@ -13,9 +13,14 @@ public static class PipelineCacheSignature
 {
     public const int UuidSize = 16;
 
+    // SHARPEMU_PIPELINE_CACHE_ANY_BUILD=1 keeps one cache across emulator builds: pipelines are keyed by
+    // their shader code, so entries a changed translator no longer produces are only dead weight, and a
+    // development rebuild no longer starts every title with a cold cache.
     public static string BuildVersion =>
-        typeof(PipelineCacheSignature).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion ??
-        typeof(PipelineCacheSignature).Assembly.GetName().Version?.ToString() ?? "unknown";
+        Environment.GetEnvironmentVariable("SHARPEMU_PIPELINE_CACHE_ANY_BUILD") == "1"
+            ? "any-build"
+            : typeof(PipelineCacheSignature).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion ??
+              typeof(PipelineCacheSignature).Assembly.GetName().Version?.ToString() ?? "unknown";
 
     public static string Build(uint vendorId, uint deviceId, uint driverVersion, ReadOnlySpan<byte> pipelineCacheUuid)
     {
