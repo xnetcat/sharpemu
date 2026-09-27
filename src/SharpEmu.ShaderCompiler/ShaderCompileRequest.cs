@@ -155,6 +155,9 @@ public sealed class ShaderCompileRequest
     public uint PositionExportControl { get; init; }
     public ShaderClipSpaceTransform ClipSpace { get; init; }
 
+    // The LDS the dispatch allocates (COMPUTE_PGM_RSRC2.LDS_SIZE), 0 when unknown.
+    public uint LocalDataShareDwords { get; init; }
+
     public uint LocalSizeX { get; init; } = 1;
     public uint LocalSizeY { get; init; } = 1;
     public uint LocalSizeZ { get; init; } = 1;

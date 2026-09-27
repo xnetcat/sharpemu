@@ -613,6 +613,7 @@ internal sealed class ShaderProgramCache
                     ComputeSystemRegisters = options.ComputeSystemRegisters,
                     NggMode = options.NggMode,
                     NggParamCount = options.NggParamCount,
+                    LocalDataShareDwords = info.LocalDataShareDwords,
                     LocalSizeX = Math.Max(info.ThreadsX, 1),
                     LocalSizeY = Math.Max(info.ThreadsY, 1),
                     LocalSizeZ = Math.Max(info.ThreadsZ, 1),
