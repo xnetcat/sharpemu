@@ -486,6 +486,18 @@ public static partial class VideoOutExports
             : (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
     }
 
+    private static readonly int? ForcedOutputResolution =
+        Environment.GetEnvironmentVariable("SHARPEMU_VIDEOOUT_OUTPUT_RESOLUTION") switch
+        {
+            "hd" => 1,
+            "4k" => 2,
+            _ => null,
+        };
+
+    private static int _outputStatusTraces;
+
+    private static bool TraceOutputStatus => Interlocked.Increment(ref _outputStatusTraces) <= 8;
+
     [SysAbiExport(
         Nid = "utPrVdxio-8",
         ExportName = "sceVideoOutGetOutputStatus",
@@ -507,7 +519,13 @@ public static partial class VideoOutExports
 
         Span<byte> status = stackalloc byte[VideoOutOutputStatusSize];
         status.Clear();
-        var resolutionClass = port.OutputWidth >= 3840 || port.OutputHeight >= 2160 ? 2 : 1;
+        // SHARPEMU_VIDEOOUT_OUTPUT_RESOLUTION=hd reports an HD display, so a title that sizes its
+        // render targets from the output resolution renders a quarter of the 4K pixels.
+        var resolutionClass = ForcedOutputResolution ?? (port.OutputWidth >= 3840 || port.OutputHeight >= 2160 ? 2 : 1);
+        if (TraceOutputStatus)
+        {
+            Console.Error.WriteLine($"[LOADER][INFO] sceVideoOutGetOutputStatus handle={handle} resolution={resolutionClass} output={port.OutputWidth}x{port.OutputHeight}");
+        }
         BinaryPrimitives.WriteInt32LittleEndian(status[0x00..0x04], resolutionClass);
         BinaryPrimitives.WriteInt32LittleEndian(status[0x04..0x08], 1);
         // The status uses a refresh-rate code, not the frequency used for pacing.
