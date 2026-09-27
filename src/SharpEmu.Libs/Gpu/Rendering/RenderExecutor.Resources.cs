@@ -186,6 +186,12 @@ public sealed partial class RenderExecutor
         var capture = WorkCapture.Enabled
             ? BeginDrawCapture(submitId, banks, in draw, ref state, topology, in emission, in indexSource, primitiveRestart)
             : null;
+        if (VideoOut.SerialComputeProfile.Enabled)
+        {
+            _host.EndRendering();
+            VideoOut.SerialComputeProfile.Before();
+        }
+
         using var preparation = _host.BeginPreparation();
         IPreparedBindings vertexBindings;
         IPreparedBindings? pixelBindings;
@@ -283,6 +289,14 @@ public sealed partial class RenderExecutor
         }
 
         EmitDraw(banks.UserConfig, vertexInput, in draw, in emission);
+        if (VideoOut.SerialComputeProfile.Enabled)
+        {
+            _host.EndRendering();
+            VideoOut.SerialComputeProfile.After(
+                VideoOut.SerialComputeProfile.DrawKey(state.PixelActive ? pixelInput.Stage.Program?.Hash ?? 0 : 0, vertexInput.Stage.Program?.Hash ?? 0),
+                draw.Count, draw.InstanceCount, 0);
+        }
+
         if (setAutoDebug)
         {
             SetDrawDebugPhase(submitId, in draw, 0x600);

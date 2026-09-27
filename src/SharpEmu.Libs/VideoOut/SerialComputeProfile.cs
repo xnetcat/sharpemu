@@ -22,6 +22,24 @@ internal static class SerialComputeProfile
 
     public static SubmissionScheduler? Scheduler;
 
+    // Image uploads are charged under a synthetic key (top bit set) per format and tiling.
+    private static readonly Dictionary<ulong, string> UploadNames = new();
+
+    public static ulong DrawKey(ulong pixel, ulong vertex)
+    {
+        var key = 0x4000_0000_0000_0000UL | ((pixel != 0 ? pixel : vertex) & 0x3FFF_FFFF_FFFF_FFFFUL);
+        UploadNames[key] = pixel != 0 ? $"draw ps=0x{pixel:X16}" : $"draw vs=0x{vertex:X16}";
+        return key;
+    }
+
+    public static ulong UploadKey(string format, bool tiled)
+    {
+        var name = $"upload {format}{(tiled ? " tiled" : " linear")}";
+        var key = 0x8000_0000_0000_0000UL | (ulong)(uint)name.GetHashCode();
+        UploadNames[key] = name;
+        return key;
+    }
+
     public static void Before()
     {
         var start = Stopwatch.GetTimestamp();
@@ -50,7 +68,7 @@ internal static class SerialComputeProfile
         foreach (var (pipeline, entry) in Pipelines.OrderByDescending(static pair => pair.Value.Ms).Take(12))
         {
             Console.Error.WriteLine(
-                $"[PERF][SERIAL_COMPUTE] cs=0x{pipeline:X16} total_ms={entry.Ms:F1} n={entry.Count} max_ms={entry.MaxMs:F2} max_args={entry.Args}");
+                $"[PERF][SERIAL_COMPUTE] {(UploadNames.TryGetValue(pipeline, out var name) ? name : $"cs=0x{pipeline:X16}")} total_ms={entry.Ms:F1} n={entry.Count} max_ms={entry.MaxMs:F2} max_args={entry.Args}");
         }
 
         Pipelines.Clear();

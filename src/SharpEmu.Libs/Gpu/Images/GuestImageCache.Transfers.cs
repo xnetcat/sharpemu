@@ -349,6 +349,12 @@ public sealed unsafe partial class GuestImageCache
                 ? (image.IsCpuDirty ? "buffer-and-cpu-dirty" : "buffer-dirty")
                 : (image.IsMaybeCpuDirty ? "maybe-cpu-dirty" : "cpu-dirty");
             var sourceStarted = measureUpload ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+            if (VideoOut.SerialComputeProfile.Enabled)
+            {
+                _scheduler.EndRendering();
+                VideoOut.SerialComputeProfile.Before();
+            }
+
             var (source, sourceOffset) = _bufferCache.ObtainBufferForImage(image.Description.Data.Address, image.Description.Data.Size);
             var sourceFinished = measureUpload ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             dataImported = true;
@@ -360,6 +366,14 @@ public sealed unsafe partial class GuestImageCache
             }
 
             UploadFromBuffer(image, request, source, sourceOffset);
+            if (VideoOut.SerialComputeProfile.Enabled)
+            {
+                ref readonly var uploaded = ref image.Description;
+                VideoOut.SerialComputeProfile.After(
+                    VideoOut.SerialComputeProfile.UploadKey(uploaded.PixelFormat.ToString(), uploaded.IsTiled),
+                    uploaded.Extent.Width, uploaded.Extent.Height, uploaded.Extent.Depth);
+            }
+
             if (measureUpload)
             {
                 RenderPhaseProfile.RecordImageUpload(image.Description, reason,
