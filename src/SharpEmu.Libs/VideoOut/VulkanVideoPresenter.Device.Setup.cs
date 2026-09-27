@@ -591,7 +591,12 @@ internal static unsafe partial class VulkanVideoPresenter
             SetNativeSubgroupCapabilities(subgroup.SubgroupSize, subgroup.SupportedStages);
             // MoltenVK reports a zero OpArrayLength for storage buffers bound through push
             // descriptors, which turns every bounds-checked load into zero and drops every store.
-            _maxPushDescriptors = IsDeviceExtensionAvailable(PortabilitySubsetExtensionName) ? 0 : pushDescriptorProperties.MaxPushDescriptors;
+            // The portability-subset extension is not always enumerated for the headless device the
+            // replay tool creates, so also refuse push descriptors on macOS, where the only driver is
+            // MoltenVK.
+            _maxPushDescriptors = OperatingSystem.IsMacOS() || IsDeviceExtensionAvailable(PortabilitySubsetExtensionName)
+                ? 0
+                : pushDescriptorProperties.MaxPushDescriptors;
             _noAttachmentSampleCounts = properties.Limits.FramebufferNoAttachmentsSampleCounts;
             _maxComputeWorkGroupCountX = properties.Limits.MaxComputeWorkGroupCount[0];
             _maxComputeWorkGroupCountY = properties.Limits.MaxComputeWorkGroupCount[1];
