@@ -24,6 +24,9 @@ public sealed partial class RenderExecutor
     private const uint NggVerticesPerPrimitive = 3;
     private const uint MaxNggSubgroups = 1u << 16;
 
+    // LOCAL ONLY diagnostic: drain the queue before and after every emulated geometry dispatch.
+    private static readonly bool DrainAroundNgg = Environment.GetEnvironmentVariable("SHARPEMU_DIAG_DRAIN_AROUND_NGG") == "1";
+
     private readonly record struct NggReplay(uint ParamCount, ulong Input, ulong Output);
 
     private NggReplay? _nggReplay;
@@ -219,6 +222,14 @@ public sealed partial class RenderExecutor
                 _host.PrepareDeviceAddresses();
             }
 
+            var drain = DrainAroundNgg && VideoOut.SerialComputeProfile.Scheduler is not null;
+            if (drain)
+            {
+                Console.Error.WriteLine($"[DIAG] ngg pre-drain subgroups={subgroupCount}");
+                VideoOut.SerialComputeProfile.Scheduler!.Finish();
+                Console.Error.WriteLine("[DIAG] ngg pre-drain done");
+            }
+
             _host.BindResources(bindings);
             Span<IPreparedBindings> stages = [bindings];
             _host.CommitBindings(PipelineBindPoint.Compute, in pipeline, stages);
@@ -229,6 +240,11 @@ public sealed partial class RenderExecutor
             _host.BindPipeline(PipelineBindPoint.Compute, in pipeline);
             _host.Dispatch((uint)subgroupCount, 1, 1);
             _host.ShaderAccessBarrier();
+            if (drain)
+            {
+                VideoOut.SerialComputeProfile.Scheduler!.Finish();
+                Console.Error.WriteLine($"[DIAG] ngg post-drain done #{traceId}");
+            }
             GpuWorkTrace.Breadcrumb(traceId);
         }
 
