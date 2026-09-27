@@ -2567,7 +2567,20 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 	}
 
+	// Patches unprotect and re-protect whole pages: two threads patching stubs that share a page
+	// (runtime module loads on guest threads) would restore the other's page to read-execute while
+	// it is still writing, so every patch runs under one gate.
+	private static readonly object ImportStubPatchGate = new();
+
 	private unsafe bool PatchImportStub(nint address, nint trampoline)
+	{
+		lock (ImportStubPatchGate)
+		{
+			return PatchImportStubLocked(address, trampoline);
+		}
+	}
+
+	private unsafe bool PatchImportStubLocked(nint address, nint trampoline)
 	{
 		uint flNewProtect = default(uint);
 		if (!VirtualProtect((void*)address, 16u, 64u, &flNewProtect))
