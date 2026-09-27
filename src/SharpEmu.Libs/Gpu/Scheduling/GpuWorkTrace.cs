@@ -78,8 +78,18 @@ public static class GpuWorkTrace
         int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_DIAG_SLEEP_BEFORE_ITEM"), out var item) ? item : 0;
     private static int _armedCountdown;
 
+    // LOCAL ONLY: SHARPEMU_DIAG_WINDOW_LOG=<dir> logs every command from the armed point for 16 traced items.
+    private static readonly string? WindowLogDirectory = Environment.GetEnvironmentVariable("SHARPEMU_DIAG_WINDOW_LOG");
+    private static int _windowLogItems;
+
     public static void ArmSleep()
     {
+        if (WindowLogDirectory is not null && _windowLogItems == 0 && !Rendering.FrameCommandLog.Active)
+        {
+            Rendering.FrameCommandLog.Start(Path.Combine(WindowLogDirectory, $"window-{Environment.TickCount64}"));
+            _windowLogItems = 16;
+        }
+
         if (SleepBeforeItem > 0)
         {
             _armedCountdown = SleepBeforeItem;
@@ -100,6 +110,11 @@ public static class GpuWorkTrace
 
     private static void MaybeSleep()
     {
+        if (_windowLogItems > 0 && --_windowLogItems == 0)
+        {
+            Rendering.FrameCommandLog.Stop();
+        }
+
         if (_armedCountdown > 0 && --_armedCountdown == 0)
         {
             Thread.Sleep(200);

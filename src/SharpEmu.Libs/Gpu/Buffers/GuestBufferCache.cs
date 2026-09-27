@@ -845,6 +845,12 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             return;
         }
 
+        if (Rendering.FrameCommandLog.Active)
+        {
+            var doomed = _registry.GetBuffer(bufferIdentifier);
+            Rendering.FrameCommandLog.Write($"  bufcache delete 0x{doomed.CpuAddress:X}+0x{doomed.Size:X} tick={_scheduler.CurrentTick}");
+        }
+
         Unregister(bufferIdentifier);
         if (_scheduler.Active)
         {
@@ -1046,6 +1052,11 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
 
         Register(bufferIdentifier);
+        if (Rendering.FrameCommandLog.Active)
+        {
+            Rendering.FrameCommandLog.Write($"  bufcache create 0x{overlap.Begin:X}+0x{overlap.End - overlap.Begin:X} merged={overlapping.Count} tick={_scheduler.CurrentTick}");
+        }
+
         return bufferIdentifier;
     }
 

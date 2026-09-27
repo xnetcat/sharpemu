@@ -148,6 +148,11 @@ public sealed class GpuRingBuffer : GpuBuffer
             return false;
         }
 
+        if (wrap && Rendering.FrameCommandLog.Active)
+        {
+            Rendering.FrameCommandLog.Write($"  ring wrap usage={Usage} size=0x{Size:X} tick={Scheduler.CurrentTick}");
+        }
+
         if (wrap)
         {
             _invalidationMark = invalidationMark;
