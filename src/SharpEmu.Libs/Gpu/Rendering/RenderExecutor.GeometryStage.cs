@@ -28,7 +28,8 @@ public sealed partial class RenderExecutor
     private static readonly string? DrainAroundNggMode = Environment.GetEnvironmentVariable("SHARPEMU_DIAG_DRAIN_AROUND_NGG");
     private static readonly bool DrainBeforeNgg = DrainAroundNggMode is "1" or "pre";
     private static readonly bool DrainAfterNgg = DrainAroundNggMode is "1" or "post";
-    private static readonly bool FlushAfterNgg = DrainAroundNggMode is "flush" or "flushsleep" or "sleepdraw";
+    private static readonly bool FlushAfterNgg = DrainAroundNggMode is "flush" or "flushsleep" or "sleepdraw" or "flushwait";
+    private static readonly bool GpuWaitAfterNgg = DrainAroundNggMode is "flushwait";
     private static readonly bool SleepAfterReplayDraw = DrainAroundNggMode is "sleepdraw";
     private static readonly bool SleepAfterNgg = DrainAroundNggMode is "flushsleep";
     private static readonly bool EventAfterNgg = DrainAroundNggMode is "event";
@@ -260,8 +261,13 @@ public sealed partial class RenderExecutor
 
             if (FlushAfterNgg && VideoOut.SerialComputeProfile.Scheduler is not null)
             {
-                VideoOut.SerialComputeProfile.Scheduler!.Flush();
-                Console.Error.WriteLine($"[DIAG] ngg post-flush #{traceId}");
+                var nggTick = VideoOut.SerialComputeProfile.Scheduler!.Flush();
+                if (GpuWaitAfterNgg)
+                {
+                    VideoOut.SerialComputeProfile.Scheduler!.WaitOnTickAtNextSubmit = nggTick;
+                }
+
+                Console.Error.WriteLine($"[DIAG] ngg post-flush #{traceId} tick={nggTick}");
                 if (SleepAfterNgg)
                 {
                     Thread.Sleep(200);

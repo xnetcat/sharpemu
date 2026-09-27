@@ -423,6 +423,9 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
     }
 
     // Add the timeline signal to a copy. Keep the caller's submission bundle unchanged.
+    // LOCAL ONLY diagnostic: the next submission waits on the GPU for this timeline value.
+    public ulong? WaitOnTickAtNextSubmit { get; set; }
+
     public ulong Submit(SubmitBundle? bundle = null)
     {
         var submit = bundle == null ? new SubmitBundle() : new SubmitBundle(bundle);
@@ -432,6 +435,11 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         }
 
         _prepareSubmit?.Invoke(submit);
+        if (WaitOnTickAtNextSubmit is { } waitTick)
+        {
+            WaitOnTickAtNextSubmit = null;
+            submit.AddWait(_timeline.Handle, waitTick);
+        }
         if (submit.WaitCount > SubmitBundle.MaxSemaphores || submit.SignalCount >= SubmitBundle.MaxSemaphores)
         {
             throw Fatal($"The submission exceeds its capacity: waits={submit.WaitCount} signals={submit.SignalCount}.");
