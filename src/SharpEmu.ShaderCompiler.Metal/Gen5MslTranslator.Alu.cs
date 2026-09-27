@@ -224,6 +224,8 @@ public static partial class Gen5MslTranslator
                 // form is fma(src0, src1, src2) exactly like the SPIR-V translator.
                 "VFmaF32" or "VMadF32" or "VMadAkF32" or "VMadMkF32" or "VFmaAkF32" or "VFmaMkF32" =>
                     FloatResult(instruction, $"fma({F(instruction, 0)}, {F(instruction, 1)}, {F(instruction, 2)})"),
+                // The mk/ak forms carry an f16 literal in the low half of the
+                // instruction-stream dword; the decoder normalises its position.
                 "VFmaF16" or "VFmaMkF16" or "VFmaAkF16" => Float16Result(
                     instruction,
                     destination,
@@ -317,6 +319,16 @@ public static partial class Gen5MslTranslator
                     instruction,
                     destination,
                     $"ldexp({F16(instruction, 0)}, as_type<int>({RawSource(instruction, 1)}))"),
+                // VOP2 accumulate forms: the third operand is the destination.
+                // V_FMAC_LEGACY_F32 follows the DX9 rule that 0 * x is 0.
+                "VFmacLegacyF32" => FloatResult(
+                    instruction,
+                    $"((({F(instruction, 0)} == 0.0f || {F(instruction, 1)} == 0.0f) ? 0.0f " +
+                    $": ({F(instruction, 0)} * {F(instruction, 1)})) + as_type<float>(v[{destination}]))"),
+                // D.i32 = sum over four signed bytes of S0 * S1, plus D.i32.
+                "VDot4cI32I8" => EmitDot4cI32I8(instruction, destination),
+                // D.f16_lo = S0.lo * S1.lo + D.lo, and the same for the high half.
+                "VPkFmacF16" => EmitPkFmacF16(instruction, destination),
                 // V_MUL_LEGACY_F32 differs from V_MUL_F32 only in the pre-IEEE rule
                 // that 0 * anything is 0.
                 "VMulLegacyF32" => FloatResult(
@@ -2332,6 +2344,37 @@ public static partial class Gen5MslTranslator
                 "uint",
                 $"(as_type<int>({source}) < 0) ? ~{source} : {source}");
             return $"(({magnitude} == 0u) ? 0xFFFFFFFFu : (uint)clz({magnitude}))";
+        }
+
+        private string EmitDot4cI32I8(Gen5ShaderInstruction instruction, uint destination)
+        {
+            var left = Temp("uint", RawSource(instruction, 0));
+            var right = Temp("uint", RawSource(instruction, 1));
+            var terms = new List<string> { $"as_type<int>(v[{destination}])" };
+            for (var element = 0; element < 4; element++)
+            {
+                var shift = element * 8;
+                terms.Add(
+                    $"(((as_type<int>({left} << {24 - shift})) >> 24) * " +
+                    $"((as_type<int>({right} << {24 - shift})) >> 24))");
+            }
+
+            return AsUInt($"({string.Join(" + ", terms)})");
+        }
+
+        // The VOP2 packed fmac has no op_sel, so each lane reads its own half of
+        // both sources and of the destination accumulator.
+        private string EmitPkFmacF16(Gen5ShaderInstruction instruction, uint destination)
+        {
+            var left = Temp("uint", RawSource(instruction, 0));
+            var right = Temp("uint", RawSource(instruction, 1));
+            var current = Temp("uint", $"v[{destination}]");
+            string Half(string raw, int shift) =>
+                $"(float)as_type<half>((ushort)((({raw}) >> {shift}) & 0xFFFFu))";
+            string Lane(int shift) =>
+                $"(uint)as_type<ushort>(half(fma({Half(left, shift)}, {Half(right, shift)}, " +
+                $"{Half(current, shift)})))";
+            return $"(({Lane(0)}) | (({Lane(16)}) << 16))";
         }
 
         private string EmitSaturatePackU8I16(Gen5ShaderInstruction instruction)
