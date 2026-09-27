@@ -1,0 +1,23 @@
+<!--
+Copyright (C) 2026 SharpEmu Emulator Project
+SPDX-License-Identifier: GPL-2.0-or-later
+-->
+
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- Standalone dev tool: opt out of the repo-wide lock-file requirement
+         so no packages.lock.json is generated or committed for it. -->
+    <RestorePackagesWithLockFile>false</RestorePackagesWithLockFile>
+  </PropertyGroup>
+
+  <!-- The headless device harness, the presenter under test and the replayer itself live in the
+       test assembly, which is the only one the emulator's internals are visible to. The tool is a
+       command line over them, so it replays exactly what the gate replays. -->
+  <ItemGroup>
+    <ProjectReference Include="..\..\tests\SharpEmu.Libs.Tests\SharpEmu.Libs.Tests.csproj" />
+  </ItemGroup>
+
+</Project>

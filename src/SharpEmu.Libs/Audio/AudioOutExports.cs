@@ -12,8 +12,13 @@ namespace SharpEmu.Libs.Audio;
 
 public static class AudioOutExports
 {
+    // audioout.h: SceAudioOutOutputParam { int32_t handle; int32_t : 32; void *ptr; }.
     private const int AudioOutOutputParamSize = 16;
     private const int AudioOutMaximumOutputCount = 25;
+    // audioout.h: SceAudioOutPortState { u16 output; u8 channel; u8 reserved8_1[1];
+    // s16 volume; u16 rerouteCounter; u64 flag; u64 reserved64[2]; }.
+    private const int AudioOutPortStateSize = 0x20;
+    private const ushort AudioOutStateOutputConnectedPrimary = 1 << 0;
 
     internal const int AudioOutErrorInvalidPort = unchecked((int)0x80260003);
     internal const int AudioOutErrorInvalidPointer = unchecked((int)0x80260004);
@@ -229,33 +234,29 @@ public static class AudioOutExports
             return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        // Same rule as AudioOut2 PortGetState: never bulk-write onto the caller
-        // stack. Some titles place small locals next to the canary; a full
-        // SceAudioOutPortState write smashes it.
-        if (IsGuestStackAddress(stateAddress))
-        {
-            return ctx.SetReturn(0);
-        }
-
-        // SceAudioOutPortState: report a connected primary output at full volume
-        // so pacing/mixing code sees a live port. We do no host rerouting, so
-        // rerouteCounter and flag stay zero.
-        Span<byte> state = stackalloc byte[16];
+        // audioout.h: int32_t sceAudioOutGetPortState(int32_t handle,
+        // SceAudioOutPortState *state) — rsi is the only out pointer and the write
+        // is exactly sizeof(SceAudioOutPortState):
+        //   +0x00 u16 output          = STATE_OUTPUT_CONNECTED_PRIMARY
+        //   +0x02 u8  channel         = SceAudioOutStateChannel
+        //   +0x03 u8  reserved8_1[1]
+        //   +0x04 s16 volume          = -1 (invalid outside PADSPK)
+        //   +0x06 u16 rerouteCounter  = 0 (the host mixer never reroutes)
+        //   +0x08 u64 flag            = SCE_AUDIO_OUT_STATE_FLAG_NONE
+        //   +0x10 u64 reserved64[2]
+        Span<byte> state = stackalloc byte[AudioOutPortStateSize];
         state.Clear();
-        System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(state, 1);
         System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(
-            state[2..], (ushort)port.Channels);
-        state[7] = 127;
+            state, AudioOutStateOutputConnectedPrimary);
+        state[2] = (byte)Math.Clamp(port.Channels, 0, 8);
+        System.Buffers.Binary.BinaryPrimitives.WriteInt16LittleEndian(state[4..], -1);
         if (!ctx.Memory.TryWrite(stateAddress, state))
         {
-            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            return ctx.SetReturn(AudioOutErrorInvalidPointer);
         }
 
         return ctx.SetReturn(0);
     }
-
-    private static bool IsGuestStackAddress(ulong value) =>
-        value >= 0x0000_7FF0_0000_0000UL && value <= 0x0000_7FFF_FFFF_FFFFUL;
 
     [SysAbiExport(
         Nid = "w3PdaSTSwGE",

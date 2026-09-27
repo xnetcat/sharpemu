@@ -47,13 +47,66 @@ public static class GameServiceStubs
 
     // ---- CES: Shift-JIS <-> Unicode conversion setup (Japanese text) ----
 
+    // ces/libces_ucs.h: SceCesUcsProfileSheet and SceCesContext are both
+    // "void* systemUse[32]" — 0x100 bytes.
+    private const int CesProfileSheetSize = 0x100;
+    private const int CesContextSize = 0x100;
+
+    // ces/libces_jis.h:
+    //   SceCesSJisUcsProfile *sceCesUcsProfileInitSJis1997Cp932(SceCesUcsProfileSheet *sheet);
+    // This returns a POINTER, not an error code: callers check for non-NULL and
+    // then pass the result to sceCesMbcsUcsContextInit. Returning 0 handed them a
+    // null profile. Clear the caller's sheet and hand the sheet back as the profile.
     [SysAbiExport(Nid = "ZiDCxUUGbec", ExportName = "sceCesUcsProfileInitSJis1997Cp932",
         Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceLibcInternal")]
-    public static int CesUcsProfileInitSJis1997Cp932(CpuContext ctx) => Ok(ctx);
+    public static int CesUcsProfileInitSJis1997Cp932(CpuContext ctx)
+    {
+        var sheet = ctx[CpuRegister.Rdi];
+        if (sheet == 0)
+        {
+            ctx[CpuRegister.Rax] = 0;
+            return 0;
+        }
 
+        Span<byte> body = stackalloc byte[CesProfileSheetSize];
+        body.Clear();
+        if (!ctx.Memory.TryWrite(sheet, body))
+        {
+            ctx[CpuRegister.Rax] = 0;
+            return 0;
+        }
+
+        ctx[CpuRegister.Rax] = sheet;
+        return 0;
+    }
+
+    // ces/libces_mbcs.h:
+    //   int sceCesMbcsUcsContextInit(SceCesMbcsUcsContext *context,
+    //                                const SceCesMbcsUcsProfile *mbcsUcsPrf);
+    // Returns SCE_CES_OK (0). A null profile is accepted: titles pass one after a
+    // successful profile initializer and expect the default SJIS profile to bind.
     [SysAbiExport(Nid = "538bRGc6Zo8", ExportName = "sceCesMbcsUcsContextInit",
         Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceLibcInternal")]
-    public static int CesMbcsUcsContextInit(CpuContext ctx) => Ok(ctx);
+    public static int CesMbcsUcsContextInit(CpuContext ctx)
+    {
+        var context = ctx[CpuRegister.Rdi];
+        var profile = ctx[CpuRegister.Rsi];
+        if (context == 0)
+        {
+            // ces/error.h: SCE_CES_ERROR_INVALID_PARAMETER.
+            const int invalidParameter = unchecked((int)0x805C_0001);
+            ctx[CpuRegister.Rax] = unchecked((ulong)invalidParameter);
+            return invalidParameter;
+        }
+
+        Span<byte> body = stackalloc byte[CesContextSize];
+        body.Clear();
+        // Keep the bound profile in systemUse[0] so a later conversion call can
+        // tell an initialized context from raw stack noise.
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt64LittleEndian(body, profile);
+        _ = ctx.Memory.TryWrite(context, body);
+        return Ok(ctx);
+    }
 
     // ---- NpUniversalDataSystem: gameplay telemetry events ----
     public static int NpUniversalDataSystemCreateEvent(CpuContext ctx) => OkWithHandle(ctx, CpuRegister.Rdi);

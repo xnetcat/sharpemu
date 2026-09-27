@@ -166,7 +166,8 @@ public sealed partial class RenderExecutor
         _host.SetDebugInformation(draw.Operation, submitId, phase, draw.Count, 0, draw.InstanceCount, draw.FirstInstance);
 
     // Binds everything the draw needs inside one preparation scope, then records it.
-    private void RecordDraw(
+    // Returns the open capture builder of a matched draw, for the caller to finish outside the preparation.
+    private WorkCaptureBuilder? RecordDraw(
         ulong submitId,
         RegisterBanks banks,
         in DrawCall draw,
@@ -182,6 +183,9 @@ public sealed partial class RenderExecutor
         var context = banks.Context;
         var vertexInput = state.Programs.VertexInput;
         var pixelInput = state.Programs.PixelInput;
+        var capture = WorkCapture.Enabled
+            ? BeginDrawCapture(submitId, banks, in draw, ref state, topology, in emission, in indexSource, primitiveRestart)
+            : null;
         using var preparation = _host.BeginPreparation();
         IPreparedBindings vertexBindings;
         IPreparedBindings? pixelBindings;
@@ -203,7 +207,7 @@ public sealed partial class RenderExecutor
                     "The draw was not executed. Images and FPS can be incorrect. Set SHARPEMU_STRICT_COMPUTE=1 to stop on this failure.");
             }
 
-            return;
+            return capture;
         }
         var vertexProgram = vertexInput.Stage.Program ?? throw _host.Fatal("The vertex stage has no program.");
         var pixelProgram = pixelBindings is null ? null : pixelInput.Stage.Program ?? throw _host.Fatal("The pixel stage has no program.");
@@ -305,6 +309,8 @@ public sealed partial class RenderExecutor
         {
             SetDrawDebugPhase(submitId, in draw, 0x700);
         }
+
+        return capture;
     }
 
     private void EmitDraw(UserConfigRegisters userConfig, VertexInputInfo vertexInput, in DrawCall draw, in DrawEmission emission)

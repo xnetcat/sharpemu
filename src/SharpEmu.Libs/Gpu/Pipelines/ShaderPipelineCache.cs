@@ -67,7 +67,14 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         var registered = _registry.Require(codeAddress, label);
         var hash = ShaderIdentity.Compute(_context.Memory, codeAddress, registered.CodeRanges, label);
         var userData = UserData(registers, declaredCount, probeWrittenRegisters, codeAddress, label);
-        return new ShaderSource(registered, hash, userData, userDataBase, stage);
+        var source = new ShaderSource(registered, hash, userData, userDataBase, stage);
+        if (WorkCapture.Enabled)
+        {
+            // The capture needs the header the draw resolved; the executor sees only the code address.
+            WorkCapture.NoteShader(source);
+        }
+
+        return source;
     }
 
     public GraphicsPrograms GetGraphicsPrograms(

@@ -31,6 +31,20 @@ public sealed class PadExportsTests
         Assert.Equal(expected, PadExports.PadSetTiltCorrectionState(_ctx));
     }
 
+    // pad.h: int scePadResetOrientation(int32_t handle) — handle only, no out
+    // parameter, so the only failure mode is a bad handle.
+    [Theory]
+    [InlineData(0, 0)]
+    [InlineData(1, 0)]
+    [InlineData(2, InvalidHandle)]
+    [InlineData(-1, InvalidHandle)]
+    public void ResetOrientation_ValidatesHandle(int handle, int expected)
+    {
+        _ctx[CpuRegister.Rdi] = unchecked((ulong)handle);
+        Assert.Equal(expected, PadExports.PadResetOrientation(_ctx));
+        Assert.Equal(unchecked((ulong)expected), _ctx[CpuRegister.Rax]);
+    }
+
     /// <summary>
     /// Mirrors the calling frame observed in PPSA10112: the out-param points at
     /// rbp-0x30 and the caller's stack cookie sits at rbp-0x28, so the state is

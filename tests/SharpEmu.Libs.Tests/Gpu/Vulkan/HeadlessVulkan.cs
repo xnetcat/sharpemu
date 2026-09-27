@@ -203,6 +203,16 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
 
     private static HeadlessVulkan? Create()
     {
+        // The harnesses over this device watch guest pages through PageGuard, which needs a 4 KiB
+        // host page. An arm64 macOS process has 16 KiB pages, so the device gates skip there and
+        // run under Rosetta as the emulator itself does.
+        if (Environment.SystemPageSize != 0x1000)
+        {
+            Console.Error.WriteLine(
+                $"[TEST][SKIP] The host page size is 0x{Environment.SystemPageSize:X}; the device gates need 0x1000 (run the osx-x64 build).");
+            return null;
+        }
+
         var vk = Vk.GetApi();
         uint instanceVersion = Vk.Version10;
         vk.EnumerateInstanceVersion(ref instanceVersion);
@@ -214,20 +224,31 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
         var appInfo = new ApplicationInfo { SType = StructureType.ApplicationInfo, ApiVersion = apiVersion };
         var validation = Environment.GetEnvironmentVariable(ValidationVariable) == "1";
         var layers = validation ? SilkMarshal.StringArrayToPtr(new[] { "VK_LAYER_KHRONOS_validation" }) : 0;
-        var extensions = validation ? SilkMarshal.StringArrayToPtr(new[] { ExtDebugUtils.ExtensionName }) : 0;
+        // MoltenVK is a portability driver: the loader hides it unless the instance asks for it, so
+        // without these two the harness finds no device at all on macOS.
+        var portableInstance = HasInstanceExtensions(vk, [PortabilityEnumerationExtension]);
+        var instanceExtensionNames = new List<string>();
+        if (validation) instanceExtensionNames.Add(ExtDebugUtils.ExtensionName);
+        if (portableInstance) instanceExtensionNames.Add(PortabilityEnumerationExtension);
+        var extensions = instanceExtensionNames.Count > 0 ? SilkMarshal.StringArrayToPtr(instanceExtensionNames.ToArray()) : 0;
         var instanceInfo = new InstanceCreateInfo
         {
             SType = StructureType.InstanceCreateInfo,
+            Flags = portableInstance ? InstanceCreateFlags.EnumeratePortabilityBitKhr : InstanceCreateFlags.None,
             PApplicationInfo = &appInfo,
             EnabledLayerCount = validation ? 1u : 0u,
             PpEnabledLayerNames = (byte**)layers,
-            EnabledExtensionCount = validation ? 1u : 0u,
+            EnabledExtensionCount = (uint)instanceExtensionNames.Count,
             PpEnabledExtensionNames = (byte**)extensions,
         };
         var created = vk.CreateInstance(&instanceInfo, null, out var instance);
         if (validation)
         {
             SilkMarshal.Free(layers);
+        }
+
+        if (extensions != 0)
+        {
             SilkMarshal.Free(extensions);
         }
 
@@ -366,6 +387,8 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
         var extensionNames = new List<string>();
         if (dynamicRendering) extensionNames.AddRange(RenderingExtensionNames);
         if (barycentric) extensionNames.Add(barycentricExtension);
+        // A portability driver requires the subset extension on the device it hands out.
+        if (HasDeviceExtensions(vk, physical, [PortabilitySubsetExtension])) extensionNames.Add(PortabilitySubsetExtension);
         var deviceExtensions = extensionNames.Count > 0 ? SilkMarshal.StringArrayToPtr(extensionNames.ToArray()) : 0;
         var deviceInfo = new DeviceCreateInfo
         {
@@ -400,6 +423,36 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
         }
 
         return result;
+    }
+
+    private const string PortabilityEnumerationExtension = "VK_KHR_portability_enumeration";
+    private const string PortabilitySubsetExtension = "VK_KHR_portability_subset";
+
+    private static bool HasInstanceExtensions(Vk vk, IReadOnlyList<string> names)
+    {
+        uint count = 0;
+        if (vk.EnumerateInstanceExtensionProperties((byte*)null, &count, null) != Result.Success || count == 0)
+        {
+            return false;
+        }
+
+        var properties = new ExtensionProperties[count];
+        fixed (ExtensionProperties* pointer = properties)
+        {
+            if (vk.EnumerateInstanceExtensionProperties((byte*)null, &count, pointer) != Result.Success)
+            {
+                return false;
+            }
+        }
+
+        var available = new HashSet<string>();
+        for (var index = 0; index < count; index++)
+        {
+            var property = properties[index];
+            available.Add(SilkMarshal.PtrToString((nint)property.ExtensionName) ?? string.Empty);
+        }
+
+        return names.All(available.Contains);
     }
 
     private static bool HasDeviceExtensions(Vk vk, PhysicalDevice physical, IReadOnlyList<string> names)
