@@ -194,6 +194,12 @@ public sealed partial class RenderExecutor
                 }
             }
 
+            if (VideoOut.SerialComputeProfile.Enabled)
+            {
+                _host.EndRendering();
+                VideoOut.SerialComputeProfile.Before();
+            }
+
             var bindings = _host.PrepareBindings(input.Stage);
             if (program.UsesDeviceAddresses)
             {
@@ -226,6 +232,10 @@ public sealed partial class RenderExecutor
                 _host.Dispatch(groupsX, groupsY, groupsZ);
             }
             _host.ShaderAccessBarrier();
+            if (VideoOut.SerialComputeProfile.Enabled)
+            {
+                VideoOut.SerialComputeProfile.After(program.Hash, groupsX, groupsY, groupsZ);
+            }
         }
 
         _host.ResetBindings();

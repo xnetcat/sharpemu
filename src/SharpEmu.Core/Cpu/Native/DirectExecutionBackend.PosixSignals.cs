@@ -257,13 +257,30 @@ public sealed unsafe partial class DirectExecutionBackend
 				return;
 			}
 		}
-		catch
+		catch (Exception exception)
 		{
-			// A managed exception must never unwind out of a signal frame.
+			// A managed exception must never unwind out of a signal frame. The fault then
+			// chains to the runtime, which reports one near the stack pointer as a bare
+			// "Stack overflow", so say what the handler hit first.
+			try
+			{
+				Console.Error.WriteLine(
+					$"[LOADER][ERROR] posix signal handler threw: sig={signal} fault=0x{(siginfo != 0 ? *(ulong*)((byte*)siginfo + PosixSigInfoAddressOffset) : 0):X16} {exception.GetType().Name}: {exception.Message}");
+				Console.Error.Flush();
+			}
+			catch
+			{
+			}
 		}
 		finally
 		{
 			_posixSignalHandlerDepth--;
+		}
+
+		if (!_posixSignalWarmup)
+		{
+			Console.Error.WriteLine($"[LOADER][ERROR] posix signal chained to the runtime: sig={signal}");
+			Console.Error.Flush();
 		}
 
 		ChainPreviousPosixAction(signal, siginfo, ucontext);

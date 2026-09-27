@@ -63,6 +63,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 _ => WakeRenderThread());
             var scheduler = _scheduler;
             GpuWorkTrace.CurrentTick = () => scheduler.CurrentTick;
+            SerialComputeProfile.Scheduler = scheduler;
         }
 
         // Both stores share the manager's page guard and read guest memory through its address space.
