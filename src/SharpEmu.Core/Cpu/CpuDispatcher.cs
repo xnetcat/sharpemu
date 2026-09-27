@@ -302,6 +302,7 @@ public sealed class CpuDispatcher : ICpuDispatcher, IDisposable
         debugHook?.OnFrameEnter(debugFrame!);
 
         _nativeCpuBackend ??= new DirectExecutionBackend(_moduleManager);
+        DirectExecutionBackend.UseProbeMemory(_virtualMemory);
         // Let backend stall reports reference the same frame as entry.
         (_nativeCpuBackend as DirectExecutionBackend)?.SetActiveDebugFrame(debugFrame);
         if (_nativeCpuBackend.TryExecute(

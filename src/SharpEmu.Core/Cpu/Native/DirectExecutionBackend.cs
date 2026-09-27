@@ -1345,6 +1345,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	private bool SetupImportStubs(IReadOnlyDictionary<ulong, string> importStubs)
 	{
 		Console.Error.WriteLine($"[LOADER][INFO] Setting up {importStubs.Count} import stubs...");
+		ArmPatchProbe(4);
 		ClearImportHandlerTrampolines();
 		_importEntries = new ImportStubEntry[importStubs.Count];
 		HashSet<ulong> hashSet = new HashSet<ulong>(importStubs.Keys);
@@ -2572,8 +2573,72 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	// to read-execute while it is still writing, so every patch runs under one gate.
 	private static readonly object ImportStubPatchGate = new();
 
+	// SHARPEMU_PROBE_PATCH=1 describes the first stub pages of each install before touching them:
+	// what the kernel really thinks of the page, not what either region registry believes.
+	private static readonly bool ProbePatch =
+		string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_PROBE_PATCH"), "1", StringComparison.Ordinal);
+
+	private static int _probesLeft;
+
+	internal static void ArmPatchProbe(int count) => Volatile.Write(ref _probesLeft, ProbePatch ? count : 0);
+
+	[DllImport("libc", EntryPoint = "task_self_trap")]
+	private static extern uint TaskSelfTrap();
+
+	[DllImport("libc", EntryPoint = "mach_vm_region")]
+	private static extern int MachVmRegion(
+		uint task, ref ulong address, ref ulong size, int flavor, int* info, ref uint infoCount, out uint objectName);
+
+	private static unsafe void ProbeStubPage(nint address, string what)
+	{
+		if (Interlocked.Decrement(ref _probesLeft) < 0)
+		{
+			return;
+		}
+
+		var report = $"[LOADER][PROBE] {what} 0x{address:X16}";
+		try
+		{
+			// VM_REGION_BASIC_INFO_64 = 9; the struct is 10 ints wide on 64-bit.
+			var info = stackalloc int[16];
+			var regionAddress = (ulong)address;
+			ulong regionSize = 0;
+			var count = 10u;
+			var status = MachVmRegion(TaskSelfTrap(), ref regionAddress, ref regionSize, 9, info, ref count, out _);
+			report += status == 0
+				? $" mach: base=0x{regionAddress:X16} size=0x{regionSize:X} prot={info[0]} maxProt={info[1]} shared={info[3]} reserved={info[4]}"
+				: $" mach: failed status={status}";
+		}
+		catch (Exception error)
+		{
+			report += $" mach: unavailable ({error.GetType().Name})";
+		}
+
+		var queried = VirtualQuery((void*)address, out var information, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) != 0;
+		report += queried
+			? $" | registry: base=0x{information.BaseAddress:X16} size=0x{information.RegionSize:X} " +
+				$"state=0x{information.State:X} protect=0x{information.Protect:X} alloc=0x{information.AllocationProtect:X}"
+			: " | registry: unknown";
+
+		var memory = Volatile.Read(ref _probeMemory);
+		if (memory is not null)
+		{
+			Span<byte> readBack = stackalloc byte[16];
+			report += memory.TryRead((ulong)address, readBack)
+				? $" | readback={Convert.ToHexString(readBack)}"
+				: " | readback: refused";
+		}
+
+		Console.Error.WriteLine(report);
+	}
+
+	private static IVirtualMemory? _probeMemory;
+
+	internal static void UseProbeMemory(IVirtualMemory? memory) => Volatile.Write(ref _probeMemory, memory);
+
 	private unsafe bool PatchImportStub(nint address, nint trampoline)
 	{
+		ProbeStubPage(address, "import stub");
 		lock (ImportStubPatchGate)
 		{
 			return PatchImportStubLocked(address, trampoline);
