@@ -112,6 +112,7 @@ public static partial class Gen5SpirvTranslator
         private readonly Dictionary<uint, uint> _scalarRegisterVariables = new();
         private readonly Dictionary<uint, uint> _vectorRegisterVariables = new();
         private uint _vectorRegisters;
+        private (uint First, uint Last) _dynamicVectorRange;
         private uint _packedHalfRegisters;
         private uint _scc;
         private uint _vcc;
@@ -500,11 +501,11 @@ public static partial class Gen5SpirvTranslator
 
             if (_request.Program.Instructions.Any(static instruction => instruction.Opcode.StartsWith("VMovrel", StringComparison.Ordinal)))
             {
-                var vectorArrayType = _module.TypeArray(_uintType, VectorRegisterCount);
-                _vectorRegisters = _module.AddGlobalVariable(
-                    _module.TypePointer(SpirvStorageClass.Private, vectorArrayType),
-                    SpirvStorageClass.Private,
-                    _module.ConstantNull(vectorArrayType));
+                // A dynamically indexed private array cannot live in registers: Metal spills the
+                // whole 2 KiB file to thread memory and every VGPR access becomes a memory access
+                // (Octopath's instanced vertex shader: 112 ms per draw). Keep one variable per
+                // register and resolve V_MOVREL* with a select over the registers the program uses.
+                _dynamicVectorRange = DynamicVectorRange(_request.Program);
             }
 
             _scc = _module.AddGlobalVariable(
@@ -6403,26 +6404,61 @@ public static partial class Gen5SpirvTranslator
         // takes a computed index instead of a constant. The index is masked to
         // the array bounds: SPIR-V leaves an out-of-range Private access chain
         // undefined, and a mask costs nothing next to the surrounding load.
-        private uint DynamicVectorPointer(uint registerIndex) =>
-            _module.AddInstruction(
-                SpirvOp.AccessChain,
-                _privateUintPointer,
-                _vectorRegisters,
-                BitwiseAnd(registerIndex, UInt(VectorRegisterCount - 1)));
+        // Every register a relative access can reach: from the lowest V_MOVREL* base to past the
+        // highest register the program names (a multi-dword result may extend beyond its listed
+        // first register). An index outside it reads zero and writes nothing.
+        private static (uint First, uint Last) DynamicVectorRange(Gen5ShaderProgram program)
+        {
+            var first = VectorRegisterCount - 1;
+            var last = 0u;
+            foreach (var instruction in program.Instructions)
+            {
+                foreach (var operand in instruction.Sources.Concat(instruction.Destinations))
+                {
+                    if (operand.Kind == Gen5OperandKind.VectorRegister)
+                    {
+                        last = Math.Max(last, operand.Value);
+                        if (instruction.Opcode.StartsWith("VMovrel", StringComparison.Ordinal))
+                        {
+                            first = Math.Min(first, operand.Value);
+                        }
+                    }
+                }
+            }
 
-        private uint LoadVDynamic(uint registerIndex) =>
-            Load(_uintType, DynamicVectorPointer(registerIndex));
+            last = Math.Min(last + 8, VectorRegisterCount - 1);
+            return (Math.Min(first, last), last);
+        }
+
+        private uint LoadVDynamic(uint registerIndex)
+        {
+            var result = UInt(0);
+            for (var register = _dynamicVectorRange.First; register <= _dynamicVectorRange.Last; register++)
+            {
+                result = _module.AddInstruction(
+                    SpirvOp.Select,
+                    _uintType,
+                    _module.AddInstruction(SpirvOp.IEqual, _boolType, registerIndex, UInt(register)),
+                    Load(_uintType, VectorPointer(register)),
+                    result);
+            }
+
+            return result;
+        }
 
         private void StoreVDynamic(uint registerIndex, uint value)
         {
-            var pointer = DynamicVectorPointer(registerIndex);
-            value = _module.AddInstruction(
-                SpirvOp.Select,
-                _uintType,
-                Load(_boolType, _exec),
-                value,
-                Load(_uintType, pointer));
-            Store(pointer, value);
+            var exec = Load(_boolType, _exec);
+            for (var register = _dynamicVectorRange.First; register <= _dynamicVectorRange.Last; register++)
+            {
+                var pointer = VectorPointer(register);
+                var selected = _module.AddInstruction(
+                    SpirvOp.LogicalAnd,
+                    _boolType,
+                    exec,
+                    _module.AddInstruction(SpirvOp.IEqual, _boolType, registerIndex, UInt(register)));
+                Store(pointer, _module.AddInstruction(SpirvOp.Select, _uintType, selected, value, Load(_uintType, pointer)));
+            }
         }
 
         private uint PackedHalfPointer(uint register) =>
