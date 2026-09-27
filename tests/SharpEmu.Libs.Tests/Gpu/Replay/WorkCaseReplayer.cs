@@ -255,6 +255,9 @@ public static class WorkCaseReplayer
             if (stage.ContinuationAddress != 0)
             {
                 fused[stage.CodeAddress] = new FusedProgramParts(stage.ContinuationAddress, stage.ContinuationHeaderAddress);
+                // The decoder joins the halves from its own registry, which AGC fills in the game.
+                SharpEmu.ShaderCompiler.Gen5ShaderTranslator.RegisterFusedProgram(
+                    context, stage.CodeAddress, stage.HeaderAddress, stage.ContinuationAddress, stage.ContinuationHeaderAddress);
             }
         }
 
