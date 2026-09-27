@@ -521,7 +521,16 @@ public sealed class RenderExecutorDrawTests : IDisposable
         _executor.DrawIndexed(1, banks, Indexed(3));
 
         Assert.Contains("reset_bindings", _host.Calls);
-        Assert.Empty(_pipelines.Calls);
+
+        // The executor now resolves the vertex stage before dropping the draw, to
+        // see whether it stores to memory on its own (a GPU-culling or stream-out
+        // pass has no attachment and no pixel stage but still has an output). This
+        // one does not, so nothing may be built or recorded - but asking the cache
+        // for the programs is part of deciding that.
+        Assert.Empty(_pipelines.PipelineRequests);
+        Assert.DoesNotContain(_pipelines.Calls, c => !c.StartsWith("get_graphics_programs", StringComparison.Ordinal));
+        Assert.DoesNotContain(_host.Calls, c => c.StartsWith("draw", StringComparison.Ordinal));
+        Assert.DoesNotContain(_host.Calls, c => c.StartsWith("begin_rendering", StringComparison.Ordinal));
     }
 
     [Fact]
