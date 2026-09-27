@@ -1478,7 +1478,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			num2++;
 			num++;
 		}
-		Console.Error.WriteLine($"[LOADER][INFO] Setup {num2}/{importStubs.Count} import stubs (direct bridge, lle_redirects={num3}, patch_route {PatchRouteReport})");
+		Console.Error.WriteLine($"[LOADER][INFO] Setup {num2}/{importStubs.Count} import stubs (direct bridge, lle_redirects={num3})");
 		return num2 == importStubs.Count;
 	}
 
@@ -2445,7 +2445,31 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 	}
 
+	// A trampoline only encodes its import index, so a runtime module load that sets up every
+	// module's stubs again reuses them: the stubs then keep their bytes and are not rewritten
+	// under guest threads that may be executing them.
+	private readonly Dictionary<int, nint> _importHandlerTrampolineByIndex = new();
+
 	private unsafe nint CreateImportHandlerTrampoline(int importIndex)
+	{
+		lock (ImportStubPatchGate)
+		{
+			if (_importHandlerTrampolineByIndex.TryGetValue(importIndex, out var existing))
+			{
+				return existing;
+			}
+
+			var created = CreateImportHandlerTrampolineCore(importIndex);
+			if (created != 0)
+			{
+				_importHandlerTrampolineByIndex[importIndex] = created;
+			}
+
+			return created;
+		}
+	}
+
+	private unsafe nint CreateImportHandlerTrampolineCore(int importIndex)
 	{
 		const uint stubSize = 1024u;
 		void* ptr = VirtualAlloc(null, stubSize, 12288u, 64u);
@@ -2626,61 +2650,30 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	// to read-execute while it is still writing, so every patch runs under one gate.
 	private static readonly object ImportStubPatchGate = new();
 
-	// The same guest pages are mprotected by the write tracker and by lazy commit, on threads this
-	// gate knows nothing about, so making a page writable and writing it is a race no lock here can
-	// win: the page can go back to read-execute between the two. The backing alias is a second
-	// mapping of the same bytes that nothing ever reprotects, so a patch written through it needs no
-	// protection change at all. VirtualProtect stays as the fallback for code that is not backed.
-	private static IGuestBackedSpace? _guestBacking;
-
-	internal static void UseGuestBacking(IGuestBackedSpace? backing) => Volatile.Write(ref _guestBacking, backing);
-
-	private static long _patchesThroughBacking;
-	private static long _patchesThroughProtect;
-
-	internal static string PatchRouteReport =>
-		$"alias={Interlocked.Read(ref _patchesThroughBacking)} unprotect={Interlocked.Read(ref _patchesThroughProtect)}";
-
-	private static unsafe bool TryPatchGuestCodeThroughBacking(nint address, ReadOnlySpan<byte> code)
-	{
-		var backing = Volatile.Read(ref _guestBacking);
-		if (backing is null ||
-			!backing.IsBackedRange((ulong)address, (ulong)code.Length) ||
-			!backing.TryWriteBacking((ulong)address, code))
-		{
-			Interlocked.Increment(ref _patchesThroughProtect);
-			return false;
-		}
-
-		Interlocked.Increment(ref _patchesThroughBacking);
-
-		// The executable view maps the same bytes; the translator still has to drop its copy.
-		FlushInstructionCache(GetCurrentProcess(), (void*)address, (nuint)code.Length);
-		return true;
-	}
-
 	private unsafe bool PatchImportStub(nint address, nint trampoline)
 	{
-		Span<byte> code = stackalloc byte[16];
-		code[0] = 0x48;
-		code[1] = 0xB8;
-		BinaryPrimitives.WriteInt64LittleEndian(code[2..], trampoline);
-		code[10] = 0xFF;
-		code[11] = 0xE0;
-		code[12..].Fill(0x90);
-		if (TryPatchGuestCodeThroughBacking(address, code))
+		lock (ImportStubPatchGate)
+		{
+			return PatchImportStubLocked(address, trampoline);
+		}
+	}
+
+	private unsafe bool PatchImportStubLocked(nint address, nint trampoline)
+	{
+		// Every runtime module load sets up the stubs of all loaded modules again; a stub that
+		// already jumps to this trampoline needs no unprotect/write/restore cycle.
+		Span<byte> patch = stackalloc byte[16];
+		patch[0] = 0x48;
+		patch[1] = 0xB8;
+		System.Buffers.Binary.BinaryPrimitives.WriteInt64LittleEndian(patch[2..], trampoline);
+		patch[10] = 0xFF;
+		patch[11] = 0xE0;
+		patch[12..].Fill(0x90);
+		if (new ReadOnlySpan<byte>((void*)address, 16).SequenceEqual(patch))
 		{
 			return true;
 		}
 
-		lock (ImportStubPatchGate)
-		{
-			return PatchImportStubLocked(address, code);
-		}
-	}
-
-	private unsafe bool PatchImportStubLocked(nint address, ReadOnlySpan<byte> code)
-	{
 		uint flNewProtect = default(uint);
 		if (!VirtualProtect((void*)address, 16u, 64u, &flNewProtect))
 		{
@@ -2689,7 +2682,15 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 		try
 		{
-			code.CopyTo(new Span<byte>((void*)address, 16));
+			*(sbyte*)address = 72;
+			*(sbyte*)(address + 1) = -72;
+			*(long*)(address + 2) = trampoline;
+			*(sbyte*)(address + 10) = -1;
+			*(sbyte*)(address + 11) = -32;
+			*(sbyte*)(address + 12) = -112;
+			*(sbyte*)(address + 13) = -112;
+			*(sbyte*)(address + 14) = -112;
+			*(sbyte*)(address + 15) = -112;
 			return true;
 		}
 		finally
@@ -2709,6 +2710,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			}
 		}
 		_importHandlerTrampolines.Clear();
+		_importHandlerTrampolineByIndex.Clear();
 	}
 
 	private unsafe void CreateTlsHandler()
@@ -3862,11 +3864,6 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private static unsafe bool WriteTlsInstruction(nint address, ReadOnlySpan<byte> replacement)
 	{
-		if (TryPatchGuestCodeThroughBacking(address, replacement))
-		{
-			return true;
-		}
-
 		// Guest threads patch their TLS sites as they first reach them; two sites on one page would
 		// otherwise race the unprotect/restore pair exactly like the import stubs.
 		lock (ImportStubPatchGate)

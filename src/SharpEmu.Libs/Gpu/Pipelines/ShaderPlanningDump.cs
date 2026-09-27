@@ -67,7 +67,7 @@ internal static class ShaderPlanningDump
 
     private static void Write(ShaderSource source, string suffix, Action<TextWriter> write)
     {
-        if (!CompiledShaderDump.ShouldWrite(source.Address)) return;
+        if (!CompiledShaderDump.ShouldWrite(source.Address) && !CompiledShaderDump.ShouldWriteRejectedPlan()) return;
         try
         {
             var path = $"{CompiledShaderDump.GetBasePath(source.Label, source.Address, source.Hash)}.{suffix}";
