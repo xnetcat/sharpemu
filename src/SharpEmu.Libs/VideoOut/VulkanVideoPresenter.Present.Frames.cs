@@ -35,6 +35,10 @@ internal static unsafe partial class VulkanVideoPresenter
         private uint _flipSourceProbeWidth;
         private uint _flipSourceProbeHeight;
         private const uint FlipSourceProbeSide = 128;
+        private VkBuffer _encodeProbeBuffer;
+        private DeviceMemory _encodeProbeMemory;
+        private nint _encodeProbeMapped;
+        private bool _encodeProbePending;
         private long _swapchainReadbackVersion;
         private long _presentedSwapchainCount;
 
@@ -520,6 +524,16 @@ internal static unsafe partial class VulkanVideoPresenter
                     isIntegerUpscale ? Filter.Nearest : Filter.Linear);
             }
 
+            if (traceDestination)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][TRACE] vk.present_blit image={imageIndex} encode={(encodeForPresent ? 1 : 0)} " +
+                    $"srgbCopy={(preserveEncodedSrgb ? 1 : 0)} initialized={(_imageInitialized[imageIndex] ? 1 : 0)} " +
+                    $"hdr={(_hdrOutputActive ? 1 : 0)} src={sourceX},{sourceY}+{sourceWidth}x{sourceHeight} " +
+                    $"dst={destinationX},{destinationY}+{destinationWidth}x{destinationHeight} " +
+                    $"extent={_extent.Width}x{_extent.Height} srcFormat={source.Format} targetFormat={PresentationTargetFormat}");
+            }
+
             if (encodeForPresent)
             {
                 var encodeToTransferSrc = new ImageMemoryBarrier2
@@ -545,6 +559,11 @@ internal static unsafe partial class VulkanVideoPresenter
                     null,
                     1,
                     &encodeToTransferSrc);
+
+                if (traceDestination)
+                {
+                    RecordEncodeProbe(encodeImage);
+                }
 
                 // Raw same-class copy keeps the sRGB-encoded bytes unchanged
                 // while landing them in the UNORM swapchain image.
@@ -709,6 +728,75 @@ internal static unsafe partial class VulkanVideoPresenter
                 _flipSourceProbeBuffer,
                 1,
                 &region);
+        }
+
+        private void RecordEncodeProbe(Image encodeImage)
+        {
+            if (_encodeProbeBuffer.Handle == 0)
+            {
+                _encodeProbeBuffer = CreateBuffer(
+                    FlipSourceProbeSide * FlipSourceProbeSide * 4,
+                    BufferUsageFlags.TransferDstBit,
+                    MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
+                    out _encodeProbeMemory);
+                void* mapped;
+                Check(
+                    _vk.MapMemory(
+                        _device,
+                        _encodeProbeMemory,
+                        0,
+                        FlipSourceProbeSide * FlipSourceProbeSide * 4,
+                        0,
+                        &mapped),
+                    "vkMapMemory(encode probe)");
+                _encodeProbeMapped = (nint)mapped;
+            }
+
+            var region = new BufferImageCopy
+            {
+                BufferOffset = 0,
+                ImageSubresource = new ImageSubresourceLayers(ImageAspectFlags.ColorBit, 0, 0, 1),
+                ImageOffset = new Offset3D(
+                    checked((int)((_extent.Width - FlipSourceProbeSide) / 2)),
+                    checked((int)((_extent.Height - FlipSourceProbeSide) / 2)),
+                    0),
+                ImageExtent = new Extent3D(FlipSourceProbeSide, FlipSourceProbeSide, 1),
+            };
+            _vk.CmdCopyImageToBuffer(
+                _commandBuffer,
+                encodeImage,
+                ImageLayout.TransferSrcOptimal,
+                _encodeProbeBuffer,
+                1,
+                &region);
+            _encodeProbePending = true;
+        }
+
+        private void TraceEncodeProbe()
+        {
+            if (!_encodeProbePending || _encodeProbeMapped == 0)
+            {
+                return;
+            }
+
+            _encodeProbePending = false;
+            var count = checked((int)(FlipSourceProbeSide * FlipSourceProbeSide * 4));
+            var bytes = new ReadOnlySpan<byte>((void*)_encodeProbeMapped, count);
+            var nonzero = 0;
+            long sum = 0;
+            for (var index = 0; index < count; index++)
+            {
+                if (bytes[index] != 0)
+                {
+                    nonzero++;
+                }
+
+                sum += bytes[index];
+            }
+
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] vk.encode_probe version={_swapchainReadbackVersion} " +
+                $"nonzero={nonzero}/{count} mean={(double)sum / count:F2}");
         }
 
         private void TraceFlipSourceProbe()

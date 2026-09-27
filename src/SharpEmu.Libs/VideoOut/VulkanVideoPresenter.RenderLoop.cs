@@ -461,6 +461,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 // Diagnostics read back GPU memory and need this frame done.
                 WaitFrameSlot(frameSlot);
                 TraceFlipSourceProbe();
+                TraceEncodeProbe();
                 TraceSwapchainReadback();
             }
 
