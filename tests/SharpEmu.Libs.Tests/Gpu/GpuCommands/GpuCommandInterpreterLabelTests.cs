@@ -11,23 +11,6 @@ public sealed class GpuCommandInterpreterLabelTests
     private const uint Nop = PacketOpcode.Nop;
     private const ulong Label = StreamRunner.LabelAddress;
 
-    // The default coalesces an end-of-pipe write into the slice's own flush; these cases describe
-    // what the submission-per-packet mode records, so they ask for it explicitly.
-    private static ImmediateFlushScope ImmediateEndOfPipeFlush() => new();
-
-    private readonly struct ImmediateFlushScope : IDisposable
-    {
-        private readonly bool _previous;
-
-        public ImmediateFlushScope()
-        {
-            _previous = GpuCommandInterpreter.FlushOnEndOfPipe;
-            GpuCommandInterpreter.FlushOnEndOfPipe = true;
-        }
-
-        public void Dispose() => GpuCommandInterpreter.FlushOnEndOfPipe = _previous;
-    }
-
     private static uint[] EventWriteEop(uint eventType, uint eventIndex, uint cacheAction, uint source, uint interruptSelector, ulong destination, ulong value, uint cachePolicy) =>
         StreamRunner.Packet(
             PacketOpcode.EventWriteEndOfPipe,
@@ -186,7 +169,6 @@ public sealed class GpuCommandInterpreterLabelTests
     [Fact]
     public void ReleaseMemoryNative_DataSelectionOne_WritesFlushesAndFollowsTheGcrBarrierRule()
     {
-        using var immediate = ImmediateEndOfPipeFlush();
         var runner = new StreamRunner();
 
         runner.Run(ReleaseMemoryNative(0x28, 5, 0, 0, 1, 0, Label, 0x77, 0));
@@ -202,7 +184,6 @@ public sealed class GpuCommandInterpreterLabelTests
     [Fact]
     public void ReleaseMemoryNative_NoDataOrSelectorFour_OnlyInterrupts()
     {
-        using var immediate = ImmediateEndOfPipeFlush();
         var runner = new StreamRunner();
         runner.Host.WriteDword(Label, 5);
 
@@ -238,7 +219,6 @@ public sealed class GpuCommandInterpreterLabelTests
     [Fact]
     public void ReleaseMemoryNative_GdsSelectionFlushesOnlyForSelectorOne()
     {
-        using var immediate = ImmediateEndOfPipeFlush();
         var runner = new StreamRunner(queueId: 2);
         runner.Host.Gds[0] = 0x42;
 
@@ -248,22 +228,6 @@ public sealed class GpuCommandInterpreterLabelTests
         runner.Host.Calls.Clear();
         runner.Run(ReleaseMemoryNative(0x28, 5, 0, 0, 5, 0, Label, 1u << 16, 0));
         Assert.DoesNotContain("flush", runner.Host.Calls);
-    }
-
-    [Fact]
-    public void ReleaseMemory_CoalescesItsSubmissionByDefault()
-    {
-        var runner = new StreamRunner();
-
-        // The label still reaches guest memory and the end-of-pipe write is still recorded;
-        // only the submission of its own is gone.
-        runner.Run(ReleaseMemoryNative(0x28, 5, 0, 0, 1, 0, Label, 0x77, 0));
-        Assert.Equal(new[] { "eop Write32" }, runner.Host.Calls);
-        Assert.Equal(0x77u, runner.Host.ReadDword(Label));
-
-        runner.Host.Calls.Clear();
-        runner.Run(ReleaseMemoryNative(0x28, 5, 0, 0, 0, 2, Label, 1, 0));
-        Assert.Equal(new[] { "eop InterruptOnly" }, runner.Host.Calls);
     }
 
     [Fact]
@@ -279,7 +243,6 @@ public sealed class GpuCommandInterpreterLabelTests
     [Fact]
     public void ReleaseMemoryWrapped_DerivesTheEventIndexFromTheAction()
     {
-        using var immediate = ImmediateEndOfPipeFlush();
         var runner = new StreamRunner();
 
         runner.Run(ReleaseMemoryWrapped(0x04, 0, 2, 2, Label, 0x5, 3));
@@ -296,7 +259,6 @@ public sealed class GpuCommandInterpreterLabelTests
     [Fact]
     public void ReleaseMemoryWrapped_ConditionalInterruptsCompareTheLabel()
     {
-        using var immediate = ImmediateEndOfPipeFlush();
         var runner = new StreamRunner();
         runner.Host.WriteDword(Label, 4);
 
