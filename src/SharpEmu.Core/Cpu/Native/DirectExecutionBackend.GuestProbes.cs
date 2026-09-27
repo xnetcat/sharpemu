@@ -50,7 +50,9 @@ public sealed partial class DirectExecutionBackend
 
             Console.Error.WriteLine(
                 $"[LOADER][PROBE] 0x{rip:X} hit={hits} ret=0x{returnAddress:X} rdi=0x{rdi:X} rsi=0x{rsi:X} " +
-                $"rdx=0x{ReadCtxU64(contextRecord, CTX_RDX):X} rcx=0x{ReadCtxU64(contextRecord, CTX_RCX):X}{detail}");
+                $"rdx=0x{ReadCtxU64(contextRecord, CTX_RDX):X} rcx=0x{ReadCtxU64(contextRecord, CTX_RCX):X} " +
+                $"guest=0x{SharpEmu.HLE.GuestThreadExecution.CurrentGuestThreadHandle:X} " +
+                $"managed={Environment.CurrentManagedThreadId} rsp=0x{ReadCtxU64(contextRecord, CTX_RSP):X}{detail}");
         }
 
         var rsp = ReadCtxU64(contextRecord, CTX_RSP) - 8;
