@@ -438,6 +438,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         }
 
         _command.End();
+        GpuWaitProfile.RecordSubmit();
         var buffer = _command.Buffer;
         bool submitted;
         string failure;

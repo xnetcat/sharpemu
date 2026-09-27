@@ -25,7 +25,42 @@ internal static class GpuWaitProfile
 
     private static readonly object _gate = new();
     private static readonly Dictionary<string, Entry> _entries = new();
+    private static readonly Dictionary<string, Entry> _submits = new();
     private static long _windowStart = Stopwatch.GetTimestamp();
+
+    // Every vkQueueSubmit lengthens the queue a later drain has to wait through, so the
+    // submissions are attributed the same way the waits are.
+    public static void RecordSubmit()
+    {
+        if (!Enabled)
+        {
+            return;
+        }
+
+        var key = Describe();
+        lock (_gate)
+        {
+            if (!_submits.TryGetValue(key, out var entry))
+            {
+                if (_submits.Count >= 128)
+                {
+                    key = "(other)";
+                    if (!_submits.TryGetValue(key, out entry))
+                    {
+                        entry = new Entry();
+                        _submits.Add(key, entry);
+                    }
+                }
+                else
+                {
+                    entry = new Entry();
+                    _submits.Add(key, entry);
+                }
+            }
+
+            entry.Count++;
+        }
+    }
 
     public static void Record(long ticks)
     {
@@ -109,10 +144,22 @@ internal static class GpuWaitProfile
         var seconds = (now - _windowStart) / (double)Stopwatch.Frequency;
         _windowStart = now;
         List<KeyValuePair<string, Entry>> ranked;
+        List<KeyValuePair<string, Entry>> submits;
         lock (_gate)
         {
             ranked = _entries.OrderByDescending(static pair => pair.Value.Ticks).ToList();
             _entries.Clear();
+            submits = _submits.OrderByDescending(static pair => pair.Value.Count).ToList();
+            _submits.Clear();
+        }
+
+        if (submits.Count != 0)
+        {
+            Console.Error.WriteLine($"[PERF][SUBMIT] window_s={seconds:F1} submits={submits.Sum(static pair => pair.Value.Count)}");
+            foreach (var (key, entry) in submits.Take(10))
+            {
+                Console.Error.WriteLine($"[PERF][SUBMIT] n={entry.Count} at={key}");
+            }
         }
 
         if (ranked.Count == 0)
