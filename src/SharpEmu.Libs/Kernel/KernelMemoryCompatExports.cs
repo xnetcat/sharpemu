@@ -1728,13 +1728,17 @@ public static partial class KernelMemoryCompatExports
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
             }
 
+            var aprReadStart = System.Diagnostics.Stopwatch.GetTimestamp();
             if (!TryResolveAprFilepath(ctx, pathListAddress, i, out var guestPath))
             {
                 KernelRuntimeCompatExports.TrySetErrno(ctx, Efault);
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
             }
 
+            Interlocked.Add(ref _aprReadTicks, System.Diagnostics.Stopwatch.GetTimestamp() - aprReadStart);
+            var aprResolveStart = System.Diagnostics.Stopwatch.GetTimestamp();
             var hostPath = ResolveGuestPath(guestPath);
+            Interlocked.Add(ref _aprPathTicks, System.Diagnostics.Stopwatch.GetTimestamp() - aprResolveStart);
             if (!TryGetAprFileSize(hostPath, out var fileSize))
             {
                 // Stop at the first miss and report its index.
@@ -1759,7 +1763,9 @@ public static partial class KernelMemoryCompatExports
                 return -1;
             }
 
+            var aprRegisterStart = System.Diagnostics.Stopwatch.GetTimestamp();
             var fileId = AmprFileRegistry.RegisterAprResolvedPath(guestPath, hostPath);
+            Interlocked.Add(ref _aprRegisterTicks, System.Diagnostics.Stopwatch.GetTimestamp() - aprRegisterStart);
             if (_logIo)
             {
                 LogIoTrace("apr_resolve", guestPath, $"host='{hostPath}' index={i} count={count} id=0x{fileId:X8} size={fileSize}");
@@ -1792,6 +1798,9 @@ public static partial class KernelMemoryCompatExports
     private static long _aprResolvePaths;
     private static long _aprResolveTicks;
     private static long _aprResolveReported;
+    private static long _aprReadTicks;
+    private static long _aprPathTicks;
+    private static long _aprRegisterTicks;
 
     private static void ReportAprResolveCost(long startTimestamp)
     {
@@ -1810,7 +1819,10 @@ public static partial class KernelMemoryCompatExports
             $"total_s={seconds:F1} us_per_path={(seconds * 1e6) / Math.Max(paths, 1):F1} " +
             $"size_cache={Interlocked.Read(ref _aprSizeCacheHits)} size_dir={Interlocked.Read(ref _aprSizeDirectoryHits)} " +
             $"size_stat={Interlocked.Read(ref _aprSizeStatHits)} size_miss={Interlocked.Read(ref _aprSizeMisses)} " +
-            $"size_negative={Interlocked.Read(ref _aprSizeNegativeHits)}");
+            $"size_negative={Interlocked.Read(ref _aprSizeNegativeHits)} " +
+            $"read_s={(double)Interlocked.Read(ref _aprReadTicks) / System.Diagnostics.Stopwatch.Frequency:F1} " +
+            $"path_s={(double)Interlocked.Read(ref _aprPathTicks) / System.Diagnostics.Stopwatch.Frequency:F1} " +
+            $"register_s={(double)Interlocked.Read(ref _aprRegisterTicks) / System.Diagnostics.Stopwatch.Frequency:F1}");
     }
 
 
