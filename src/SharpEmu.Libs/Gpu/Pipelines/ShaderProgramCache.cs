@@ -15,6 +15,10 @@ namespace SharpEmu.Libs.Gpu.Pipelines;
 // One program as a draw names it: the registered code, its identity and the user data of the draw.
 public sealed record ShaderSource(RegisteredShader Registered, ulong Hash, uint[] UserData, uint UserDataBase, ShaderStage Stage)
 {
+    // The SGPR that holds user-data slot 0. A merged export/geometry source seeds its data from s0
+    // (the table address comes first), so its slots still start above the system registers.
+    public uint UserSlotRegister { get; init; } = UserDataBase;
+
     public ulong Address => Registered.CodeAddress;
 
     public uint CodeSize => Registered.TotalCodeSizeBytes;
@@ -306,8 +310,8 @@ internal sealed class ShaderProgramCache
         {
             fetch = EmbeddedVertexFetchDetector.Detect(
                 program,
-                (int)source.UserDataBase + vertexInfo.FetchAttributeRegister,
-                (int)source.UserDataBase + vertexInfo.FetchBufferRegister,
+                (int)source.UserSlotRegister + vertexInfo.FetchAttributeRegister,
+                (int)source.UserSlotRegister + vertexInfo.FetchBufferRegister,
                 source.UserDataBase,
                 (uint)source.UserData.Length,
                 waveSize: 32);

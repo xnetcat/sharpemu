@@ -71,13 +71,27 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         return registers.Values.AsSpan(0, (int)count).ToArray();
     }
 
-    private ShaderSource PrepareSource(ulong codeAddress, ShaderStage stage, string label, UserScalarRegisters registers, uint declaredCount, bool probeWrittenRegisters, uint userDataBase)
+    private ShaderSource PrepareSource(ulong codeAddress, ShaderStage stage, string label, UserScalarRegisters registers, uint declaredCount, bool probeWrittenRegisters, uint userDataBase,
+        ulong? mergedUserDataAddress = null)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramSourceRead);
         var registered = _registry.Require(codeAddress, label);
         var hash = ShaderIdentity.Compute(_context.Memory, codeAddress, registered.CodeRanges, label);
         var userData = UserData(registers, declaredCount, probeWrittenRegisters, codeAddress, label);
-        var source = new ShaderSource(registered, hash, userData, userDataBase, stage);
+        var slotRegister = userDataBase;
+        if (mergedUserDataAddress is { } tableAddress)
+        {
+            // A merged export/geometry wave starts with the user-data table address in s[0:1]; the
+            // system values of s[2:7] are written by the stage setup after the user data is seeded.
+            var widened = new uint[userDataBase + userData.Length];
+            widened[0] = (uint)tableAddress;
+            widened[1] = (uint)(tableAddress >> 32);
+            userData.CopyTo(widened, (int)userDataBase);
+            userData = widened;
+            slotRegister = userDataBase;
+            userDataBase = 0;
+        }
+        var source = new ShaderSource(registered, hash, userData, userDataBase, stage) { UserSlotRegister = slotRegister };
         if (WorkCapture.Enabled)
         {
             // The capture needs the header the draw resolved; the executor sees only the code address.
@@ -100,7 +114,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         WorkCapture.BeginResolution();
         var vertexSource = PrepareSource(
             vertex.ExportAddress, ShaderStage.Vertex, "vertex", vertex.GeometryUserScalars, vertex.GeometryResource2.UserScalarCount,
-            probeWrittenRegisters: true, VertexUserDataBase);
+            probeWrittenRegisters: true, VertexUserDataBase, vertex.GeometryUserDataAddress);
         var vertexInfo = PrepareVertexInput(vertexSource, shaderInterface, context);
         ShaderSource? pixelSource = null;
         PixelInputInfo? pixelInfo = null;
@@ -225,7 +239,9 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
                 Math.Min(limits.MaxViewportHeight, MaxViewportDimension) * 0.5f);
         }
 
-        return VertexInputResolver.ResolveVertexInputs(_context, source.Registered, source.UserData,
+        // The header names the vertex tables by user-data slot, not by SGPR.
+        var slots = source.UserData.AsSpan((int)(source.UserSlotRegister - source.UserDataBase));
+        return VertexInputResolver.ResolveVertexInputs(_context, source.Registered, slots,
             shaderInterface.VertexOutputControl, clipSpace);
     }
 
@@ -358,7 +374,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramPreparation);
         var source = PrepareSource(
             vertex.ExportAddress, ShaderStage.Compute, "geometry", vertex.GeometryUserScalars, vertex.GeometryResource2.UserScalarCount,
-            probeWrittenRegisters: true, VertexUserDataBase);
+            probeWrittenRegisters: true, VertexUserDataBase, vertex.GeometryUserDataAddress);
         paramCount = NggReplayProgram.ParamCount(_programs.Decode(source));
         var input = new ComputeInputInfo
         {

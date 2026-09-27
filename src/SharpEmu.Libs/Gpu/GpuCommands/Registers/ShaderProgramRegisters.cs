@@ -189,6 +189,10 @@ public sealed class VertexStageRegisters
     public GeometryResource2 GeometryResource2;
     public UserScalarRegisters HullUserScalars = new();
     public UserScalarRegisters GeometryUserScalars = new();
+    // SPI_SHADER_USER_DATA_ADDR_LO/HI_GS: the merged export/geometry wave starts with this address in
+    // s[0:1]; it points at the stage's whole user-data table, which programs reload after they reuse
+    // the user SGPRs.
+    public ulong GeometryUserDataAddress;
     // The legacy vertex block and the export resources and user scalars are stored, not
     // decoded: the merged export stage runs with the geometry resources.
     public uint ExportResource1;

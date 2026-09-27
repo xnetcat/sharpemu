@@ -22,7 +22,7 @@ internal static partial class RegisterWriters
     private static readonly uint[] IgnoredShaderOffsets =
     [
         SpiShaderPaceIdPs, SpiGraphicsShaderControlPs, SpiShaderPaceIdGs, SpiShaderPgmRsrc4Gs, SpiGraphicsShaderControlGs,
-        SpiShaderUserDataAddrLoGs, SpiShaderUserDataAddrHiGs, SpiShaderPgmChksumHs, SpiShaderPgmRsrc4Hs, SpiGraphicsShaderControlHs,
+        SpiShaderPgmChksumHs, SpiShaderPgmRsrc4Hs, SpiGraphicsShaderControlHs,
         SpiShaderUserDataAddrLoHs, SpiShaderUserDataAddrHiHs,
     ];
 
@@ -75,6 +75,8 @@ internal static partial class RegisterWriters
         direct[SpiShaderUserDataAddrLoHs] = ForwardShaderPacket;
         direct[SpiShaderUserDataAddrHiHs] = ForwardShaderPacket;
 
+        indirect[SpiShaderUserDataAddrLoGs] = static (banks, _, value) => banks.Shader.Vertex.GeometryUserDataAddress = (banks.Shader.Vertex.GeometryUserDataAddress & 0xFFFF_FFFF_0000_0000ul) | value;
+        indirect[SpiShaderUserDataAddrHiGs] = static (banks, _, value) => banks.Shader.Vertex.GeometryUserDataAddress = (banks.Shader.Vertex.GeometryUserDataAddress & 0xFFFF_FFFFul) | ((ulong)value << 32);
         indirect[SpiShaderPgmLoHs] = static (banks, _, value) => banks.Shader.Vertex.HullAddress = RegisterField.WithLowAddress(banks.Shader.Vertex.HullAddress, value);
         indirect[SpiShaderPgmHiHs] = static (banks, _, value) => banks.Shader.Vertex.HullAddress = RegisterField.WithHighAddress(banks.Shader.Vertex.HullAddress, value);
         indirect[SpiShaderPgmRsrc1Hs] = static (banks, _, value) => banks.Shader.Vertex.HullResource1 = HullResource1.Decode(value);
