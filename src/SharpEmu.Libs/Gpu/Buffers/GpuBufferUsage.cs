@@ -9,4 +9,6 @@ public enum GpuBufferUsage : byte
     Upload,
     Download,
     Stream,
+    // Device-local, and host-visible where the device shares memory with the host.
+    DeviceLocalMapped,
 }

@@ -128,6 +128,12 @@ public unsafe class GpuBuffer : IDisposable
 
     public void AddStreamScore(int score) => StreamScore += score;
 
+    // The latest scheduler tick whose commands may access this buffer on the device; a mapped buffer
+    // can be read by the host once that tick completes, without draining later submissions.
+    public ulong LastUseTick { get; private set; }
+
+    public void MarkUsed() => LastUseTick = Math.Max(LastUseTick, _scheduler.CurrentTick);
+
     public void Write(ulong offset, ReadOnlySpan<byte> source)
     {
         if (_mapped == null || offset > Size || (ulong)source.Length > Size - offset)
@@ -188,6 +194,8 @@ public unsafe class GpuBuffer : IDisposable
             throw SubmissionScheduler.Fatal("Cannot copy overlapping ranges of the same buffer.");
         }
 
+        MarkUsed();
+        source.MarkUsed();
         command.EndRendering();
         var vk = _device.Vk;
         var native = new CommandBuffer(command.Handle);
@@ -214,6 +222,7 @@ public unsafe class GpuBuffer : IDisposable
             throw SubmissionScheduler.Fatal("The buffer fill range must be aligned to four bytes.");
         }
 
+        MarkUsed();
         var command = _scheduler.Current;
         command.EndRendering();
         var vk = _device.Vk;
@@ -253,6 +262,8 @@ public unsafe class GpuBuffer : IDisposable
         var (required, preferred, avoided) = usage switch
         {
             GpuBufferUsage.DeviceLocal => (MemoryPropertyFlags.None, MemoryPropertyFlags.DeviceLocalBit, MemoryPropertyFlags.None),
+            GpuBufferUsage.DeviceLocalMapped => (MemoryPropertyFlags.None,
+                MemoryPropertyFlags.DeviceLocalBit | MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit, MemoryPropertyFlags.None),
             GpuBufferUsage.Upload => (MemoryPropertyFlags.HostVisibleBit, MemoryPropertyFlags.HostCoherentBit, MemoryPropertyFlags.DeviceLocalBit),
             GpuBufferUsage.Download => (MemoryPropertyFlags.HostVisibleBit, MemoryPropertyFlags.HostCoherentBit | MemoryPropertyFlags.HostCachedBit, MemoryPropertyFlags.DeviceLocalBit),
             _ => (MemoryPropertyFlags.HostVisibleBit, MemoryPropertyFlags.HostCoherentBit | MemoryPropertyFlags.DeviceLocalBit, MemoryPropertyFlags.None),

@@ -823,6 +823,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
     private void TouchBuffer(GpuBuffer buffer)
     {
+        buffer.MarkUsed();
         var identifier = _registry.FindContainingBuffer(buffer.CpuAddress, buffer.Size);
         if (identifier.IsValid && ReferenceEquals(_registry.GetBuffer(identifier), buffer))
         {
@@ -830,8 +831,11 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
     }
 
-    private void TouchBuffer(ResourceSlotIdentifier identifier) =>
+    private void TouchBuffer(ResourceSlotIdentifier identifier)
+    {
         _registry.MarkBufferUsed(identifier, _retirementPolicy.CurrentTick);
+        _registry.GetBuffer(identifier).MarkUsed();
+    }
 
     private void DeleteBuffer(ResourceSlotIdentifier bufferIdentifier)
     {
@@ -851,9 +855,63 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
     }
 
+    // Host-visible cache buffers on unified memory: a download waits only for the last tick that used
+    // the buffers and reads them in place, instead of copying and draining every later submission.
+    // SHARPEMU_MAPPED_BUFFER_DOWNLOADS=0 restores the copy through the download ring.
+    private static readonly bool MappedDownloads = OperatingSystem.IsMacOS() &&
+        Environment.GetEnvironmentVariable("SHARPEMU_MAPPED_BUFFER_DOWNLOADS") != "0";
+
+    private bool TryDownloadMappedBufferMemory(List<DownloadPiece> copies)
+    {
+        if (!MappedDownloads)
+        {
+            return false;
+        }
+
+        var tick = 0ul;
+        foreach (var piece in copies)
+        {
+            if (piece.Buffer.Mapped.IsEmpty)
+            {
+                return false;
+            }
+
+            tick = Math.Max(tick, piece.Buffer.LastUseTick);
+        }
+
+        using (MappedDownloadProfile.Measure(tick, _scheduler.CurrentTick))
+        {
+            _scheduler.Wait(tick);
+            _scheduler.WaitForPriorityOperations(tick);
+        }
+
+        foreach (var piece in copies)
+        {
+            if (!piece.Buffer.IsCoherent)
+            {
+                piece.Buffer.Invalidate(piece.SourceOffset, piece.Size);
+            }
+
+            var bytes = piece.Buffer.Mapped.Slice(checked((int)piece.SourceOffset), checked((int)piece.Size));
+            if (!_backing.TryWriteBacking(piece.Address, bytes))
+            {
+                throw SubmissionScheduler.Fatal($"Could not write the required direct backing: addr=0x{piece.Address:X16} size=0x{piece.Size:X16}");
+            }
+
+            _gpuModifiedRanges.Remove(piece.Address, piece.Size);
+        }
+
+        return true;
+    }
+
     // Packs pieces into the download ring, waits for the copy, then writes each through the backing alias.
     private void DownloadBufferMemory(List<DownloadPiece> copies)
     {
+        if (TryDownloadMappedBufferMemory(copies))
+        {
+            return;
+        }
+
         var batch = new List<PlannedDownload>();
         var planner = new BufferDownloadBatchPlanner(_download.Size);
         foreach (var piece in copies)
@@ -976,7 +1034,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
 
         var bufferIdentifier = _registry.AllocateBuffer(new GpuBuffer(
-            _device, _scheduler, GpuBufferUsage.DeviceLocal, overlap.Begin,
+            _device, _scheduler, MappedDownloads ? GpuBufferUsage.DeviceLocalMapped : GpuBufferUsage.DeviceLocal, overlap.Begin,
             GpuBuffer.AllFlags | BufferUsageFlags.ShaderDeviceAddressBit, overlap.End - overlap.Begin), overlap.Begin, overlap.End - overlap.Begin);
         foreach (var oldId in overlapping)
         {
@@ -1038,6 +1096,8 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             {
                 vk.CmdCopyBuffer(native, source.Handle, buffer.Handle, (uint)regions.Length, pointer);
             }
+
+            buffer.MarkUsed();
 
             var after = before;
             after.SrcAccessMask = AccessFlags2.TransferWriteBit;
