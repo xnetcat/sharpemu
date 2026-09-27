@@ -211,6 +211,77 @@ public sealed class MslNewOpcodeExecutionTests(ITestOutputHelper output)
         Assert.Equal(0xABCD_369Cu, ReadDword(result, 36));
     }
 
+    private static readonly Gen5ComputeFixture Float16FmaLiterals = new(
+        "f16-fma-literals",
+        [
+            0x7E0002FF, 0x00004200,   // v_mov_b32 v0, 3.0h
+            0x7E0202FF, 0x00003C00,   // v_mov_b32 v1, 1.0h
+            0x7E0402FF, 0x11110000,   // v_mov_b32 v2, fmamk destination sentinel
+            0x7E0602FF, 0x22220000,   // v_mov_b32 v3, fmaak destination sentinel
+            // D = S0 * K + S1 = 3 * 4 + 1 = 13.0h. The literal's high half is
+            // garbage on purpose: only its low 16 bits are the f16 value.
+            0x6E040300, 0xDEAD4400,   // v_fmamk_f16 v2, v0, 0xDEAD4400, v1
+            // D = S0 * S1 + K = 3 * 1 + 4 = 7.0h, same three values in the other
+            // roles, so swapping the mk/ak operand order would change the answer.
+            0x70060300, 0xBEEF4400,   // v_fmaak_f16 v3, v0, v1, 0xBEEF4400
+            0xE0700000, 0x80020200,   // buffer_store_dword v2 offset:0
+            0xE0700004, 0x80020300,   // buffer_store_dword v3 offset:4
+            0xBF810000,               // s_endpgm
+        ],
+        StoreScalarResourceBase: 8,
+        StoreBackingBytes: 64);
+
+    [Fact]
+    public void Float16FmaLiteralFormsAreBitExactOnTheGpu()
+    {
+        if (SkipWithoutMetalDevice("the f16 fma literal test")) return;
+
+        var result = ExecuteRequestOrThrow(Float16FmaLiterals, new byte[64]);
+
+        // 3 * 4 + 1 = 13.0h, into the low half, high half preserved.
+        Assert.Equal(0x1111_4A80u, ReadDword(result, 0));
+        // 3 * 1 + 4 = 7.0h, into the low half, high half preserved.
+        Assert.Equal(0x2222_4700u, ReadDword(result, 4));
+    }
+
+    private static readonly Gen5ComputeFixture Vop2Accumulators = new(
+        "vop2-accumulators",
+        [
+            0x7E0002FF, 0xFF030201,   // v_mov_b32 v0, signed bytes 1, 2, 3, -1
+            0x7E0202FF, 0x07060504,   // v_mov_b32 v1, signed bytes 4, 5, 6, 7
+            0x7E0402FF, 0x0000000A,   // v_mov_b32 v2, dot4c accumulator 10
+            0x7E0602FF, 0x40004200,   // v_mov_b32 v3, {hi 2.0h, lo 3.0h}
+            0x7E0802FF, 0x42004000,   // v_mov_b32 v4, {hi 3.0h, lo 2.0h}
+            0x7E0A02FF, 0x3C004400,   // v_mov_b32 v5, {hi 1.0h, lo 4.0h}
+            0x7E0C02FF, 0x00000000,   // v_mov_b32 v6, 0.0f
+            0x7E0E02FF, 0x7F800000,   // v_mov_b32 v7, +INF
+            0x7E1002FF, 0x40000000,   // v_mov_b32 v8, 2.0f
+            0x1A040300,               // v_dot4c_i32_i8 v2, v0, v1
+            0x780A0903,               // v_pk_fmac_f16 v5, v3, v4
+            0x0C100F06,               // v_fmac_legacy_f32 v8, v6, v7
+            0xE0700000, 0x80020200,   // buffer_store_dword v2 offset:0
+            0xE0700004, 0x80020500,   // buffer_store_dword v5 offset:4
+            0xE0700008, 0x80020800,   // buffer_store_dword v8 offset:8
+            0xBF810000,               // s_endpgm
+        ],
+        StoreScalarResourceBase: 8,
+        StoreBackingBytes: 64);
+
+    [Fact]
+    public void Vop2AccumulatorFormsAreBitExactOnTheGpu()
+    {
+        if (SkipWithoutMetalDevice("the VOP2 accumulator test")) return;
+
+        var result = ExecuteRequestOrThrow(Vop2Accumulators, new byte[64]);
+
+        // 1*4 + 2*5 + 3*6 + (-1)*7 + 10 = 35; the bytes are signed.
+        Assert.Equal(35u, ReadDword(result, 0));
+        // Per half: lo 3*2 + 4 = 10.0h, hi 2*3 + 1 = 7.0h.
+        Assert.Equal(0x4700_4900u, ReadDword(result, 4));
+        // DX9 rule: 0 * INF is 0, not NaN, so the accumulator survives unchanged.
+        Assert.Equal(BitConverter.SingleToUInt32Bits(2.0f), ReadDword(result, 8));
+    }
+
     private static byte[] ExecuteRequestOrThrow(Gen5ComputeFixture fixture, byte[] buffer)
     {
         var shader = Gen5ComputeFixtures.CompileRequestOrThrow(fixture);
