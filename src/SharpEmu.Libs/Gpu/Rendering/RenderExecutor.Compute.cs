@@ -14,6 +14,10 @@ public readonly record struct ComputeImageClear(BufferDescriptorWords Descriptor
 
 public sealed partial class RenderExecutor
 {
+    // Opt back in to dropping a dispatch whose pipeline is still compiling.
+    private static readonly bool DropCompilingDispatch =
+        string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_DROP_COMPILING_DISPATCH"), "1", StringComparison.Ordinal);
+
     private const uint DispatchInitiatorUseThreadDimensions = 1u << 5;
     private const uint DispatchInitiatorBaseBits = 0x41;
     private const uint DispatchInitiatorModifierBits = 0xA038;
@@ -174,12 +178,20 @@ public sealed partial class RenderExecutor
         {
             if (!_pipelines.TryCreateComputePipeline(input, computeProgram.Program, out var pipeline))
             {
-                // The host is still compiling this program. Blocking here stops the whole
-                // command stream (and with it presentation) for as long as the shader
-                // compiler takes, so the dispatch is dropped and replayed by the guest's
-                // next frame instead.
-                DroppedWorkLog.Dispatch("pipeline-compiling", compute.Address, groupsX, groupsY, groupsZ, dispatchInitiator);
-                return;
+                // The host is still compiling this program. Dropping the dispatch keeps the
+                // command stream moving, but a guest that does not replay it deadlocks: UE5
+                // one-shot dispatches feed a label a later packet waits on, so the tick never
+                // completes and the game's render-thread watchdog aborts. Waiting for the
+                // compile is a stall; losing the dispatch is a hang, so wait by default.
+                if (!DropCompilingDispatch)
+                {
+                    pipeline = _pipelines.CreateComputePipeline(input, computeProgram.Program);
+                }
+                else
+                {
+                    DroppedWorkLog.Dispatch("pipeline-compiling", compute.Address, groupsX, groupsY, groupsZ, dispatchInitiator);
+                    return;
+                }
             }
 
             var bindings = _host.PrepareBindings(input.Stage);

@@ -2392,7 +2392,31 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 	}
 
+	// A trampoline only encodes its import index, so a runtime module load that sets up every
+	// module's stubs again reuses them: the stubs then keep their bytes and are not rewritten
+	// under guest threads that may be executing them.
+	private readonly Dictionary<int, nint> _importHandlerTrampolineByIndex = new();
+
 	private unsafe nint CreateImportHandlerTrampoline(int importIndex)
+	{
+		lock (ImportStubPatchGate)
+		{
+			if (_importHandlerTrampolineByIndex.TryGetValue(importIndex, out var existing))
+			{
+				return existing;
+			}
+
+			var created = CreateImportHandlerTrampolineCore(importIndex);
+			if (created != 0)
+			{
+				_importHandlerTrampolineByIndex[importIndex] = created;
+			}
+
+			return created;
+		}
+	}
+
+	private unsafe nint CreateImportHandlerTrampolineCore(int importIndex)
 	{
 		const uint stubSize = 1024u;
 		void* ptr = VirtualAlloc(null, stubSize, 12288u, 64u);
@@ -2647,6 +2671,20 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private unsafe bool PatchImportStubLocked(nint address, nint trampoline)
 	{
+		// Every runtime module load sets up the stubs of all loaded modules again; a stub that
+		// already jumps to this trampoline needs no unprotect/write/restore cycle.
+		Span<byte> patch = stackalloc byte[16];
+		patch[0] = 0x48;
+		patch[1] = 0xB8;
+		System.Buffers.Binary.BinaryPrimitives.WriteInt64LittleEndian(patch[2..], trampoline);
+		patch[10] = 0xFF;
+		patch[11] = 0xE0;
+		patch[12..].Fill(0x90);
+		if (new ReadOnlySpan<byte>((void*)address, 16).SequenceEqual(patch))
+		{
+			return true;
+		}
+
 		uint flNewProtect = default(uint);
 		if (!VirtualProtect((void*)address, 16u, 64u, &flNewProtect))
 		{
@@ -2683,6 +2721,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			}
 		}
 		_importHandlerTrampolines.Clear();
+		_importHandlerTrampolineByIndex.Clear();
 	}
 
 	private unsafe void CreateTlsHandler()
