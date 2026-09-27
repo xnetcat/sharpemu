@@ -367,6 +367,14 @@ public sealed unsafe partial class DirectExecutionBackend
 		}
 		if (disposition != -1 && !_posixSignalWarmup)
 		{
+			// Unrecovered: this is the fault the runtime turns into its own report
+			// (an access violation, or the bare "Stack overflow" when it lands on a
+			// guard page). Say which stack the address belongs to before chaining.
+			ReportUnrecoveredFault(
+				signal,
+				ReadCtxU64(contextRecord, CTX_RIP),
+				ReadCtxU64(contextRecord, CTX_RSP),
+				record.ExceptionInformation[1]);
 			return false;
 		}
 
