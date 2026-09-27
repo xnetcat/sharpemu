@@ -125,6 +125,7 @@ public static partial class KernelMemoryCompatExports
     // Mount components already found to exist without being reparse points. Titles resolve
     // every asset path at startup; re-reading each directory's attributes costs seconds.
     private static readonly ConcurrentDictionary<string, byte> _verifiedMountComponents = new(HostFsPath.Comparer);
+    private static readonly ConcurrentDictionary<string, object> _verifiedMountDirectoryGates = new(HostFsPath.Comparer);
     private static readonly ConcurrentDictionary<string, byte> _verifiedMountDirectories = new(HostFsPath.Comparer);
     private static readonly ConcurrentDictionary<string, string> _fullMountRoots = new(StringComparer.Ordinal);
     private static readonly ConcurrentDictionary<string, byte> _aprScannedDirectories = new(HostFsPath.Comparer);
@@ -5210,9 +5211,15 @@ public static partial class KernelMemoryCompatExports
             }
 
             // One listing returns every entry's attributes: verify the whole parent directory
-            // at once. Reparse points stay unverified and are rejected below.
-            if (_verifiedMountDirectories.TryAdd(parent, 0))
+            // at once. Reparse points stay unverified and are rejected below. The listing is
+            // done under a per-directory gate so a second thread waits for it instead of
+            // falling through to one host stat per component, which on a game image held on
+            // an external volume costs hundreds of microseconds per path.
+            var directoryGate = _verifiedMountDirectoryGates.GetOrAdd(parent, static _ => new object());
+            lock (directoryGate)
             {
+                if (_verifiedMountDirectories.TryAdd(parent, 0))
+                {
                 try
                 {
                     foreach (var entry in new DirectoryInfo(parent).EnumerateFileSystemInfos())
@@ -5228,10 +5235,12 @@ public static partial class KernelMemoryCompatExports
                 {
                 }
 
-                if (_verifiedMountComponents.ContainsKey(current))
-                {
-                    continue;
                 }
+            }
+
+            if (_verifiedMountComponents.ContainsKey(current))
+            {
+                continue;
             }
 
             try
