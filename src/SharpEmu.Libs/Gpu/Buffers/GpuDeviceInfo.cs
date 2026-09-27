@@ -29,6 +29,17 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport
         MaxStorageBufferRange = properties.Limits.MaxStorageBufferRange;
         MaxMemoryAllocationCount = properties.Limits.MaxMemoryAllocationCount;
         MaxComputeWorkGroupCount = (properties.Limits.MaxComputeWorkGroupCount[0], properties.Limits.MaxComputeWorkGroupCount[1], properties.Limits.MaxComputeWorkGroupCount[2]);
+        fixed (PhysicalDeviceMemoryProperties* memory = &_memoryProperties)
+        {
+            for (var heap = 0; heap < memory->MemoryHeapCount; heap++)
+            {
+                var description = memory->MemoryHeaps[heap];
+                if ((description.Flags & MemoryHeapFlags.DeviceLocalBit) != 0)
+                {
+                    DeviceLocalHeapBytes = Math.Max(DeviceLocalHeapBytes, description.Size);
+                }
+            }
+        }
     }
 
     public Vk Vk { get; }
@@ -48,6 +59,9 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport
     public uint MaxMemoryAllocationCount { get; }
 
     public (uint X, uint Y, uint Z) MaxComputeWorkGroupCount { get; }
+
+    // The largest device-local heap; on unified-memory devices this is the GPU working-set budget.
+    public ulong DeviceLocalHeapBytes { get; }
 
     public uint MemoryTypeCount => _memoryProperties.MemoryTypeCount;
 

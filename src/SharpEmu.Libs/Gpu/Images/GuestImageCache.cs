@@ -51,6 +51,13 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         _bufferCache = bufferCache;
         _backing = backing;
         _readbackLinearImages = readbackLinearImages;
+        // Titles keep several GiB of textures resident. Fixed thresholds below that evict textures
+        // that are still drawn every frame (the collection age is counted in submissions, not frames),
+        // so scale them to the device-local heap and keep the fixed values as the floor.
+        var heap = device.DeviceLocalHeapBytes;
+        _collectionStartBytes = Math.Max(_collectionStartBytes, heap / 4);
+        _memoryPressureBytes = Math.Max(_memoryPressureBytes, heap / 5 * 2);
+        _criticalMemoryBytes = Math.Max(_criticalMemoryBytes, heap / 20 * 11);
         _blit = new ColorToMultisampleDepthBlit(device, scheduler);
         _tiler = new GpuTiler(device, scheduler, bufferCache.GetUtilityBuffer(GpuBufferUsage.Stream));
         if (Rendering.WorkCapture.Enabled)
