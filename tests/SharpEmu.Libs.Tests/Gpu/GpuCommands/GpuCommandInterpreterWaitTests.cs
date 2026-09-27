@@ -162,28 +162,62 @@ public sealed class GpuCommandInterpreterWaitTests
     }
 
     [Fact]
-    public void SetPredication_BothLayoutsAndTheWaitFlag()
+    public void SetPredication_NeverDrainsWhileThePredicateIsIgnored()
     {
         var runner = new StreamRunner();
         runner.Host.WriteQword(Label, 0);
-        var skipped = CreateInstanceCountPacket(2);
-        skipped[0] |= 1u;
+        var predicated = CreateInstanceCountPacket(2);
+        predicated[0] |= 1u;
 
-        var newLayout = StreamRunner.Packet(PacketOpcode.SetPredication, (3u << 16) | (1u << 8) | (1u << 12), StreamRunner.Low(Label), StreamRunner.High(Label));
-        runner.Run(newLayout, skipped);
-        Assert.Equal(new[] { "flush_and_wait" }, runner.Host.Calls);
-        Assert.True(runner.Interpreter.PredicateSkip);
-        Assert.Equal(1u, runner.Interpreter.InstanceCount);
-
-        var oldLayout = StreamRunner.Packet(PacketOpcode.SetPredication, StreamRunner.Low(Label), StreamRunner.High(Label) | (3u << 16));
-        runner.Run(oldLayout, skipped);
+        // Predicated work runs by default, so no layout may pay for a GPU drain.
+        var waitingLayout = StreamRunner.Packet(PacketOpcode.SetPredication, (3u << 16) | (1u << 8), StreamRunner.Low(Label), StreamRunner.High(Label));
+        runner.Run(waitingLayout, predicated);
+        Assert.Empty(runner.Host.Calls);
         Assert.False(runner.Interpreter.PredicateSkip);
         Assert.Equal(2u, runner.Interpreter.InstanceCount);
+
+        var nonWaitingLayout = StreamRunner.Packet(PacketOpcode.SetPredication, (3u << 16) | (1u << 8) | (1u << 12), StreamRunner.Low(Label), StreamRunner.High(Label));
+        runner.Run(nonWaitingLayout, CreateInstanceCountPacket(3));
+        Assert.Empty(runner.Host.Calls);
+        Assert.False(runner.Interpreter.PredicateSkip);
 
         runner.Run(StreamRunner.Packet(PacketOpcode.SetPredication, 0, 0, 0));
         Assert.False(runner.Interpreter.PredicateSkip);
         Assert.Contains("predication address is zero", runner.RunExpectingFatal(StreamRunner.Packet(PacketOpcode.SetPredication, 3u << 16, 0, 0)).Message);
         Assert.Contains("predication operation is unknown", runner.RunExpectingFatal(StreamRunner.Packet(PacketOpcode.SetPredication, 1u << 16, 0, 0)).Message);
+    }
+
+    [Fact]
+    public void SetPredication_HonouredPredicateWaitsOnlyForTheWaitingWaitOp()
+    {
+        var previous = GpuCommandInterpreter.HonorPredication;
+        GpuCommandInterpreter.HonorPredication = true;
+        try
+        {
+            var runner = new StreamRunner();
+            runner.Host.WriteQword(Label, 0);
+            var predicated = CreateInstanceCountPacket(2);
+            predicated[0] |= 1u;
+
+            // PredicationZPassWaitOp 0 (kWaitForQueryResults) drains and predicates on the label.
+            var waitingLayout = StreamRunner.Packet(PacketOpcode.SetPredication, (3u << 16) | (1u << 8), StreamRunner.Low(Label), StreamRunner.High(Label));
+            runner.Run(waitingLayout, predicated);
+            Assert.Equal(new[] { "flush_and_wait" }, runner.Host.Calls);
+            Assert.True(runner.Interpreter.PredicateSkip);
+            Assert.Equal(1u, runner.Interpreter.InstanceCount);
+
+            // 1 (kDoNotPredicateIfQueryResultsNotReady) never drains and leaves the packets unpredicated.
+            runner.Host.Calls.Clear();
+            var nonWaitingLayout = StreamRunner.Packet(PacketOpcode.SetPredication, (3u << 16) | (1u << 8) | (1u << 12), StreamRunner.Low(Label), StreamRunner.High(Label));
+            runner.Run(nonWaitingLayout, predicated);
+            Assert.Empty(runner.Host.Calls);
+            Assert.False(runner.Interpreter.PredicateSkip);
+            Assert.Equal(2u, runner.Interpreter.InstanceCount);
+        }
+        finally
+        {
+            GpuCommandInterpreter.HonorPredication = previous;
+        }
     }
 
     [Fact]

@@ -50,9 +50,15 @@ public sealed class TickTimeline
             return;
         }
 
+        var started = GpuWaitProfile.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
         if (!_device.TryWaitTimeline(tick, out var failure))
         {
             throw SubmissionScheduler.Fatal($"vkWaitSemaphores failed: {failure}, tick={tick}");
+        }
+
+        if (GpuWaitProfile.Enabled)
+        {
+            GpuWaitProfile.Record(System.Diagnostics.Stopwatch.GetTimestamp() - started);
         }
 
         RefreshCompletedTick();

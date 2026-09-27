@@ -9,6 +9,8 @@ public enum CommandSubmissionKind
     Compute,
     // A video-out export flip queued behind the graphics submissions before it.
     FlipPreparation,
+    // A suspend point queued behind the graphics submissions of the frame it ends.
+    FrameBoundary,
 }
 
 public enum SubmissionProgress

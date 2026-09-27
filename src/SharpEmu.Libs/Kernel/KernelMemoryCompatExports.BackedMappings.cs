@@ -317,16 +317,31 @@ public static partial class KernelMemoryCompatExports
     internal static int ReserveBackingRange(CpuContext ctx, ulong pointer, ulong length, ulong flags, ulong alignment)
         => RunMappingTransaction(() => ReserveBackingRangeCore(ctx, pointer, length, flags, alignment));
 
+    // A batch wraps its entries in one transaction, so the entries must not hand off again.
+    [ThreadStatic]
+    private static bool _insideMappingTransaction;
+
     private static int RunMappingTransaction(Func<int> transaction)
     {
         // GPU handoff must precede locks needed by image and buffer reads.
         if (Monitor.IsEntered(_memoryGate))
             throw new InvalidOperationException("Cannot start a mapping transaction while holding the mapping lock.");
-        if (GuestGpuMemoryHook.Current is not { } memory)
+        if (_insideMappingTransaction || GuestGpuMemoryHook.Current is not { } memory)
             return transaction();
 
         var result = MemoryFault;
-        memory.RunMappingChange(() => result = transaction());
+        memory.RunMappingChange(() =>
+        {
+            _insideMappingTransaction = true;
+            try
+            {
+                result = transaction();
+            }
+            finally
+            {
+                _insideMappingTransaction = false;
+            }
+        });
         return result;
     }
 

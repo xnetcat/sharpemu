@@ -14,7 +14,12 @@ internal static unsafe partial class VulkanVideoPresenter
     {
         // This partial owns guest GPU submission execution and lifetime.
 
-        private const int MaxInFlightGuestSubmissions = 8;
+        // Every readback and mapping change drains the timeline, so the depth of the queue
+        // is also the cost of a drain. SHARPEMU_GUEST_SUBMISSION_DEPTH tunes it.
+        private static readonly int MaxInFlightGuestSubmissions =
+            int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_GUEST_SUBMISSION_DEPTH"), out var depth) && depth > 0
+                ? depth
+                : 8;
         // Scheduler ticks: the last submitted tick and the highest tick known retired.
         private ulong _submitTimeline;
         private ulong _completedTimeline;
