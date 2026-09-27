@@ -254,6 +254,16 @@ public sealed partial class RenderExecutor
             SetDrawDebugPhase(submitId, in draw, 0x200);
         }
 
+        if (VideoOut.SerialComputeProfile.Enabled)
+        {
+            // Charge everything recorded while preparing the draw (uploads, clears, copies,
+            // transitions) separately from the draw itself.
+            _host.EndRendering();
+            VideoOut.SerialComputeProfile.After(
+                VideoOut.SerialComputeProfile.PrepKey(state.PixelActive ? pixelInput.Stage.Program?.Hash ?? 0 : 0, vertexInput.Stage.Program?.Hash ?? 0),
+                draw.Count, draw.InstanceCount, 0);
+        }
+
         _host.BindVertexBuffers(vertexBuffers, vertexInput);
 
         if (pixelBindings is not null && setAutoDebug)

@@ -32,6 +32,13 @@ internal static class SerialComputeProfile
         return key;
     }
 
+    public static ulong PrepKey(ulong pixel, ulong vertex)
+    {
+        var key = 0x2000_0000_0000_0000UL | ((pixel != 0 ? pixel : vertex) & 0x1FFF_FFFF_FFFF_FFFFUL);
+        UploadNames[key] = pixel != 0 ? $"prep ps=0x{pixel:X16}" : $"prep vs=0x{vertex:X16}";
+        return key;
+    }
+
     public static ulong UploadKey(string format, bool tiled)
     {
         var name = $"upload {format}{(tiled ? " tiled" : " linear")}";

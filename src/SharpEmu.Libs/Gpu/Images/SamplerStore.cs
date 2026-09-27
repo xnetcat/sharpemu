@@ -69,6 +69,10 @@ public sealed unsafe class SamplerStore : IDisposable
         }
     }
 
+    // LOCAL EXPERIMENT: SHARPEMU_MAX_ANISOTROPY caps the guest's anisotropy ratio.
+    private static readonly float? MaxAnisotropy =
+        float.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_MAX_ANISOTROPY"), System.Globalization.CultureInfo.InvariantCulture, out var value) ? value : null;
+
     private static bool IsAnisotropic(uint filter) => (SamplerFilter)filter switch
     {
         SamplerFilter.AnisotropicPoint or SamplerFilter.AnisotropicLinear => true,
@@ -114,6 +118,11 @@ public sealed unsafe class SamplerStore : IDisposable
                 _ => throw SubmissionScheduler.Fatal(
                     $"The anisotropy ratio is unknown: ratio={words.MaxAnisotropyRatio} words={words[0]:x8},{words[1]:x8},{words[2]:x8},{words[3]:x8}."),
             };
+        }
+
+        if (anisotropic && MaxAnisotropy is { } cap)
+        {
+            anisotropyRatio = Math.Min(anisotropyRatio, cap);
         }
 
         var mipFilter = (SamplerMipFilter)words.MipFilter;
