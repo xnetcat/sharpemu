@@ -404,6 +404,14 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             memoryOffset = (uint)adjustment;
+            if (RenderTrace.Enabled)
+            {
+                RenderTrace.Write(
+                    $"Storage buffer bound: slot={slot} hash=0x{program.Hash:X16} address=0x{address:X} " +
+                    $"requested=0x{requested:X} size=0x{size:X} offset=0x{offset:X} adjustment=0x{adjustment:X} " +
+                    $"range=0x{size + adjustment:X} handle=0x{buffer.Handle.Handle:X} bufferSize=0x{buffer.Size:X}");
+            }
+
             if (GpuWorkTrace.WatchedAddresses.FirstOrDefault(candidate => candidate >= address && candidate - address < size) is var watched && watched != 0)
             {
                 Console.Error.WriteLine(
