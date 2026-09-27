@@ -235,6 +235,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         _ = SynchronizeBuffer(buffer, guestAddress, size, isWritten, isTexelBuffer, preserveCpuWriteHotPages: false);
         if (isWritten)
         {
+            buffer.MarkWritten();
             _gpuModifiedRanges.Add(guestAddress, size);
         }
 
@@ -861,6 +862,9 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     private static readonly bool MappedDownloads = OperatingSystem.IsMacOS() &&
         Environment.GetEnvironmentVariable("SHARPEMU_MAPPED_BUFFER_DOWNLOADS") != "0";
 
+    // SHARPEMU_READBACK_WAIT=use restores waiting for every use of the buffer instead of its last write.
+    private static readonly bool WaitForWritesOnly = Environment.GetEnvironmentVariable("SHARPEMU_READBACK_WAIT") != "use";
+
     private bool TryDownloadMappedBufferMemory(List<DownloadPiece> copies)
     {
         if (!MappedDownloads)
@@ -876,7 +880,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                 return false;
             }
 
-            tick = Math.Max(tick, piece.Buffer.LastUseTick);
+            tick = Math.Max(tick, WaitForWritesOnly ? piece.Buffer.LastWriteTick : piece.Buffer.LastUseTick);
         }
 
         using (MappedDownloadProfile.Measure(tick, _scheduler.CurrentTick))

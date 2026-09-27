@@ -134,6 +134,16 @@ public unsafe class GpuBuffer : IDisposable
 
     public void MarkUsed() => LastUseTick = Math.Max(LastUseTick, _scheduler.CurrentTick);
 
+    // The last tick whose commands write this buffer. A readback of GPU-written bytes only has to wait
+    // for this tick: later reads of the buffer cannot change them.
+    public ulong LastWriteTick { get; private set; }
+
+    public void MarkWritten()
+    {
+        MarkUsed();
+        LastWriteTick = Math.Max(LastWriteTick, _scheduler.CurrentTick);
+    }
+
     public void Write(ulong offset, ReadOnlySpan<byte> source)
     {
         if (_mapped == null || offset > Size || (ulong)source.Length > Size - offset)
@@ -194,7 +204,7 @@ public unsafe class GpuBuffer : IDisposable
             throw SubmissionScheduler.Fatal("Cannot copy overlapping ranges of the same buffer.");
         }
 
-        MarkUsed();
+        MarkWritten();
         source.MarkUsed();
         command.EndRendering();
         var vk = _device.Vk;
@@ -222,7 +232,7 @@ public unsafe class GpuBuffer : IDisposable
             throw SubmissionScheduler.Fatal("The buffer fill range must be aligned to four bytes.");
         }
 
-        MarkUsed();
+        MarkWritten();
         var command = _scheduler.Current;
         command.EndRendering();
         var vk = _device.Vk;
