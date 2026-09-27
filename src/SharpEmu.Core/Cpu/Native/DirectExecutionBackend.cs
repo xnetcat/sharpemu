@@ -941,6 +941,25 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	[ThreadStatic] private static nint _guestEntryStackLimit;
 	[ThreadStatic] private static nint _guestEntryLowWater;
 
+	// The deepest point of the host stack during guest execution is inside an import,
+	// so the low-water mark is sampled there: a host stack that is genuinely being
+	// exhausted shows up as a steadily falling headroom against the thread's limit.
+	private unsafe void ReportImportStackHeadroom(in ImportStubEntry entry)
+	{
+		byte probe = 0;
+		var here = (nint)(&probe);
+		var limit = _guestEntryStackLimit;
+		if (limit == 0 || here >= _guestEntryLowWater - (256 * 1024))
+		{
+			return;
+		}
+
+		_guestEntryLowWater = here;
+		Console.Error.WriteLine(
+			$"[LOADER][WARN] Host stack low water: headroom={here - limit} depth={_guestEntryDepth} " +
+			$"import={entry.Export?.Name ?? entry.Nid} thread='{Thread.CurrentThread.Name}'");
+	}
+
 	private unsafe static void ReportGuestEntryDepth(int depth)
 	{
 		byte probe = 0;
@@ -959,15 +978,6 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			Console.Error.WriteLine(
 				$"[LOADER][INFO] Guest executor stack: thread='{Thread.CurrentThread.Name}' " +
 				$"size={MacPthreadStackSize(self)} headroom={here - _guestEntryStackLimit}");
-		}
-
-		// Report the stack low-water mark whenever it drops by another quarter.
-		if (_guestEntryStackLimit != 0 && here < _guestEntryLowWater - (64 * 1024))
-		{
-			_guestEntryLowWater = here;
-			Console.Error.WriteLine(
-				$"[LOADER][WARN] Guest executor stack headroom={here - _guestEntryStackLimit} depth={depth} " +
-				$"thread='{Thread.CurrentThread.Name}'");
 		}
 
 		// Powers of two only: the report must not itself become the hot path.
