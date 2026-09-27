@@ -51,6 +51,10 @@ public class ShaderProgramInfo
     public int VertexOffsetScalarRegister { get; init; } = NoScalarRegister;
     public int InstanceOffsetScalarRegister { get; init; } = NoScalarRegister;
     public bool UsesDeviceAddresses { get; init; }
+
+    // The dword every invocation stores when the whole program is 'index, v_mov constant, one
+    // buffer store, end' (AGC's constant fill kernels); null for any other program.
+    public uint? ConstantStoreValue { get; init; }
     public bool HasBitwiseExclusiveOr { get; init; }
     public BufferResourceInfo[] Buffers { get; init; } = [];
     public ImageResourceInfo[] Images { get; init; } = [];

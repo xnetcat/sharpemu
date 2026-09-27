@@ -622,6 +622,87 @@ internal sealed class ShaderProgramCache
         }
     }
 
+    // A fill kernel computes its thread index, moves one constant into a VGPR and stores it once.
+    internal static uint? FindConstantStoreValue(Gen5ShaderProgram program)
+    {
+        var constants = new Dictionary<uint, uint>();
+        uint? stored = null;
+        foreach (var instruction in program.Instructions)
+        {
+            switch (instruction.Opcode)
+            {
+                case "SEndpgm" or "SWaitcnt" or "SNop" or "SInstPrefetch":
+                    continue;
+                case "VLshlAddU32" or "VMadU32U24" or "VAddU32" or "VAddI32" or "VAddNcU32" or "VLshlrevB32":
+                    // Index arithmetic; a register it writes is no longer a known constant.
+                    foreach (var destination in instruction.Destinations)
+                    {
+                        if (destination.Kind == Gen5OperandKind.VectorRegister) constants.Remove(destination.Value);
+                    }
+
+                    continue;
+                case "VMovB32":
+                {
+                    if (instruction.Destinations.Count != 1 || instruction.Destinations[0].Kind != Gen5OperandKind.VectorRegister ||
+                        instruction.Sources.Count != 1 || !TryDecodeIntegerConstant(instruction.Sources[0], out var value))
+                    {
+                        return null;
+                    }
+
+                    constants[instruction.Destinations[0].Value] = value;
+                    continue;
+                }
+
+                case "BufferStoreFormatX" or "BufferStoreDword":
+                {
+                    if (stored.HasValue || instruction.Control is not Gen5BufferMemoryControl control ||
+                        !constants.TryGetValue(control.VectorData, out var value))
+                    {
+                        return null;
+                    }
+
+                    stored = value;
+                    continue;
+                }
+
+                default:
+                    return null;
+            }
+        }
+
+        return stored;
+    }
+
+    private static bool TryDecodeIntegerConstant(Gen5Operand operand, out uint value)
+    {
+        value = 0;
+        if (operand.Kind == Gen5OperandKind.LiteralConstant)
+        {
+            value = operand.Value;
+            return true;
+        }
+
+        if (operand.Kind != Gen5OperandKind.EncodedConstant)
+        {
+            return false;
+        }
+
+        // Inline integers: 128..192 are 0..64, 193..208 are -1..-16.
+        if (operand.Value is >= 128 and <= 192)
+        {
+            value = operand.Value - 128;
+            return true;
+        }
+
+        if (operand.Value is >= 193 and <= 208)
+        {
+            value = unchecked((uint)(192 - (int)operand.Value));
+            return true;
+        }
+
+        return false;
+    }
+
     private static ShaderProgramInfo CreateProgramInfo(
         ShaderSource source,
         ProgramSourceEntry entry,
@@ -675,6 +756,7 @@ internal sealed class ShaderProgramCache
             VertexOffsetScalarRegister = entry.EmbeddedFetch?.VertexOffsetScalarRegister ?? ShaderProgramInfo.NoScalarRegister,
             InstanceOffsetScalarRegister = entry.EmbeddedFetch?.InstanceOffsetScalarRegister ?? ShaderProgramInfo.NoScalarRegister,
             UsesDeviceAddresses = info.UsesDeviceAddresses,
+            ConstantStoreValue = FindConstantStoreValue(entry.Program),
             HasBitwiseExclusiveOr = entry.HasBitwiseExclusiveOr,
             Buffers = buffers,
             Images = images,

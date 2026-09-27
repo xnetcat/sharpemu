@@ -350,7 +350,39 @@ public sealed partial class RenderExecutor
     // Recognizes a dispatch that fills one formatted buffer with a single value over every record.
     public ComputeImageClear? TryDecodeImageClear(ComputeInputInfo input, uint groupsX, uint groupsY, uint groupsZ, uint dispatchInitiator) =>
         TryDecodeUserDataFill(input, groupsX, groupsY, groupsZ, dispatchInitiator) ??
-        TryDecodeLoadedValueFill(input, groupsX, groupsY, groupsZ);
+        TryDecodeLoadedValueFill(input, groupsX, groupsY, groupsZ) ??
+        TryDecodeConstantFill(input, groupsX, groupsY, groupsZ);
+
+    // AGC's constant fill kernel: one formatted dword buffer written at every thread index with a
+    // value the program moves from a constant (a DCC or CMask clear code).
+    private ComputeImageClear? TryDecodeConstantFill(ComputeInputInfo input, uint groupsX, uint groupsY, uint groupsZ)
+    {
+        var program = input.Stage.Program ?? throw _host.Fatal("The compute stage has no program.");
+        var resources = input.Stage.Resources;
+        if (program.ConstantStoreValue is not { } value ||
+            program.Buffers.Length != 1 || resources.Buffers.Length != 1 || resources.Buffers[0].Length != 4 ||
+            program.Images.Length != 0 || program.SamplerCount != 0 || program.UsesDeviceAddresses)
+        {
+            return null;
+        }
+
+        var info = program.Buffers[0];
+        var descriptor = BufferDescriptorWords.From(resources.Buffers[0]);
+        var threads = (ulong)groupsX * input.ThreadsX;
+        if (!info.Formatted || !info.Written || info.Read || info.Atomic || info.Scalar || info.MaxByteExtent != sizeof(uint) ||
+            descriptor.Stride != sizeof(uint) || descriptor.Format != BufferDescriptorWords.Format32UInt || descriptor.SwizzleEnabled ||
+            descriptor.IndexStride != 0 || descriptor.AddThreadId || descriptor.RecordCount == 0 ||
+            input.ThreadsX != ImageClearWaveSize || input.ThreadsY != 1 || input.ThreadsZ != 1 || input.WaveSize != ImageClearWaveSize ||
+            groupsX == 0 || groupsY != 1 || groupsZ != 1 || threads != descriptor.RecordCount ||
+            !input.GroupIdX || input.GroupIdY || input.GroupIdZ || input.ThreadIdCount != 1 ||
+            (input.DispatchThreadDimensions && input.DispatchThreadsX != threads))
+        {
+            return null;
+        }
+
+        var size = descriptor.Footprint() ?? throw _host.Fatal($"The compute buffer footprint overflows: stride={descriptor.Stride} records={descriptor.RecordCount}.");
+        return new ComputeImageClear(descriptor, value, size);
+    }
 
     // The fill shader AGC titles use for DCC and CMask clears: each thread stores one dword it loaded
     // with s_buffer_load_dword from a one-record constant buffer, at its global thread index.
