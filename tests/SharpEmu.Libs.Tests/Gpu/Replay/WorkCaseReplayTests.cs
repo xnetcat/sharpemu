@@ -1,6 +1,7 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using SharpEmu.Libs.Gpu.Rendering;
 using SharpEmu.Libs.Tests.Gpu.Images;
 using SharpEmu.Libs.Tests.Gpu.Scheduling;
 using SharpEmu.Libs.Tests.Gpu.Vulkan;
@@ -58,6 +59,49 @@ public sealed class WorkCaseReplayTests : IClassFixture<HeadlessVulkanFixture>
             if (keep)
             {
                 Console.Error.WriteLine($"[TEST][INFO] The synthetic case stayed at '{root}'.");
+            }
+            else
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    // A real game's base pass fetches its vertices through pointer tables the user scalars name, and a
+    // case that does not carry those tables cannot replay. This pins both halves: the tables travel
+    // with a case, and a case missing one says which address it could not read instead of crashing.
+    [Fact]
+    public void FetchCase_CarriesTheTablesItsUserScalarsPointAt()
+    {
+        if (!GatePrerequisites.Ready(_vulkan) || !_vulkan.SupportsDynamicRendering)
+        {
+            return;
+        }
+
+        var keep = Environment.GetEnvironmentVariable("SHARPEMU_REPLAY_KEEP") == "1";
+        var root = Path.Combine(keep ? Path.Combine(Path.GetTempPath(), "sharpemu-replay") : Path.GetTempPath(), $"fetch-{Guid.NewGuid():N}");
+        try
+        {
+            var caseDirectory = SyntheticWorkCase.Write(root, vertexTables: true);
+            var complete = WorkCaseReplayer.Replay(_vulkan, caseDirectory, new WorkCaseReplayOptions());
+            Assert.True(complete.Recorded, complete.Describe());
+            Assert.Equal(0, complete.DroppedWork);
+
+            // Drop the attribute table the vertex header reaches through a user scalar pointer.
+            var manifest = WorkCase.Read(caseDirectory);
+            Assert.Equal(1, manifest.Memory.RemoveAll(range => range.Role == SyntheticWorkCase.AttributeTableRole));
+            File.WriteAllText(Path.Combine(caseDirectory, WorkCase.ManifestName),
+                System.Text.Json.JsonSerializer.Serialize(manifest, WorkCase.Json));
+            var broken = WorkCaseReplayer.Replay(_vulkan, caseDirectory,
+                new WorkCaseReplayOptions { OutputDirectory = Path.Combine(root, "replay-broken") });
+            Assert.False(broken.Recorded, broken.Describe());
+            Assert.Contains(broken.Notes, note => note.Contains("vertex attribute table is unreadable", StringComparison.Ordinal));
+        }
+        finally
+        {
+            if (keep)
+            {
+                Console.Error.WriteLine($"[TEST][INFO] The fetch case stayed at '{root}'.");
             }
             else
             {

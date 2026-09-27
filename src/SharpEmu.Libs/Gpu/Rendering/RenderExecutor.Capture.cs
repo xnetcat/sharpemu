@@ -38,6 +38,7 @@ public sealed partial class RenderExecutor
         }
 
         builder.SetBanks(banks);
+        builder.AddResolutionReads();
         builder.Manifest.Draw = new WorkCaseDraw
         {
             Indexed = emission.Indexed,
@@ -132,6 +133,7 @@ public sealed partial class RenderExecutor
         }
 
         builder.SetBanks(banks);
+        builder.AddResolutionReads();
         builder.Manifest.Dispatch = new WorkCaseDispatch
         {
             GroupsX = groupsX,
