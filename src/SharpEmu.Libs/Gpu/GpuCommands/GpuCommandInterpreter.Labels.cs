@@ -327,7 +327,7 @@ public sealed partial class GpuCommandInterpreter
         if (dataSelection == 1)
         {
             WriteEndOfPipe(false, cachePolicy, 0, 0x2F, cacheAction, 6, 2, destination, (uint)value, interruptSelector, interruptContextId);
-            _host.Flush();
+            FlushAfterEndOfPipe();
             return;
         }
 
@@ -341,7 +341,7 @@ public sealed partial class GpuCommandInterpreter
             WriteEndOfPipe(false, cachePolicy, 0, 0x2F, cacheAction, 6, 1, destination, (uint)value, interruptSelector, interruptContextId);
             if (interruptSelector == 1)
             {
-                _host.Flush();
+                FlushAfterEndOfPipe();
             }
 
             return;
@@ -360,6 +360,22 @@ public sealed partial class GpuCommandInterpreter
         WriteEndOfPipe(true, cachePolicy, 0, eopEventType, cacheAction, eventIndex, source, destination, value, interruptSelector, interruptContextId);
     }
 
+    // Every submission lengthens the queue that a later drain has to wait through. A release-memory
+    // packet already wrote its label into guest memory at parse time, and the GPU-side write it
+    // records still becomes visible only when the work before it completes, so the write rides the
+    // flush the slice does anyway instead of claiming a submission of its own. Flips keep their own
+    // flush: they gate presentation. SHARPEMU_EOP_FLUSH=immediate restores the old submission.
+    internal static bool FlushOnEndOfPipe { get; set; } =
+        string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_EOP_FLUSH"), "immediate", StringComparison.Ordinal);
+
+    private void FlushAfterEndOfPipe()
+    {
+        if (FlushOnEndOfPipe)
+        {
+            _host.Flush();
+        }
+    }
+
     private void TriggerReleaseInterrupt(uint interruptSelector, uint interruptContextId)
     {
         switch (interruptSelector)
@@ -371,7 +387,7 @@ public sealed partial class GpuCommandInterpreter
             case 2:
             case 4:
                 QueueInterrupt(interruptContextId);
-                _host.Flush();
+                FlushAfterEndOfPipe();
                 return;
             default:
                 throw _host.Fatal($"The release-memory interrupt selector is unknown: selector={interruptSelector}.");
