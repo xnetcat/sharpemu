@@ -1232,6 +1232,17 @@ public sealed partial class DirectExecutionBackend
 			return TryReadHostQword(address, out value);
 		}
 
+		// Stack arguments sit on the calling guest thread's own stack, which the backend mapped read-write
+		// for the thread's lifetime and no tracker ever protects. Reading inside it needs no query: the
+		// cached range below is keyed by a mapping generation that every tracker protection change bumps,
+		// so falling through here cost a locked host region query per argument on nearly every import.
+		if (_activeGuestThreadState is { StackSize: > 0 } thread &&
+			address >= thread.StackBase && address <= thread.StackBase + thread.StackSize - sizeof(ulong))
+		{
+			value = *(ulong*)address;
+			return true;
+		}
+
 		var generation = HostMemory.MappingGeneration;
 		if (generation == _importReadableGeneration &&
 			address >= _importReadableStart && address <= _importReadableEnd - 8)
