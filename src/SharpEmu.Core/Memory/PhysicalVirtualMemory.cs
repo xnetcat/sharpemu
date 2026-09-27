@@ -1784,6 +1784,19 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
 
     public bool TryRead(ulong virtualAddress, Span<byte> destination)
     {
+        if (MemoryAccessProfile.Enabled)
+        {
+            var start = System.Diagnostics.Stopwatch.GetTimestamp();
+            var result = TryReadUntimed(virtualAddress, destination);
+            MemoryAccessProfile.RecordRead(System.Diagnostics.Stopwatch.GetTimestamp() - start);
+            return result;
+        }
+
+        return TryReadUntimed(virtualAddress, destination);
+    }
+
+    private bool TryReadUntimed(ulong virtualAddress, Span<byte> destination)
+    {
         var requiresExclusiveAccess = false;
         _gate.EnterReadLock();
         try
@@ -1933,9 +1946,25 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         // there). Pre-visit the span so tracked pages are unprotected and
         // their owners dirtied before the copy; guest addresses are
         // host-identical, matching the tracker's fault addresses.
+        if (MemoryAccessProfile.Enabled)
+        {
+            var start = System.Diagnostics.Stopwatch.GetTimestamp();
+            GuestImageWriteTracker.NotifyManagedWrite(virtualAddress, (ulong)source.Length);
+            var notified = System.Diagnostics.Stopwatch.GetTimestamp();
+            GuestGpuMemoryHook.MarkCpuWrite(virtualAddress, (ulong)source.Length);
+            var marked = System.Diagnostics.Stopwatch.GetTimestamp();
+            var result = TryWriteUntracked(virtualAddress, source);
+            MemoryAccessProfile.RecordWrite(notified - start, marked - notified, System.Diagnostics.Stopwatch.GetTimestamp() - marked);
+            return result;
+        }
+
         GuestImageWriteTracker.NotifyManagedWrite(virtualAddress, (ulong)source.Length);
         GuestGpuMemoryHook.MarkCpuWrite(virtualAddress, (ulong)source.Length);
+        return TryWriteUntracked(virtualAddress, source);
+    }
 
+    private bool TryWriteUntracked(ulong virtualAddress, ReadOnlySpan<byte> source)
+    {
         var requiresExclusiveAccess = false;
         _gate.EnterReadLock();
         try

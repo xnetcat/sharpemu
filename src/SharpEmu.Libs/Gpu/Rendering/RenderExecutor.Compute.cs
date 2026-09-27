@@ -222,9 +222,10 @@ public sealed partial class RenderExecutor
             }
 
             _host.BindPipeline(PipelineBindPoint.Compute, in pipeline);
+            var traceId = 0;
             if (GpuWorkTrace.Enabled)
             {
-                GpuWorkTrace.Note($"dispatch cs=0x{program.Hash:X16} shader=0x{compute.Address:X} groups={groupsX}x{groupsY}x{groupsZ} indirect=0x{indirectArgumentsAddress:X}{DescribeWrittenBuffers(input.Stage, program)}");
+                traceId = GpuWorkTrace.Note($"dispatch cs=0x{program.Hash:X16} shader=0x{compute.Address:X} groups={groupsX}x{groupsY}x{groupsZ} indirect=0x{indirectArgumentsAddress:X}{DescribeWrittenBuffers(input.Stage, program)}");
             }
 
             if (indirectArgumentsAddress == 0 || !_host.TryDispatchIndirect(indirectArgumentsAddress))
@@ -232,6 +233,7 @@ public sealed partial class RenderExecutor
                 _host.Dispatch(groupsX, groupsY, groupsZ);
             }
             _host.ShaderAccessBarrier();
+            GpuWorkTrace.Breadcrumb(traceId);
             if (VideoOut.SerialComputeProfile.Enabled)
             {
                 VideoOut.SerialComputeProfile.After(program.Hash, groupsX, groupsY, groupsZ);

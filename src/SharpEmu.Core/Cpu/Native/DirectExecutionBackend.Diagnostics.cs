@@ -88,6 +88,7 @@ public sealed partial class DirectExecutionBackend
 					return $"{kvp.Key}: {cores:F2}cores {seconds:F1}s n={callCount} {perCallUs:F2}us/call";
 				});
 			System.Console.Error.WriteLine($"[PERF][HLE] cost: {string.Join(" | ", top)}");
+			System.Console.Error.WriteLine($"[PERF][HLE] memory: {SharpEmu.Core.Memory.MemoryAccessProfile.Report()}");
 
 			if (SharpEmu.HLE.GuestFastPath.Enabled)
 			{

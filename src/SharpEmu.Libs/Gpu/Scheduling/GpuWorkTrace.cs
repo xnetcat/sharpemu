@@ -22,24 +22,40 @@ public static class GpuWorkTrace
 
     public static ulong? WatchedAddress => WatchedAddresses.Length == 0 ? null : WatchedAddresses[0];
 
-    private static readonly (ulong Tick, string Work)[] Entries = new (ulong, string)[Capacity];
+    private static readonly (ulong Tick, string Work, int Id)[] Entries = new (ulong, string, int)[Capacity];
+    private static int _nextId;
+
+    // The host records a GPU write of a traced item's id after that item (a breadcrumb), and reads
+    // back the last id the GPU completed, so a hung tick names the item that never finished.
+    public static Action<int>? RecordBreadcrumb { get; set; }
+    public static Func<int>? ReadBreadcrumb { get; set; }
+
+    public static void Breadcrumb(int id)
+    {
+        if (Enabled && id != 0)
+        {
+            RecordBreadcrumb?.Invoke(id);
+        }
+    }
     private static readonly object Gate = new();
     private static int _next;
 
     // The tick the host records into now.
     public static Func<ulong>? CurrentTick { get; set; }
 
-    public static void Note(string work)
+    public static int Note(string work)
     {
         if (!Enabled || CurrentTick is not { } tick)
         {
-            return;
+            return 0;
         }
 
         lock (Gate)
         {
-            Entries[_next] = (tick(), work);
+            var id = ++_nextId;
+            Entries[_next] = (tick(), work, id);
             _next = (_next + 1) % Capacity;
+            return id;
         }
     }
 
@@ -52,6 +68,10 @@ public static class GpuWorkTrace
         }
 
         ReportTick(tick);
+        if (Enabled && ReadBreadcrumb is { } read)
+        {
+            Console.Error.WriteLine($"[GPU][ERROR]   last traced item the GPU completed: #{read()}");
+        }
     }
 
     private static void ReportTick(ulong tick)
@@ -66,10 +86,10 @@ public static class GpuWorkTrace
             var count = 0;
             for (var offset = 0; offset < Capacity; offset++)
             {
-                var (entryTick, work) = Entries[(_next + offset) % Capacity];
+                var (entryTick, work, id) = Entries[(_next + offset) % Capacity];
                 if (work is not null && entryTick == tick)
                 {
-                    Console.Error.WriteLine($"[GPU][ERROR]   tick {tick}: {work}");
+                    Console.Error.WriteLine($"[GPU][ERROR]   tick {tick}: #{id} {work}");
                     count++;
                 }
             }

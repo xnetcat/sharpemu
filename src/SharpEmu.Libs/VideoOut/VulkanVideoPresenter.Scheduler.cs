@@ -63,7 +63,37 @@ internal static unsafe partial class VulkanVideoPresenter
                 _ => WakeRenderThread());
             var scheduler = _scheduler;
             GpuWorkTrace.CurrentTick = () => scheduler.CurrentTick;
+            if (GpuWorkTrace.Enabled)
+            {
+                InstallGpuWorkBreadcrumb();
+            }
             SerialComputeProfile.Scheduler = scheduler;
+        }
+
+        private GpuBuffer? _breadcrumb;
+
+        private void InstallGpuWorkBreadcrumb()
+        {
+            var breadcrumb = new GpuBuffer(_deviceInfo, _scheduler, GpuBufferUsage.Download, 0, BufferUsageFlags.TransferDstBit, 16);
+            _breadcrumb = breadcrumb;
+            GpuWorkTrace.RecordBreadcrumb = id =>
+            {
+                EndRendering();
+                var command = new CommandBuffer(_scheduler.Current.Handle);
+                // The fill must not start before the traced work has finished executing.
+                _vk.CmdPipelineBarrier(command, PipelineStageFlags.AllCommandsBit, PipelineStageFlags.TransferBit, 0, 0, null, 0, null, 0, null);
+                _vk.CmdFillBuffer(command, breadcrumb.Handle, 0, 4, (uint)id);
+                breadcrumb.MarkWritten();
+            };
+            GpuWorkTrace.ReadBreadcrumb = () =>
+            {
+                if (!breadcrumb.IsCoherent)
+                {
+                    breadcrumb.Invalidate(0, 4);
+                }
+
+                return System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(breadcrumb.Mapped[..4]);
+            };
         }
 
         // Both stores share the manager's page guard and read guest memory through its address space.
