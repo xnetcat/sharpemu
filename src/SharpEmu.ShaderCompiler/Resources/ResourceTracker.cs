@@ -319,7 +319,13 @@ public sealed partial class ResourceTracker
 
         if (!ValidateSource(source, out var badDword))
         {
-            throw Failure(pc, $"{expected} dword {badDword} is not a valid runtime value");
+            // Naming the value tree makes the cause actionable: an Undefined leaf
+            // is almost always an instruction the scalar value graph does not
+            // model yet, and the operation chain says which one to look for.
+            throw Failure(
+                pc,
+                $"{expected} dword {badDword} is not a valid runtime value " +
+                $"({source.Dwords[badDword].Type}: {source.Dwords[badDword]})");
         }
 
         return InternSource(source);

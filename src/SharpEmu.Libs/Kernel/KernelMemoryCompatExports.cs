@@ -235,6 +235,8 @@ public static partial class KernelMemoryCompatExports
             _guestMounts[normalizedMountPoint] = normalizedHostRoot;
         }
 
+        InvalidateResolvedGuestPaths();
+
         lock (_statCacheGate)
         {
             _negativeStatCache.RemoveWhere(path =>
@@ -252,10 +254,18 @@ public static partial class KernelMemoryCompatExports
             return false;
         }
 
+        bool removed;
         lock (_guestMountGate)
         {
-            return _guestMounts.Remove(normalizedMountPoint);
+            removed = _guestMounts.Remove(normalizedMountPoint);
         }
+
+        if (removed)
+        {
+            InvalidateResolvedGuestPaths();
+        }
+
+        return removed;
     }
 
     internal static bool TryAllocateHleData(
@@ -4708,6 +4718,25 @@ public static partial class KernelMemoryCompatExports
         return FileMode.Open;
     }
 
+    // Resolution is pure text work plus a per-component reparse-point check, but a
+    // resource streamer resolves the same paths hundreds of thousands of times
+    // (Demon's Souls spends ~90 s of its boot in ResourcePool::GatherResourceFileInfo,
+    // i.e. in sceKernelAprResolveFilepathsToIdsAndFileSizes). Memoize the mapping and
+    // drop it whenever the mount table changes, which is the only input that can
+    // change an already-computed answer.
+    // Only /app0 is memoized. It is the read-only game image, it carries every
+    // streamed asset, and its root is one environment variable that the entry is
+    // checked against, so a host configuration change cannot serve a stale answer.
+    private static readonly ConcurrentDictionary<string, (string Root, string Path)> _resolvedGuestPaths =
+        new(StringComparer.Ordinal);
+    private const int ResolvedGuestPathCacheLimit = 1 << 20;
+
+    internal static void InvalidateResolvedGuestPaths() => _resolvedGuestPaths.Clear();
+
+    private static bool IsApp0GuestPath(string guestPath) =>
+        guestPath.StartsWith("/app0/", StringComparison.OrdinalIgnoreCase) ||
+        guestPath.StartsWith("app0/", StringComparison.OrdinalIgnoreCase);
+
     public static string ResolveGuestPath(string guestPath)
     {
         if (string.IsNullOrWhiteSpace(guestPath))
@@ -4715,6 +4744,30 @@ public static partial class KernelMemoryCompatExports
             return guestPath;
         }
 
+        var app0Root = IsApp0GuestPath(guestPath) ? ResolveApp0Root() : null;
+        var memoizable = !string.IsNullOrWhiteSpace(app0Root);
+        if (memoizable &&
+            _resolvedGuestPaths.TryGetValue(guestPath, out var memoized) &&
+            string.Equals(memoized.Root, app0Root, StringComparison.Ordinal))
+        {
+            return memoized.Path;
+        }
+
+        var resolved = ResolveGuestPathUncached(guestPath);
+        // Only a successful resolution is memoized: a denial is a containment
+        // decision about the host filesystem's current shape, so it stays live.
+        if (memoizable &&
+            !string.IsNullOrEmpty(resolved) &&
+            _resolvedGuestPaths.Count < ResolvedGuestPathCacheLimit)
+        {
+            _resolvedGuestPaths[guestPath] = (app0Root!, resolved);
+        }
+
+        return resolved;
+    }
+
+    private static string ResolveGuestPathUncached(string guestPath)
+    {
         if (TryResolveRegisteredGuestMount(guestPath, out var mountedPath, out var mountPrefixMatched))
         {
             return mountedPath;

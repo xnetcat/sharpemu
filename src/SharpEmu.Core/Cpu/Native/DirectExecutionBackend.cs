@@ -606,9 +606,17 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		private Action? _work;
 		private volatile bool _stopping;
 
+		// Every guest call that blocks in an HLE import resumes through a managed
+		// continuation frame, so a guest thread that blocks deep inside its own call
+		// tree nests host frames rather than unwinding. Demon's Souls' render thread
+		// overflowed the default thread stack within a minute of reaching its main
+		// loop; the reservation is virtual, so a generous stack costs nothing until
+		// it is touched.
+		private const int GuestExecutionStackBytes = 64 * 1024 * 1024;
+
 		public GuestExecutionRunner(ulong guestThreadHandle, string name, ThreadPriority priority)
 		{
-			_thread = new Thread(() => ThreadMain(guestThreadHandle))
+			_thread = new Thread(() => ThreadMain(guestThreadHandle), GuestExecutionStackBytes)
 			{
 				IsBackground = true,
 				Name = $"SharpEmu-{name}",
@@ -899,10 +907,88 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		return *(ulong*)((byte*)contextRecord + offset);
 	}
 
+	// Guest code that calls back into the host, and host code that calls back into
+	// the guest, nest on the host thread's stack. Unbounded nesting exhausts it
+	// (a managed "Stack overflow" abort with no usable trace), so the depth and
+	// the stack it has consumed are reported before that happens.
+	[ThreadStatic] private static int _guestEntryDepth;
+	[ThreadStatic] private static nint _guestEntryStackBase;
+
 	private unsafe static ulong CallNativeEntry(void* entry)
 	{
 		var nativeEntry = (delegate* unmanaged[Cdecl]<ulong>)entry;
-		return nativeEntry();
+		var depth = ++_guestEntryDepth;
+		try
+		{
+			ReportGuestEntryDepth(depth);
+			return nativeEntry();
+		}
+		finally
+		{
+			_guestEntryDepth = depth - 1;
+		}
+	}
+
+	[DllImport("libSystem.dylib", EntryPoint = "pthread_self")]
+	private static extern nint MacPthreadSelf();
+
+	[DllImport("libSystem.dylib", EntryPoint = "pthread_get_stackaddr_np")]
+	private static extern nint MacPthreadStackAddress(nint thread);
+
+	[DllImport("libSystem.dylib", EntryPoint = "pthread_get_stacksize_np")]
+	private static extern nuint MacPthreadStackSize(nint thread);
+
+	[ThreadStatic] private static nint _guestEntryStackLimit;
+	[ThreadStatic] private static nint _guestEntryLowWater;
+
+	// The deepest point of the host stack during guest execution is inside an import,
+	// so the low-water mark is sampled there: a host stack that is genuinely being
+	// exhausted shows up as a steadily falling headroom against the thread's limit.
+	private unsafe void ReportImportStackHeadroom(in ImportStubEntry entry)
+	{
+		byte probe = 0;
+		var here = (nint)(&probe);
+		var limit = _guestEntryStackLimit;
+		if (limit == 0 || here >= _guestEntryLowWater - (256 * 1024))
+		{
+			return;
+		}
+
+		_guestEntryLowWater = here;
+		Console.Error.WriteLine(
+			$"[LOADER][WARN] Host stack low water: headroom={here - limit} depth={_guestEntryDepth} " +
+			$"import={entry.Export?.Name ?? entry.Nid} thread='{Thread.CurrentThread.Name}'");
+	}
+
+	private unsafe static void ReportGuestEntryDepth(int depth)
+	{
+		byte probe = 0;
+		var here = (nint)(&probe);
+		if (depth <= 1)
+		{
+			_guestEntryStackBase = here;
+		}
+
+		if (_guestEntryStackLimit == 0 && OperatingSystem.IsMacOS())
+		{
+			// pthread_get_stackaddr_np returns the HIGH end of the stack.
+			var self = MacPthreadSelf();
+			_guestEntryStackLimit = MacPthreadStackAddress(self) - (nint)MacPthreadStackSize(self);
+			_guestEntryLowWater = here;
+			Console.Error.WriteLine(
+				$"[LOADER][INFO] Guest executor stack: thread='{Thread.CurrentThread.Name}' " +
+				$"size={MacPthreadStackSize(self)} headroom={here - _guestEntryStackLimit}");
+		}
+
+		// Powers of two only: the report must not itself become the hot path.
+		if (depth < 8 || (depth & (depth - 1)) != 0)
+		{
+			return;
+		}
+
+		Console.Error.WriteLine(
+			$"[LOADER][WARN] Guest re-entry depth={depth} host_stack_used={_guestEntryStackBase - here} " +
+			$"thread='{Thread.CurrentThread.Name}'");
 	}
 
 	private unsafe static void WriteCtxU64(void* contextRecord, int offset, ulong value)
@@ -2481,7 +2567,20 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 	}
 
+	// Patches unprotect and re-protect whole pages: two threads patching code that shares a page
+	// (runtime module loads, lazy TLS site patches on guest threads) would restore the other's page
+	// to read-execute while it is still writing, so every patch runs under one gate.
+	private static readonly object ImportStubPatchGate = new();
+
 	private unsafe bool PatchImportStub(nint address, nint trampoline)
+	{
+		lock (ImportStubPatchGate)
+		{
+			return PatchImportStubLocked(address, trampoline);
+		}
+	}
+
+	private unsafe bool PatchImportStubLocked(nint address, nint trampoline)
 	{
 		uint flNewProtect = default(uint);
 		if (!VirtualProtect((void*)address, 16u, 64u, &flNewProtect))
@@ -3671,6 +3770,16 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	}
 
 	private static unsafe bool WriteTlsInstruction(nint address, ReadOnlySpan<byte> replacement)
+	{
+		// Guest threads patch their TLS sites as they first reach them; two sites on one page would
+		// otherwise race the unprotect/restore pair exactly like the import stubs.
+		lock (ImportStubPatchGate)
+		{
+			return WriteTlsInstructionLocked(address, replacement);
+		}
+	}
+
+	private static unsafe bool WriteTlsInstructionLocked(nint address, ReadOnlySpan<byte> replacement)
 	{
 		if (replacement.Length is < 1 or > 15 ||
 			VirtualQuery((void*)address, out var information, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) == 0 ||

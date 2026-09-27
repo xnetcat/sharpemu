@@ -73,6 +73,44 @@ public sealed partial class GpuCommandInterpreter
 
     public bool PredicateSkip { get; private set; }
 
+    // A BOOL64 predicate (SET_PREDICATION PRED_OP 3) is a plain qword the guest expects some other
+    // agent to have written - an occlusion resolve, a compute pass, the CPU. The parser reads it
+    // where the packet sits in the stream, which is ahead of the work that writes it, and nothing in
+    // the emulator produces one at all, so every predicate reads zero and every draw behind it is
+    // dropped. Conditional rendering is only ever an optimization: running the work always paints
+    // the right picture, so the default is to run it. SHARPEMU_PREDICATION=skip restores honouring
+    // the predicate, for measuring what it would have removed.
+    private static readonly bool HonorPredication =
+        string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_PREDICATION"), "skip", StringComparison.Ordinal);
+
+    private static long _predicatedPackets;
+    private static long _predicatedWork;
+    private static long _predicatedReported;
+
+    public static long PredicatedPacketCount => Interlocked.Read(ref _predicatedPackets);
+
+    public static long PredicatedWorkCount => Interlocked.Read(ref _predicatedWork);
+
+    // One line per power of two, so a run says how much of its work the predicate covered.
+    private static void ReportPredication(long packets, long work)
+    {
+        if ((packets & (packets - 1)) != 0)
+        {
+            return;
+        }
+
+        Interlocked.Exchange(ref _predicatedReported, packets);
+        Console.Error.WriteLine(
+            $"[GPU][WARN] Predicated packets reached: packets={packets} draws_or_dispatches={work} " +
+            $"action={(HonorPredication ? "skipped" : "run anyway")}");
+    }
+
+    private static bool IsWorkOpcode(uint opcode) => opcode is
+        PacketOpcode.DispatchDirect or PacketOpcode.DispatchIndirect or
+        PacketOpcode.DrawIndirect or PacketOpcode.DrawIndexIndirect or PacketOpcode.DrawIndex2 or
+        PacketOpcode.DrawIndirectMulti or PacketOpcode.DrawIndexAuto or PacketOpcode.DrawIndexMultiAuto or
+        PacketOpcode.DrawIndexOffset2 or PacketOpcode.DrawIndexIndirectMulti;
+
     public bool ConditionalWaitEnabled { get; private set; }
 
     public FlipRequest PendingFlip { get; private set; }
@@ -278,14 +316,24 @@ public sealed partial class GpuCommandInterpreter
 
             if (PacketHeader.IsPredicated(header) && PredicateSkip)
             {
+                var predicatedOpcode = PacketHeader.Opcode(header);
+                var predicatedWork = IsWorkOpcode(predicatedOpcode);
+                var packets = Interlocked.Increment(ref _predicatedPackets);
+                var work = predicatedWork ? Interlocked.Increment(ref _predicatedWork) : Interlocked.Read(ref _predicatedWork);
+                ReportPredication(packets, work);
                 if (Rendering.FrameCommandLog.Active)
                 {
-                    Rendering.FrameCommandLog.Write($"  pkt 0x{packetAddress:X} op=0x{PacketHeader.Opcode(header):X2} len={length} SKIPPED-PREDICATE");
+                    Rendering.FrameCommandLog.Write(
+                        $"  pkt 0x{packetAddress:X} op=0x{predicatedOpcode:X2} len={length} " +
+                        (HonorPredication ? "SKIPPED-PREDICATE" : "PREDICATE-IGNORED"));
                 }
 
-                cursor.Offset += length;
-                execution.MadeProgress = true;
-                continue;
+                if (HonorPredication)
+                {
+                    cursor.Offset += length;
+                    execution.MadeProgress = true;
+                    continue;
+                }
             }
 
             var opcode = PacketHeader.Opcode(header);

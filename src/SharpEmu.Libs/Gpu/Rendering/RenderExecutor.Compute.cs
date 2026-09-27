@@ -172,7 +172,16 @@ public sealed partial class RenderExecutor
         _host.EndRendering();
         using (_host.BeginPreparation())
         {
-            var pipeline = _pipelines.CreateComputePipeline(input, computeProgram.Program);
+            if (!_pipelines.TryCreateComputePipeline(input, computeProgram.Program, out var pipeline))
+            {
+                // The host is still compiling this program. Blocking here stops the whole
+                // command stream (and with it presentation) for as long as the shader
+                // compiler takes, so the dispatch is dropped and replayed by the guest's
+                // next frame instead.
+                DroppedWorkLog.Dispatch("pipeline-compiling", compute.Address, groupsX, groupsY, groupsZ, dispatchInitiator);
+                return;
+            }
+
             var bindings = _host.PrepareBindings(input.Stage);
             if (program.UsesDeviceAddresses)
             {
