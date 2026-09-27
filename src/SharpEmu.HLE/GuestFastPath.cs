@@ -97,6 +97,14 @@ public static unsafe class GuestFastPath
     {
         _publishBlock = publishBlock ?? throw new ArgumentNullException(nameof(publishBlock));
         _enabled = true;
+
+        // A block is published once per host thread, so a second backend (and
+        // therefore a second TLS slot) must be handed the block this thread
+        // already owns or its stubs would never see one.
+        if (_block != 0)
+        {
+            _publishBlock(_block);
+        }
     }
 
     /// <summary>Disarms every stub by clearing the calling thread's block; used by tests.</summary>
