@@ -930,6 +930,7 @@ public static partial class Gen5SpirvTranslator
                     SpirvDecoration.BuiltIn,
                     (uint)SpirvBuiltIn.FragCoord);
                 _interfaces.Add(_fragCoordInput);
+                DeclarePixelSystemInputs();
 
                 var declaredPixelOutputs =
                     Environment.GetEnvironmentVariable(
@@ -1215,10 +1216,10 @@ public static partial class Gen5SpirvTranslator
             EmitPixelPositionInput(11, 3, fragCoord, ref vgpr); // POS_W_FLOAT
 
             // FRONT_FACE, ANCILLARY, SAMPLE_COVERAGE and POS_FIXED_PT follow
-            // position inputs. Reserve their compact slots until their SPIR-V
-            // builtins are needed by a guest shader.
-            AdvancePixelInput(12, 1, ref vgpr);
-            AdvancePixelInput(13, 1, ref vgpr);
+            // position inputs. SAMPLE_COVERAGE and POS_FIXED_PT only reserve
+            // their compact slots until a guest shader needs them.
+            EmitPixelSystemInput(12, _frontFacingInput == 0 ? 0 : LoadFrontFaceInput(), ref vgpr);
+            EmitPixelSystemInput(13, _ancillaryLayerInput == 0 ? 0 : LoadAncillaryInput(), ref vgpr);
             AdvancePixelInput(14, 1, ref vgpr);
             AdvancePixelInput(15, 1, ref vgpr);
         }

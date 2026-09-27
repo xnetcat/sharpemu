@@ -13,6 +13,8 @@ public static partial class Gen5SpirvTranslator
         private readonly HashSet<uint> _flatParameterAttributes = [];
         private readonly Dictionary<int, uint> _barycentricInputs = [];
         private uint _interpolationSampleId;
+        private uint _frontFacingInput;
+        private uint _ancillaryLayerInput;
         private const uint InterpolateAtCentroid = 76;
         private const uint InterpolateAtSample = 77;
         private const uint InterpolateAtOffset = 78;
@@ -88,6 +90,57 @@ public static partial class Gen5SpirvTranslator
                 _module.AddDecoration(_interpolationSampleId, SpirvDecoration.Flat);
                 _interfaces.Add(_interpolationSampleId);
             }
+        }
+
+        // FRONT_FACE and ANCILLARY are VGPRs the hardware fills for pixel shaders that enable them.
+        // UE writes volume textures one slice per instance and has the pixel shader read the slice
+        // back out of ANCILLARY[28:16] (the render target array index); leaving that register zero
+        // bakes every slice of a color grading LUT from the blue=0 slice.
+        private void DeclarePixelSystemInputs()
+        {
+            var enabledInputs = _pixelInputAddress & _pixelInputEnable;
+            if ((enabledInputs & (1u << 12)) != 0)
+            {
+                _frontFacingInput = _module.AddGlobalVariable(
+                    _module.TypePointer(SpirvStorageClass.Input, _boolType), SpirvStorageClass.Input);
+                _module.AddDecoration(_frontFacingInput, SpirvDecoration.BuiltIn, (uint)SpirvBuiltIn.FrontFacing);
+                _interfaces.Add(_frontFacingInput);
+            }
+
+            if ((enabledInputs & (1u << 13)) != 0)
+            {
+                _module.AddExtension("SPV_EXT_shader_viewport_index_layer");
+                _module.AddCapability(SpirvCapability.ShaderViewportIndexLayerExt);
+                _ancillaryLayerInput = _module.AddGlobalVariable(
+                    _module.TypePointer(SpirvStorageClass.Input, _uintType), SpirvStorageClass.Input);
+                _module.AddDecoration(_ancillaryLayerInput, SpirvDecoration.BuiltIn, (uint)SpirvBuiltIn.Layer);
+                _module.AddDecoration(_ancillaryLayerInput, SpirvDecoration.Flat);
+                _interfaces.Add(_ancillaryLayerInput);
+            }
+        }
+
+        // Front facing reads as 1.0f and back facing as 0, which satisfies both the float greater-than
+        // and the integer not-equal tests compilers emit for it.
+        private uint LoadFrontFaceInput() => _module.AddInstruction(
+            SpirvOp.Select, _uintType, Load(_boolType, _frontFacingInput), UInt(0x3F800000u), UInt(0));
+
+        private uint LoadAncillaryInput() =>
+            ShiftLeftLogical(Load(_uintType, _ancillaryLayerInput), UInt(16));
+
+        private void EmitPixelSystemInput(int bit, uint value, ref uint vgpr)
+        {
+            var mask = 1u << bit;
+            if ((_pixelInputAddress & mask) == 0)
+            {
+                return;
+            }
+
+            if ((_pixelInputEnable & mask) != 0 && value != 0)
+            {
+                StoreV(vgpr, value, guardWithExec: false);
+            }
+
+            vgpr++;
         }
 
         private uint LoadBarycentricCoordinates(int bit, uint variable) => bit switch

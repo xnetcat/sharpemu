@@ -107,6 +107,22 @@ public sealed class Gen5InterpolationParameterTests
             instruction.Operands[1] == (uint)SpirvDecoration.PerVertexKhr);
     }
 
+    [Fact]
+    public void FrontFaceAndAncillary_ReadTheirBuiltIns()
+    {
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(
+            Request(0, false, inputs: 0x3002, opcode: "VInterpP2F32"), out var shader, out var error), error);
+        var instructions = Instructions(shader.Spirv);
+        var builtIns = instructions
+            .Where(instruction => instruction.Opcode == SpirvOp.Decorate &&
+                instruction.Operands[1] == (uint)SpirvDecoration.BuiltIn)
+            .Select(instruction => instruction.Operands[2]).ToArray();
+        Assert.Contains((uint)SpirvBuiltIn.FrontFacing, builtIns);
+        Assert.Contains((uint)SpirvBuiltIn.Layer, builtIns);
+        Assert.Contains(instructions, instruction => instruction.Opcode == SpirvOp.ShiftLeftLogical);
+        ValidateWhenAvailable(shader.Spirv);
+    }
+
     private static ShaderCompileRequest Request(
         uint selector, bool custom, uint inputs = 2, string opcode = "VInterpMovF32",
         uint inputCntl = 0x401, bool supportsPerVertex = true)
