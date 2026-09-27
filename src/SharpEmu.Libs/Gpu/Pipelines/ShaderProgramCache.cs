@@ -314,17 +314,34 @@ internal sealed class ShaderProgramCache
         }
 
         ShaderResourcePlan plan;
+        // Dumping every shader to catch the one that fails costs gigabytes on a UE title.
+        // This keeps the planning inputs of the rejected shader only, which is what the
+        // opcode hunt needs, so a single run answers "which instruction is missing".
+        var dumpFailure = dumpPlanning || CompiledShaderDump.ShouldWriteRejectedPlan();
+        ShaderResourcePlan? planningSnapshot = null;
         try
         {
             plan = ShaderResourcePlan.Extract(program, source.Stage, source.Hash, source.UserDataBase, (uint)source.UserData.Length,
                 fetch?.Loads.Select(load => load.Pc).ToHashSet(),
-                beforeResourceTracking: dumpPlanning ? resourcePlan => ShaderPlanningDump.WriteGraph(source, resourcePlan) : null,
+                beforeResourceTracking: dumpFailure
+                    ? resourcePlan =>
+                    {
+                        planningSnapshot = resourcePlan;
+                        if (dumpPlanning) ShaderPlanningDump.WriteGraph(source, resourcePlan);
+                    }
+                    : null,
                 // Graphics stages compile as wave32 (see the compile request); compute follows the dispatch.
                 waveSize: source.Stage == ShaderStage.Compute ? options.ComputeInfo?.WaveSize ?? 64u : 32u);
         }
         catch (ResourcePlanException exception)
         {
-            if (dumpPlanning) ShaderPlanningDump.WriteFailure(source, exception.Message);
+            if (!dumpPlanning && dumpFailure)
+            {
+                ShaderPlanningDump.WriteInput(source, program);
+                if (planningSnapshot is { } rejectedPlan) ShaderPlanningDump.WriteGraph(source, rejectedPlan);
+            }
+
+            if (dumpFailure) ShaderPlanningDump.WriteFailure(source, exception.Message);
             throw new ShaderProgramRejectedException($"The shader resource plan is invalid: stage={source.Label} hash=0x{source.Hash:X16} shader=0x{source.Address:X16} error={exception.Message}.");
         }
 
@@ -671,6 +688,11 @@ internal sealed class ShaderProgramCache
 // Writes each compiled module and its decoded listing when the dump switch is on.
 internal static class CompiledShaderDump
 {
+    // SHARPEMU_DUMP_SHADER_PLAN_ON_FAILURE keeps the listing and graph of a shader whose
+    // resource plan was rejected, without dumping the thousands that compile fine.
+    internal static bool ShouldWriteRejectedPlan() =>
+        string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_DUMP_SHADER_PLAN_ON_FAILURE"), "1", StringComparison.Ordinal);
+
     internal static bool ShouldWrite(ulong shaderAddress)
     {
         if (!string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_DUMP_SPIRV"), "1", StringComparison.Ordinal))
