@@ -245,6 +245,10 @@ public sealed partial class RenderExecutor
             _host.ShaderWriteHazardBarrier();
             _host.BindPipeline(PipelineBindPoint.Compute, in pipeline);
             var traceId = GpuWorkTrace.Note($"ngg compute cs=0x{computeInput.Stage.Program!.Hash:X16} subgroups={subgroupCount}");
+            if (subgroupCount == 64)
+            {
+                GpuWorkTrace.ArmSleep();
+            }
             GpuWorkTrace.Breadcrumb(-traceId);
             _host.BindPipeline(PipelineBindPoint.Compute, in pipeline);
             _host.Dispatch((uint)subgroupCount, 1, 1);

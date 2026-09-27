@@ -72,8 +72,31 @@ public static class GpuWorkTrace
         }
     }
 
+    // LOCAL ONLY bisection aid: after Arm(), the k-th later traced item (SHARPEMU_DIAG_SLEEP_BEFORE_ITEM)
+    // first sleeps, so the GPU work recorded before it can finish before the CPU records the item.
+    private static readonly int SleepBeforeItem =
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_DIAG_SLEEP_BEFORE_ITEM"), out var item) ? item : 0;
+    private static int _armedCountdown;
+
+    public static void ArmSleep()
+    {
+        if (SleepBeforeItem > 0)
+        {
+            _armedCountdown = SleepBeforeItem;
+        }
+    }
+
+    private static void MaybeSleep()
+    {
+        if (_armedCountdown > 0 && --_armedCountdown == 0)
+        {
+            Thread.Sleep(200);
+        }
+    }
+
     public static int Note(string work)
     {
+        MaybeSleep();
         if (!Enabled || CurrentTick is not { } tick)
         {
             return 0;
