@@ -31,7 +31,7 @@ public readonly record struct CapturedImageBytes(string Format, uint Width, uint
 internal static class WorkCapture
 {
     private const ulong DefaultByteBudget = 512UL * 1024 * 1024;
-    private const ulong PerImageByteCap = 16UL * 1024 * 1024;
+    private const ulong PerImageByteCap = 128UL * 1024 * 1024;
 
     // What the header chains carry beyond their own words: the user data block and the direct
     // resource offsets it points at, which the vertex tables read while the program resolves.
