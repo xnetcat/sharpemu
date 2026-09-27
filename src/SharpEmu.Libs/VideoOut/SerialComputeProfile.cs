@@ -18,6 +18,7 @@ internal static class SerialComputeProfile
 
     private static readonly Dictionary<ulong, (double Ms, long Count, double MaxMs, string Args)> Pipelines = new();
     private static double _betweenMs;
+    private static double _overheadMs;
     private static long _windowStart = Stopwatch.GetTimestamp();
 
     public static SubmissionScheduler? Scheduler;
@@ -59,6 +60,13 @@ internal static class SerialComputeProfile
         var start = Stopwatch.GetTimestamp();
         Scheduler?.Finish();
         var ms = Stopwatch.GetElapsedTime(start).TotalMilliseconds;
+        // An empty submit-and-wait costs the same fixed latency as the measured drain; charging the
+        // pipeline only the difference keeps a frame of many small draws from looking GPU-bound.
+        var overheadStart = Stopwatch.GetTimestamp();
+        Scheduler?.Finish();
+        var overhead = Stopwatch.GetElapsedTime(overheadStart).TotalMilliseconds;
+        _overheadMs += overhead;
+        ms = Math.Max(0, ms - overhead);
         Pipelines.TryGetValue(pipeline, out var entry);
         Pipelines[pipeline] = (entry.Ms + ms, entry.Count + 1, Math.Max(entry.MaxMs, ms), ms >= entry.MaxMs ? $"{x},{y},{z}" : entry.Args);
         if (Stopwatch.GetElapsedTime(_windowStart).TotalSeconds >= 10)
@@ -71,8 +79,8 @@ internal static class SerialComputeProfile
     {
         var window = Stopwatch.GetElapsedTime(_windowStart).TotalMilliseconds;
         var total = Pipelines.Values.Sum(static entry => entry.Ms);
-        Console.Error.WriteLine($"[PERF][SERIAL_COMPUTE] window_ms={window:F0} dispatch_ms={total:F0} between_ms={_betweenMs:F0}");
-        foreach (var (pipeline, entry) in Pipelines.OrderByDescending(static pair => pair.Value.Ms).Take(12))
+        Console.Error.WriteLine($"[PERF][SERIAL_COMPUTE] window_ms={window:F0} dispatch_ms={total:F0} between_ms={_betweenMs:F0} overhead_ms={_overheadMs:F0}");
+        foreach (var (pipeline, entry) in Pipelines.OrderByDescending(static pair => pair.Value.Ms).Take(30))
         {
             Console.Error.WriteLine(
                 $"[PERF][SERIAL_COMPUTE] {(UploadNames.TryGetValue(pipeline, out var name) ? name : $"cs=0x{pipeline:X16}")} total_ms={entry.Ms:F1} n={entry.Count} max_ms={entry.MaxMs:F2} max_args={entry.Args}");
@@ -80,6 +88,7 @@ internal static class SerialComputeProfile
 
         Pipelines.Clear();
         _betweenMs = 0;
+        _overheadMs = 0;
         _windowStart = Stopwatch.GetTimestamp();
     }
 }
