@@ -370,7 +370,7 @@ public sealed partial class GpuCommandInterpreter
 
     private void FlushAfterEndOfPipe()
     {
-        if (FlushOnEndOfPipe)
+        if (Diagnostics.LiveTune.Get("eop_flush") is { } live ? live == "immediate" : FlushOnEndOfPipe)
         {
             _host.Flush();
         }

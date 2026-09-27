@@ -110,7 +110,10 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.SubmissionCapacity);
             CollectCompletedGuestSubmissions(waitForOldest: false);
-            if (_pendingGuestSubmissions.Count >= MaxInFlightGuestSubmissions)
+            var maxInFlight = int.TryParse(SharpEmu.Libs.Diagnostics.LiveTune.Get("submission_depth"), out var live) && live > 0
+                ? live
+                : MaxInFlightGuestSubmissions;
+            if (_pendingGuestSubmissions.Count >= maxInFlight)
             {
                 CollectCompletedGuestSubmissions(waitForOldest: true);
             }
