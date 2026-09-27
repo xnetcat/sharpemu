@@ -1,0 +1,297 @@
+// Copyright (C) 2026 SharpEmu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+using SharpEmu.Core.Cpu.Native;
+using SharpEmu.HLE;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using Xunit;
+
+namespace SharpEmu.Libs.Tests.Cpu;
+
+/// <summary>
+/// Executes the emitted pthread_self / pthread_getspecific fast-path stubs for
+/// real. The stubs are the whole point of the optimization, so the tests run
+/// their machine code rather than pattern-matching bytes: a stub that answers
+/// the wrong value, clobbers a caller-saved-only contract, or unbalances the
+/// stack fails here instead of in a game.
+/// </summary>
+[Collection("GuestFastPathStubs")]
+public sealed unsafe class GuestFastPathStubTests
+{
+    private const ulong RaxSentinel = 0x1122334455667788UL;
+
+    [Fact]
+    public void SelfStub_ReturnsTheBoundGuestThreadHandle()
+    {
+        if (!CanRunStubs())
+        {
+            return;
+        }
+
+        using var harness = new StubHarness(DirectExecutionBackend.GuestFastPathStub.PthreadSelf);
+        const ulong handle = 0x0000700011223340UL;
+        harness.Bind(handle);
+
+        Assert.Equal(handle, harness.Call(0));
+    }
+
+    [Fact]
+    public void SelfStub_FallsBackWhenNoGuestThreadIsBound()
+    {
+        if (!CanRunStubs())
+        {
+            return;
+        }
+
+        using var harness = new StubHarness(DirectExecutionBackend.GuestFastPathStub.PthreadSelf);
+        harness.Bind(0);
+
+        // The fallback trampoline returns the incoming RAX untouched, so this
+        // asserts both that the slow path was taken and that the guest's RAX
+        // (the SysV variadic vector count) survived the attempt.
+        Assert.Equal(RaxSentinel, harness.Call(0));
+    }
+
+    [Fact]
+    public void GetspecificStub_ReturnsValuesWrittenThroughTheManagedApi()
+    {
+        if (!CanRunStubs())
+        {
+            return;
+        }
+
+        using var harness = new StubHarness(DirectExecutionBackend.GuestFastPathStub.PthreadGetspecific);
+        var handle = NewHandle();
+        harness.Bind(handle);
+
+        Assert.Equal(0UL, harness.Call(7));
+
+        GuestFastPath.SetSpecific(handle, 7, 0xDEADBEEFCAFEF00DUL);
+        GuestFastPath.SetSpecific(handle, GuestFastPath.TlsSlotCount - 1, 0x55UL);
+
+        Assert.Equal(0xDEADBEEFCAFEF00DUL, harness.Call(7));
+        Assert.Equal(0x55UL, harness.Call((ulong)(GuestFastPath.TlsSlotCount - 1)));
+        Assert.Equal(0UL, harness.Call(8));
+
+        // pthread_key_delete must make the key read back unset everywhere.
+        GuestFastPath.ClearKeyEverywhere(7);
+        Assert.Equal(0UL, harness.Call(7));
+    }
+
+    [Fact]
+    public void GetspecificStub_FallsBackForKeysTheTableCannotHold()
+    {
+        if (!CanRunStubs())
+        {
+            return;
+        }
+
+        using var harness = new StubHarness(DirectExecutionBackend.GuestFastPathStub.PthreadGetspecific);
+        harness.Bind(NewHandle());
+
+        Assert.Equal(RaxSentinel, harness.Call(GuestFastPath.TlsSlotCount));
+        Assert.Equal(RaxSentinel, harness.Call(unchecked((ulong)-1L)));
+    }
+
+    [Fact]
+    public void GetspecificStub_FallsBackWhenNoGuestThreadIsBound()
+    {
+        if (!CanRunStubs())
+        {
+            return;
+        }
+
+        using var harness = new StubHarness(DirectExecutionBackend.GuestFastPathStub.PthreadGetspecific);
+        harness.Bind(0);
+
+        Assert.Equal(RaxSentinel, harness.Call(3));
+    }
+
+    [Fact]
+    public void GetspecificStub_ReadsTheThreadCurrentlyBound()
+    {
+        if (!CanRunStubs())
+        {
+            return;
+        }
+
+        using var harness = new StubHarness(DirectExecutionBackend.GuestFastPathStub.PthreadGetspecific);
+        var first = NewHandle();
+        var second = NewHandle();
+        GuestFastPath.SetSpecific(first, 2, 0x1111UL);
+        GuestFastPath.SetSpecific(second, 2, 0x2222UL);
+
+        harness.Bind(first);
+        Assert.Equal(0x1111UL, harness.Call(2));
+
+        harness.Bind(second);
+        Assert.Equal(0x2222UL, harness.Call(2));
+
+        harness.Bind(first);
+        Assert.Equal(0x1111UL, harness.Call(2));
+    }
+
+    /// <summary>
+    /// Measures the per-call cost the stubs replace. The managed gateway costs
+    /// ~2.9 us/call as measured in-game with SHARPEMU_PERF_HLE=1; the stub must
+    /// be orders of magnitude below that, so the bound is deliberately loose
+    /// enough to survive a loaded CI machine while still failing if a stub ever
+    /// regains a managed transition.
+    /// </summary>
+    [Fact]
+    public void Stubs_CostFarLessThanTheManagedGateway()
+    {
+        if (!CanRunStubs())
+        {
+            return;
+        }
+
+        using var self = new StubHarness(DirectExecutionBackend.GuestFastPathStub.PthreadSelf);
+        using var getspecific = new StubHarness(DirectExecutionBackend.GuestFastPathStub.PthreadGetspecific);
+        var handle = NewHandle();
+        self.Bind(handle);
+        GuestFastPath.SetSpecific(handle, 4, 0x99UL);
+
+        var selfNanos = MeasureNanosPerCall(self, 0);
+        getspecific.Bind(handle);
+        var getspecificNanos = MeasureNanosPerCall(getspecific, 4);
+
+        Assert.True(
+            selfNanos < 500,
+            $"pthread_self stub cost {selfNanos:F1} ns/call; the managed gateway it replaces costs ~2900 ns/call.");
+        Assert.True(
+            getspecificNanos < 500,
+            $"pthread_getspecific stub cost {getspecificNanos:F1} ns/call; the managed gateway costs ~2900 ns/call.");
+    }
+
+    private static double MeasureNanosPerCall(StubHarness harness, ulong argument)
+    {
+        const int iterations = 2_000_000;
+        for (var i = 0; i < 100_000; i++)
+        {
+            _ = harness.Call(argument);
+        }
+
+        var start = Stopwatch.GetTimestamp();
+        for (var i = 0; i < iterations; i++)
+        {
+            _ = harness.Call(argument);
+        }
+
+        var elapsed = Stopwatch.GetTimestamp() - start;
+        // The measured loop includes the managed calli that a guest call does not
+        // pay, so this is an upper bound on the stub's own cost.
+        return elapsed * 1_000_000_000.0 / Stopwatch.Frequency / iterations;
+    }
+
+    private static bool CanRunStubs() =>
+        OperatingSystem.IsMacOS() && RuntimeInformation.ProcessArchitecture == Architecture.X64;
+
+    private static ulong NewHandle() =>
+        0x0000700020000000UL + ((ulong)Environment.CurrentManagedThreadId << 20) +
+        ((ulong)Interlocked.Increment(ref _handleCounter) << 8);
+
+    private static int _handleCounter;
+
+    /// <summary>
+    /// Owns one emitted stub, a fallback trampoline that reports "slow path
+    /// taken" by returning the incoming RAX, and a caller thunk that sets up
+    /// RAX/RDI the way guest code would.
+    /// </summary>
+    private sealed class StubHarness : IDisposable
+    {
+        // One native TLS key for the whole fixture: GuestFastPath publishes a
+        // host thread's block exactly once, so a second key would never receive
+        // it and every stub would silently take the slow path.
+        private static readonly uint BlockTlsKey = EnableFastPath();
+
+        private readonly byte* _page;
+        private readonly delegate* unmanaged<ulong> _entry;
+        private readonly ulong* _argumentSlot;
+
+        private static uint EnableFastPath()
+        {
+            var key = PosixHostStubs.TlsAlloc();
+            Assert.NotEqual(uint.MaxValue, key);
+            GuestFastPath.Enable(block => PosixHostStubs.TlsSetValue(key, block));
+            return key;
+        }
+
+        public StubHarness(DirectExecutionBackend.GuestFastPathStub kind)
+        {
+            var key = BlockTlsKey;
+
+            _page = (byte*)HostMemory.Alloc(
+                null,
+                4096,
+                HostMemory.MEM_COMMIT | HostMemory.MEM_RESERVE,
+                HostMemory.PAGE_EXECUTE_READWRITE);
+            Assert.True(_page != null);
+
+            // The argument the thunk loads into RDI lives outside the code page,
+            // which becomes read-execute below.
+            _argumentSlot = (ulong*)NativeMemory.AllocZeroed(sizeof(ulong));
+
+            // Fallback trampoline at +0x100: `ret`, which hands back RAX exactly
+            // as the stub left it.
+            _page[0x100] = 0xC3;
+
+            var stub = DirectExecutionBackend.EmitGuestFastPathStub(kind, key, (nint)(_page + 0x100));
+            for (var i = 0; i < stub.Count; i++)
+            {
+                _page[0x200 + i] = stub[i];
+            }
+
+            // Caller thunk at +0: mov rax, sentinel / mov rdi, [argumentSlot] /
+            // mov r11, stub / call r11 / ret. Only caller-saved registers are
+            // touched, so the managed caller's state is safe.
+            var offset = 0;
+            Emit(ref offset, 0x48, 0xB8);
+            EmitU64(ref offset, RaxSentinel);
+            Emit(ref offset, 0x48, 0xBF);
+            EmitU64(ref offset, (ulong)(nint)_argumentSlot);
+            Emit(ref offset, 0x48, 0x8B, 0x3F); // mov rdi, [rdi]
+            Emit(ref offset, 0x49, 0xBB);
+            EmitU64(ref offset, (ulong)(nint)(_page + 0x200));
+            Emit(ref offset, 0x41, 0xFF, 0xD3); // call r11
+            Emit(ref offset, 0xC3);
+            Assert.True(offset < 0x100);
+
+            Assert.True(HostMemory.Protect(_page, 4096, HostMemory.PAGE_EXECUTE_READ, out _));
+            HostMemory.FlushInstructionCache(_page, 4096);
+            _entry = (delegate* unmanaged<ulong>)_page;
+        }
+
+        public void Bind(ulong guestThreadHandle) => GuestFastPath.BindGuestThread(guestThreadHandle);
+
+        public ulong Call(ulong argument)
+        {
+            *_argumentSlot = argument;
+            return _entry();
+        }
+
+        public void Dispose()
+        {
+            GuestFastPath.BindGuestThread(0);
+            NativeMemory.Free(_argumentSlot);
+            _ = HostMemory.Free(_page, 0, HostMemory.MEM_RELEASE);
+        }
+
+        private void Emit(ref int offset, params byte[] bytes)
+        {
+            foreach (var value in bytes)
+            {
+                _page[offset++] = value;
+            }
+        }
+
+        private void EmitU64(ref int offset, ulong value)
+        {
+            for (var i = 0; i < 8; i++)
+            {
+                _page[offset++] = (byte)(value >> (i * 8));
+            }
+        }
+    }
+}
