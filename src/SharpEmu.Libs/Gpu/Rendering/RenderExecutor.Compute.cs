@@ -228,6 +228,12 @@ public sealed partial class RenderExecutor
                 traceId = GpuWorkTrace.Note($"dispatch cs=0x{program.Hash:X16} shader=0x{compute.Address:X} groups={groupsX}x{groupsY}x{groupsZ} indirect=0x{indirectArgumentsAddress:X}{DescribeWrittenBuffers(input.Stage, program)}");
             }
 
+            if (traceId != 0)
+            {
+                GpuWorkTrace.Breadcrumb(-traceId);
+                _host.BindPipeline(PipelineBindPoint.Compute, in pipeline);
+            }
+
             if (indirectArgumentsAddress == 0 || !_host.TryDispatchIndirect(indirectArgumentsAddress))
             {
                 _host.Dispatch(groupsX, groupsY, groupsZ);
