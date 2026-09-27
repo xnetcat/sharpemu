@@ -575,6 +575,7 @@ internal sealed class ShaderProgramCache
                     TraceDeviceAddressFaults = SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.TraceEnabled,
                     ScratchDwords = info.ScratchDwords,
                     ComputeSystemRegisters = options.ComputeSystemRegisters,
+                    LocalDataShareDwords = info.LocalDataShareDwords,
                     LocalSizeX = Math.Max(info.ThreadsX, 1),
                     LocalSizeY = Math.Max(info.ThreadsY, 1),
                     LocalSizeZ = Math.Max(info.ThreadsZ, 1),
