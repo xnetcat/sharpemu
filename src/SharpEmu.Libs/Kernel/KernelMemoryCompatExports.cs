@@ -4774,8 +4774,15 @@ public static partial class KernelMemoryCompatExports
     private static readonly ConcurrentDictionary<string, (string Root, string Path)> _resolvedGuestPaths =
         new(StringComparer.Ordinal);
     private const int ResolvedGuestPathCacheLimit = 1 << 20;
+    // ConcurrentDictionary.Count takes every bucket lock, which on a path resolved by
+    // a dozen guest threads at once costs far more than the resolution it guards.
+    private static int _resolvedGuestPathCount;
 
-    internal static void InvalidateResolvedGuestPaths() => _resolvedGuestPaths.Clear();
+    internal static void InvalidateResolvedGuestPaths()
+    {
+        _resolvedGuestPaths.Clear();
+        Interlocked.Exchange(ref _resolvedGuestPathCount, 0);
+    }
 
     // Every mount root a built-in branch can use. Resolution depends on nothing else
     // that changes at runtime (the mount table clears the cache itself), so a memoized
@@ -4806,9 +4813,11 @@ public static partial class KernelMemoryCompatExports
         var resolved = ResolveGuestPathUncached(guestPath);
         // Only a successful resolution is memoized: a denial is a containment
         // decision about the host filesystem's current shape, so it stays live.
-        if (!string.IsNullOrEmpty(resolved) && _resolvedGuestPaths.Count < ResolvedGuestPathCacheLimit)
+        if (!string.IsNullOrEmpty(resolved) &&
+            Volatile.Read(ref _resolvedGuestPathCount) < ResolvedGuestPathCacheLimit &&
+            _resolvedGuestPaths.TryAdd(guestPath, (roots, resolved)))
         {
-            _resolvedGuestPaths[guestPath] = (roots, resolved);
+            Interlocked.Increment(ref _resolvedGuestPathCount);
         }
 
         return resolved;
