@@ -60,7 +60,9 @@ public sealed partial class GpuCommandInterpreter
                     throw _host.Fatal("The predication address is zero.");
                 }
 
-                if (waitOperation != 0)
+                // Draining costs the whole host queue, so only pay for it when the answer is used:
+                // kWaitForQueryResults (0), and only while the predicate is honoured at all.
+                if (waitOperation != 0 || !HonorPredication)
                 {
                     // The results are outstanding while work is queued behind this packet, and
                     // the game asked for the packets to run unpredicated in that case.

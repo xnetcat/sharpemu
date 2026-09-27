@@ -80,7 +80,7 @@ public sealed partial class GpuCommandInterpreter
     // dropped. Conditional rendering is only ever an optimization: running the work always paints
     // the right picture, so the default is to run it. SHARPEMU_PREDICATION=skip restores honouring
     // the predicate, for measuring what it would have removed.
-    private static readonly bool HonorPredication =
+    internal static bool HonorPredication { get; set; } =
         string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_PREDICATION"), "skip", StringComparison.Ordinal);
 
     private static long _predicatedPackets;
