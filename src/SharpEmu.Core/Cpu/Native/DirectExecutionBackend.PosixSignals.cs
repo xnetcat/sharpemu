@@ -5,6 +5,7 @@ using System;
 using System.Runtime.InteropServices;
 using System.Threading;
 using SharpEmu.HLE;
+using SharpEmu.HLE.GpuMemory;
 
 namespace SharpEmu.Core.Cpu.Native;
 
@@ -252,6 +253,17 @@ public sealed unsafe partial class DirectExecutionBackend
 				return;
 			}
 
+			// GPU-tracked pages fault on every first CPU access after the GPU or an upload used them,
+			// thousands of times a second in a frame. Resolving them needs only the address and the
+			// access kind, so they skip the Win64 context conversion and the other handlers.
+			if (PosixGpuFaultFastPath && !_posixSignalWarmup &&
+				(signal == PosixSigSegv || signal == PosixSigBus) &&
+				siginfo != 0 &&
+				TryResolvePosixGpuFault(siginfo, ucontext))
+			{
+				return;
+			}
+
 			if (TryHandlePosixFault(signal, siginfo, ucontext))
 			{
 				return;
@@ -284,6 +296,28 @@ public sealed unsafe partial class DirectExecutionBackend
 		}
 
 		ChainPreviousPosixAction(signal, siginfo, ucontext);
+	}
+
+	private static readonly bool PosixGpuFaultFastPath =
+		Environment.GetEnvironmentVariable("SHARPEMU_POSIX_GPU_FAULT_FAST_PATH") != "0";
+
+	private static bool TryResolvePosixGpuFault(nint siginfo, nint ucontext)
+	{
+		byte* registers = GetPosixRegisterBase(ucontext);
+		if (registers == null)
+		{
+			return false;
+		}
+
+		ulong faultAddress = GetPosixFaultAddress(siginfo, registers);
+		ulong rip = *(ulong*)(registers + PosixRegisterOffsets[16]);
+		var kind = GetPosixAccessType(registers, faultAddress, rip) switch
+		{
+			0 => FaultKind.Read,
+			1 => FaultKind.Write,
+			_ => FaultKind.Unknown,
+		};
+		return kind != FaultKind.Unknown && GuestGpuMemoryHook.TryResolveFault(kind, faultAddress);
 	}
 
 	private static bool TryHandlePosixFault(int signal, nint siginfo, nint ucontext)
