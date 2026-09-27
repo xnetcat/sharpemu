@@ -96,6 +96,17 @@ public sealed class AvPlayerPlaybackTests
         Assert.Equal(1, playback.IsActive());
     }
 
+    [Fact]
+    public void ALoadedSourceIsActiveBeforePlaybackStarts()
+    {
+        using var playback = new DecodedPlayback(0, 3, 2, 0);
+        playback.SetState("Started", false);
+        Assert.Equal(1, playback.IsActive());
+
+        playback.SetState("Stopped", true);
+        Assert.Equal(0, playback.IsActive());
+    }
+
     private sealed class DecodedPlayback : IDisposable
     {
         private const ulong Handle = 0xA0_0000_2300;
@@ -215,7 +226,7 @@ public sealed class AvPlayerPlaybackTests
         public TValue GetState<TValue>(string propertyName) =>
             (TValue)_player.GetType().GetProperty(propertyName)!.GetValue(_player)!;
 
-        private void SetState(string propertyName, object value) =>
+        public void SetState(string propertyName, object value) =>
             _player.GetType().GetProperty(propertyName)!.SetValue(_player, value);
 
         private void SetArguments()
