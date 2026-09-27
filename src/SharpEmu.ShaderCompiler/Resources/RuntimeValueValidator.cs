@@ -16,6 +16,9 @@ public sealed class RuntimeValueValidator
     private readonly ScalarValue? _activeMask;
     private readonly HashSet<ScalarValue> _visiting = [];
 
+    // The deepest node that failed, and why: the leaf that makes a descriptor unresolvable.
+    public string? FirstFailure { get; private set; }
+
     public RuntimeValueValidator(ScalarValueGraph graph, uint userDataBase, uint userDataCount, int tableReadCount, ScalarValue? activeMask = null)
     {
         _graph = graph;
@@ -67,7 +70,13 @@ public sealed class RuntimeValueValidator
 
         try
         {
-            return ValidateNode(value);
+            var valid = ValidateNode(value);
+            if (!valid && FirstFailure is null)
+            {
+                FirstFailure = DescribeFailure(value);
+            }
+
+            return valid;
         }
         finally
         {
@@ -166,6 +175,19 @@ public sealed class RuntimeValueValidator
 
         return true;
     }
+
+    private string DescribeFailure(ScalarValue value) => value.Kind switch
+    {
+        ScalarValueKind.UserData =>
+            $"user data s{value.UserDataRegister} is outside the declared range s{_userDataBase}..s{_userDataBase + _userDataCount - 1}",
+        ScalarValueKind.ScalarAddressWord or ScalarValueKind.ScalarBufferWord when !IsRawRead(value) =>
+            $"{value.Kind} read #{value.MemoryIndex} has memory kind " +
+            (value.MemoryIndex < _graph.Memory.Count ? _graph.Memory[value.MemoryIndex].Kind.ToString() : "none"),
+        ScalarValueKind.ResourceTableWord => $"resource table word {value.Payload} of {_tableReadCount}",
+        ScalarValueKind.Operation => $"operation {value.Operation} is not uniform",
+        ScalarValueKind.Phi => "phi without an invariant value",
+        _ => $"{value.Kind} {value}",
+    };
 
     // A raw read is a scalar load whose memory record has the matching scalar kind.
     public bool IsRawRead(ScalarValue value)

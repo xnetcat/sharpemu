@@ -201,6 +201,13 @@ public sealed class ShaderResourcePlan
         }
     }
 
-    public bool ValidateRuntimeValue(ScalarValue value) =>
-        new RuntimeValueValidator(Graph, UserDataBase, UserDataCount, TableReads.Count).Validate(value);
+    public bool ValidateRuntimeValue(ScalarValue value) => ValidateRuntimeValue(value, out _);
+
+    public bool ValidateRuntimeValue(ScalarValue value, out string? failure)
+    {
+        var validator = new RuntimeValueValidator(Graph, UserDataBase, UserDataCount, TableReads.Count);
+        var valid = validator.Validate(value);
+        failure = validator.FirstFailure;
+        return valid;
+    }
 }

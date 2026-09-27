@@ -325,7 +325,8 @@ public sealed partial class ResourceTracker
             throw Failure(
                 pc,
                 $"{expected} dword {badDword} is not a valid runtime value " +
-                $"({source.Dwords[badDword].Type}: {source.Dwords[badDword]})");
+                $"({source.Dwords[badDword].Type}: {source.Dwords[badDword]}): " +
+                (_plan.ValidateRuntimeValue(source.Dwords[badDword], out var why) ? "valid on recheck" : why));
         }
 
         return InternSource(source);
