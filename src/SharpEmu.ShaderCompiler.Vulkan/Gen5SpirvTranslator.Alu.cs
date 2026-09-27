@@ -5447,15 +5447,6 @@ public static partial class Gen5SpirvTranslator
         private uint BroadcastFirstWave64Active(uint value)
         {
             var lane = GuestWaveLane();
-            EmitConditional(
-                _module.AddInstruction(
-                    SpirvOp.IEqual,
-                    _boolType,
-                    lane,
-                    UInt(0)),
-                () => Store(WaveBroadcastScratchPointer(), UInt(0)));
-            EmitWave64Barrier();
-
             var activeMask = BooleanToWaveMask(Load(_boolType, _exec));
             var lowMask = _module.AddInstruction(
                 SpirvOp.UConvert,
@@ -5482,6 +5473,7 @@ public static partial class Gen5SpirvTranslator
                     hasHigh,
                     firstHigh,
                     UInt(0)));
+            var slot = BeginWave64Exchange();
             var isFirst = _module.AddInstruction(
                 SpirvOp.IEqual,
                 _boolType,
@@ -5497,11 +5489,18 @@ public static partial class Gen5SpirvTranslator
                         _boolType,
                         hasLow,
                         hasHigh)),
-                () => Store(WaveBroadcastScratchPointer(), value));
+                () => Store(WaveBroadcastScratchPointer(slot), value));
             EmitWave64Barrier();
-            var result = Load(_uintType, WaveBroadcastScratchPointer());
-            EmitWave64Barrier();
-            return result;
+            var result = Load(_uintType, WaveBroadcastScratchPointer(slot));
+            EndWave64Exchange();
+
+            // The mask is uniform, so with no active lane every invocation skips the slot.
+            return _module.AddInstruction(
+                SpirvOp.Select,
+                _uintType,
+                _module.AddInstruction(SpirvOp.LogicalOr, _boolType, hasLow, hasHigh),
+                result,
+                UInt(0));
         }
 
         private void StoreCarryOut(
@@ -5544,10 +5543,11 @@ public static partial class Gen5SpirvTranslator
                 // Read it even when the guest execution mask disables that lane.
                 var isSelectedLane = _module.AddInstruction(
                     SpirvOp.IEqual, _boolType, GuestWaveLane(), selectedLane);
-                EmitConditional(isSelectedLane, () => Store(WaveBroadcastScratchPointer(), sourceValue));
+                var slot = BeginWave64Exchange();
+                EmitConditional(isSelectedLane, () => Store(WaveBroadcastScratchPointer(slot), sourceValue));
                 EmitWave64Barrier();
-                var broadcast = Load(_uintType, WaveBroadcastScratchPointer());
-                EmitWave64Barrier();
+                var broadcast = Load(_uintType, WaveBroadcastScratchPointer(slot));
+                EndWave64Exchange();
                 StoreS(destination, broadcast);
             }
             else if (_subgroupInvocationIdInput != 0)

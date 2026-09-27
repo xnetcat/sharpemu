@@ -152,8 +152,9 @@ public static partial class Gen5SpirvTranslator
         private uint _subgroupInvocationIdInput;
         private uint _waveMaskScratch;
         private uint _waveMaskScratchElementPointer;
-        private uint _waveBroadcastScratch;
         private bool _waveScratchInLds;
+        private uint _waveScratchSlots = 1;
+        private uint _waveScratchSlotCounter;
         private uint _glsl;
 
         private enum ImageComponentKind
@@ -627,36 +628,51 @@ public static partial class Gen5SpirvTranslator
             // Metal exposes 32 KiB of threadgroup memory on the Apple GPUs we
             // target. Some PS5 compute shaders legitimately request all of it,
             // so allocating another workgroup variable for the wave64 bridge
-            // makes pipeline creation fail. Reuse the final three dwords of the
+            // makes pipeline creation fail. Reuse the final dwords of the
             // existing LDS allocation in that case. The translator already
             // bounds guest LDS accesses to this fixed allocation; keeping the
             // bridge inside it preserves the host limit and still provides the
             // cross-subgroup rendezvous needed to model one 64-lane guest wave.
+            // Each exchange writes a slot, crosses one barrier and reads it back. With two slots used
+            // alternately a slot is rewritten only after the next exchange's barrier, which every
+            // invocation reaches after its previous read, so no trailing barrier is needed. Inside a
+            // guest LDS allocation that leaves no room for the second slot, fall back to one slot.
             if (_lds != 0)
             {
                 _waveScratchInLds = true;
                 _waveMaskScratchElementPointer = _ldsElementPointer;
-                return;
+                var allocated = _request.LocalDataShareDwords;
+                if (_stage == Gen5SpirvStage.Compute &&
+                    allocated != 0 &&
+                    _ldsDwordCount >= allocated + 2 * WaveScratchSlotDwords)
+                {
+                    _waveScratchSlots = 2;
+                }
+            }
+            else
+            {
+                _waveScratchSlots = 2;
+                var scratchArrayType = _module.TypeArray(_uintType, 2 * WaveScratchSlotDwords);
+                var scratchArrayPointer =
+                    _module.TypePointer(SpirvStorageClass.Workgroup, scratchArrayType);
+                _waveMaskScratchElementPointer =
+                    _module.TypePointer(SpirvStorageClass.Workgroup, _uintType);
+                _waveMaskScratch = _module.AddGlobalVariable(
+                    scratchArrayPointer,
+                    SpirvStorageClass.Workgroup);
+                _module.AddName(_waveMaskScratch, "wave64ExchangeScratch");
+                _interfaces.Add(_waveMaskScratch);
             }
 
-            var maskArrayType = _module.TypeArray(_uintType, 2);
-            var maskArrayPointer =
-                _module.TypePointer(SpirvStorageClass.Workgroup, maskArrayType);
-            _waveMaskScratchElementPointer =
-                _module.TypePointer(SpirvStorageClass.Workgroup, _uintType);
-            _waveMaskScratch = _module.AddGlobalVariable(
-                maskArrayPointer,
-                SpirvStorageClass.Workgroup);
-            _module.AddName(_waveMaskScratch, "wave64MaskScratch");
-            _interfaces.Add(_waveMaskScratch);
-
-            var uintPointer =
-                _module.TypePointer(SpirvStorageClass.Workgroup, _uintType);
-            _waveBroadcastScratch = _module.AddGlobalVariable(
-                uintPointer,
-                SpirvStorageClass.Workgroup);
-            _module.AddName(_waveBroadcastScratch, "wave64BroadcastScratch");
-            _interfaces.Add(_waveBroadcastScratch);
+            if (_waveScratchSlots == 2)
+            {
+                _waveScratchSlotCounter = _module.AddGlobalVariable(
+                    _privateUintPointer,
+                    SpirvStorageClass.Private,
+                    _module.Constant(_uintType, 0));
+                _module.AddName(_waveScratchSlotCounter, "wave64ExchangeSlot");
+                _interfaces.Add(_waveScratchSlotCounter);
+            }
         }
 
         // Threadgroup memory bounds how many workgroups a Metal core keeps resident: declaring the
@@ -2100,11 +2116,12 @@ public static partial class Gen5SpirvTranslator
             uint broadcast;
             if (_emulateWave64)
             {
+                var slot = BeginWave64Exchange();
                 EmitConditional(isFirstActive, () =>
-                    Store(WaveBroadcastScratchPointer(), firstValue));
+                    Store(WaveBroadcastScratchPointer(slot), firstValue));
                 EmitWave64Barrier();
-                broadcast = Load(_uintType, WaveBroadcastScratchPointer());
-                EmitWave64Barrier();
+                broadcast = Load(_uintType, WaveBroadcastScratchPointer(slot));
+                EndWave64Exchange();
             }
             else
             {
@@ -7010,9 +7027,10 @@ public static partial class Gen5SpirvTranslator
                     subgroupLane,
                     UInt(0));
                 var half = ShiftRightLogical(GuestWaveLane(), UInt(5));
+                var slot = BeginWave64Exchange();
                 EmitConditional(firstLane, () =>
                 {
-                    Store(WaveMaskScratchPointer(half), low);
+                    Store(WaveMaskScratchPointer(slot, half), low);
 
                     var nativeWave64 = _module.AddInstruction(
                         SpirvOp.UGreaterThanEqual,
@@ -7021,16 +7039,16 @@ public static partial class Gen5SpirvTranslator
                         UInt(64));
                     EmitConditional(nativeWave64, () =>
                     {
-                        Store(WaveMaskScratchPointer(UInt(1)), high);
+                        Store(WaveMaskScratchPointer(slot, UInt(1)), high);
                     });
                 });
                 EmitWave64Barrier();
                 var lowMask = Load(
                     _uintType,
-                    WaveMaskScratchPointer(UInt(0)));
+                    WaveMaskScratchPointer(slot, UInt(0)));
                 var highMask = Load(
                     _uintType,
-                    WaveMaskScratchPointer(UInt(1)));
+                    WaveMaskScratchPointer(slot, UInt(1)));
                 var combined = BitwiseOr64(
                     _module.AddInstruction(
                         SpirvOp.UConvert,
@@ -7042,7 +7060,7 @@ public static partial class Gen5SpirvTranslator
                             _ulongType,
                             highMask),
                         _module.Constant64(_ulongType, 32)));
-                EmitWave64Barrier();
+                EndWave64Exchange();
                 return combined;
             }
 
@@ -7066,21 +7084,51 @@ public static partial class Gen5SpirvTranslator
                 widened);
         }
 
-        private uint WaveMaskScratchPointer(uint index) =>
-            _module.AddInstruction(
+        // A wave64 exchange slot is [mask low, mask high, broadcast].
+        private const uint WaveScratchSlotDwords = 3;
+
+        // Picks the slot the next exchange uses; every invocation runs the same exchanges in
+        // the same order, so the counter stays uniform across the workgroup.
+        private uint BeginWave64Exchange()
+        {
+            if (_waveScratchSlots == 1)
+            {
+                return UInt(0);
+            }
+
+            var slot = Load(_uintType, _waveScratchSlotCounter);
+            Store(_waveScratchSlotCounter, BitwiseXor(slot, UInt(1)));
+            return IMul(slot, UInt(WaveScratchSlotDwords));
+        }
+
+        private void EndWave64Exchange()
+        {
+            if (_waveScratchSlots == 1)
+            {
+                EmitWave64Barrier();
+            }
+        }
+
+        private uint WaveScratchPointer(uint slotBase, uint offset)
+        {
+            var index = IAdd(slotBase, offset);
+            if (_waveScratchInLds)
+            {
+                index = IAdd(UInt(_ldsDwordCount - _waveScratchSlots * WaveScratchSlotDwords), index);
+            }
+
+            return _module.AddInstruction(
                 SpirvOp.AccessChain,
                 _waveMaskScratchElementPointer,
                 _waveScratchInLds ? _lds : _waveMaskScratch,
-                _waveScratchInLds ? IAdd(UInt(_ldsDwordCount - 3), index) : index);
+                index);
+        }
 
-        private uint WaveBroadcastScratchPointer() =>
-            _waveScratchInLds
-                ? _module.AddInstruction(
-                    SpirvOp.AccessChain,
-                    _ldsElementPointer,
-                    _lds,
-                    UInt(_ldsDwordCount - 1))
-                : _waveBroadcastScratch;
+        private uint WaveMaskScratchPointer(uint slotBase, uint half) =>
+            WaveScratchPointer(slotBase, half);
+
+        private uint WaveBroadcastScratchPointer(uint slotBase) =>
+            WaveScratchPointer(slotBase, UInt(2));
 
         private void EmitWave64Barrier()
         {

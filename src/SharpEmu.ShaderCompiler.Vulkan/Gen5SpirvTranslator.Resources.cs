@@ -1606,10 +1606,11 @@ public static partial class Gen5SpirvTranslator
             uint broadcast;
             if (_emulateWave64)
             {
-                EmitConditional(isFirstActive, () => Store(WaveBroadcastScratchPointer(), firstValue));
+                var slot = BeginWave64Exchange();
+                EmitConditional(isFirstActive, () => Store(WaveBroadcastScratchPointer(slot), firstValue));
                 EmitWave64Barrier();
-                broadcast = Load(_uintType, WaveBroadcastScratchPointer());
-                EmitWave64Barrier();
+                broadcast = Load(_uintType, WaveBroadcastScratchPointer(slot));
+                EndWave64Exchange();
             }
             else if (_stage == Gen5SpirvStage.Compute || _enableGraphicsSubgroupOperations)
             {
