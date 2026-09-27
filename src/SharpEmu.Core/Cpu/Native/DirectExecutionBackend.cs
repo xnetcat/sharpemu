@@ -981,6 +981,38 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			$"import={entry.Export?.Name ?? entry.Nid} thread='{Thread.CurrentThread.Name}'");
 	}
 
+	[ThreadStatic] private static bool _signalStackReported;
+
+	// Called from the POSIX signal handler. Reports once per thread when the handler
+	// is entered on a stack the runtime does not know about, or with less than 1 MiB
+	// left, because the managed recovery that follows needs room on that same stack.
+	internal unsafe static void ReportSignalStackPosition(int signal, ulong interruptedRsp)
+	{
+		if (_signalStackReported || !OperatingSystem.IsMacOS())
+		{
+			return;
+		}
+
+		byte probe = 0;
+		var here = (nint)(&probe);
+		var self = MacPthreadSelf();
+		var top = MacPthreadStackAddress(self);
+		var limit = top - (nint)MacPthreadStackSize(self);
+		var onKnownStack = here >= limit && here <= top;
+		var headroom = here - limit;
+		if (onKnownStack && headroom > 1024 * 1024)
+		{
+			return;
+		}
+
+		_signalStackReported = true;
+		Console.Error.WriteLine(
+			$"[LOADER][ERROR] Signal handler on a tight or foreign stack: sig={signal} " +
+			$"handler_rsp~0x{here:X} interrupted_rsp=0x{interruptedRsp:X16} " +
+			$"stack=[0x{limit:X}..0x{top:X}] headroom={headroom} on_known_stack={onKnownStack} " +
+			$"thread='{Thread.CurrentThread.Name}'");
+	}
+
 	private unsafe static void ReportGuestEntryDepth(int depth)
 	{
 		byte probe = 0;
