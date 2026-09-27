@@ -939,7 +939,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	private static extern nuint MacPthreadStackSize(nint thread);
 
 	[ThreadStatic] private static nint _guestEntryStackLimit;
+	[ThreadStatic] private static nint _guestEntryStackTop;
 	[ThreadStatic] private static nint _guestEntryLowWater;
+	[ThreadStatic] private static bool _guestEntryStackReported;
 
 	// The deepest point of the host stack during guest execution is inside an import,
 	// so the low-water mark is sampled there: a host stack that is genuinely being
@@ -949,7 +951,26 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		byte probe = 0;
 		var here = (nint)(&probe);
 		var limit = _guestEntryStackLimit;
-		if (limit == 0 || here >= _guestEntryLowWater - (256 * 1024))
+		if (limit == 0)
+		{
+			return;
+		}
+
+		// An import that runs with RSP outside the executor thread's stack is the
+		// real failure behind the "Stack overflow" abort: the runtime's stack probe
+		// compares against these bounds, so a stale or guest-side RSP trips it even
+		// though nothing is exhausted.
+		if ((here < limit || here > _guestEntryStackTop) && !_guestEntryStackReported)
+		{
+			_guestEntryStackReported = true;
+			Console.Error.WriteLine(
+				$"[LOADER][ERROR] Import dispatched off the executor stack: rsp~0x{here:X} " +
+				$"stack=[0x{limit:X}..0x{_guestEntryStackTop:X}] depth={_guestEntryDepth} " +
+				$"import={entry.Export?.Name ?? entry.Nid} thread='{Thread.CurrentThread.Name}'");
+			return;
+		}
+
+		if (here >= _guestEntryLowWater - (256 * 1024))
 		{
 			return;
 		}
@@ -958,6 +979,38 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		Console.Error.WriteLine(
 			$"[LOADER][WARN] Host stack low water: headroom={here - limit} depth={_guestEntryDepth} " +
 			$"import={entry.Export?.Name ?? entry.Nid} thread='{Thread.CurrentThread.Name}'");
+	}
+
+	[ThreadStatic] private static bool _signalStackReported;
+
+	// Called from the POSIX signal handler. Reports once per thread when the handler
+	// is entered on a stack the runtime does not know about, or with less than 1 MiB
+	// left, because the managed recovery that follows needs room on that same stack.
+	internal unsafe static void ReportSignalStackPosition(int signal, ulong interruptedRsp)
+	{
+		if (_signalStackReported || !OperatingSystem.IsMacOS())
+		{
+			return;
+		}
+
+		byte probe = 0;
+		var here = (nint)(&probe);
+		var self = MacPthreadSelf();
+		var top = MacPthreadStackAddress(self);
+		var limit = top - (nint)MacPthreadStackSize(self);
+		var onKnownStack = here >= limit && here <= top;
+		var headroom = here - limit;
+		if (onKnownStack && headroom > 1024 * 1024)
+		{
+			return;
+		}
+
+		_signalStackReported = true;
+		Console.Error.WriteLine(
+			$"[LOADER][ERROR] Signal handler on a tight or foreign stack: sig={signal} " +
+			$"handler_rsp~0x{here:X} interrupted_rsp=0x{interruptedRsp:X16} " +
+			$"stack=[0x{limit:X}..0x{top:X}] headroom={headroom} on_known_stack={onKnownStack} " +
+			$"thread='{Thread.CurrentThread.Name}'");
 	}
 
 	private unsafe static void ReportGuestEntryDepth(int depth)
@@ -973,7 +1026,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		{
 			// pthread_get_stackaddr_np returns the HIGH end of the stack.
 			var self = MacPthreadSelf();
-			_guestEntryStackLimit = MacPthreadStackAddress(self) - (nint)MacPthreadStackSize(self);
+			_guestEntryStackTop = MacPthreadStackAddress(self);
+			_guestEntryStackLimit = _guestEntryStackTop - (nint)MacPthreadStackSize(self);
 			_guestEntryLowWater = here;
 			Console.Error.WriteLine(
 				$"[LOADER][INFO] Guest executor stack: thread='{Thread.CurrentThread.Name}' " +
