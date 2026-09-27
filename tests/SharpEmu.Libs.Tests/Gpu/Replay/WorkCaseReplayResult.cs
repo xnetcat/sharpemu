@@ -12,6 +12,10 @@ public sealed class WorkCaseReplayOptions
 
     // Also write each stage's resource plan and binding layout.
     public bool StageDump { get; init; }
+
+    // Run the work this many more times after the recorded replay, each drained on its own, and
+    // report the host-clock time per run: GPU timestamps are not trustworthy on MoltenVK.
+    public int TimeRepeats { get; init; }
 }
 
 // How one replayed target compares with what the capture recorded after the work ran.

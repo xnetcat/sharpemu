@@ -9,12 +9,16 @@ using SharpEmu.Libs.Tests.Gpu.Replay;
 var cases = new List<string>();
 string? output = null;
 var stageDump = false;
+var timeRepeats = 0;
 for (var index = 0; index < args.Length; index++)
 {
     switch (args[index])
     {
         case "--stage-dump":
             stageDump = true;
+            break;
+        case "--time" when index + 1 < args.Length:
+            timeRepeats = int.Parse(args[++index], System.Globalization.CultureInfo.InvariantCulture);
             break;
         case "--out" when index + 1 < args.Length:
             output = args[++index];
@@ -76,6 +80,7 @@ foreach (var directory in directories)
         {
             OutputDirectory = output,
             StageDump = stageDump,
+            TimeRepeats = timeRepeats,
         });
         Console.WriteLine(result.Describe());
         Console.WriteLine($"  output: {result.OutputDirectory}");
@@ -106,6 +111,7 @@ static void Usage()
 
           --stage-dump  also write each stage's descriptor words and user scalars
           --out <dir>   write one case's output here instead of <case>/replay
+          --time <n>    run the work n more times, drained one by one, and print host-clock times
 
         Capture cases from a running game with:
           SHARPEMU_CAPTURE_WORK=0x<program-hash>[@N] SHARPEMU_CAPTURE_DIR=<dir> ...

@@ -72,6 +72,7 @@ internal sealed class PresenterUnderTest : IDisposable
         HostBuffers = new VulkanHostBufferPool(128UL * 1024 * 1024, allocation => InvokeMethod("DestroyHostBufferAllocation", allocation));
         SetField("_hostBufferPool", HostBuffers);
         SetField("_maxColorAttachments", 8u);
+        SetField("_minStorageBufferOffsetAlignment", vulkan.DeviceInfo.MinStorageBufferOffsetAlignment);
         SetField("_renderHostLimits", new RenderHostLimits(16384, 16384, 16384, 16384));
         foreach (var name in new[]
         {
@@ -82,6 +83,20 @@ internal sealed class PresenterUnderTest : IDisposable
         {
             var field = PresenterType.GetField(name, InstanceMembers)!;
             field.SetValue(Instance, Activator.CreateInstance(field.FieldType, nonPublic: true));
+        }
+
+        // The presenter is built without its constructor, so every collection it initializes inline
+        // is still null; create the remaining ones so a newly added field cannot break the harness.
+        foreach (var field in PresenterType.GetFields(InstanceMembers))
+        {
+            if (field.GetValue(Instance) == null &&
+                field.FieldType.IsGenericType &&
+                field.FieldType.Namespace == "System.Collections.Generic" &&
+                !field.FieldType.IsInterface &&
+                field.FieldType.GetConstructor(Type.EmptyTypes) != null)
+            {
+                field.SetValue(Instance, Activator.CreateInstance(field.FieldType));
+            }
         }
 
         forwarder.Target = this;

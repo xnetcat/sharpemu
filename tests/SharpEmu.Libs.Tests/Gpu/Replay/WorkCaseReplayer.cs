@@ -82,6 +82,28 @@ public static class WorkCaseReplayer
         {
             presenter.Run(() => Execute(executor, manifest, banks));
             presenter.Run(() => presenter.InvokeMethod("FlushBatchedGuestCommands"));
+            if (options.TimeRepeats > 0)
+            {
+                harness.Finish();
+                var times = new List<double>(options.TimeRepeats);
+                var recordTimes = new List<double>(options.TimeRepeats);
+                for (var repeat = 0; repeat < options.TimeRepeats; repeat++)
+                {
+                    var start = System.Diagnostics.Stopwatch.GetTimestamp();
+                    presenter.Run(() => Execute(executor, manifest, banks));
+                    recordTimes.Add(System.Diagnostics.Stopwatch.GetElapsedTime(start).TotalMilliseconds);
+                    start = System.Diagnostics.Stopwatch.GetTimestamp();
+                    presenter.Run(() => presenter.InvokeMethod("FlushBatchedGuestCommands"));
+                    harness.Finish();
+                    times.Add(System.Diagnostics.Stopwatch.GetElapsedTime(start).TotalMilliseconds);
+                }
+
+                times.Sort();
+                recordTimes.Sort();
+                result.Notes.Add(
+                    $"gpu_ms min={times[0]:F3} median={times[times.Count / 2]:F3} max={times[^1]:F3} " +
+                    $"record_ms median={recordTimes[recordTimes.Count / 2]:F3} runs={times.Count}");
+            }
         }
         catch (Exception exception)
         {
@@ -89,6 +111,10 @@ public static class WorkCaseReplayer
             // of taking the process down: the whole point of a case is to be looked at.
             result.Notes.Add($"the work did not run: {exception.Message}");
             Console.Error.WriteLine($"[REPLAY][ERROR] {result.Notes[^1]}");
+            if (Environment.GetEnvironmentVariable("SHARPEMU_REPLAY_STACKS") == "1")
+            {
+                Console.Error.WriteLine(exception);
+            }
         }
         finally
         {
