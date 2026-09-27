@@ -205,6 +205,7 @@ public sealed class ComputeInputInfo
 // The four buffer resource words as the guest writes them.
 public readonly record struct BufferDescriptorWords(uint Word0, uint Word1, uint Word2, uint Word3)
 {
+    public const uint Format32UInt = 20;
     public const uint Format32x4UInt = 75;
 
     public static BufferDescriptorWords From(ReadOnlySpan<uint> words) => new(words[0], words[1], words[2], words[3]);
