@@ -138,6 +138,15 @@ public sealed class ShaderCompileRequest
     public uint NggParamCount { get; init; }
     public uint ScratchDwords { get; init; }
     public bool EnableGraphicsSubgroupOperations { get; init; } = true;
+
+    // True only when the host measured GLSL UnpackHalf2x16 / PackHalf2x16 to be bit-exact
+    // against the emulator's own f16 conversion on this device, for every half bit pattern
+    // and every rounding boundary. The packed-f16 paths then convert with those two ext
+    // instructions instead of the branchless integer sequences, which is what a driver
+    // lowers to one hardware convert. Default false: the spec leaves f16 rounding and
+    // subnormal behaviour to the implementation, so the exact emulation is the only safe
+    // default and native is opted into by a device probe, never by a capability bit.
+    public bool NativeHalfConversionExact { get; init; }
     public Gen5ComputeSystemRegisters? ComputeSystemRegisters { get; init; }
 
     public IReadOnlyList<Gen5PixelOutputBinding> PixelOutputs { get; init; } = [];
