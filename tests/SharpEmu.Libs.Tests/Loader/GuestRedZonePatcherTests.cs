@@ -24,6 +24,21 @@ public sealed class GuestRedZonePatcherTests
         Assert.Equal(expected, GuestRedZonePatcher.UsesRedZone(instruction));
     }
 
+    // After 'push rbp; mov rbp, rsp' and five more pushes, RSP = RBP - 0x28: [rbp-0x30] is below
+    // RSP inside the red zone, [rbp-0x28] is the last pushed register, [rbp-0xB0] is below the zone.
+    [Theory]
+    [InlineData(new byte[] { 0x48, 0x89, 0x45, 0xD0 }, 0x28, true)]
+    [InlineData(new byte[] { 0x48, 0x89, 0x45, 0xD8 }, 0x28, false)]
+    [InlineData(new byte[] { 0x48, 0x89, 0x85, 0x50, 0xFF, 0xFF, 0xFF }, 0x28, false)]
+    [InlineData(new byte[] { 0x48, 0x89, 0x45, 0xD0 }, -1, false)]
+    [InlineData(new byte[] { 0x48, 0x89, 0x44, 0x24, 0xD0 }, 0x28, false)]
+    public void RecognizesFramePointerSpillsBelowTheStackPointer(byte[] instructionBytes, int frameDelta, bool expected)
+    {
+        var instruction = Decode(instructionBytes);
+
+        Assert.Equal(expected, GuestRedZonePatcher.UsesFramePointerRedZone(instruction, frameDelta));
+    }
+
     [Fact]
     public void RelocatesOnlyOrdinaryNonStackMemoryInstructions()
     {
