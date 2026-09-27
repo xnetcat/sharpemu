@@ -28,6 +28,7 @@ public sealed partial class RenderExecutor
     private static readonly string? DrainAroundNggMode = Environment.GetEnvironmentVariable("SHARPEMU_DIAG_DRAIN_AROUND_NGG");
     private static readonly bool DrainBeforeNgg = DrainAroundNggMode is "1" or "pre";
     private static readonly bool DrainAfterNgg = DrainAroundNggMode is "1" or "post";
+    private static readonly bool FlushAfterNgg = DrainAroundNggMode is "flush";
 
     private readonly record struct NggReplay(uint ParamCount, ulong Input, ulong Output);
 
@@ -241,6 +242,12 @@ public sealed partial class RenderExecutor
             _host.BindPipeline(PipelineBindPoint.Compute, in pipeline);
             _host.Dispatch((uint)subgroupCount, 1, 1);
             _host.ShaderAccessBarrier();
+            if (FlushAfterNgg && VideoOut.SerialComputeProfile.Scheduler is not null)
+            {
+                VideoOut.SerialComputeProfile.Scheduler!.Flush();
+                Console.Error.WriteLine($"[DIAG] ngg post-flush #{traceId}");
+            }
+
             if (DrainAfterNgg && VideoOut.SerialComputeProfile.Scheduler is not null)
             {
                 VideoOut.SerialComputeProfile.Scheduler!.Finish();
