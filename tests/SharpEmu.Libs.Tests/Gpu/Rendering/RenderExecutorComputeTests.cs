@@ -194,6 +194,37 @@ public sealed class RenderExecutorComputeTests : IDisposable
         Assert.Null(_executor.TryDecodeImageClear(input, 256, 1, 1, ClearInitiator));
     }
 
+    // AGC's fill kernel: s_buffer_load_dword the value from a one-record buffer, store it per thread.
+    private void ConfigureLoadedValueFill(uint records, ulong valueAddress, uint value)
+    {
+        Span<byte> bytes = stackalloc byte[sizeof(uint)];
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(bytes, value);
+        Assert.True(_host.GuestMemory.TryWrite(valueAddress, bytes));
+        var target = BufferDescriptor(MetadataAddress, 4, records, format: BufferDescriptorWords.Format32UInt);
+        var source = BufferDescriptor(valueAddress, 0, 1);
+        var program = Program(ShaderStageKind.Compute, buffers:
+        [
+            new BufferResourceInfo(Read: true, Written: false, Atomic: false, Formatted: false, Scalar: true, MaxByteExtent: 4, PackedStride: 0),
+            ClearResource(maxByteExtent: 4, packedStride: 4),
+        ]);
+        _pipelines.Compute = ComputeProgram(Stage(program, buffers: [source, target], userData: [.. target, .. source]));
+    }
+
+    [Fact]
+    public void LoadedValueFill_DecodesWithTheValueReadFromItsSourceBuffer()
+    {
+        const ulong valueAddress = RecordingRenderHost.MemoryBase + 0x70_0000;
+        ConfigureLoadedValueFill(128 * 64, valueAddress, 0x4040_4040);
+
+        var clear = _executor.TryDecodeImageClear(_pipelines.Compute.Input, 128, 1, 1, 0x41);
+        Assert.NotNull(clear);
+        Assert.Equal((MetadataAddress, 0x4040_4040u, 0x8000ul), (clear.Value.Descriptor.Address, clear.Value.PackedClear, clear.Value.Size));
+
+        // The dispatch must cover exactly one record per thread.
+        Assert.Null(_executor.TryDecodeImageClear(_pipelines.Compute.Input, 127, 1, 1, 0x41));
+        Assert.Null(_executor.TryDecodeImageClear(_pipelines.Compute.Input, 128, 2, 1, 0x41));
+    }
+
     [Fact]
     public void DifferentPatternDwords_RefuseTheClearAndRunTheDispatch()
     {
