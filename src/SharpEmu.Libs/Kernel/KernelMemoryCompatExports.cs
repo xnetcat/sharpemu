@@ -1807,7 +1807,10 @@ public static partial class KernelMemoryCompatExports
         var seconds = (double)ticks / System.Diagnostics.Stopwatch.Frequency;
         Console.Error.WriteLine(
             $"[LOADER][INFO] apr_resolve: calls={calls} paths={paths} paths_per_call={(double)paths / Math.Max(calls, 1):F1} " +
-            $"total_s={seconds:F1} us_per_path={(seconds * 1e6) / Math.Max(paths, 1):F1}");
+            $"total_s={seconds:F1} us_per_path={(seconds * 1e6) / Math.Max(paths, 1):F1} " +
+            $"size_cache={Interlocked.Read(ref _aprSizeCacheHits)} size_dir={Interlocked.Read(ref _aprSizeDirectoryHits)} " +
+            $"size_stat={Interlocked.Read(ref _aprSizeStatHits)} size_miss={Interlocked.Read(ref _aprSizeMisses)} " +
+            $"size_negative={Interlocked.Read(ref _aprSizeNegativeHits)}");
     }
 
 
@@ -6885,6 +6888,24 @@ public static partial class KernelMemoryCompatExports
         return TryWriteHostPathStat(ctx, statAddress, hostPath, isDirectory);
     }
 
+    // /app0 is the read-only game image, so a path that is not in it now will not
+    // appear later. Remembering the absent ones turns a repeated pair of host stats
+    // on the (slow, external) game volume into a dictionary probe; Demon's Souls
+    // resolves tens of thousands of paths per boot and misses are the common case.
+    private static readonly ConcurrentDictionary<string, byte> _aprMissingImagePaths = new(HostFsPath.Comparer);
+    private static long _aprSizeCacheHits;
+    private static long _aprSizeDirectoryHits;
+    private static long _aprSizeStatHits;
+    private static long _aprSizeMisses;
+    private static long _aprSizeNegativeHits;
+
+    private static bool IsUnderApp0(string cachePath)
+    {
+        var app0Root = ResolveApp0Root();
+        return !string.IsNullOrWhiteSpace(app0Root) &&
+            cachePath.StartsWith(Path.TrimEndingDirectorySeparator(app0Root) + Path.DirectorySeparatorChar, HostFsPath.Comparison);
+    }
+
     private static bool TryGetAprFileSize(string hostPath, out ulong size)
     {
         size = 0;
@@ -6901,7 +6922,14 @@ public static partial class KernelMemoryCompatExports
 
         if (_aprFileSizeCache.TryGetValue(cachePath, out size))
         {
+            Interlocked.Increment(ref _aprSizeCacheHits);
             return true;
+        }
+
+        if (_aprMissingImagePaths.ContainsKey(cachePath))
+        {
+            Interlocked.Increment(ref _aprSizeNegativeHits);
+            return false;
         }
 
         // One directory listing returns every file's size; titles resolve whole asset
@@ -6921,6 +6949,7 @@ public static partial class KernelMemoryCompatExports
 
             if (_aprFileSizeCache.TryGetValue(cachePath, out size))
             {
+                Interlocked.Increment(ref _aprSizeDirectoryHits);
                 return true;
             }
         }
@@ -6933,11 +6962,18 @@ public static partial class KernelMemoryCompatExports
                 var length = fileInfo.Length;
                 size = length < 0 ? 0UL : unchecked((ulong)length);
                 _aprFileSizeCache.TryAdd(cachePath, size);
+                Interlocked.Increment(ref _aprSizeStatHits);
                 return true;
             }
 
             if (!new DirectoryInfo(cachePath).Exists)
             {
+                Interlocked.Increment(ref _aprSizeMisses);
+                if (IsUnderApp0(cachePath))
+                {
+                    _aprMissingImagePaths.TryAdd(cachePath, 0);
+                }
+
                 return false;
             }
 
