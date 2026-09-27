@@ -307,18 +307,29 @@ public sealed class Gen5ImageTests
             }
 
             Assert.Equal(SpirvOp.Load, value.Opcode);
-            var pointer = FindResult(
-                instructions,
-                SpirvOp.AccessChain,
-                value.Operands[2]);
-            var register = FindResult(
-                instructions,
-                SpirvOp.Constant,
-                pointer.Operands[^1]);
-            result[component] = checked((int)register.Operands[2]);
+            result[component] = VgprIndexOfPointer(instructions, value.Operands[2]);
         }
 
         return result;
+    }
+
+    // A VGPR is either its own Private variable named "v<N>" or an access chain into the register array.
+    private static int VgprIndexOfPointer(IReadOnlyList<ParsedSpirvInstruction> instructions, uint pointerId)
+    {
+        var names = instructions.Where(item =>
+            item.Opcode == SpirvOp.Name && item.Operands.Length > 1 && item.Operands[0] == pointerId).ToArray();
+        if (names.Length == 1)
+        {
+            var name = names[0];
+            var bytes = name.Operands.Skip(1).SelectMany(BitConverter.GetBytes).TakeWhile(static b => b != 0).ToArray();
+            var text = System.Text.Encoding.UTF8.GetString(bytes);
+            Assert.StartsWith("v", text);
+            return int.Parse(text[1..], System.Globalization.CultureInfo.InvariantCulture);
+        }
+
+        var pointer = FindResult(instructions, SpirvOp.AccessChain, pointerId);
+        var register = FindResult(instructions, SpirvOp.Constant, pointer.Operands[^1]);
+        return checked((int)register.Operands[2]);
     }
 
     private static ParsedSpirvInstruction FindValueDefinition(

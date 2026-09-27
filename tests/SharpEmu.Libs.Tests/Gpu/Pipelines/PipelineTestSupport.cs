@@ -87,6 +87,23 @@ internal sealed class FakePipelineHost(ICpuMemory memory) : IShaderPipelineHost
         var handle = _nextHandle++;
         return new PipelineHandle(handle, handle, UsesPushDescriptors: true);
     }
+
+    // How many times each program reports "still compiling" before it is handed over,
+    // standing in for the host shader compiler running on a worker thread.
+    public Dictionary<ulong, int> PendingComputeCompiles { get; } = new();
+
+    public bool TryCreateComputePipeline(ComputePipelineDescription description, out PipelineHandle handle)
+    {
+        handle = default;
+        if (PendingComputeCompiles.TryGetValue(description.Program.Id, out var remaining) && remaining > 0)
+        {
+            PendingComputeCompiles[description.Program.Id] = remaining - 1;
+            return false;
+        }
+
+        handle = CreateComputePipeline(description);
+        return true;
+    }
 }
 
 // Remembers every request; compiles nothing unless a module factory was given.
