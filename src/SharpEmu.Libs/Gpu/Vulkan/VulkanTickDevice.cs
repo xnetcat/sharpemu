@@ -48,6 +48,101 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
 
     public VulkanCommandProfile? CommandProfile { get; }
 
+    // MoltenVK records Metal command buffers with unretained references and signals the timeline
+    // semaphore with a Metal event at the end of each one, which can fire before Metal has finished
+    // with the command buffer. Destroying a resource once its tick signals is valid Vulkan but breaks
+    // Metal's rule that unretained resources outlive the command buffer. On macOS each submission
+    // also signals a fence, which MoltenVK signals from the command buffer's completion handler, and a
+    // tick counts as complete to the host only once its fence has signaled too.
+    // SHARPEMU_FENCE_RETIREMENT=0 reports the timeline value alone.
+    private static readonly bool FenceRetirement = OperatingSystem.IsMacOS() &&
+        Environment.GetEnvironmentVariable("SHARPEMU_FENCE_RETIREMENT") != "0";
+
+    private readonly object _fenceGate = new();
+    private readonly Queue<(ulong Tick, Fence Fence)> _inFlightFences = new();
+    private readonly Stack<Fence> _freeFences = new();
+
+    private Fence TakeFenceLocked()
+    {
+        if (_freeFences.TryPop(out var fence))
+        {
+            return fence;
+        }
+
+        var info = new FenceCreateInfo { SType = StructureType.FenceCreateInfo };
+        RequireSuccess(_vk.CreateFence(_device, &info, null, out fence), "vkCreateFence(scheduler retirement)");
+        return fence;
+    }
+
+    // Retires the leading submissions whose fences signaled; returns the first tick still in flight.
+    private ulong RetireSignaledFencesLocked()
+    {
+        while (_inFlightFences.TryPeek(out var entry))
+        {
+            if (_vk.GetFenceStatus(_device, entry.Fence) != Result.Success)
+            {
+                return entry.Tick;
+            }
+
+            var fence = entry.Fence;
+            RequireSuccess(_vk.ResetFences(_device, 1, &fence), "vkResetFences(scheduler retirement)");
+            _freeFences.Push(fence);
+            _inFlightFences.Dequeue();
+        }
+
+        return ulong.MaxValue;
+    }
+
+    // The timeline value the host may treat as complete.
+    private ulong RetiredValue(ulong timelineValue)
+    {
+        if (!FenceRetirement)
+        {
+            return timelineValue;
+        }
+
+        lock (_fenceGate)
+        {
+            var firstInFlight = RetireSignaledFencesLocked();
+            return firstInFlight == ulong.MaxValue ? timelineValue : Math.Min(timelineValue, firstInFlight - 1);
+        }
+    }
+
+    private bool WaitRetired(ulong tick)
+    {
+        if (!FenceRetirement)
+        {
+            return true;
+        }
+
+        Fence fence = default;
+        lock (_fenceGate)
+        {
+            foreach (var entry in _inFlightFences)
+            {
+                if (entry.Tick > tick)
+                {
+                    break;
+                }
+
+                fence = entry.Fence;
+            }
+        }
+
+        if (fence.Handle == 0)
+        {
+            return true;
+        }
+
+        var result = _vk.WaitForFences(_device, 1, &fence, true, ulong.MaxValue);
+        lock (_fenceGate)
+        {
+            _ = RetireSignaledFencesLocked();
+        }
+
+        return result == Result.Success;
+    }
+
     public object QueueGate { get; }
 
     public ulong TimelineHandle => _timeline.Handle;
@@ -56,7 +151,7 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
     {
         ulong value;
         RequireSuccess(_vk.GetSemaphoreCounterValue(_device, _timeline, &value), "vkGetSemaphoreCounterValue");
-        return value;
+        return RetiredValue(value);
     }
 
     private const ulong HangReportNanoseconds = 10_000_000_000;
@@ -87,7 +182,7 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
             }
         }
         failure = result.ToString();
-        return result == Result.Success;
+        return result == Result.Success && WaitRetired(tick);
     }
 
     public nint[] AllocateBuffers(int count)
@@ -180,7 +275,43 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
                 SignalSemaphoreInfoCount = (uint)bundle.SignalCount,
                 PSignalSemaphoreInfos = signalInfos,
             };
-            var result = _vk.QueueSubmit2(_queue, 1, &submitInfo, default);
+            Fence fence = default;
+            ulong fenceTick = 0;
+            if (FenceRetirement && bundle.SignalCount != 0)
+            {
+                for (var index = 0; index < bundle.SignalCount; index++)
+                {
+                    if (signalSemaphores[index] == _timeline.Handle)
+                    {
+                        fenceTick = Math.Max(fenceTick, signalTicks[index]);
+                    }
+                }
+
+                if (fenceTick != 0)
+                {
+                    lock (_fenceGate)
+                    {
+                        fence = TakeFenceLocked();
+                    }
+                }
+            }
+
+            var result = _vk.QueueSubmit2(_queue, 1, &submitInfo, fence);
+            if (fence.Handle != 0)
+            {
+                lock (_fenceGate)
+                {
+                    if (result == Result.Success)
+                    {
+                        _inFlightFences.Enqueue((fenceTick, fence));
+                    }
+                    else
+                    {
+                        _freeFences.Push(fence);
+                    }
+                }
+            }
+
             if (result == Result.Success)
                 CommandProfile?.MarkSubmitted(buffer);
             failure = result.ToString();
@@ -191,6 +322,22 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
     public void Dispose()
     {
         CommandProfile?.Dispose();
+        lock (_fenceGate)
+        {
+            foreach (var entry in _inFlightFences)
+            {
+                var fence = entry.Fence;
+                _ = _vk.WaitForFences(_device, 1, &fence, true, ulong.MaxValue);
+                _vk.DestroyFence(_device, fence, null);
+            }
+
+            _inFlightFences.Clear();
+            while (_freeFences.TryPop(out var fence))
+            {
+                _vk.DestroyFence(_device, fence, null);
+            }
+        }
+
         _vk.DestroySemaphore(_device, _timeline, null);
         _vk.DestroyCommandPool(_device, _pool, null);
     }
