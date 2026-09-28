@@ -59,7 +59,16 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
         Environment.GetEnvironmentVariable("SHARPEMU_FENCE_RETIREMENT") != "0";
 
     private readonly object _fenceGate = new();
-    private readonly Queue<(ulong Tick, Fence Fence)> _inFlightFences = new();
+    private sealed class InFlightFence(ulong tick, Fence fence)
+    {
+        public readonly ulong Tick = tick;
+        public readonly Fence Fence = fence;
+        // Host threads blocked on the fence; it is reset and pooled only once none are.
+        public int Waiters;
+    }
+
+    private readonly Queue<InFlightFence> _inFlightFences = new();
+    private readonly List<InFlightFence> _retiredWithWaiters = new();
     private readonly Stack<Fence> _freeFences = new();
 
     private Fence TakeFenceLocked()
@@ -74,9 +83,25 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
         return fence;
     }
 
+    private void RecycleLocked(InFlightFence entry)
+    {
+        var fence = entry.Fence;
+        RequireSuccess(_vk.ResetFences(_device, 1, &fence), "vkResetFences(scheduler retirement)");
+        _freeFences.Push(fence);
+    }
+
     // Retires the leading submissions whose fences signaled; returns the first tick still in flight.
     private ulong RetireSignaledFencesLocked()
     {
+        for (var index = _retiredWithWaiters.Count - 1; index >= 0; index--)
+        {
+            if (_retiredWithWaiters[index].Waiters == 0)
+            {
+                RecycleLocked(_retiredWithWaiters[index]);
+                _retiredWithWaiters.RemoveAt(index);
+            }
+        }
+
         while (_inFlightFences.TryPeek(out var entry))
         {
             if (_vk.GetFenceStatus(_device, entry.Fence) != Result.Success)
@@ -84,10 +109,15 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
                 return entry.Tick;
             }
 
-            var fence = entry.Fence;
-            RequireSuccess(_vk.ResetFences(_device, 1, &fence), "vkResetFences(scheduler retirement)");
-            _freeFences.Push(fence);
             _inFlightFences.Dequeue();
+            if (entry.Waiters == 0)
+            {
+                RecycleLocked(entry);
+            }
+            else
+            {
+                _retiredWithWaiters.Add(entry);
+            }
         }
 
         return ulong.MaxValue;
@@ -103,15 +133,20 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
 
         lock (_fenceGate)
         {
+            // Below the oldest in-flight tick the timeline value is already retired; poll fences only
+            // for ticks the timeline reports done.
+            if (!_inFlightFences.TryPeek(out var oldest) || timelineValue < oldest.Tick)
+            {
+                return timelineValue;
+            }
+
             var firstInFlight = RetireSignaledFencesLocked();
             return firstInFlight == ulong.MaxValue ? timelineValue : Math.Min(timelineValue, firstInFlight - 1);
         }
     }
 
-    // Waits until every submission up to the tick has retired. Fences never leave the gate: another
-    // thread may retire and recycle a fence the moment it signals, so waiting on a handle outside the
-    // gate could wait on a reset fence. The completion handler runs just after the timeline signal,
-    // so a short poll replaces the blocking wait.
+    // Waits until every submission up to the tick has retired. The waited fence is counted so no
+    // other thread resets and reuses it while this one blocks on it.
     private bool WaitRetired(ulong tick)
     {
         if (!FenceRetirement)
@@ -119,19 +154,41 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
             return true;
         }
 
-        var spinner = new SpinWait();
-        for (;;)
+        InFlightFence? waited = null;
+        lock (_fenceGate)
         {
-            lock (_fenceGate)
+            if (RetireSignaledFencesLocked() > tick)
             {
-                if (RetireSignaledFencesLocked() > tick)
-                {
-                    return true;
-                }
+                return true;
             }
 
-            spinner.SpinOnce(sleep1Threshold: -1);
+            foreach (var entry in _inFlightFences)
+            {
+                if (entry.Tick > tick)
+                {
+                    break;
+                }
+
+                waited = entry;
+            }
+
+            if (waited is null)
+            {
+                return true;
+            }
+
+            waited.Waiters++;
         }
+
+        var fence = waited.Fence;
+        var result = _vk.WaitForFences(_device, 1, &fence, true, ulong.MaxValue);
+        lock (_fenceGate)
+        {
+            waited.Waiters--;
+            _ = RetireSignaledFencesLocked();
+        }
+
+        return result == Result.Success;
     }
 
     public object QueueGate { get; }
@@ -284,7 +341,7 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
                     lock (_fenceGate)
                     {
                         fence = TakeFenceLocked();
-                        _inFlightFences.Enqueue((fenceTick, fence));
+                        _inFlightFences.Enqueue(new InFlightFence(fenceTick, fence));
                     }
                 }
             }
@@ -318,7 +375,7 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
         CommandProfile?.Dispose();
         lock (_fenceGate)
         {
-            foreach (var entry in _inFlightFences)
+            foreach (var entry in _inFlightFences.Concat(_retiredWithWaiters))
             {
                 var fence = entry.Fence;
                 _ = _vk.WaitForFences(_device, 1, &fence, true, ulong.MaxValue);
@@ -326,6 +383,7 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
             }
 
             _inFlightFences.Clear();
+            _retiredWithWaiters.Clear();
             while (_freeFences.TryPop(out var fence))
             {
                 _vk.DestroyFence(_device, fence, null);
