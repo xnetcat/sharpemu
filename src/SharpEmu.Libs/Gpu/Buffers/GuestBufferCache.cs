@@ -330,8 +330,11 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             throw SubmissionScheduler.Fatal($"Could not write the required direct backing: addr=0x{guestAddress:X16} size=0x{data.Length:X16}");
         }
 
+        // Registered buffers are ordered and disjoint: walk only the ones the write overlaps.
         var end = guestAddress + (ulong)data.Length;
-        for (var index = 0; index < _registry.RegisteredCount; index++)
+        for (var index = _registry.FindFirstOverlappingIndex(guestAddress);
+             index < _registry.RegisteredCount && _registry.GetRegisteredAddress(index) < end;
+             index++)
         {
             var address = _registry.GetRegisteredAddress(index);
             var bufferIdentifier = _registry.GetRegisteredIdentifier(index);
@@ -381,9 +384,10 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                 images.InvalidateMemory(guestAddress, size);
             }
 
-            var values = new uint[4096];
-            Array.Fill(values, value);
-            var bytes = MemoryMarshal.AsBytes<uint>(values);
+            // Labels and small clears dominate; fill a stack chunk once and repeat it.
+            Span<uint> values = stackalloc uint[(int)Math.Min(size / sizeof(uint), 1024UL)];
+            values.Fill(value);
+            var bytes = MemoryMarshal.AsBytes(values);
             for (ulong offset = 0; offset < size;)
             {
                 var chunk = (int)Math.Min(size - offset, (ulong)bytes.Length);
@@ -425,17 +429,24 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                 images.InvalidateMemory(dstVaddr, size);
             }
 
-            var bytes = new byte[64 * 1024];
-            for (ulong offset = 0; offset < size;)
+            var bytes = System.Buffers.ArrayPool<byte>.Shared.Rent((int)Math.Min(size, 64UL * 1024));
+            try
             {
-                var chunk = (int)Math.Min(size - offset, (ulong)bytes.Length);
-                if (!_backing.TryReadBacking(srcVaddr + offset, bytes.AsSpan(0, chunk)))
+                for (ulong offset = 0; offset < size;)
                 {
-                    throw SubmissionScheduler.Fatal("The host DMA source has no direct backing.");
-                }
+                    var chunk = (int)Math.Min(size - offset, (ulong)bytes.Length);
+                    if (!_backing.TryReadBacking(srcVaddr + offset, bytes.AsSpan(0, chunk)))
+                    {
+                        throw SubmissionScheduler.Fatal("The host DMA source has no direct backing.");
+                    }
 
-                WriteHostMemory(dstVaddr + offset, bytes.AsSpan(0, chunk));
-                offset += (ulong)chunk;
+                    WriteHostMemory(dstVaddr + offset, bytes.AsSpan(0, chunk));
+                    offset += (ulong)chunk;
+                }
+            }
+            finally
+            {
+                System.Buffers.ArrayPool<byte>.Shared.Return(bytes);
             }
 
             return;
