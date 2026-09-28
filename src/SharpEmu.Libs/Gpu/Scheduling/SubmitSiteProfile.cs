@@ -13,14 +13,45 @@ namespace SharpEmu.Libs.Gpu.Scheduling;
 /// </summary>
 internal static class SubmitSiteProfile
 {
-    public static readonly bool Enabled =
-        string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_PROFILE_SUBMIT_SITES"), "1", StringComparison.Ordinal);
+    private static readonly CallSiteProfile _profile = new("SUBMIT_SITE", "SHARPEMU_PROFILE_SUBMIT_SITES");
 
-    private static readonly object _gate = new();
-    private static readonly Dictionary<string, long> _counts = new();
-    private static long _windowStart = Stopwatch.GetTimestamp();
+    public static bool Enabled => _profile.Enabled;
 
-    public static void Record()
+    public static void Record() => _profile.Record();
+
+    public static void Report()
+    {
+        _profile.Report();
+        RenderBreakProfile.Report();
+    }
+}
+
+/// <summary>
+/// LOCAL ONLY diagnostic: counts every ended dynamic-rendering scope by the managed call site
+/// that ended it, so a report says what splits a guest render pass into many small ones.
+/// Enabled with SHARPEMU_PROFILE_RENDER_BREAKS=1.
+/// </summary>
+internal static class RenderBreakProfile
+{
+    private static readonly CallSiteProfile _profile = new("RENDER_BREAK", "SHARPEMU_PROFILE_RENDER_BREAKS");
+
+    public static bool Enabled => _profile.Enabled;
+
+    public static void Record() => _profile.Record();
+
+    public static void Report() => _profile.Report();
+}
+
+internal sealed class CallSiteProfile(string tag, string environmentVariable)
+{
+    public readonly bool Enabled =
+        string.Equals(Environment.GetEnvironmentVariable(environmentVariable), "1", StringComparison.Ordinal);
+
+    private readonly object _gate = new();
+    private readonly Dictionary<string, long> _counts = new();
+    private long _windowStart = Stopwatch.GetTimestamp();
+
+    public void Record()
     {
         if (!Enabled)
         {
@@ -41,7 +72,7 @@ internal static class SubmitSiteProfile
 
     private static string Describe()
     {
-        var trace = new StackTrace(2, false);
+        var trace = new StackTrace(3, false);
         var builder = new StringBuilder();
         var kept = 0;
         for (var index = 0; index < trace.FrameCount && kept < 7; index++)
@@ -64,7 +95,7 @@ internal static class SubmitSiteProfile
         return builder.Length == 0 ? "(unknown)" : builder.ToString();
     }
 
-    public static void Report()
+    public void Report()
     {
         if (!Enabled)
         {
@@ -86,10 +117,10 @@ internal static class SubmitSiteProfile
             return;
         }
 
-        Console.Error.WriteLine($"[PERF][SUBMIT_SITE] window_s={seconds:F1} submits={ranked.Sum(static pair => pair.Value)}");
+        Console.Error.WriteLine($"[PERF][{tag}] window_s={seconds:F1} submits={ranked.Sum(static pair => pair.Value)}");
         foreach (var (key, count) in ranked.Take(16))
         {
-            Console.Error.WriteLine($"[PERF][SUBMIT_SITE] n={count} at={key}");
+            Console.Error.WriteLine($"[PERF][{tag}] n={count} at={key}");
         }
     }
 }
