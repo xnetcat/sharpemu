@@ -108,13 +108,24 @@ public sealed class GuestPageTracker
     }
 
     // Removes protection from a range; a GPU-dirty region flushes through onFlush without the lock.
-    public bool InvalidateRegion(ulong vaddr, ulong size, Action onFlush)
+    public bool InvalidateRegion(ulong vaddr, ulong size, Action onFlush) =>
+        InvalidateRegion(vaddr, size, onFlush, static flush =>
+        {
+            flush();
+            return true;
+        }, out _);
+
+    // Allocation-free form for the CPU-write path, which runs on every tracked guest write: the flush
+    // takes its state as an argument, and flushesSucceeded is false when any flush returned false.
+    public bool InvalidateRegion<TState>(ulong vaddr, ulong size, TState state, Func<TState, bool> onFlush,
+        out bool flushesSucceeded)
     {
         RejectUploadCallbackReentry();
-        var tracked = false;
-        VisitRegions(vaddr, size, create: false, (region, offset, bytes) =>
+        var visit = new InvalidateVisit<TState>(state, onFlush);
+        VisitRegions(vaddr, size, create: false, ref visit, static (TrackedRegion region, ulong offset, ulong bytes,
+            ref InvalidateVisit<TState> visit) =>
         {
-            tracked = true;
+            visit.Tracked = true;
             bool shouldFlush;
             using (region.Lock.Hold())
             {
@@ -127,12 +138,21 @@ public sealed class GuestPageTracker
 
             if (shouldFlush)
             {
-                onFlush();
+                visit.FlushesSucceeded &= visit.OnFlush(visit.State);
             }
 
             return false;
         });
-        return tracked;
+        flushesSucceeded = visit.FlushesSucceeded;
+        return visit.Tracked;
+    }
+
+    private struct InvalidateVisit<TState>(TState state, Func<TState, bool> onFlush)
+    {
+        public readonly TState State = state;
+        public readonly Func<TState, bool> OnFlush = onFlush;
+        public bool Tracked;
+        public bool FlushesSucceeded = true;
     }
 
     public void ForEachDownloadRange(ulong vaddr, ulong size, bool clear, Action<ulong, ulong>? preflight, Action<ulong, ulong> visit)
@@ -342,7 +362,13 @@ public sealed class GuestPageTracker
     }
 
     // Visits (region, offset, bytes) per 4 MiB chunk; a true result stops the walk early.
-    private bool VisitRegions(ulong vaddr, ulong size, bool create, Func<TrackedRegion, ulong, ulong, bool> visit)
+    private delegate bool RegionVisitor<TState>(TrackedRegion region, ulong offset, ulong bytes, ref TState state);
+
+    private bool VisitRegions(ulong vaddr, ulong size, bool create, Func<TrackedRegion, ulong, ulong, bool> visit) =>
+        VisitRegions(vaddr, size, create, ref visit, static (TrackedRegion region, ulong offset, ulong bytes,
+            ref Func<TrackedRegion, ulong, ulong, bool> visit) => visit(region, offset, bytes));
+
+    private bool VisitRegions<TState>(ulong vaddr, ulong size, bool create, ref TState state, RegionVisitor<TState> visit)
     {
         ValidateRange(vaddr, size);
         var remaining = size;
@@ -357,7 +383,7 @@ public sealed class GuestPageTracker
                 region = GetOrCreateRegion(index);
             }
 
-            if (region != null && visit(region, offset, bytes))
+            if (region != null && visit(region, offset, bytes, ref state))
             {
                 return true;
             }

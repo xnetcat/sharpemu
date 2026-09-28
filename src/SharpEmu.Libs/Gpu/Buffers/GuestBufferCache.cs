@@ -126,10 +126,10 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     // A CPU write fault: true when the range is tracked and any GPU data reached guest memory.
     bool IGuestBufferStore.MarkCpuWrite(ulong address, ulong size)
     {
-        var completed = true;
-        var tracked = _tracker.InvalidateRegion(address, size,
-            () => completed &= ReadMemoryOrAwaitShutdown(address, size, isWrite: true,
-                GuestMemoryProfile.ReadbackSource.CpuWriteInvalidation));
+        var tracked = _tracker.InvalidateRegion(address, size, (Cache: this, Address: address, Size: size),
+            static write => write.Cache.ReadMemoryOrAwaitShutdown(write.Address, write.Size, isWrite: true,
+                GuestMemoryProfile.ReadbackSource.CpuWriteInvalidation),
+            out var completed);
         if (GuestGpuMemoryHook.Traces(address, size))
             GuestGpuMemoryHook.Trace(address, size, $"buffer-write tracked={tracked} completed={completed}");
         return tracked && completed;
