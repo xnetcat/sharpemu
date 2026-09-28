@@ -43,6 +43,8 @@ public sealed partial class DirectExecutionBackend
 
 	private static long _perfHleFirstTimestamp;
 
+	private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, PerfHleExportCost> _perfHleThreadCosts = new();
+
 	private static void RecordPerfHleDispatchTime(long ticks)
 	{
 		var total = System.Threading.Interlocked.Add(ref _perfHleDispatchTicks, ticks);
@@ -54,6 +56,11 @@ public sealed partial class DirectExecutionBackend
 			var cost = _perfHleCosts.GetOrAdd(name, static _ => new PerfHleExportCost());
 			System.Threading.Interlocked.Increment(ref cost.Calls);
 			System.Threading.Interlocked.Add(ref cost.Ticks, ticks);
+			// LOCAL ONLY: the same cost split by guest thread, to find where a frame-critical thread blocks.
+			var threadCost = _perfHleThreadCosts.GetOrAdd(
+				(System.Threading.Thread.CurrentThread.Name ?? "?") + "|" + name, static _ => new PerfHleExportCost());
+			System.Threading.Interlocked.Increment(ref threadCost.Calls);
+			System.Threading.Interlocked.Add(ref threadCost.Ticks, ticks);
 		}
 
 		if (calls > 0 && calls % 500000 == 0)
@@ -89,6 +96,14 @@ public sealed partial class DirectExecutionBackend
 				});
 			System.Console.Error.WriteLine($"[PERF][HLE] cost: {string.Join(" | ", top)}");
 			System.Console.Error.WriteLine($"[PERF][HLE] memory: {SharpEmu.Core.Memory.MemoryAccessProfile.Report()}");
+			foreach (var kvp in _perfHleThreadCosts.ToArray()
+				.OrderByDescending(kvp => System.Threading.Interlocked.Read(ref kvp.Value.Ticks)).Take(24))
+			{
+				var seconds = System.Threading.Interlocked.Read(ref kvp.Value.Ticks) / frequency;
+				var callCount = System.Threading.Interlocked.Read(ref kvp.Value.Calls);
+				System.Console.Error.WriteLine(
+					$"[PERF][HLE] thread_cost {kvp.Key}: {seconds:F1}s n={callCount} {(callCount > 0 ? seconds * 1_000_000.0 / callCount : 0):F1}us/call");
+			}
 
 			if (SharpEmu.HLE.GuestFastPath.Enabled)
 			{
