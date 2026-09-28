@@ -113,13 +113,29 @@ public static class GuestGpuMemoryHook
         _current.Unregister(address, size);
     }
 
+    private static long _faultTicks;
+    private static long _reportedFaults;
+    private static long _reportedFaultTicks;
+
+    // LOCAL ONLY: resolved write-tracking faults since the previous call, and the time spent resolving them.
+    public static (long Faults, double Milliseconds) TakeFaultWindow()
+    {
+        var faults = Interlocked.Read(ref _faultsResolved);
+        var ticks = Interlocked.Read(ref _faultTicks);
+        var delta = (faults - Interlocked.Exchange(ref _reportedFaults, faults),
+            (ticks - Interlocked.Exchange(ref _reportedFaultTicks, ticks)) * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
+        return delta;
+    }
+
     public static bool TryResolveFault(FaultKind kind, ulong address)
     {
         if (_current == null && Traces(address, 8))
             Trace(address, 8, $"fault={kind} result=no-manager");
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
         if (_current != null && _current.TryResolveFault(kind, address))
         {
             Interlocked.Increment(ref _faultsResolved);
+            Interlocked.Add(ref _faultTicks, System.Diagnostics.Stopwatch.GetTimestamp() - started);
             return true;
         }
 
