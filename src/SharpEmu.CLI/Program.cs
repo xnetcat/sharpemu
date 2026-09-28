@@ -323,6 +323,16 @@ internal static partial class Program
                     VideoOutExports.NotifyHostInterrupt();
                 };
                 Console.CancelKeyPress += cancelHandler;
+                // SIGTERM (launchd, process managers, `kill`) takes the same cooperative shutdown: the
+                // runtime's default exits with GPU work in flight, which leaves the host driver to reclaim
+                // resources the device still owns.
+                using var terminateRegistration = OperatingSystem.IsWindows()
+                    ? null
+                    : PosixSignalRegistration.Create(PosixSignal.SIGTERM, context =>
+                    {
+                        context.Cancel = true;
+                        VideoOutExports.NotifyHostInterrupt();
+                    });
 
                 Console.Error.WriteLine($"[DEBUG] Running: {ebootPath}");
                 result = runtime.Run(ebootPath);
