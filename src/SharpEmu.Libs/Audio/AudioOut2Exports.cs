@@ -100,25 +100,12 @@ public static class AudioOut2Exports
         public uint QueueDepth { get; }
         public IHostAudioStream? Backend { get; }
 
-        // When this context last handed a grain to the host backend, whose Submit already blocks.
-        public long LastSubmitTimestamp;
 
-        // Software pacing stands in for a grain nothing was submitted for; a call right after a real
-        // submit (Advance then Push for the same grain) must not wait for a second grain.
-        public void PaceUnlessJustSubmitted()
+        public void PaceAdvance() => SleepUntil(ReserveGrain());
+
+        // Claims the next grain on the context's clock and returns when it starts.
+        public long ReserveGrain()
         {
-            var grainTicks = (long)(Stopwatch.Frequency * (double)GrainSamples / Frequency);
-            if (Stopwatch.GetTimestamp() - Volatile.Read(ref LastSubmitTimestamp) < grainTicks)
-            {
-                return;
-            }
-
-            PaceAdvance();
-        }
-
-        public void PaceAdvance()
-        {
-            long delay;
             lock (_paceGate)
             {
                 var now = Stopwatch.GetTimestamp();
@@ -127,16 +114,24 @@ public static class AudioOut2Exports
                     _nextAdvanceTimestamp = now;
                 }
 
-                delay = _nextAdvanceTimestamp - now;
+                var start = _nextAdvanceTimestamp;
                 _nextAdvanceTimestamp += checked(
                     (long)Math.Ceiling(Stopwatch.Frequency * (double)GrainSamples / Frequency));
+                return start;
             }
+        }
 
+        public static void SleepUntil(long timestamp)
+        {
+            var delay = timestamp - Stopwatch.GetTimestamp();
             if (delay > 0)
             {
                 Thread.Sleep(TimeSpan.FromSeconds((double)delay / Stopwatch.Frequency));
             }
         }
+
+        // The start of the grain an Advance reserved and no Push has waited for yet; 0 when none.
+        public long AdvancedGrainStart;
     }
 
     private sealed class PortState
@@ -381,10 +376,17 @@ public static class AudioOut2Exports
 
         // Host Submit already blocks on the output queue; software pacing covers grains with nothing
         // queued, once per grain whichever of Advance and Push comes first.
-        if (!TrySubmitContextAudio(ctx, context))
+        var started = Stopwatch.GetTimestamp();
+        var submitted = TrySubmitContextAudio(ctx, context);
+        var advancedGrain = Interlocked.Exchange(ref context.AdvancedGrainStart, 0);
+        if (!submitted)
         {
-            context.PaceUnlessJustSubmitted();
+            // Push is the blocking point of a grain: it waits for the grain an Advance claimed, or
+            // claims one itself when the title does not advance separately.
+            ContextState.SleepUntil(advancedGrain != 0 ? advancedGrain : context.ReserveGrain());
         }
+
+        TraceGrainCall("push", handle, submitted, started);
 
         return SetReturn(ctx, 0);
     }
@@ -398,10 +400,25 @@ public static class AudioOut2Exports
     {
         if (Contexts.TryGetValue(ctx[CpuRegister.Rdi], out var state))
         {
-            if (!TrySubmitContextAudio(ctx, state))
+            var started = Stopwatch.GetTimestamp();
+            var submitted = TrySubmitContextAudio(ctx, state);
+            if (submitted)
             {
-                state.PaceUnlessJustSubmitted();
+                // The host backend already blocked for this grain; the Push that follows must not.
+                Volatile.Write(ref state.AdvancedGrainStart, 1);
             }
+            else
+            {
+                // Advance moves the context one grain on without blocking; the Push that follows waits.
+                var previous = Interlocked.Exchange(ref state.AdvancedGrainStart, state.ReserveGrain());
+                if (previous != 0)
+                {
+                    // Two Advances without a Push: the earlier grain is waited for here.
+                    ContextState.SleepUntil(previous);
+                }
+            }
+
+            TraceGrainCall("advance", ctx[CpuRegister.Rdi], submitted, started);
         }
 
         return SetReturn(ctx, 0);
@@ -989,6 +1006,21 @@ public static class AudioOut2Exports
         }
     }
 
+    // LOCAL ONLY (SHARPEMU_TRACE_AUDIO_GRAINS=1): the first calls' kind, submit and duration.
+    private static readonly bool TraceGrains = Environment.GetEnvironmentVariable("SHARPEMU_TRACE_AUDIO_GRAINS") == "1";
+    private static int _grainTraceCount;
+
+    private static void TraceGrainCall(string kind, ulong handle, bool submitted, long started)
+    {
+        if (!TraceGrains || Interlocked.Increment(ref _grainTraceCount) > 400)
+        {
+            return;
+        }
+
+        Console.Error.WriteLine(
+            $"[AUDIO2][GRAIN] {kind} ctx=0x{handle:X} submitted={submitted} ms={(Stopwatch.GetTimestamp() - started) * 1000.0 / Stopwatch.Frequency:F2} t={Stopwatch.GetTimestamp() * 1000.0 / Stopwatch.Frequency:F1}");
+    }
+
     private static bool TrySubmitContextAudio(CpuContext ctx, ContextState context)
     {
         var frames = checked((int)context.GrainSamples);
@@ -1075,13 +1107,7 @@ public static class AudioOut2Exports
                         $"ports={mixedPorts} peak={peak:F4} backend={backendName}");
                 }
 
-                var submitted = backend.Submit(outputSpan);
-                if (submitted)
-                {
-                    Volatile.Write(ref context.LastSubmitTimestamp, Stopwatch.GetTimestamp());
-                }
-
-                return submitted;
+                return backend.Submit(outputSpan);
             }
             finally
             {
