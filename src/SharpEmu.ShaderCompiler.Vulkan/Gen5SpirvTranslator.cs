@@ -3461,6 +3461,13 @@ public static partial class Gen5SpirvTranslator
         private (uint DataFormat, uint NumberFormat) DecodeGfx10BufferFormat(
             uint unifiedFormat)
         {
+            // A specialized descriptor makes the format a translation-time constant.
+            if (_module.TryGetConstantValue(unifiedFormat, out var knownFormat) && knownFormat < 128)
+            {
+                Gfx10UnifiedFormat.TryDecode(knownFormat, out var knownDataFormat, out var knownNumberFormat);
+                return (UInt(knownDataFormat), UInt(knownNumberFormat));
+            }
+
             // The descriptor is loaded at execution time, so format decoding
             // must remain dynamic too. Generate one module-level lookup table
             // from the same authoritative decoder used by descriptor
