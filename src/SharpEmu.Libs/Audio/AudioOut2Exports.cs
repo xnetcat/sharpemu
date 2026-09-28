@@ -414,6 +414,7 @@ public static class AudioOut2Exports
         // Host Submit already blocks on the output queue; software pacing covers grains with nothing
         // queued, once per grain whichever of Advance and Push comes first.
         var started = Stopwatch.GetTimestamp();
+        Interlocked.Increment(ref SharpEmu.Libs.Kernel.KernelPthreadCompatExports.MutexLockStats.AudioPushesActive);
         var submitted = TrySubmitContextAudio(ctx, context);
         var advancedGrain = Interlocked.Exchange(ref context.AdvancedGrainStart, 0);
         if (submitted)
@@ -427,7 +428,8 @@ public static class AudioOut2Exports
             ContextState.SleepUntil(context.QueueSlotFree(advancedGrain != 0 ? advancedGrain : context.ReserveGrain()));
         }
 
-        TraceGrainCall("push", handle, submitted, started);
+        Interlocked.Decrement(ref SharpEmu.Libs.Kernel.KernelPthreadCompatExports.MutexLockStats.AudioPushesActive);
+        TraceGrainCall("push", handle, submitted, started, ctx);
 
         return SetReturn(ctx, 0);
     }
@@ -460,7 +462,7 @@ public static class AudioOut2Exports
                 }
             }
 
-            TraceGrainCall("advance", ctx[CpuRegister.Rdi], submitted, started);
+            TraceGrainCall("advance", ctx[CpuRegister.Rdi], submitted, started, ctx);
         }
 
         return SetReturn(ctx, 0);
@@ -480,6 +482,7 @@ public static class AudioOut2Exports
         // Bink Snd @ eboot+0xAE36, so both writes stay exactly 4 bytes wide.
         var outLevelAddress = ctx[CpuRegister.Rsi];
         var outAvailableAddress = ctx[CpuRegister.Rdx];
+        TraceGrainCall("level", ctx[CpuRegister.Rdi], false, Stopwatch.GetTimestamp(), ctx);
 
         // Titles size their rendering by these: Wwise renders exactly puiAvailableQueues grains per
         // update and pushes them non-blocking, so a queue always reported empty made it render a
@@ -1055,15 +1058,34 @@ public static class AudioOut2Exports
     private static readonly bool TraceGrains = Environment.GetEnvironmentVariable("SHARPEMU_TRACE_AUDIO_GRAINS") == "1";
     private static int _grainTraceCount;
 
-    private static void TraceGrainCall(string kind, ulong handle, bool submitted, long started)
+    private static void TraceGrainCall(string kind, ulong handle, bool submitted, long started, CpuContext? caller = null)
     {
-        if (!TraceGrains || Interlocked.Increment(ref _grainTraceCount) > 400)
+        if (!TraceGrains || Interlocked.Increment(ref _grainTraceCount) > 20000)
         {
             return;
         }
 
         Console.Error.WriteLine(
-            $"[AUDIO2][GRAIN] {kind} ctx=0x{handle:X} submitted={submitted} ms={(Stopwatch.GetTimestamp() - started) * 1000.0 / Stopwatch.Frequency:F2} t={Stopwatch.GetTimestamp() * 1000.0 / Stopwatch.Frequency:F1}");
+            $"[AUDIO2][GRAIN] {kind} ctx=0x{handle:X} ra=0x{ReturnAddress(caller):X} chain={FrameChain(caller)} tid={Environment.CurrentManagedThreadId} submitted={submitted} ms={(Stopwatch.GetTimestamp() - started) * 1000.0 / Stopwatch.Frequency:F2} t={Stopwatch.GetTimestamp() * 1000.0 / Stopwatch.Frequency:F1}");
+    }
+
+    private static string FrameChain(CpuContext? ctx)
+    {
+        if (ctx is null)
+        {
+            return "";
+        }
+
+        Span<byte> frame = stackalloc byte[16];
+        var rbp = ctx[CpuRegister.Rbp];
+        var text = new System.Text.StringBuilder();
+        for (var depth = 0; depth < 6 && rbp != 0 && ctx.Memory.TryRead(rbp, frame); depth++)
+        {
+            text.Append($"0x{BinaryPrimitives.ReadUInt64LittleEndian(frame[8..]):X},");
+            rbp = BinaryPrimitives.ReadUInt64LittleEndian(frame);
+        }
+
+        return text.ToString();
     }
 
     private static uint QueuedGrains(ContextState context)
@@ -1079,6 +1101,14 @@ public static class AudioOut2Exports
         }
 
         return context.ClockQueuedGrains();
+    }
+
+    private static ulong ReturnAddress(CpuContext? ctx)
+    {
+        Span<byte> slot = stackalloc byte[sizeof(ulong)];
+        return ctx is not null && ctx.Memory.TryRead(ctx[CpuRegister.Rsp], slot)
+            ? BinaryPrimitives.ReadUInt64LittleEndian(slot)
+            : 0;
     }
 
     private static bool TrySubmitContextAudio(CpuContext ctx, ContextState context)

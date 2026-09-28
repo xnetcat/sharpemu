@@ -885,7 +885,8 @@ public static class KernelPthreadCompatExports
     // LOCAL ONLY: how guest mutex acquisitions resolve, reported with the render profile.
     internal static class MutexLockStats
     {
-        public static long Uncontended, GrantedWhileQueueing, CooperativeBlocks, HostWaits, HostWaitTicks;
+        public static long Uncontended, GrantedWhileQueueing, CooperativeBlocks, HostWaits, HostWaitTicks, WaitsInPush, WaitInPushTicks;
+        public static int AudioPushesActive;
         private static readonly System.Collections.Concurrent.ConcurrentDictionary<(ulong Owner, ulong Mutex), long[]> Owners = new();
 
         public static void RecordOwner(ulong owner, ulong mutex, long ticks)
@@ -907,7 +908,8 @@ public static class KernelPthreadCompatExports
         {
             var text = $"uncontended={Interlocked.Exchange(ref Uncontended, 0)} granted_queueing={Interlocked.Exchange(ref GrantedWhileQueueing, 0)} " +
                 $"coop_blocks={Interlocked.Exchange(ref CooperativeBlocks, 0)} host_waits={Interlocked.Exchange(ref HostWaits, 0)} " +
-                $"host_wait_ms={Interlocked.Exchange(ref HostWaitTicks, 0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1}";
+                $"host_wait_ms={Interlocked.Exchange(ref HostWaitTicks, 0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} " +
+                $"waits_in_audio_push={Interlocked.Exchange(ref WaitsInPush, 0)} ms={Interlocked.Exchange(ref WaitInPushTicks, 0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1}";
             return text;
         }
     }
@@ -1091,11 +1093,17 @@ public static class KernelPthreadCompatExports
 
         var hostWaitStarted = System.Diagnostics.Stopwatch.GetTimestamp();
         var ownerAtWait = state.OwnerThreadId;
+        var pushActiveAtWait = Volatile.Read(ref MutexLockStats.AudioPushesActive) > 0;
         var hostResult = WaitForHostMutexLock(ctx, state, waiter!);
         var hostWaitTicks = System.Diagnostics.Stopwatch.GetTimestamp() - hostWaitStarted;
         Interlocked.Increment(ref MutexLockStats.HostWaits);
         Interlocked.Add(ref MutexLockStats.HostWaitTicks, hostWaitTicks);
         MutexLockStats.RecordOwner(ownerAtWait, mutexAddress, hostWaitTicks);
+        if (pushActiveAtWait)
+        {
+            Interlocked.Increment(ref MutexLockStats.WaitsInPush);
+            Interlocked.Add(ref MutexLockStats.WaitInPushTicks, hostWaitTicks);
+        }
         TracePthreadMutex(ctx, "lock", mutexAddress, resolvedAddress, state, currentThreadId, hostResult);
         return hostResult;
     }
