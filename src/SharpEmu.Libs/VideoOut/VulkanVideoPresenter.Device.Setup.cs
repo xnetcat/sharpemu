@@ -182,6 +182,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
             if (_setDebugUtilsObjectName is not null)
             {
+                SharpEmu.Libs.Gpu.Buffers.GpuBuffer.NameHook = (handle, name) => SetDebugName(ObjectType.Buffer, handle, name);
                 Console.Error.WriteLine("[LOADER][INFO] Vulkan debug labels enabled.");
             }
         }

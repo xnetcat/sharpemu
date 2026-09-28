@@ -180,6 +180,7 @@ public sealed unsafe class GpuTiler : IDisposable
 
         var buffer = new GpuBuffer(_device, _scheduler, GpuBufferUsage.DeviceLocal, 0,
             BufferUsageFlags.StorageBufferBit | BufferUsageFlags.TransferSrcBit | BufferUsageFlags.TransferDstBit, size);
+        buffer.Name($"tiler-scratch tick={_scheduler.CurrentTick}");
         _scheduler.QueueCompletionAction(buffer.Dispose);
         return buffer;
     }

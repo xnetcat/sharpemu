@@ -248,6 +248,11 @@ public unsafe class GpuBuffer : IDisposable
             0, null, 1, &after, 0, null);
     }
 
+    // LOCAL ONLY diagnostic (SHARPEMU_VK_DEBUG_LABELS=1): names the buffer for validation reports.
+    public static Action<ulong, string>? NameHook { get; set; }
+
+    public void Name(string name) => NameHook?.Invoke(_handle.Handle, name);
+
     public void Dispose()
     {
         if (_handle.Handle == 0)

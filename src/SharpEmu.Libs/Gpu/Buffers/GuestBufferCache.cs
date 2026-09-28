@@ -1062,6 +1062,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             MergeOverlappingBuffer(bufferIdentifier, oldId, !overlap.HasStreamLeap);
         }
 
+        _registry.GetBuffer(bufferIdentifier).Name($"cache 0x{overlap.Begin:X}+0x{overlap.End - overlap.Begin:X} tick={_scheduler.CurrentTick}");
         Register(bufferIdentifier);
         if (Rendering.FrameCommandLog.Active)
         {
