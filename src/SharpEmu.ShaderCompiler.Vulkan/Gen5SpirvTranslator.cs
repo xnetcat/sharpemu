@@ -4149,6 +4149,19 @@ public static partial class Gen5SpirvTranslator
             out string error)
         {
             error = string.Empty;
+            // LOCAL ONLY ablation (SHARPEMU_DIAG_ZERO_IMAGE=vertex|pixel|compute): image results read zero, to time texture cost.
+            if (Environment.GetEnvironmentVariable("SHARPEMU_DIAG_ZERO_IMAGE") is { } zeroStage &&
+                string.Equals(zeroStage, _stage.ToString(), StringComparison.OrdinalIgnoreCase) &&
+                instruction.Opcode.StartsWith("ImageSample", StringComparison.Ordinal))
+            {
+                for (var component = 0u; component < (uint)System.Numerics.BitOperations.PopCount(image.Dmask); component++)
+                {
+                    StoreV(image.VectorData + component, UInt(0));
+                }
+
+                return true;
+            }
+
             if (instruction.Opcode is "ImageBvhIntersectRay" or "ImageBvh64IntersectRay")
             {
                 // The host path does not expose Vulkan ray-query or an
