@@ -886,6 +886,22 @@ public static class KernelPthreadCompatExports
     internal static class MutexLockStats
     {
         public static long Uncontended, GrantedWhileQueueing, CooperativeBlocks, HostWaits, HostWaitTicks;
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<(ulong Owner, ulong Mutex), long[]> Owners = new();
+
+        public static void RecordOwner(ulong owner, ulong mutex, long ticks)
+        {
+            var entry = Owners.GetOrAdd((owner, mutex), static _ => new long[2]);
+            Interlocked.Increment(ref entry[0]);
+            Interlocked.Add(ref entry[1], ticks);
+        }
+
+        public static string TakeOwnerReport()
+        {
+            var top = Owners.ToArray().OrderByDescending(pair => pair.Value[1]).Take(5)
+                .Select(pair => $"owner=0x{pair.Key.Owner:X} mutex=0x{pair.Key.Mutex:X} n={pair.Value[0]} ms={pair.Value[1] * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F0}");
+            Owners.Clear();
+            return string.Join(" | ", top);
+        }
 
         public static string TakeReport()
         {
@@ -1074,9 +1090,12 @@ public static class KernelPthreadCompatExports
         }
 
         var hostWaitStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+        var ownerAtWait = state.OwnerThreadId;
         var hostResult = WaitForHostMutexLock(ctx, state, waiter!);
+        var hostWaitTicks = System.Diagnostics.Stopwatch.GetTimestamp() - hostWaitStarted;
         Interlocked.Increment(ref MutexLockStats.HostWaits);
-        Interlocked.Add(ref MutexLockStats.HostWaitTicks, System.Diagnostics.Stopwatch.GetTimestamp() - hostWaitStarted);
+        Interlocked.Add(ref MutexLockStats.HostWaitTicks, hostWaitTicks);
+        MutexLockStats.RecordOwner(ownerAtWait, mutexAddress, hostWaitTicks);
         TracePthreadMutex(ctx, "lock", mutexAddress, resolvedAddress, state, currentThreadId, hostResult);
         return hostResult;
     }
