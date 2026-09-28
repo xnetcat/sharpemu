@@ -210,9 +210,15 @@ public sealed class GuestGpuMemoryTests
         Assert.False(_memory.MarkCpuWrite(0x20000, 0x10));
         Assert.Empty(_stores.Calls);
 
+        // An unwatched page is already CPU-dirty or untracked: no store hears about the write.
+        Assert.False(_memory.MarkCpuWrite(0x10100, 0x10));
+        Assert.Empty(_stores.Calls);
+
+        _memory.Pages.AddWatch(0x10000, 0x1000, blockReads: false);
         Assert.True(_memory.MarkCpuWrite(0x10100, 0x10));
         Assert.Equal(new[] { "buffer.write 10100+10", "image.write 10100+10" }, _stores.Calls);
 
+        _memory.Pages.RemoveWatch(0x10000, 0x1000, blockReads: false);
         _memory.Unregister(0x10000, 0x1000);
         _memory.Dispose();
     }
@@ -265,9 +271,11 @@ public sealed class GuestGpuMemoryTests
 
         Assert.False(_memory.TryResolveFault(FaultKind.Write, 0x10010));
         Assert.False(_memory.TryResolveFault(FaultKind.Read, 0x10010));
+        _memory.Pages.AddWatch(0x10000, 0x1000, blockReads: false);
         Assert.True(_memory.MarkCpuWrite(0x10010, 8));
         Assert.Empty(_stores.Calls);
 
+        _memory.Pages.RemoveWatch(0x10000, 0x1000, blockReads: false);
         _memory.Unregister(0x10000, 0x1000);
         _memory.Dispose();
     }
