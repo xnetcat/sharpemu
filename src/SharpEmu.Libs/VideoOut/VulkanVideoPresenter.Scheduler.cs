@@ -74,7 +74,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 _ => WakeRenderThread());
             var scheduler = _scheduler;
             GpuWorkTrace.CurrentTick = () => scheduler.CurrentTick;
-            if (GpuWorkTrace.Enabled)
+            if (GpuWorkTrace.Intrusive)
             {
                 InstallGpuWorkBreadcrumb();
             }

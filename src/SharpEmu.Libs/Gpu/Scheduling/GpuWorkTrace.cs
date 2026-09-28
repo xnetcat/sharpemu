@@ -9,7 +9,11 @@ public static class GpuWorkTrace
 {
     private const int Capacity = 4096;
 
-    public static readonly bool Enabled = Environment.GetEnvironmentVariable("SHARPEMU_TRACE_GPU_WORK") == "1";
+    // SHARPEMU_TRACE_GPU_WORK=1 also records GPU breadcrumbs and reads indirect arguments back, which
+    // changes GPU timing; =notes keeps only the host-side notes a hung tick report prints.
+    public static readonly bool Enabled = Environment.GetEnvironmentVariable("SHARPEMU_TRACE_GPU_WORK") is "1" or "notes";
+
+    public static readonly bool Intrusive = Environment.GetEnvironmentVariable("SHARPEMU_TRACE_GPU_WORK") == "1";
 
     // Diagnostic (SHARPEMU_WATCH_GPU_ADDRESS=0x...,0x...): every listed address is read back
     // after each dispatch that writes one of them.
@@ -47,7 +51,7 @@ public static class GpuWorkTrace
 
     public static void Breadcrumb(int id)
     {
-        if (Enabled && id != 0)
+        if (Intrusive && id != 0)
         {
             RecordBreadcrumb?.Invoke(id);
         }

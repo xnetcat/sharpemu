@@ -147,7 +147,7 @@ public sealed partial class RenderExecutor
             return;
         }
 
-        if (GpuWorkTrace.Enabled && indirectArgumentsAddress != 0 &&
+        if (GpuWorkTrace.Intrusive && indirectArgumentsAddress != 0 &&
             _host.ReadIndirectDispatchArguments(indirectArgumentsAddress) is { } gpuArguments)
         {
             GpuWorkTrace.Note($"indirect arguments on the GPU: {gpuArguments[0]}x{gpuArguments[1]}x{gpuArguments[2]} cs=0x{program.Hash:X16}");
