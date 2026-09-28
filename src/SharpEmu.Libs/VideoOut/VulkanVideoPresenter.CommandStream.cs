@@ -346,7 +346,8 @@ internal static unsafe partial class VulkanVideoPresenter
         public void FillBuffer(ulong address, ulong size, uint value, bool isGds)
         {
             using var transferScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CommandMemoryTransfer);
-            EndRendering();
+            // Transfers the buffer cache completes in guest memory leave the rendering scope open;
+            // its GPU paths end the scope before they record.
             _ = BeginBatchedGuestCommands();
             _bufferCache.FillBuffer(address, size, value, isGds);
         }
@@ -354,7 +355,8 @@ internal static unsafe partial class VulkanVideoPresenter
         public void CopyBuffer(ulong destination, ulong source, ulong size, bool destinationIsGds, bool sourceIsGds)
         {
             using var transferScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CommandMemoryTransfer);
-            EndRendering();
+            // Transfers the buffer cache completes in guest memory leave the rendering scope open;
+            // its GPU paths end the scope before they record.
             _ = BeginBatchedGuestCommands();
             _bufferCache.CopyBuffer(destination, source, size, destinationIsGds, sourceIsGds);
         }

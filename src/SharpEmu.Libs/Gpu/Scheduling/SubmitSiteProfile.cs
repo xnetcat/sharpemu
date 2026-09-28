@@ -39,6 +39,8 @@ internal static class RenderBreakProfile
 
     public static void Record() => _profile.Record();
 
+    public static void RecordKey(string key) => _profile.RecordKey(key);
+
     public static void Report() => _profile.Report();
 }
 
@@ -58,7 +60,16 @@ internal sealed class CallSiteProfile(string tag, string environmentVariable)
             return;
         }
 
-        var key = Describe();
+        RecordKey(Describe());
+    }
+
+    public void RecordKey(string key)
+    {
+        if (!Enabled)
+        {
+            return;
+        }
+
         lock (_gate)
         {
             if (!_counts.ContainsKey(key) && _counts.Count >= 128)
