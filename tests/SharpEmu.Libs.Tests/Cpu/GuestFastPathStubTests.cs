@@ -235,6 +235,103 @@ public sealed unsafe class GuestFastPathStubTests
         return elapsed * 1_000_000_000.0 / Stopwatch.Frequency / iterations;
     }
 
+    private const ulong MemoryCopySlowPathMarker = 0x5105_1A7B_AC4E_0001UL;
+
+    [Fact]
+    public void MemoryCopyStub_CopiesForwardAndReturnsTheDestination()
+    {
+        if (!CanRunStubs())
+        {
+            return;
+        }
+
+        using var stub = new MemoryCopyStub();
+        var source = Enumerable.Range(1, 300).Select(value => (byte)value).ToArray();
+        var destination = new byte[300];
+        fixed (byte* sourcePointer = source)
+        fixed (byte* destinationPointer = destination)
+        {
+            Assert.Equal((ulong)destinationPointer, stub.Call(destinationPointer, sourcePointer, 300));
+            Assert.Equal((ulong)destinationPointer, stub.Call(destinationPointer + 7, sourcePointer, 0) - 7);
+        }
+
+        Assert.Equal(source, destination);
+    }
+
+    [Fact]
+    public void MemoryCopyStub_HandlesADestinationBelowAnOverlappingSource()
+    {
+        if (!CanRunStubs())
+        {
+            return;
+        }
+
+        using var stub = new MemoryCopyStub();
+        var buffer = Enumerable.Range(0, 64).Select(value => (byte)value).ToArray();
+        fixed (byte* pointer = buffer)
+        {
+            Assert.Equal((ulong)pointer, stub.Call(pointer, pointer + 8, 40));
+        }
+
+        Assert.Equal(Enumerable.Range(8, 40).Select(value => (byte)value), buffer.Take(40));
+        Assert.Equal(Enumerable.Range(40, 24).Select(value => (byte)value), buffer.Skip(40));
+    }
+
+    [Fact]
+    public void MemoryCopyStub_LeavesADestinationInsideTheSourceToTheManagedExport()
+    {
+        if (!CanRunStubs())
+        {
+            return;
+        }
+
+        using var stub = new MemoryCopyStub();
+        var buffer = Enumerable.Range(0, 64).Select(value => (byte)value).ToArray();
+        var original = buffer.ToArray();
+        fixed (byte* pointer = buffer)
+        {
+            Assert.Equal(MemoryCopySlowPathMarker, stub.Call(pointer + 8, pointer, 40));
+            Assert.Equal(MemoryCopySlowPathMarker, stub.Call(pointer, pointer, 1));
+        }
+
+        Assert.Equal(original, buffer);
+    }
+
+    /// <summary>The memcpy stub called with the platform (SysV) convention the guest uses.</summary>
+    private sealed class MemoryCopyStub : IDisposable
+    {
+        private readonly byte* _page;
+
+        public MemoryCopyStub()
+        {
+            _page = (byte*)HostMemory.Alloc(
+                null,
+                4096,
+                HostMemory.MEM_COMMIT | HostMemory.MEM_RESERVE,
+                HostMemory.PAGE_EXECUTE_READWRITE);
+            Assert.True(_page != null);
+
+            // Fallback at +0x100: mov rax, marker / ret.
+            _page[0x100] = 0x48;
+            _page[0x101] = 0xB8;
+            *(ulong*)(_page + 0x102) = MemoryCopySlowPathMarker;
+            _page[0x10A] = 0xC3;
+
+            var stub = DirectExecutionBackend.EmitGuestMemoryCopyStub((nint)(_page + 0x100));
+            for (var i = 0; i < stub.Count; i++)
+            {
+                _page[i] = stub[i];
+            }
+
+            Assert.True(HostMemory.Protect(_page, 4096, HostMemory.PAGE_EXECUTE_READ, out _));
+        }
+
+        public ulong Call(byte* destination, byte* source, nuint count) =>
+            ((delegate* unmanaged<byte*, byte*, nuint, ulong>)_page)(destination, source, count);
+
+        public void Dispose() => _ = HostMemory.Free(_page, 0, HostMemory.MEM_RELEASE);
+    }
+
     private static bool CanRunStubs() =>
         OperatingSystem.IsMacOS() && RuntimeInformation.ProcessArchitecture == Architecture.X64;
 

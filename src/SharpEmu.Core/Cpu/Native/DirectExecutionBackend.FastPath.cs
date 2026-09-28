@@ -22,6 +22,7 @@ public sealed unsafe partial class DirectExecutionBackend
 		None,
 		PthreadSelf,
 		PthreadGetspecific,
+		MemoryCopy,
 	}
 
 	// scePthreadSelf / pthread_self.
@@ -31,6 +32,16 @@ public sealed unsafe partial class DirectExecutionBackend
 	// scePthreadGetspecific / pthread_getspecific.
 	private const string PthreadGetspecificNid = "eoht7mQOCmo";
 	private const string PosixPthreadGetspecificNid = "0-KXaS70xy4";
+
+	// memcpy / memmove.
+	private const string MemcpyNid = "Q3VBxCXhUHs";
+	private const string MemmoveNid = "+P6FRGH4LfA";
+
+	// Guest memory is identity-mapped and every fault the copy can take (write tracking, lazy
+	// commit) is resolved from the fault address alone, so the copy may run as guest-side code.
+	// SHARPEMU_HLE_FAST_MEMCPY=0 keeps it on the managed export.
+	private static readonly bool GuestMemoryCopyStubEnabled =
+		!string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_HLE_FAST_MEMCPY"), "0", StringComparison.Ordinal);
 
 	private uint _fastPathBlockTlsIndex = uint.MaxValue;
 	private bool _guestFastPathEnabled;
@@ -88,6 +99,7 @@ public sealed unsafe partial class DirectExecutionBackend
 	{
 		PthreadSelfNid or PosixPthreadSelfNid => GuestFastPathStub.PthreadSelf,
 		PthreadGetspecificNid or PosixPthreadGetspecificNid => GuestFastPathStub.PthreadGetspecific,
+		MemcpyNid or MemmoveNid => GuestFastPathStub.MemoryCopy,
 		_ => GuestFastPathStub.None,
 	};
 
@@ -105,7 +117,9 @@ public sealed unsafe partial class DirectExecutionBackend
 		}
 
 		var kind = ClassifyGuestFastPathStub(nid);
-		if (kind == GuestFastPathStub.None)
+		if (kind == GuestFastPathStub.None ||
+			// The write watch inspects every managed guest write, which a native copy never reaches.
+			(kind == GuestFastPathStub.MemoryCopy && (!GuestMemoryCopyStubEnabled || GuestWriteWatch.Armed)))
 		{
 			return false;
 		}
@@ -154,6 +168,11 @@ public sealed unsafe partial class DirectExecutionBackend
 		uint blockTlsIndex,
 		nint fallbackTrampoline)
 	{
+		if (kind == GuestFastPathStub.MemoryCopy)
+		{
+			return EmitGuestMemoryCopyStub(fallbackTrampoline);
+		}
+
 		var code = new List<byte>(48);
 		var slowPathFixups = new List<int>();
 
@@ -239,6 +258,29 @@ public sealed unsafe partial class DirectExecutionBackend
 			code[fixup] = (byte)delta;
 		}
 
+		return code;
+	}
+
+	/// <summary>
+	/// memcpy/memmove(dst, src, n) as a forward <c>rep movsb</c>, returning dst. The libc
+	/// export copies with memmove semantics, so a destination that starts inside the source
+	/// (where a forward copy would read bytes it already overwrote) takes the managed path.
+	/// Only RAX, RCX, RSI, RDI and the flags change - all caller-saved - and the direction
+	/// flag is clear on entry per the SysV ABI.
+	/// </summary>
+	internal static List<byte> EmitGuestMemoryCopyStub(nint fallbackTrampoline)
+	{
+		var code = new List<byte>(40);
+		// mov rcx, rdi / sub rcx, rsi / cmp rcx, rdx / jb slow: dst - src < n (unsigned) is
+		// exactly a destination in (src, src + n) or equal to src with a non-empty copy.
+		code.AddRange([0x48, 0x89, 0xF9, 0x48, 0x29, 0xF1, 0x48, 0x39, 0xD1, 0x72, 0x00]);
+		var slowPathFixup = code.Count - 1;
+		// mov rax, rdi / mov rcx, rdx / rep movsb / ret
+		code.AddRange([0x48, 0x89, 0xF8, 0x48, 0x89, 0xD1, 0xF3, 0xA4, 0xC3]);
+		code[slowPathFixup] = checked((byte)(code.Count - (slowPathFixup + 1)));
+		// jmp qword [rip+0] with the absolute trampoline address after it.
+		code.AddRange([0xFF, 0x25, 0x00, 0x00, 0x00, 0x00]);
+		code.AddRange(BitConverter.GetBytes((long)fallbackTrampoline));
 		return code;
 	}
 }
