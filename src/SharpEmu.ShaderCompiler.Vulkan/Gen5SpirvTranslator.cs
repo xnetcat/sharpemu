@@ -7259,9 +7259,14 @@ public static partial class Gen5SpirvTranslator
             _module.AddLabel(mergeLabel);
         }
 
+        // Only instructions that address LDS memory need the array. ds_swizzle/ds_bpermute move data
+        // between lanes and GDS instructions use the global data share, so a graphics stage using
+        // just those must not get an 8 KiB zero-initialized per-invocation array: Metal pays for it
+        // in compile time (seconds for a large pixel shader) and in private memory per pixel.
         private bool UsesLds() =>
-            _request.Program.Instructions.Any(instruction =>
-                instruction.Control is Gen5DataShareControl);
+            _request.Program.Instructions.Any(static instruction =>
+                instruction.Control is Gen5DataShareControl { Gds: false } &&
+                instruction.Opcode is not ("DsSwizzleB32" or "DsBpermuteB32"));
 
         private bool UsesSubgroupShuffle() =>
             _request.Program.Instructions.Any(instruction =>
