@@ -1066,6 +1066,10 @@ internal static unsafe partial class VulkanVideoPresenter
                         buffer.Dispose();
                     });
                 }
+                else if (Environment.GetEnvironmentVariable("SHARPEMU_DIAG_LATE_DISPOSE") == "1")
+                {
+                    _scheduler.QueueCompletionAction(() => _scheduler.QueueCompletionAction(buffer.Dispose));
+                }
                 else
                 {
                     _scheduler.QueueCompletionAction(buffer.Dispose);

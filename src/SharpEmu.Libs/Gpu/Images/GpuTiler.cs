@@ -171,6 +171,8 @@ public sealed unsafe class GpuTiler : IDisposable
     private ulong StorageAlignment => Math.Max(_device.MinStorageBufferOffsetAlignment, 4);
 
     // The scratch stays alive through the current tick; a completion action frees it.
+    private static readonly bool LateDispose = Environment.GetEnvironmentVariable("SHARPEMU_DIAG_LATE_DISPOSE") == "1";
+
     private GpuBuffer AllocateScratch(ulong size)
     {
         if (size == 0)
@@ -181,7 +183,15 @@ public sealed unsafe class GpuTiler : IDisposable
         var buffer = new GpuBuffer(_device, _scheduler, GpuBufferUsage.DeviceLocal, 0,
             BufferUsageFlags.StorageBufferBit | BufferUsageFlags.TransferSrcBit | BufferUsageFlags.TransferDstBit, size);
         buffer.Name($"tiler-scratch tick={_scheduler.CurrentTick}");
-        _scheduler.QueueCompletionAction(buffer.Dispose);
+        if (LateDispose)
+        {
+            // LOCAL ONLY (SHARPEMU_DIAG_LATE_DISPOSE=1): outlive Metal's command buffer completion for the validation layer.
+            _scheduler.QueueCompletionAction(() => _scheduler.QueueCompletionAction(buffer.Dispose));
+        }
+        else
+        {
+            _scheduler.QueueCompletionAction(buffer.Dispose);
+        }
         return buffer;
     }
 
