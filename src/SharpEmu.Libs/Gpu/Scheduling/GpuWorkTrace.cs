@@ -11,7 +11,9 @@ public static class GpuWorkTrace
 
     // SHARPEMU_TRACE_GPU_WORK=1 also records GPU breadcrumbs and reads indirect arguments back, which
     // changes GPU timing; =notes keeps only the host-side notes a hung tick report prints.
-    public static readonly bool Enabled = Environment.GetEnvironmentVariable("SHARPEMU_TRACE_GPU_WORK") is "1" or "notes";
+    public static readonly bool Enabled = Environment.GetEnvironmentVariable("SHARPEMU_TRACE_GPU_WORK") is "1" or "notes" or "stream";
+
+    private static readonly bool Stream = Environment.GetEnvironmentVariable("SHARPEMU_TRACE_GPU_WORK") == "stream";
 
     public static readonly bool Intrusive = Environment.GetEnvironmentVariable("SHARPEMU_TRACE_GPU_WORK") == "1";
 
@@ -137,6 +139,10 @@ public static class GpuWorkTrace
         {
             var id = ++_nextId;
             Entries[_next] = (tick(), work, id);
+            if (Stream)
+            {
+                Console.Error.WriteLine($"[GPU][WORK] tick={Entries[_next].Tick} #{id} {work}");
+            }
             _next = (_next + 1) % Capacity;
             return id;
         }
