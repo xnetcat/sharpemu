@@ -182,6 +182,26 @@ public sealed class PageGuard : IDisposable
             : allowedAccess != GuestPageProtection.None;
     }
 
+    // Whether every page of the range is writable, so no store is watching it for CPU writes.
+    public bool AllowsWriteRange(ulong address, ulong size)
+    {
+        if (size == 0)
+        {
+            return true;
+        }
+
+        var end = address + size;
+        for (var page = address & ~(PageBytes - 1); page < end; page += PageBytes)
+        {
+            if (!Allows(page, FaultKind.Write))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     internal long GetWriteRestorationVersion(ulong address)
     {
         var block = FindBlock(address);

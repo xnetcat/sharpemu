@@ -131,9 +131,18 @@ public sealed class GuestGpuMemory : IDisposable
         return true;
     }
 
+    private const ulong MaxUnwatchedWriteCheckBytes = 64 * 1024;
+
     public bool MarkCpuWrite(ulong address, ulong size)
     {
         if (!Covers(address, size))
+        {
+            return false;
+        }
+
+        // Writable pages have no store watching them: they are CPU-dirty already or untracked, so a
+        // managed write needs no notification (and takes neither store's lock).
+        if (size <= MaxUnwatchedWriteCheckBytes && _pages.AllowsWriteRange(address, size))
         {
             return false;
         }
