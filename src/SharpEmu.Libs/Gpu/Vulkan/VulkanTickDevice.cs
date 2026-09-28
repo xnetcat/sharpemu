@@ -108,6 +108,10 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
         }
     }
 
+    // Waits until every submission up to the tick has retired. Fences never leave the gate: another
+    // thread may retire and recycle a fence the moment it signals, so waiting on a handle outside the
+    // gate could wait on a reset fence. The completion handler runs just after the timeline signal,
+    // so a short poll replaces the blocking wait.
     private bool WaitRetired(ulong tick)
     {
         if (!FenceRetirement)
@@ -115,32 +119,19 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
             return true;
         }
 
-        Fence fence = default;
-        lock (_fenceGate)
+        var spinner = new SpinWait();
+        for (;;)
         {
-            foreach (var entry in _inFlightFences)
+            lock (_fenceGate)
             {
-                if (entry.Tick > tick)
+                if (RetireSignaledFencesLocked() > tick)
                 {
-                    break;
+                    return true;
                 }
-
-                fence = entry.Fence;
             }
-        }
 
-        if (fence.Handle == 0)
-        {
-            return true;
+            spinner.SpinOnce(sleep1Threshold: -1);
         }
-
-        var result = _vk.WaitForFences(_device, 1, &fence, true, ulong.MaxValue);
-        lock (_fenceGate)
-        {
-            _ = RetireSignaledFencesLocked();
-        }
-
-        return result == Result.Success;
     }
 
     public object QueueGate { get; }
@@ -289,26 +280,29 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
 
                 if (fenceTick != 0)
                 {
+                    // Tracked before the submit so no reader sees the tick signal without its fence.
                     lock (_fenceGate)
                     {
                         fence = TakeFenceLocked();
+                        _inFlightFences.Enqueue((fenceTick, fence));
                     }
                 }
             }
 
             var result = _vk.QueueSubmit2(_queue, 1, &submitInfo, fence);
-            if (fence.Handle != 0)
+            if (fence.Handle != 0 && result != Result.Success)
             {
                 lock (_fenceGate)
                 {
-                    if (result == Result.Success)
+                    // Submissions are serialized by the queue gate, so the failed one is the newest.
+                    var kept = _inFlightFences.Where(entry => entry.Fence.Handle != fence.Handle).ToArray();
+                    _inFlightFences.Clear();
+                    foreach (var entry in kept)
                     {
-                        _inFlightFences.Enqueue((fenceTick, fence));
+                        _inFlightFences.Enqueue(entry);
                     }
-                    else
-                    {
-                        _freeFences.Push(fence);
-                    }
+
+                    _freeFences.Push(fence);
                 }
             }
 
