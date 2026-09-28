@@ -137,6 +137,9 @@ public interface IRenderHost
 
     void EndRendering();
 
+    // The next draw stores to buffers or storage images; called before its BeginRendering.
+    void PrepareMemoryWritingDraw() { }
+
     void BindPipeline(PipelineBindPoint bindPoint, in PipelineHandle pipeline);
 
     void Draw(uint vertexCount, uint instanceCount, uint firstVertex, uint firstInstance);

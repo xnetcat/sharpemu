@@ -129,6 +129,11 @@ public sealed partial class RenderExecutor
     }
 
     // A written buffer resource with an address and a footprint needs a barrier after the stage.
+    // Device-address accesses are not split into reads and writes, so they count as stores.
+    private bool DrawWritesMemory(ShaderStageResources stage) =>
+        stage.Program is { } program &&
+        (program.UsesDeviceAddresses || WritesStorageImage(program) || HasBufferWrites(stage));
+
     private bool HasBufferWrites(ShaderStageResources stage)
     {
         var program = stage.Program ?? throw _host.Fatal("A shader stage has no program.");
@@ -282,6 +287,11 @@ public sealed partial class RenderExecutor
         if (setAutoDebug)
         {
             SetDrawDebugPhase(submitId, in draw, 0x400);
+        }
+
+        if (DrawWritesMemory(vertexInput.Stage) || (pixelBindings is not null && DrawWritesMemory(pixelInput.Stage)))
+        {
+            _host.PrepareMemoryWritingDraw();
         }
 
         _host.BeginRendering(in state.Rendering);

@@ -40,6 +40,17 @@ internal static unsafe partial class VulkanVideoPresenter
             EndRendering();
         }
 
+        bool IRenderingState.TryDeferUntilRenderingEnds(PipelineStageFlags sourceStages, PipelineStageFlags destinationStages, List<ImageMemoryBarrier2> barriers)
+        {
+            if (!_renderingActive)
+            {
+                return false;
+            }
+
+            _barriersAfterRendering.Add((sourceStages, destinationStages, barriers.ToArray()));
+            return true;
+        }
+
         internal static void WakeRenderThread()
         {
             SubmissionFlowProfile.Record(SubmissionFlowProfile.EventKind.WakeRequested);

@@ -112,6 +112,14 @@ internal static unsafe partial class VulkanVideoPresenter
         private bool _renderingActive;
         private RenderingState _renderingState;
         private long _renderingScopesBegun;
+        // SHARPEMU_DEFER_GLOBAL_BARRIERS=0 ends the rendering scope at every guest cache flush again.
+        private static readonly bool DeferGlobalBarriers =
+            Environment.GetEnvironmentVariable("SHARPEMU_DEFER_GLOBAL_BARRIERS") != "0";
+        private bool _renderingWritesMemory;
+        private bool _nextDrawWritesMemory;
+        private bool _globalBarrierAfterRendering;
+        // Attachment barriers that order this rendering scope before later work; see TryDeferUntilRenderingEnds.
+        private readonly List<(PipelineStageFlags Source, PipelineStageFlags Destination, ImageMemoryBarrier2[] Barriers)> _barriersAfterRendering = new();
         private bool _hasBoundDepth;
         private DepthAttachmentState _boundDepth;
         private ImageLayout _boundDepthLayout;
@@ -629,12 +637,23 @@ internal static unsafe partial class VulkanVideoPresenter
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawRenderingSetup);
             if (_renderingActive && _renderingState == state)
             {
+                _renderingWritesMemory |= _nextDrawWritesMemory;
+                _nextDrawWritesMemory = false;
                 return;
             }
 
             EndRendering();
             var command = BeginBatchedGuestCommands();
             _commandBuffer = command;
+            if (DeferGlobalBarriers)
+            {
+                // A guest cache flush inside this scope may be deferred to its end; this keeps
+                // everything recorded before the scope ordered before its draws either way.
+                RecordGlobalBarrier(command);
+            }
+
+            _renderingWritesMemory = _nextDrawWritesMemory;
+            _nextDrawWritesMemory = false;
             var colors = stackalloc RenderingAttachmentInfo[RenderingState.ColorAttachmentCapacity];
             for (var index = 0; index < state.ColorAttachmentCount; index++)
             {
@@ -713,7 +732,38 @@ internal static unsafe partial class VulkanVideoPresenter
 
             _renderingActive = false;
             _renderingState = default;
-            _vk.CmdEndRendering(new CommandBuffer(_scheduler.Current.Handle));
+            SharpEmu.Libs.Gpu.Scheduling.RenderBreakProfile.Record();
+            var command = new CommandBuffer(_scheduler.Current.Handle);
+            _vk.CmdEndRendering(command);
+            foreach (var (sourceStages, destinationStages, barriers) in _barriersAfterRendering)
+            {
+                fixed (ImageMemoryBarrier2* pointer = barriers)
+                {
+                    VulkanSynchronization.PipelineBarrier(_vk,
+                        command, sourceStages, destinationStages, DependencyFlags.ByRegionBit,
+                        0, null, 0, null, (uint)barriers.Length, pointer);
+                }
+            }
+
+            _barriersAfterRendering.Clear();
+            if (_globalBarrierAfterRendering)
+            {
+                _globalBarrierAfterRendering = false;
+                RecordGlobalBarrier(command);
+            }
+
+            _renderingWritesMemory = false;
+        }
+
+        void IRenderHost.PrepareMemoryWritingDraw()
+        {
+            // The store must not move ahead of a cache flush deferred inside this scope.
+            if (_globalBarrierAfterRendering)
+            {
+                EndRendering();
+            }
+
+            _nextDrawWritesMemory = true;
         }
 
         public void BindPipeline(PipelineBindPoint bindPoint, in PipelineHandle pipeline)

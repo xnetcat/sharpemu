@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using SharpEmu.HLE.GpuMemory;
+using Silk.NET.Vulkan;
 
 namespace SharpEmu.Libs.Gpu.Scheduling;
 
@@ -44,6 +45,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
     private bool _disposeRequested;
     private bool _deviceDisposed;
     private SubmissionContext? _context;
+    private readonly IRenderingState _rendering;
     private ulong _lastMemoryDrainTick;
 
     public SubmissionScheduler(
@@ -54,6 +56,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         Action<ulong>? completed = null)
     {
         _device = device;
+        _rendering = rendering;
         _prepareSubmit = prepareSubmit;
         _submitted = submitted;
         _completed = completed;
@@ -209,6 +212,10 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
             Current.EndRendering();
         }
     }
+
+    public bool TryDeferUntilRenderingEnds(PipelineStageFlags sourceStages, PipelineStageFlags destinationStages, List<ImageMemoryBarrier2> barriers) =>
+        Active && !_command.IsInvalid && _rendering.IsRendering &&
+        _rendering.TryDeferUntilRenderingEnds(sourceStages, destinationStages, barriers);
 
     public ulong Flush() => Flush(new SubmitBundle());
 

@@ -125,8 +125,37 @@ public sealed unsafe partial class CachedImage
             return;
         }
 
+        // Attachment accesses inside one rendering scope are already ordered by rasterization
+        // order, so a barrier that only repeats an attachment write in the same layout matters
+        // only to what runs after the scope; it waits for the scope to end instead of ending it.
+        if (OnlyRepeatsAttachmentAccess(barriers) &&
+            _scheduler.TryDeferUntilRenderingEnds(sourceStages == 0 ? PipelineStageFlags.TopOfPipeBit : sourceStages, stage, barriers))
+        {
+            return;
+        }
+
         _scheduler.EndRendering();
         RecordBarriers(command, sourceStages, stage, null, barriers);
+    }
+
+    private const AccessFlags2 AttachmentAccess =
+        AccessFlags2.ColorAttachmentReadBit | AccessFlags2.ColorAttachmentWriteBit |
+        AccessFlags2.DepthStencilAttachmentReadBit | AccessFlags2.DepthStencilAttachmentWriteBit;
+
+    private static bool OnlyRepeatsAttachmentAccess(List<ImageMemoryBarrier2> barriers)
+    {
+        foreach (var barrier in barriers)
+        {
+            if (barrier.OldLayout != barrier.NewLayout ||
+                barrier.SrcAccessMask == 0 ||
+                (barrier.SrcAccessMask & ~AttachmentAccess) != 0 ||
+                (barrier.DstAccessMask & ~AttachmentAccess) != 0)
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private void RecordBarriers(CommandBuffer command, PipelineStageFlags sourceStages, PipelineStageFlags destinationStages, BufferMemoryBarrier2* bufferBarrier, List<ImageMemoryBarrier2> imageBarriers)
