@@ -19,6 +19,45 @@ public sealed class AgcInterpolantMappingTests
     private const uint SpiPsInputCntl0 = 0x191;
 
     [Fact]
+    public void CreateInterpolantMapping_MatchesOutputsBySemanticAndKeepsIdentitySlots()
+    {
+        var memory = new FakeCpuMemory(BaseAddress, 0x2000);
+        var ctx = new CpuContext(memory, Generation.Gen5);
+
+        WriteUInt64(memory, GeometryShaderAddress + 0x38, GeometrySemanticsAddress);
+        WriteUInt16(memory, GeometryShaderAddress + 0x56, 3);
+        WriteUInt32(memory, GeometrySemanticsAddress + 0, Semantic(7, hardwareMapping: 5));
+        WriteUInt32(memory, GeometrySemanticsAddress + 4, Semantic(9, hardwareMapping: 12));
+        WriteUInt32(memory, GeometrySemanticsAddress + 8, Semantic(10, hardwareMapping: 4, isF16: 1));
+
+        WriteUInt64(memory, PixelShaderAddress + 0x30, PixelSemanticsAddress);
+        WriteUInt32(memory, PixelShaderAddress + 0x50, 5);
+        WriteUInt32(memory, PixelSemanticsAddress + 0, Semantic(7));
+        WriteUInt32(memory, PixelSemanticsAddress + 4, Semantic(8, defaultValue: 2));
+        WriteUInt32(memory, PixelSemanticsAddress + 8, Semantic(9, flatShaded: true, custom: true, defaultValue: 1));
+        WriteUInt32(memory, PixelSemanticsAddress + 12, Semantic(10, isF16: 1, defaultValue: 3, defaultValueHigh: 2));
+        WriteUInt32(memory, PixelSemanticsAddress + 16, Semantic(11, isF16: 2, defaultValueHigh: 3));
+
+        ctx[CpuRegister.Rdi] = RegistersAddress;
+        ctx[CpuRegister.Rsi] = GeometryShaderAddress;
+        ctx[CpuRegister.Rdx] = PixelShaderAddress;
+
+        Assert.Equal(
+            (int)OrbisGen2Result.ORBIS_GEN2_OK,
+            AgcExports.CreateInterpolantMapping(ctx));
+
+        // Values captured from the per-word implementation before the reads and the register
+        // block write were batched.
+        uint[] expectedValues = [0x0000_0005, 0x0000_0220, 0x0000_052C, 0x0158_0304, 0x0278_0020];
+        for (uint index = 0; index < 32; index++)
+        {
+            Assert.Equal(SpiPsInputCntl0 + index, ReadUInt32(memory, RegistersAddress + (index * 8)));
+            var expected = index < expectedValues.Length ? expectedValues[index] : index;
+            Assert.Equal(expected, ReadUInt32(memory, RegistersAddress + (index * 8) + 4));
+        }
+    }
+
+    [Fact]
     public void CreateInterpolantMapping2_WritesIdentityMappingWithoutPixelInputs()
     {
         var memory = new FakeCpuMemory(BaseAddress, 0x2000);
