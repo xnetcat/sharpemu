@@ -100,6 +100,10 @@ public static class AudioOut2Exports
         public uint QueueDepth { get; }
         public IHostAudioStream? Backend { get; }
 
+        // Set when sceAudioOut2ContextAdvance already emitted (and paced) this grain, so the Push
+        // that follows it does not wait for a second grain.
+        public int AdvancedSincePush;
+
         public void PaceAdvance()
         {
             long delay;
@@ -363,8 +367,13 @@ public static class AudioOut2Exports
             return SetReturn(ctx, 0);
         }
 
-        // Host Submit already blocks on the waveOut queue; only fall back to
-        // software pacing when nothing was queued (silence / non-primary ctx).
+        // A grain is emitted once: by Advance when the title calls it first, else here. Host Submit
+        // already blocks on the output queue; software pacing covers grains with nothing queued.
+        if (Interlocked.Exchange(ref context.AdvancedSincePush, 0) != 0)
+        {
+            return SetReturn(ctx, 0);
+        }
+
         if (!TrySubmitContextAudio(ctx, context))
         {
             context.PaceAdvance();
@@ -386,6 +395,8 @@ public static class AudioOut2Exports
             {
                 state.PaceAdvance();
             }
+
+            Volatile.Write(ref state.AdvancedSincePush, 1);
         }
 
         return SetReturn(ctx, 0);
