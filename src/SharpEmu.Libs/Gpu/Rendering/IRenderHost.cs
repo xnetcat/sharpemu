@@ -170,6 +170,9 @@ public interface IRenderHost
     // dependency the driver enforces between command encoders (not only a pipeline barrier).
     void ComputeCompletionDependency() => ShaderAccessBarrier();
 
+    // LOCAL ONLY diagnostic: a full memory barrier between everything recorded so far and what follows.
+    void DiagnosticGlobalBarrier() => ShaderAccessBarrier();
+
     // Clears the bound color targets to one colour in place of the draw.
     void ClearColorTargets(ReadOnlySpan<ColorTargetState> targets, SolidColorClear clear);
 

@@ -975,6 +975,8 @@ internal static unsafe partial class VulkanVideoPresenter
             _vk.CmdResetEvent(command, ev, PipelineStageFlags.AllCommandsBit);
         }
 
+        void IRenderHost.DiagnosticGlobalBarrier() => RecordGlobalBarrier(BeginBatchedGuestCommands());
+
         public void ShaderAccessBarrier() =>
             RecordMemoryBarrier(
                 PipelineStageFlags.ComputeShaderBit,

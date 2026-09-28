@@ -27,6 +27,7 @@ public sealed partial class RenderExecutor
     // LOCAL ONLY diagnostic: drain the queue before and after every emulated geometry dispatch.
     private static readonly string? DrainAroundNggMode = Environment.GetEnvironmentVariable("SHARPEMU_DIAG_DRAIN_AROUND_NGG");
     private static readonly bool DrainBeforeNgg = DrainAroundNggMode is "1" or "pre";
+    private static readonly bool BarrierBeforeNgg = Environment.GetEnvironmentVariable("SHARPEMU_DIAG_NGG_BARRIER") == "1";
     private static readonly bool DrainAfterNgg = DrainAroundNggMode is "1" or "post";
     private static readonly bool FlushAfterNgg = DrainAroundNggMode is "flush" or "flushsleep" or "sleepdraw" or "flushwait";
     private static readonly bool GpuWaitAfterNgg = DrainAroundNggMode is "flushwait";
@@ -252,6 +253,11 @@ public sealed partial class RenderExecutor
             }
             GpuWorkTrace.Breadcrumb(-traceId);
             _host.BindPipeline(PipelineBindPoint.Compute, in pipeline);
+            if (BarrierBeforeNgg)
+            {
+                _host.DiagnosticGlobalBarrier();
+            }
+
             _host.Dispatch((uint)subgroupCount, 1, 1);
             _host.ShaderAccessBarrier();
             if (EventAfterNgg)
