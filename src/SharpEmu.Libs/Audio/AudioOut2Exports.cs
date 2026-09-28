@@ -100,9 +100,21 @@ public static class AudioOut2Exports
         public uint QueueDepth { get; }
         public IHostAudioStream? Backend { get; }
 
-        // Set when sceAudioOut2ContextAdvance already emitted (and paced) this grain, so the Push
-        // that follows it does not wait for a second grain.
-        public int AdvancedSincePush;
+        // When this context last handed a grain to the host backend, whose Submit already blocks.
+        public long LastSubmitTimestamp;
+
+        // Software pacing stands in for a grain nothing was submitted for; a call right after a real
+        // submit (Advance then Push for the same grain) must not wait for a second grain.
+        public void PaceUnlessJustSubmitted()
+        {
+            var grainTicks = (long)(Stopwatch.Frequency * (double)GrainSamples / Frequency);
+            if (Stopwatch.GetTimestamp() - Volatile.Read(ref LastSubmitTimestamp) < grainTicks)
+            {
+                return;
+            }
+
+            PaceAdvance();
+        }
 
         public void PaceAdvance()
         {
@@ -367,16 +379,11 @@ public static class AudioOut2Exports
             return SetReturn(ctx, 0);
         }
 
-        // A grain is emitted once: by Advance when the title calls it first, else here. Host Submit
-        // already blocks on the output queue; software pacing covers grains with nothing queued.
-        if (Interlocked.Exchange(ref context.AdvancedSincePush, 0) != 0)
-        {
-            return SetReturn(ctx, 0);
-        }
-
+        // Host Submit already blocks on the output queue; software pacing covers grains with nothing
+        // queued, once per grain whichever of Advance and Push comes first.
         if (!TrySubmitContextAudio(ctx, context))
         {
-            context.PaceAdvance();
+            context.PaceUnlessJustSubmitted();
         }
 
         return SetReturn(ctx, 0);
@@ -393,10 +400,8 @@ public static class AudioOut2Exports
         {
             if (!TrySubmitContextAudio(ctx, state))
             {
-                state.PaceAdvance();
+                state.PaceUnlessJustSubmitted();
             }
-
-            Volatile.Write(ref state.AdvancedSincePush, 1);
         }
 
         return SetReturn(ctx, 0);
@@ -1070,7 +1075,13 @@ public static class AudioOut2Exports
                         $"ports={mixedPorts} peak={peak:F4} backend={backendName}");
                 }
 
-                return backend.Submit(outputSpan);
+                var submitted = backend.Submit(outputSpan);
+                if (submitted)
+                {
+                    Volatile.Write(ref context.LastSubmitTimestamp, Stopwatch.GetTimestamp());
+                }
+
+                return submitted;
             }
             finally
             {
