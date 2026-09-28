@@ -63,6 +63,19 @@ public readonly record struct DepthStencilState(
 
     public bool IsReadOnly(Format format) => AttachmentWriteAspects(format) == ImageAspectFlags.None;
 
+    // The layout for an attachment the draw does not also sample: writable in every aspect the
+    // format has, so draws that toggle depth or stencil writes keep one layout (and one rendering
+    // scope). Only a sampled attachment needs the read-only layouts of AttachmentLayout.
+    public static ImageLayout WritableAttachmentLayout(Format format)
+    {
+        var available = ViewFormatRules.DepthAspects(format);
+        var hasDepth = (available & ImageAspectFlags.DepthBit) != 0;
+        var hasStencil = (available & ImageAspectFlags.StencilBit) != 0;
+        return hasDepth && hasStencil ? ImageLayout.DepthStencilAttachmentOptimal
+            : hasStencil ? ImageLayout.StencilAttachmentOptimal
+            : ImageLayout.DepthAttachmentOptimal;
+    }
+
     public ImageLayout AttachmentLayout(Format format)
     {
         var available = ViewFormatRules.DepthAspects(format);

@@ -296,7 +296,9 @@ public sealed partial class RenderExecutor
             }
 
             var loadState = depth.LoadState;
-            var layout = loadState.AttachmentLayout(target.Format);
+            var layout = _host.SamplesDepthAttachment(in depth)
+                ? loadState.AttachmentLayout(target.Format)
+                : DepthStencilState.WritableAttachmentLayout(target.Format);
             _host.TransitionDepthAttachment(in depth, layout, loadState.AttachmentWriteAspects(target.Format));
             var view = target.Request.View;
             rendering.Width = Math.Min(rendering.Width, target.Width);

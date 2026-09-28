@@ -366,6 +366,28 @@ internal static unsafe partial class VulkanVideoPresenter
             BindBuffers(stage);
             ObtainDeviceAddressRanges(stage);
             BindImages(stage);
+            _preparedTextures.Add(stage.Textures);
+        }
+
+        // Textures bound for the draw being prepared; cleared when its preparation closes.
+        private readonly List<TextureResource[]> _preparedTextures = new();
+
+        bool IRenderHost.SamplesDepthAttachment(in DepthAttachmentState depth)
+        {
+            var image = _imageCache.GetImage(depth.Image);
+            var attachmentView = depth.Target.Target.Request.View;
+            foreach (var textures in _preparedTextures)
+            {
+                foreach (var texture in textures)
+                {
+                    if (!texture.IsHostMovie && ReferenceEquals(texture.CachedImage, image) && ViewsOverlap(texture.Request.View, attachmentView))
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            return false;
         }
 
         private BufferView NullStorageBuffer() => new(_bufferCache.GetBuffer(GuestBufferCache.NullBufferId).Handle, 0, NullStorageBufferBytes);
