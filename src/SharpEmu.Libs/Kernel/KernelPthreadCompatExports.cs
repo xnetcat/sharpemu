@@ -882,6 +882,20 @@ public static class KernelPthreadCompatExports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
+    // LOCAL ONLY: how guest mutex acquisitions resolve, reported with the render profile.
+    internal static class MutexLockStats
+    {
+        public static long Uncontended, GrantedWhileQueueing, CooperativeBlocks, HostWaits, HostWaitTicks;
+
+        public static string TakeReport()
+        {
+            var text = $"uncontended={Interlocked.Exchange(ref Uncontended, 0)} granted_queueing={Interlocked.Exchange(ref GrantedWhileQueueing, 0)} " +
+                $"coop_blocks={Interlocked.Exchange(ref CooperativeBlocks, 0)} host_waits={Interlocked.Exchange(ref HostWaits, 0)} " +
+                $"host_wait_ms={Interlocked.Exchange(ref HostWaitTicks, 0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1}";
+            return text;
+        }
+    }
+
     private static int PthreadMutexLockCore(CpuContext ctx, ulong mutexAddress, bool tryOnly)
     {
         if (mutexAddress == 0)
@@ -899,6 +913,7 @@ public static class KernelPthreadCompatExports
         var currentThreadId = KernelPthreadState.GetCurrentThreadHandle();
         if (state.TryAcquireUncontended(currentThreadId, allowWaiterBarge: tryOnly))
         {
+            Interlocked.Increment(ref MutexLockStats.Uncontended);
             TracePthreadMutex(ctx, tryOnly ? "trylock" : "lock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_OK);
             return (int)OrbisGen2Result.ORBIS_GEN2_OK;
         }
@@ -1039,6 +1054,7 @@ public static class KernelPthreadCompatExports
 
         if (acquiredWhileQueueing)
         {
+            Interlocked.Increment(ref MutexLockStats.GrantedWhileQueueing);
             waiter!.HostSignal?.Dispose();
             TracePthreadMutex(ctx, "lock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_OK);
             return (int)OrbisGen2Result.ORBIS_GEN2_OK;
@@ -1052,11 +1068,15 @@ public static class KernelPthreadCompatExports
                 () => CompleteBlockedMutexLock(ctx, mutexAddress, resolvedAddress, state, waiter),
                 () => TryGrantBlockedMutexLock(ctx, mutexAddress, resolvedAddress, state, waiter)))
         {
+            Interlocked.Increment(ref MutexLockStats.CooperativeBlocks);
             TracePthreadMutex(ctx, "lock-block", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_OK);
             return (int)OrbisGen2Result.ORBIS_GEN2_OK;
         }
 
+        var hostWaitStarted = System.Diagnostics.Stopwatch.GetTimestamp();
         var hostResult = WaitForHostMutexLock(ctx, state, waiter!);
+        Interlocked.Increment(ref MutexLockStats.HostWaits);
+        Interlocked.Add(ref MutexLockStats.HostWaitTicks, System.Diagnostics.Stopwatch.GetTimestamp() - hostWaitStarted);
         TracePthreadMutex(ctx, "lock", mutexAddress, resolvedAddress, state, currentThreadId, hostResult);
         return hostResult;
     }

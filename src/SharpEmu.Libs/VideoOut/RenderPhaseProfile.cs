@@ -467,6 +467,7 @@ internal static class RenderPhaseProfile
         SharpEmu.Libs.Gpu.Scheduling.SubmitSiteProfile.Report();
         var (faults, faultMs) = SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.TakeFaultWindow();
         Console.Error.WriteLine($"[PERF][GPU_FAULTS] resolved={faults} handler_ms={faultMs:F1}");
+        Console.Error.WriteLine($"[PERF][MUTEX] {SharpEmu.Libs.Kernel.KernelPthreadCompatExports.MutexLockStats.TakeReport()}");
         BufferUploadProfile.Report();
         SharpEmu.ShaderCompiler.Resources.ResourceMaterializationProfile.WriteReport();
         SharpEmu.Libs.Diagnostics.AgcRegisterPacketProfile.WriteReport();
