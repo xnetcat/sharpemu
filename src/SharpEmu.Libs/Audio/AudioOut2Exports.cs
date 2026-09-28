@@ -78,6 +78,7 @@ public static class AudioOut2Exports
 
     private static readonly ConcurrentDictionary<ulong, byte> SpeakerArrays = new();
     private static readonly ConcurrentDictionary<ulong, ContextState> Contexts = new();
+    private const int DeviceCushionMilliseconds = 40;
     private static readonly ConcurrentDictionary<ulong, PortState> Ports = new();
 
     private sealed class ContextState
@@ -101,7 +102,43 @@ public static class AudioOut2Exports
         public IHostAudioStream? Backend { get; }
 
 
-        public void PaceAdvance() => SleepUntil(ReserveGrain());
+        public long GrainTicks => (long)Math.Ceiling(Stopwatch.Frequency * (double)GrainSamples / Frequency);
+
+        // Set once a grain reaches a host device: the device queue, not the grain clock, is then
+        // what holds the context's queued audio.
+        public volatile bool DevicePaced;
+
+        public void PaceAdvance() => SleepUntil(QueueSlotFree(ReserveGrain()));
+
+        // The output holds QueueDepth grains: a grain can be queued as soon as the grain
+        // QueueDepth-1 ahead of it starts playing, so a title may render that far ahead of real
+        // time before a push blocks. Blocking every push for a whole grain instead holds a title's
+        // audio lock across each grain it renders in a burst (Wwise renders several under one lock).
+        public long QueueSlotFree(long grainStart) =>
+            grainStart - (GrainTicks * Math.Max((long)QueueDepth - 1, 0));
+
+        // Grains reserved on the clock that have not started playing, at most QueueDepth.
+        public uint ClockQueuedGrains()
+        {
+            long ahead;
+            lock (_paceGate)
+            {
+                ahead = _nextAdvanceTimestamp - Stopwatch.GetTimestamp();
+            }
+
+            return ahead <= 0 ? 0 : (uint)Math.Min((ahead + GrainTicks - 1) / GrainTicks, QueueDepth);
+        }
+
+        // Grains the device holds beyond DeviceCushionMilliseconds, at most QueueDepth. The cushion
+        // stays below the emulated queue so host scheduling jitter does not become a dropout.
+        public uint DeviceQueuedGrains(int queuedMilliseconds)
+        {
+            var grainMilliseconds = GrainSamples * 1000.0 / Frequency;
+            var beyondCushion = queuedMilliseconds - DeviceCushionMilliseconds;
+            return beyondCushion <= 0
+                ? 0
+                : (uint)Math.Min(Math.Ceiling(beyondCushion / grainMilliseconds), QueueDepth);
+        }
 
         // Claims the next grain on the context's clock and returns when it starts.
         public long ReserveGrain()
@@ -379,11 +416,15 @@ public static class AudioOut2Exports
         var started = Stopwatch.GetTimestamp();
         var submitted = TrySubmitContextAudio(ctx, context);
         var advancedGrain = Interlocked.Exchange(ref context.AdvancedGrainStart, 0);
-        if (!submitted)
+        if (submitted)
+        {
+            context.DevicePaced = true;
+        }
+        else
         {
             // Push is the blocking point of a grain: it waits for the grain an Advance claimed, or
             // claims one itself when the title does not advance separately.
-            ContextState.SleepUntil(advancedGrain != 0 ? advancedGrain : context.ReserveGrain());
+            ContextState.SleepUntil(context.QueueSlotFree(advancedGrain != 0 ? advancedGrain : context.ReserveGrain()));
         }
 
         TraceGrainCall("push", handle, submitted, started);
@@ -404,6 +445,7 @@ public static class AudioOut2Exports
             var submitted = TrySubmitContextAudio(ctx, state);
             if (submitted)
             {
+                state.DevicePaced = true;
                 // The host backend already blocked for this grain; the Push that follows must not.
                 Volatile.Write(ref state.AdvancedGrainStart, 1);
             }
@@ -414,7 +456,7 @@ public static class AudioOut2Exports
                 if (previous != 0)
                 {
                     // Two Advances without a Push: the earlier grain is waited for here.
-                    ContextState.SleepUntil(previous);
+                    ContextState.SleepUntil(state.QueueSlotFree(previous));
                 }
             }
 
@@ -439,10 +481,15 @@ public static class AudioOut2Exports
         var outLevelAddress = ctx[CpuRegister.Rsi];
         var outAvailableAddress = ctx[CpuRegister.Rdx];
 
+        // Titles size their rendering by these: Wwise renders exactly puiAvailableQueues grains per
+        // update and pushes them non-blocking, so a queue always reported empty made it render a
+        // full queue every update and block in Push while holding its audio lock.
+        var hasContext = Contexts.TryGetValue(ctx[CpuRegister.Rdi], out var context);
+        var queued = hasContext ? QueuedGrains(context!) : 0u;
         Span<byte> level = stackalloc byte[sizeof(uint)];
         if (outLevelAddress != 0)
         {
-            BinaryPrimitives.WriteUInt32LittleEndian(level, 0);
+            BinaryPrimitives.WriteUInt32LittleEndian(level, queued);
             if (!ctx.Memory.TryWrite(outLevelAddress, level))
             {
                 return SetReturn(ctx, AudioOut2ErrorInvalidPointer);
@@ -451,9 +498,7 @@ public static class AudioOut2Exports
 
         if (outAvailableAddress != 0)
         {
-            var available = Contexts.TryGetValue(ctx[CpuRegister.Rdi], out var context)
-                ? context.QueueDepth
-                : 4u;
+            var available = hasContext ? context!.QueueDepth - queued : 4u;
             BinaryPrimitives.WriteUInt32LittleEndian(level, available);
             if (!ctx.Memory.TryWrite(outAvailableAddress, level))
             {
@@ -1019,6 +1064,21 @@ public static class AudioOut2Exports
 
         Console.Error.WriteLine(
             $"[AUDIO2][GRAIN] {kind} ctx=0x{handle:X} submitted={submitted} ms={(Stopwatch.GetTimestamp() - started) * 1000.0 / Stopwatch.Frequency:F2} t={Stopwatch.GetTimestamp() * 1000.0 / Stopwatch.Frequency:F1}");
+    }
+
+    private static uint QueuedGrains(ContextState context)
+    {
+        if (context.DevicePaced)
+        {
+            var backend = ResolveContextBackend(context, out _);
+            var queuedMilliseconds = backend?.QueuedMilliseconds ?? -1;
+            if (queuedMilliseconds >= 0)
+            {
+                return context.DeviceQueuedGrains(queuedMilliseconds);
+            }
+        }
+
+        return context.ClockQueuedGrains();
     }
 
     private static bool TrySubmitContextAudio(CpuContext ctx, ContextState context)

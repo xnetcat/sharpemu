@@ -225,4 +225,49 @@ public sealed class AudioOut2PortGetStateExportsTests
         Assert.Equal(4u, BinaryPrimitives.ReadUInt32LittleEndian(written[8..]));
         Assert.Equal(0x11, written[0x0C]);
     }
+
+    [Fact]
+    public void ContextGetQueueLevel_ReportsGrainsQueuedByAdvanceAndPush()
+    {
+        // Wwise renders exactly puiAvailableQueues grains per update and pushes them
+        // non-blocking; a queue that never fills made it block in Push under its lock.
+        var ctx = CreateContext(out var memory);
+        var param = new byte[0x40];
+        BinaryPrimitives.WriteUInt32LittleEndian(param.AsSpan(0x0C), 4);
+        // 16384-sample grains (341 ms) keep the queue from draining during the test.
+        BinaryPrimitives.WriteUInt32LittleEndian(param.AsSpan(0x10), 0x4000);
+        Assert.True(memory.TryWrite(StateAddress, param));
+        ctx[CpuRegister.Rdi] = StateAddress;
+        ctx[CpuRegister.Rsi] = StateAddress + 0x100;
+        ctx[CpuRegister.Rdx] = 0x1000;
+        ctx[CpuRegister.Rcx] = StateAddress + 0x200;
+        Assert.Equal(0, AudioOut2Exports.AudioOut2ContextCreate(ctx));
+        Span<byte> handleBytes = stackalloc byte[8];
+        Assert.True(memory.TryRead(StateAddress + 0x200, handleBytes));
+        var handle = BinaryPrimitives.ReadUInt64LittleEndian(handleBytes);
+
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        for (var grain = 1u; grain <= 4; grain++)
+        {
+            ctx[CpuRegister.Rdi] = handle;
+            AudioOut2Exports.AudioOut2ContextAdvance(ctx);
+            ctx[CpuRegister.Rdi] = handle;
+            ctx[CpuRegister.Rsi] = 0;
+            AudioOut2Exports.AudioOut2ContextPush(ctx);
+
+            ctx[CpuRegister.Rdi] = handle;
+            ctx[CpuRegister.Rsi] = StateAddress + 0x300;
+            ctx[CpuRegister.Rdx] = StateAddress + 0x308;
+            Assert.Equal(0, AudioOut2Exports.AudioOut2ContextGetQueueLevel(ctx));
+            Span<byte> level = stackalloc byte[0x0C];
+            Assert.True(memory.TryRead(StateAddress + 0x300, level));
+            Assert.Equal(grain, BinaryPrimitives.ReadUInt32LittleEndian(level));
+            Assert.Equal(4 - grain, BinaryPrimitives.ReadUInt32LittleEndian(level[8..]));
+        }
+
+        // Filling the queue up to its depth never blocks.
+        Assert.True(System.Diagnostics.Stopwatch.GetElapsedTime(started) < TimeSpan.FromMilliseconds(300));
+        ctx[CpuRegister.Rdi] = handle;
+        AudioOut2Exports.AudioOut2ContextDestroy(ctx);
+    }
 }
