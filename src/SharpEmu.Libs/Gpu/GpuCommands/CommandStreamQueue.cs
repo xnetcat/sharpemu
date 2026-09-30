@@ -600,6 +600,24 @@ public sealed class CommandStreamQueue
         }
     }
 
+    // LOCAL ONLY: every queue's head as (queue, blocked, packet address, submission id).
+    public List<(int Queue, bool Blocked, ulong Packet, ulong SubmissionId, int Depth)> DescribeHeads()
+    {
+        lock (_gate)
+        {
+            var heads = new List<(int, bool, ulong, ulong, int)>();
+            for (var queueId = 0; queueId < QueueCount; queueId++)
+            {
+                if (_queues[queueId].First is { } head)
+                {
+                    heads.Add((queueId, head.Value.Blocked, head.Value.BlockedPacketAddress, head.Value.SubmissionId, _queues[queueId].Count));
+                }
+            }
+
+            return heads;
+        }
+    }
+
     // A diagnostic view of the blocked heads: their count, the oldest age and one sample.
     public BlockedSnapshot SnapshotBlocked()
     {

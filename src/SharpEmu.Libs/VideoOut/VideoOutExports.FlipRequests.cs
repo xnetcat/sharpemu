@@ -299,6 +299,21 @@ public static partial class VideoOutExports
         }
     }
 
+    // LOCAL ONLY: every outstanding flip request, for stall diagnostics.
+    internal static string DescribeFlipRequests()
+    {
+        lock (_stateGate)
+        {
+            var text = new System.Text.StringBuilder();
+            foreach (var request in _flipRequests.Values)
+            {
+                text.Append($" [req={request.RequestId} h={request.Handle} buf={request.BufferIndex} mode={request.FlipMode} gpu={request.GpuQueued} state={request.State} outcome={request.Outcome} ready={(request.ReadyTimestamp is null ? "no" : "yes")}]");
+            }
+
+            return text.Length == 0 ? " none" : text.ToString();
+        }
+    }
+
     // The graphics queue reached the preparation of a CPU flip, so later waits on its buffer are ordered after it.
     internal static void MarkFlipOrdered(ulong requestId)
     {

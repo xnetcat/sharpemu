@@ -36,22 +36,35 @@ internal static unsafe partial class VulkanVideoPresenter
                 Thread.Sleep(10_000);
                 try
                 {
-                    if (SnapshotBlockedCommandStream(memory) is not { } snapshot)
+                    if (!TryGetActivePresenter(out var active))
                         continue;
-                    var text = new System.Text.StringBuilder();
-                    text.Append($"[GPU][BLOCKWATCH] blocked={snapshot.Outstanding} oldest_ms={snapshot.OldestAgeMilliseconds:F0} queue={snapshot.SampleQueueId} packet=0x{snapshot.SampleWaitAddress:X}");
-                    if (snapshot.SampleWaitAddress != 0)
+                    var text = new System.Text.StringBuilder("[GPU][BLOCKWATCH]");
+                    text.Append($" flips:{VideoOutExports.DescribeFlipRequests()} present: {active.DescribePresentationState()}");
+                    foreach (var head in active.CommandStream.DescribeHeads())
                     {
-                        Span<byte> words = stackalloc byte[32];
-                        if (memory.TryRead(snapshot.SampleWaitAddress, words))
+                        text.Append($" | q{head.Queue} depth={head.Depth} sub={head.SubmissionId} blocked={head.Blocked} packet=0x{head.Packet:X}");
+                        Span<byte> words = stackalloc byte[36];
+                        if (!head.Blocked || head.Packet == 0 || !memory.TryRead(head.Packet, words))
+                            continue;
+                        var header = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(words);
+                        text.Append($" hdr={header:X8}");
+                        var op = (header >> 8) & 0xFF;
+                        var register = (header >> 2) & 0x3F;
+                        if (op == 0x10 && register is 0x0A or 0x0B)
+                        {
+                            var pollAddress = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(words[4..]) |
+                                ((ulong)System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(words[8..]) << 32);
+                            var reference = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(words[(register == 0x0A ? 16 : 20)..]);
+                            var control = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(words[(register == 0x0A ? 20 : 28)..]);
+                            Span<byte> value = stackalloc byte[8];
+                            var current = memory.TryRead(pollAddress, value) ? System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(value) : ulong.MaxValue;
+                            text.Append($" waitmem{(register == 0x0A ? 32 : 64)} addr=0x{pollAddress:X} ref=0x{reference:X} ctl=0x{control:X} now=0x{current:X}");
+                        }
+                        else
                         {
                             text.Append(" dwords=");
-                            for (var i = 0; i < 8; i++)
+                            for (var i = 1; i < 8; i++)
                                 text.Append($"{System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(words[(i * 4)..]):X8} ");
-                            var pollAddress = System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(words[8..]) & ~3UL;
-                            Span<byte> value = stackalloc byte[8];
-                            if (pollAddress != 0 && memory.TryRead(pollAddress, value))
-                                text.Append($"poll@0x{pollAddress:X}={System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(value):X16}");
                         }
                     }
                     Console.Error.WriteLine(text.ToString());
@@ -711,6 +724,23 @@ internal static unsafe partial class VulkanVideoPresenter
                         DestroyGuestImage(snapshot);
                     }
                 }
+            }
+        }
+
+        // LOCAL ONLY: presentation queue and GPU timeline, for stall diagnostics.
+        internal string DescribePresentationState()
+        {
+            lock (_gate)
+            {
+                var text = new System.Text.StringBuilder();
+                text.Append($"completed_tick={_scheduler?.Timeline.CompletedTick} current_tick={_scheduler?.Timeline.CurrentTick} presented_seq={_presentedSequence} pending_presentations={_pendingGuestImagePresentations.Count}");
+                foreach (var pending in _pendingGuestImagePresentations)
+                {
+                    text.Append($" [seq={pending.Sequence} req_tick={pending.RequiredTick} flip={pending.FlipRequestId} ready={IsPresentationReadyLocked(in pending)}]");
+                }
+
+                text.Append($" latest={(_latestPresentation is { } latest ? $"seq={latest.Sequence} flip={latest.FlipRequestId} splash={latest.IsSplash}" : "none")}");
+                return text.ToString();
             }
         }
 
