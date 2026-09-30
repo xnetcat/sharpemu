@@ -97,6 +97,7 @@ public sealed unsafe partial class DirectExecutionBackend
 	// aborting thread's recent faults when Rosetta asserts (it raises SIGABRT on the faulting thread).
 	private static long _perfTrackerFaults;
 	private static long _perfGpuFastFaults;
+	private static long _perfNearStackFaults;
 	private static readonly ulong[] _faultRipRing = new ulong[8192];
 	private static readonly ulong[] _faultAddrRing = new ulong[8192];
 	[ThreadStatic]
@@ -131,6 +132,17 @@ public sealed unsafe partial class DirectExecutionBackend
 			return;
 		}
 
+		// A fault within 64 KiB of RSP means the tracker protected this thread's own stack pages;
+		// Rosetta writes the x86 signal frame just below RSP, so such a page can fault inside Rosetta.
+		if (addr != 0 && rsp != 0 && addr + 0x10000 >= rsp && addr < rsp + 0x10000)
+		{
+			var near = Interlocked.Increment(ref _perfNearStackFaults);
+			if (near <= 32 || (near & (near - 1)) == 0)
+			{
+				Console.Error.WriteLine($"[PERF][MEM] near_stack_fault#{near} sig={signal} rip=0x{rip:X} addr=0x{addr:X} rsp=0x{rsp:X} delta={(long)(addr - rsp)}");
+			}
+		}
+
 		var threadRing = _threadFaultRing ??= new ulong[32];
 		var index = _threadFaultIndex++ & 15;
 		threadRing[index * 2] = rip;
@@ -147,7 +159,7 @@ public sealed unsafe partial class DirectExecutionBackend
 				top[r] = top.TryGetValue(r, out var c) ? c + 1 : 1;
 			}
 			var text = new System.Text.StringBuilder();
-			text.Append($"[PERF][MEM] posix_faults={n} tracker={Interlocked.Read(ref _perfTrackerFaults)} gpu_fast={Interlocked.Read(ref _perfGpuFastFaults)} top_rips(of 8192):");
+			text.Append($"[PERF][MEM] posix_faults={n} tracker={Interlocked.Read(ref _perfTrackerFaults)} gpu_fast={Interlocked.Read(ref _perfGpuFastFaults)} near_stack={Interlocked.Read(ref _perfNearStackFaults)} top_rips(of 8192):");
 			foreach (var pair in top.OrderByDescending(static p => p.Value).Take(12))
 			{
 				text.Append($" 0x{pair.Key:X}={pair.Value}");
