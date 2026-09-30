@@ -259,6 +259,30 @@ public sealed unsafe class GuestFastPathStubTests
     }
 
     [Fact]
+    public void MemoryCopyStub_CopiesEverySizeAcrossTheBlockBoundaryAndNoFurther()
+    {
+        if (!CanRunStubs())
+        {
+            return;
+        }
+
+        using var stub = new MemoryCopyStub();
+        var source = Enumerable.Range(1, 48).Select(value => (byte)value).ToArray();
+        for (var count = 0; count <= 40; count++)
+        {
+            var destination = Enumerable.Repeat((byte)0xEE, 48).ToArray();
+            fixed (byte* sourcePointer = source)
+            fixed (byte* destinationPointer = destination)
+            {
+                Assert.Equal((ulong)destinationPointer, stub.Call(destinationPointer, sourcePointer, (nuint)count));
+            }
+
+            Assert.Equal(source.Take(count), destination.Take(count));
+            Assert.All(destination.Skip(count), value => Assert.Equal(0xEE, value));
+        }
+    }
+
+    [Fact]
     public void MemoryCopyStub_HandlesADestinationBelowAnOverlappingSource()
     {
         if (!CanRunStubs())

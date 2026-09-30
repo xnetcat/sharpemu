@@ -262,21 +262,46 @@ public sealed unsafe partial class DirectExecutionBackend
 	}
 
 	/// <summary>
-	/// memcpy/memmove(dst, src, n) as a forward <c>rep movsb</c>, returning dst. The libc
-	/// export copies with memmove semantics, so a destination that starts inside the source
-	/// (where a forward copy would read bytes it already overwrote) takes the managed path.
-	/// Only RAX, RCX, RSI, RDI and the flags change - all caller-saved - and the direction
-	/// flag is clear on entry per the SysV ABI.
+	/// memcpy/memmove(dst, src, n) as a forward copy of 16-byte blocks and then single bytes,
+	/// returning dst. The libc export copies with memmove semantics, so a destination that
+	/// starts inside the source (where a forward copy would read bytes it already overwrote)
+	/// takes the managed path; a destination below the source is safe because each block is
+	/// loaded before it is stored. Only RAX, RCX, RDX, RSI, RDI, XMM0 and the flags change -
+	/// all caller-saved in the SysV ABI.
 	/// </summary>
+	/// <remarks>
+	/// Not <c>rep movsb</c>: Rosetta 2 runs string instructions in runtime helpers, and a
+	/// fault inside one (every first CPU write to a GPU-tracked page) can hit Rosetta's
+	/// "expected saved LR to be in translated code" assertion, which kills the process.
+	/// </remarks>
 	internal static List<byte> EmitGuestMemoryCopyStub(nint fallbackTrampoline)
 	{
-		var code = new List<byte>(40);
+		var code = new List<byte>(72);
 		// mov rcx, rdi / sub rcx, rsi / cmp rcx, rdx / jb slow: dst - src < n (unsigned) is
 		// exactly a destination in (src, src + n) or equal to src with a non-empty copy.
 		code.AddRange([0x48, 0x89, 0xF9, 0x48, 0x29, 0xF1, 0x48, 0x39, 0xD1, 0x72, 0x00]);
 		var slowPathFixup = code.Count - 1;
-		// mov rax, rdi / mov rcx, rdx / rep movsb / ret
-		code.AddRange([0x48, 0x89, 0xF8, 0x48, 0x89, 0xD1, 0xF3, 0xA4, 0xC3]);
+		code.AddRange([
+			0x48, 0x89, 0xF8,       // mov rax, rdi
+			0x48, 0x89, 0xD1,       // mov rcx, rdx
+			0x48, 0xC1, 0xE9, 0x04, // shr rcx, 4
+			0x74, 0x15,             // jz tail
+			0xF3, 0x0F, 0x6F, 0x06, // blocks: movdqu xmm0, [rsi]
+			0xF3, 0x0F, 0x7F, 0x07, // movdqu [rdi], xmm0
+			0x48, 0x83, 0xC6, 0x10, // add rsi, 16
+			0x48, 0x83, 0xC7, 0x10, // add rdi, 16
+			0x48, 0xFF, 0xC9,       // dec rcx
+			0x75, 0xEB,             // jnz blocks
+			0x83, 0xE2, 0x0F,       // tail: and edx, 15
+			0x74, 0x0E,             // jz done
+			0x8A, 0x0E,             // bytes: mov cl, [rsi]
+			0x88, 0x0F,             // mov [rdi], cl
+			0x48, 0xFF, 0xC6,       // inc rsi
+			0x48, 0xFF, 0xC7,       // inc rdi
+			0xFF, 0xCA,             // dec edx
+			0x75, 0xF2,             // jnz bytes
+			0xC3,                   // done: ret
+		]);
 		code[slowPathFixup] = checked((byte)(code.Count - (slowPathFixup + 1)));
 		// jmp qword [rip+0] with the absolute trampoline address after it.
 		code.AddRange([0xFF, 0x25, 0x00, 0x00, 0x00, 0x00]);
