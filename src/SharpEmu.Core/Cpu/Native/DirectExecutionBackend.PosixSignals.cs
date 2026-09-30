@@ -4,6 +4,8 @@
 using System;
 using System.Runtime.InteropServices;
 using System.Threading;
+using System.Collections.Generic;
+using System.Linq;
 using SharpEmu.HLE;
 using SharpEmu.HLE.GpuMemory;
 
@@ -90,6 +92,69 @@ public sealed unsafe partial class DirectExecutionBackend
 
 	[ThreadStatic]
 	private static int _posixSignalHandlerDepth;
+
+	// LOCAL ONLY diagnostics (SHARPEMU_PERF_MEM=1): fault categories, a sampled RIP histogram, and the
+	// aborting thread's recent faults when Rosetta asserts (it raises SIGABRT on the faulting thread).
+	private static long _perfTrackerFaults;
+	private static long _perfGpuFastFaults;
+	private static readonly ulong[] _faultRipRing = new ulong[8192];
+	private static readonly ulong[] _faultAddrRing = new ulong[8192];
+	[ThreadStatic]
+	private static ulong[]? _threadFaultRing;
+	[ThreadStatic]
+	private static int _threadFaultIndex;
+
+	private static void RecordFaultDiagnostics(int signal, nint siginfo, nint ucontext)
+	{
+		byte* registers = GetPosixRegisterBase(ucontext);
+		ulong rip = registers == null ? 0 : *(ulong*)(registers + PosixRegisterOffsets[16]);
+		ulong rsp = registers == null ? 0 : *(ulong*)(registers + PosixRegisterOffsets[4]);
+		ulong addr = siginfo == 0 ? 0 : *(ulong*)((byte*)siginfo + PosixSigInfoAddressOffset);
+		if (signal == PosixSigAbort)
+		{
+			var ring = _threadFaultRing;
+			var text = new System.Text.StringBuilder();
+			text.Append($"[PERF][MEM] SIGABRT rip=0x{rip:X} rsp=0x{rsp:X} thread_recent_faults:");
+			if (ring != null)
+			{
+				for (var i = 0; i < 16; i++)
+				{
+					var slot = (_threadFaultIndex - 1 - i) & 15;
+					if (ring[slot * 2] != 0)
+					{
+						text.Append($" rip=0x{ring[slot * 2]:X}/addr=0x{ring[slot * 2 + 1]:X}");
+					}
+				}
+			}
+			Console.Error.WriteLine(text.ToString());
+			Console.Error.Flush();
+			return;
+		}
+
+		var threadRing = _threadFaultRing ??= new ulong[32];
+		var index = _threadFaultIndex++ & 15;
+		threadRing[index * 2] = rip;
+		threadRing[index * 2 + 1] = addr;
+		var n = Interlocked.Increment(ref _perfSignalCount);
+		var g = (int)(n & 8191);
+		_faultRipRing[g] = rip;
+		_faultAddrRing[g] = addr;
+		if (n % 100000 == 0)
+		{
+			var top = new Dictionary<ulong, int>();
+			foreach (var r in _faultRipRing)
+			{
+				top[r] = top.TryGetValue(r, out var c) ? c + 1 : 1;
+			}
+			var text = new System.Text.StringBuilder();
+			text.Append($"[PERF][MEM] posix_faults={n} tracker={Interlocked.Read(ref _perfTrackerFaults)} gpu_fast={Interlocked.Read(ref _perfGpuFastFaults)} top_rips(of 8192):");
+			foreach (var pair in top.OrderByDescending(static p => p.Value).Take(12))
+			{
+				text.Append($" 0x{pair.Key:X}={pair.Value}");
+			}
+			Console.Error.WriteLine(text.ToString());
+		}
+	}
 
 	// True when the signal context contains the current vector register values.
 	// Copy changes back to these registers before the guest continues.
@@ -233,11 +298,7 @@ public sealed unsafe partial class DirectExecutionBackend
 		_posixSignalHandlerDepth++;
 		if (_perfSignalCounter)
 		{
-			var n = Interlocked.Increment(ref _perfSignalCount);
-			if (n % 100000 == 0)
-			{
-				Console.Error.WriteLine($"[PERF][MEM] posix_faults={n}");
-			}
+			RecordFaultDiagnostics(signal, siginfo, ucontext);
 		}
 		try
 		{
@@ -250,6 +311,10 @@ public sealed unsafe partial class DirectExecutionBackend
 				SharpEmu.HLE.GuestImageWriteTracker.TryHandleWriteFault(
 					*(ulong*)((byte*)siginfo + PosixSigInfoAddressOffset)))
 			{
+				if (_perfSignalCounter)
+				{
+					Interlocked.Increment(ref _perfTrackerFaults);
+				}
 				return;
 			}
 
@@ -261,6 +326,10 @@ public sealed unsafe partial class DirectExecutionBackend
 				siginfo != 0 &&
 				TryResolvePosixGpuFault(siginfo, ucontext))
 			{
+				if (_perfSignalCounter)
+				{
+					Interlocked.Increment(ref _perfGpuFastFaults);
+				}
 				return;
 			}
 
