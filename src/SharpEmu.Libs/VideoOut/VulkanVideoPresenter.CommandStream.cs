@@ -20,8 +20,54 @@ internal static unsafe partial class VulkanVideoPresenter
     private static Exception? _presenterStartupFailure;
     internal static Func<ICpuMemory, AgcExports.HeadlessCommandStream>? TestCommandStreamFactory { get; set; }
 
+    // LOCAL ONLY (SHARPEMU_BLOCK_WATCH=1): every 10 s, the oldest blocked command-stream head with its packet dwords and
+    // the current value at the address a WAIT_REG_MEM would poll, to diagnose GPU/guest wait deadlocks.
+    private static int _blockWatchStarted;
+    private static readonly bool _blockWatch = Environment.GetEnvironmentVariable("SHARPEMU_BLOCK_WATCH") == "1";
+
+    private static void StartBlockWatch(ICpuMemory memory)
+    {
+        if (!_blockWatch || Interlocked.Exchange(ref _blockWatchStarted, 1) != 0)
+            return;
+        var thread = new Thread(() =>
+        {
+            while (true)
+            {
+                Thread.Sleep(10_000);
+                try
+                {
+                    if (SnapshotBlockedCommandStream(memory) is not { } snapshot)
+                        continue;
+                    var text = new System.Text.StringBuilder();
+                    text.Append($"[GPU][BLOCKWATCH] blocked={snapshot.Outstanding} oldest_ms={snapshot.OldestAgeMilliseconds:F0} queue={snapshot.SampleQueueId} packet=0x{snapshot.SampleWaitAddress:X}");
+                    if (snapshot.SampleWaitAddress != 0)
+                    {
+                        Span<byte> words = stackalloc byte[32];
+                        if (memory.TryRead(snapshot.SampleWaitAddress, words))
+                        {
+                            text.Append(" dwords=");
+                            for (var i = 0; i < 8; i++)
+                                text.Append($"{System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(words[(i * 4)..]):X8} ");
+                            var pollAddress = System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(words[8..]) & ~3UL;
+                            Span<byte> value = stackalloc byte[8];
+                            if (pollAddress != 0 && memory.TryRead(pollAddress, value))
+                                text.Append($"poll@0x{pollAddress:X}={System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(value):X16}");
+                        }
+                    }
+                    Console.Error.WriteLine(text.ToString());
+                }
+                catch (Exception exception)
+                {
+                    Console.Error.WriteLine($"[GPU][BLOCKWATCH] failed: {exception.Message}");
+                }
+            }
+        }) { IsBackground = true, Name = "SharpEmu-BlockWatch" };
+        thread.Start();
+    }
+
     public static void SubmitCommandStream(ICpuMemory memory, uint queue, ulong address, uint dwordCount, ulong submissionId, object? geometrySnapshots)
     {
+        StartBlockWatch(memory);
         SubmissionFlowProfile.RecordGuest(SubmissionFlowProfile.EventKind.PresenterEntered,
             queue, submissionId, address, dwordCount);
         lock (_gate)
