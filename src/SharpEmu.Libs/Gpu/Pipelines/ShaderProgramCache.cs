@@ -74,7 +74,6 @@ internal sealed class ProgramPermutation
     public required ResourceSpecialization Specialization { get; init; }
     public required ShaderProgramInfo Program { get; init; }
     public required ShaderProgram Handle { get; init; }
-    public required IGuestCompiledShader Compiled { get; init; }
 
     public BindingLayout Bindings => Program.Bindings!;
 }
@@ -544,7 +543,6 @@ internal sealed class ShaderProgramCache
             Specialization = specialization,
             Program = info,
             Handle = new ShaderProgram(id, module),
-            Compiled = compiled,
         };
     }
 
