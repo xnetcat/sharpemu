@@ -27,7 +27,7 @@ internal static class SubmissionFlowProfile
     }
 
     internal readonly record struct TraceEvent(long Timestamp, int ThreadId, EventKind Kind,
-        int QueueId, ulong SubmissionId, ulong Address, uint DwordCount, int Detail, ulong GuestThreadHandle = 0);
+        int QueueId, ulong SubmissionId, ulong Address, uint DwordCount, int Detail, ulong GuestThreadHandle = 0, GuestProducerProfile.Sample Producer = default);
 
     internal readonly record struct Snapshot(TraceEvent[] Events, long TotalEvents);
 
@@ -93,7 +93,8 @@ internal static class SubmissionFlowProfile
     {
         if (!RenderPhaseProfile.FrameTraceEnabled) return;
         Storage.Events.Record(new TraceEvent(Stopwatch.GetTimestamp(), Environment.CurrentManagedThreadId,
-            kind, queueId, submissionId, address, dwordCount, detail, GuestThreadExecution.CurrentGuestThreadHandle));
+            kind, queueId, submissionId, address, dwordCount, detail, GuestThreadExecution.CurrentGuestThreadHandle,
+            kind == EventKind.SubmitEntered ? GuestProducerProfile.Capture() : default));
     }
 
     internal static void RecordGuest(EventKind kind, uint queue, ulong submissionId, ulong address, uint dwordCount)
@@ -131,6 +132,11 @@ internal static class SubmissionFlowProfile
         {
             var traceEvent = snapshot.Events[index];
             output.WriteLine($"[PERF][SUBMISSION_FLOW] sequence={snapshot.TotalEvents - snapshot.Events.Length + index} timestamp={traceEvent.Timestamp} thread={traceEvent.ThreadId} guest=0x{traceEvent.GuestThreadHandle:X} event={traceEvent.Kind} queue={traceEvent.QueueId} submission={traceEvent.SubmissionId} address=0x{traceEvent.Address:X} dwords={traceEvent.DwordCount} detail={traceEvent.Detail}");
+            if (GuestProducerProfile.Enabled && traceEvent.Kind == EventKind.SubmitEntered)
+            {
+                var cpu = traceEvent.Producer;
+                output.WriteLine($"[PERF][PRODUCER_CPU] timestamp={traceEvent.Timestamp} thread={traceEvent.ThreadId} guest=0x{traceEvent.GuestThreadHandle:X} queue={traceEvent.QueueId} submission={traceEvent.SubmissionId} cpu_ns={cpu.CpuNs} mutex_ticks={cpu.MutexTicks} condition_ticks={cpu.ConditionTicks} semaphore_ticks={cpu.SemaphoreTicks} apr_ticks={cpu.AprTicks} event_ticks={cpu.EventTicks} sleep_ticks={cpu.SleepTicks} gpu_ticks={cpu.GpuTicks} other_ticks={cpu.OtherTicks} longest_import={cpu.LongestImport} longest_ticks={cpu.LongestTicks}");
+            }
         }
         output.Flush();
     }
