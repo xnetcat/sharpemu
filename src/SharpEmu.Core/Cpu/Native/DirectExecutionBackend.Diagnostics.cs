@@ -490,13 +490,15 @@ public sealed partial class DirectExecutionBackend
 		return false;
 	}
 
-	// The committed readable run of host pages that contains address.
+	// Only the containing page is needed for the import argument snapshot. Querying
+	// a whole shared mapping scans its protection array while holding the global
+	// region lock, even when the caller only wants six words from a fiber stack.
 	private unsafe static bool TryQueryReadableRange(ulong address, out ulong start, out ulong end)
 	{
 		start = 0;
 		end = 0;
 		if (address <= 65536 || address >= 140737488355328L ||
-			VirtualQuery((void*)address, out var info, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) == 0)
+			HostMemory.QueryPage((void*)address, out var info) == 0)
 		{
 			return false;
 		}

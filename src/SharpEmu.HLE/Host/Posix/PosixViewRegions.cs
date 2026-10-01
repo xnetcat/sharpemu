@@ -64,7 +64,7 @@ internal static class PosixViewRegions
         }
     }
 
-    internal static bool TryQuery(ulong address, out HostMemory.BasicInfo info)
+    internal static bool TryQuery(ulong address, out HostMemory.BasicInfo info, bool singlePage = false)
     {
         lock (Gate)
         {
@@ -81,7 +81,10 @@ internal static class PosixViewRegions
                     var index = (int)((start - region.PageBase) / pageSize);
                     protection = pages[index];
                     end = start + pageSize;
-                    while (end < region.End && pages[++index] == protection) end += pageSize;
+                    if (!singlePage)
+                    {
+                        while (end < region.End && pages[++index] == protection) end += pageSize;
+                    }
                 }
                 info = new HostMemory.BasicInfo
                 {

@@ -95,6 +95,28 @@ public static unsafe class HostMemory
         return Posix.Query(address, out info);
     }
 
+    /// <summary>
+    /// Queries the page containing an address without scanning the remaining
+    /// protection entries in a large shared mapping. Use Query when the entire
+    /// contiguous region is needed, rather than validating a small memory read.
+    /// </summary>
+    public static nuint QueryPage(void* address, out BasicInfo info)
+    {
+        var result = !OperatingSystem.IsWindows() &&
+            Host.Posix.PosixViewRegions.TryQuery((ulong)address, out info, singlePage: true)
+                ? (nuint)sizeof(BasicInfo)
+                : Query(address, out info);
+        if (result != 0)
+        {
+            var pageSize = (ulong)Environment.SystemPageSize;
+            var start = (ulong)address - (ulong)address % pageSize;
+            var end = info.BaseAddress + info.RegionSize;
+            info.BaseAddress = start;
+            info.RegionSize = Math.Min(pageSize, end - start);
+        }
+        return result;
+    }
+
     public static void FlushInstructionCache(void* address, nuint size)
     {
         if (OperatingSystem.IsWindows())

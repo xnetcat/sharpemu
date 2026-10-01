@@ -11,6 +11,39 @@ namespace SharpEmu.Libs.Tests.Memory.HostViews;
 public sealed unsafe class HostViewQueryTests
 {
     [Fact]
+    public void PageQueriesPreserveProtectionWithoutExtendingIntoAdjacentPages()
+    {
+        if (!Supported) return;
+        var views = HostViewMemory.Create();
+        var size = HoleSize(views);
+        var address = ReserveFreeHole(views, size);
+        try
+        {
+            using var backing = CreateBacking(views);
+            Assert.True(views.SplitHole(address, 2 * Segment));
+            Assert.True(views.TryMapView(backing, address, 0, 2 * Segment, HostPageProtection.ReadWrite, out _));
+            Assert.NotEqual((nuint)0, HostMemory.Query((void*)address, out var region));
+            Assert.Equal(2 * Segment, region.RegionSize);
+            Assert.NotEqual((nuint)0, HostMemory.QueryPage((void*)(address + 8), out var page));
+            Assert.Equal(address, page.BaseAddress);
+            Assert.Equal((ulong)Environment.SystemPageSize, page.RegionSize);
+            Assert.Equal(HostMemory.PAGE_READWRITE, page.Protect);
+            Assert.Equal(region.AllocationBase, page.AllocationBase);
+
+            Assert.True(views.ChangeAccess(address + views.PageSize, views.PageSize, HostPageProtection.NoAccess));
+            Assert.NotEqual((nuint)0, HostMemory.QueryPage((void*)(address + views.PageSize), out page));
+            Assert.Equal(HostMemory.PAGE_NOACCESS, page.Protect);
+            Assert.Equal((ulong)Environment.SystemPageSize, page.RegionSize);
+            Assert.NotEqual((nuint)0, HostMemory.QueryPage((void*)address, out page));
+            Assert.Equal(HostMemory.PAGE_READWRITE, page.Protect);
+        }
+        finally
+        {
+            Assert.True(views.FreeOwnedRange(address, size));
+        }
+    }
+
+    [Fact]
     public void QueriesFollowViewProtectionRestorationAndRelease()
     {
         if (!Supported) return;
