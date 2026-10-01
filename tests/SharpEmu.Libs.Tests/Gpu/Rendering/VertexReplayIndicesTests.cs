@@ -37,4 +37,30 @@ public sealed class VertexReplayIndicesTests
         Assert.Equal(new uint[] { 1, 3, 4, 0 }, words[12..16]);
         Assert.Equal(24, words.Length);
     }
+    [Fact]
+    public void WriterPreservesUnusedDestinationAndAllocatesNothingForLargeMeshes()
+    {
+        var indices = Enumerable.Range(0, 30000).Select(index => (uint)index).ToArray();
+        var size = VertexReplayIndices.MaximumByteCount(indices.Length, PrimitiveTopology.TriangleList);
+        var storage = new byte[size + 16];
+        storage.AsSpan().Fill(0xCD);
+        for (var i = 0; i < 10; i++)
+            VertexReplayIndices.Write(indices, PrimitiveTopology.TriangleList, null, -4, storage.AsSpan(8, size));
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        var written = 0;
+        for (var i = 0; i < 100; i++)
+            written = VertexReplayIndices.Write(indices, PrimitiveTopology.TriangleList, null, -4, storage.AsSpan(8, size));
+        var allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+        Assert.Equal(size, written);
+        Assert.Equal(0, allocated);
+        Assert.All(storage[..8], value => Assert.Equal((byte)0xCD, value));
+        Assert.All(storage[^8..], value => Assert.Equal((byte)0xCD, value));
+        var words = MemoryMarshal.Cast<byte, uint>(storage.AsSpan(8, size));
+        Assert.Equal(unchecked(0u - 4), words[0]);
+        Assert.Equal(29995u, words[^2]);
+        Assert.Equal(2u, words[^1]);
+        Assert.Throws<ArgumentException>(() => VertexReplayIndices.Write(indices,
+            PrimitiveTopology.TriangleList, null, 0, new byte[1]));
+    }
+
 }
