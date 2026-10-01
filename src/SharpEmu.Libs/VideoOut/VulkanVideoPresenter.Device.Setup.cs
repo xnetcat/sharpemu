@@ -1200,8 +1200,13 @@ internal static unsafe partial class VulkanVideoPresenter
             var persistentCacheEnabled =
                 !string.Equals(cacheMode, "0", StringComparison.Ordinal);
             _pipelineCachePath = persistentCacheEnabled ? GetPipelineCachePath() : null;
+            // MoltenVK imports compile every cached MSL library. Load shader
+            // groups on demand on macOS so a mature cache cannot hold startup
+            // behind unrelated scenes. Keep explicit overrides for comparison.
+            var shardMode = Environment.GetEnvironmentVariable("SHARPEMU_VK_PIPELINE_CACHE_SHARDS");
+            var useShards = shardMode == "1" || (shardMode is null && OperatingSystem.IsMacOS());
             if (_pipelineCachePath is not null &&
-                Environment.GetEnvironmentVariable("SHARPEMU_VK_PIPELINE_CACHE_SHARDS") == "1")
+                useShards)
             {
                 _pipelineCacheShardDirectory = _pipelineCachePath + ".shards";
                 _pipelineCachePath = Path.Combine(_pipelineCacheShardDirectory, "present.bin");
