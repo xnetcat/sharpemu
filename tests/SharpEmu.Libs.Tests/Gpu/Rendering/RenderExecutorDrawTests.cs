@@ -26,6 +26,22 @@ public sealed class RenderExecutorDrawTests : IDisposable
 
     public void Dispose() => _fatal.Dispose();
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void OnlyProvenReadOnlyDeviceAccessesAvoidMemoryWritingScope(bool readOnly)
+    {
+        _pipelines.Graphics = Programs(pixelStage: Stage(new ShaderProgramInfo
+        {
+            Stage = ShaderStageKind.Pixel,
+            UsesDeviceAddresses = true,
+            DeviceAddressesAreReadOnly = readOnly,
+        }));
+        _executor.DrawIndexed(1, Banks(), Indexed(3));
+        Assert.Equal(!readOnly, _host.Calls.Contains("prepare_memory_writing_draw"));
+        Assert.Contains("prepare_device_addresses", _host.Calls);
+    }
+
     private void AssertOrder(params string[] prefixes)
     {
         var last = -1;

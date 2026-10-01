@@ -129,10 +129,12 @@ public sealed partial class RenderExecutor
     }
 
     // A written buffer resource with an address and a footprint needs a barrier after the stage.
-    // Device-address accesses are not split into reads and writes, so they count as stores.
+    // A proven read-only device-address stage does not turn the render scope into
+    // a memory-writing scope. Unknown stages still take the conservative path.
     private bool DrawWritesMemory(ShaderStageResources stage) =>
         stage.Program is { } program &&
-        (program.UsesDeviceAddresses || WritesStorageImage(program) || HasBufferWrites(stage));
+        ((program.UsesDeviceAddresses && !program.DeviceAddressesAreReadOnly) ||
+         WritesStorageImage(program) || HasBufferWrites(stage));
 
     private bool HasBufferWrites(ShaderStageResources stage)
     {

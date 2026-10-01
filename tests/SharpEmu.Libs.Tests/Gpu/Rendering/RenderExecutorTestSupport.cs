@@ -149,6 +149,8 @@ internal sealed class RecordingRenderHost : IRenderHost
 
     public void RunPendingOperations() => Calls.Add("pending");
 
+    public void PrepareMemoryWritingDraw() => Calls.Add("prepare_memory_writing_draw");
+
     public void SetDebugInformation(RecordedOperation operation, ulong submitId, uint argument0, uint argument1, uint argument2, uint argument3, ulong argument4) =>
         Calls.Add($"debug {operation} {submitId} {argument0:X} {argument1:X} {argument2:X} {argument3:X} {argument4:X}");
 
