@@ -100,7 +100,7 @@ public static class AmprExports
         public uint Flush;
     }
 
-    private sealed class CachedHostFile : IDisposable
+    internal sealed class CachedHostFile : IDisposable
     {
         public CachedHostFile(string path)
         {
@@ -110,13 +110,38 @@ public static class AmprExports
                 FileAccess.Read,
                 FileShare.ReadWrite | FileShare.Delete,
                 FileOptions.RandomAccess);
-            Length = RandomAccess.GetLength(Handle);
+            try { Length = RandomAccess.GetLength(Handle); }
+            catch { Handle.Dispose(); throw; }
         }
 
+        private int _references = 1; // The cache owns the initial reference.
+        private int _disposed;
         public SafeFileHandle Handle { get; }
         public long Length { get; }
 
-        public void Dispose() => Handle.Dispose();
+        // Acquired while the cache gate still protects this entry from eviction.
+        internal void AcquireRead()
+        {
+            while (true)
+            {
+                var current = Volatile.Read(ref _references);
+                ObjectDisposedException.ThrowIf(current == 0, this);
+                if (Interlocked.CompareExchange(ref _references, current + 1, current) == current)
+                    return;
+            }
+        }
+
+        internal void ReleaseRead()
+        {
+            if (Interlocked.Decrement(ref _references) == 0)
+                Handle.Dispose();
+        }
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) == 0)
+                ReleaseRead();
+        }
     }
 
     private sealed class CachedHostFileEntry
@@ -1225,10 +1250,11 @@ public static class AmprExports
         // APR reads without blowing the ArrayPool for small probes.
         const int ChunkSize = 4 * 1024 * 1024;
         var buffer = ArrayPool<byte>.Shared.Rent((int)Math.Min((ulong)ChunkSize, size));
+        CachedHostFile? cachedFile = null;
 
         try
         {
-            if (!TryGetCachedHostFile(hostPath, out var cachedFile, out var openResult))
+            if (!TryGetCachedHostFile(hostPath, out cachedFile, out var openResult))
             {
                 return openResult;
             }
@@ -1285,6 +1311,7 @@ public static class AmprExports
         }
         finally
         {
+            cachedFile?.ReleaseRead();
             ArrayPool<byte>.Shared.Return(buffer);
         }
 
@@ -1314,6 +1341,7 @@ public static class AmprExports
                 _hostFileLru.Remove(existing);
                 _hostFileLru.AddFirst(existing);
                 file = existing.Value.File;
+                file.AcquireRead();
                 return true;
             }
         }
@@ -1358,6 +1386,7 @@ public static class AmprExports
                 _hostFileLru.Remove(raced);
                 _hostFileLru.AddFirst(raced);
                 file = raced.Value.File;
+                file.AcquireRead();
                 return true;
             }
 
@@ -1370,6 +1399,7 @@ public static class AmprExports
             var node = _hostFileLru.AddFirst(entry);
             _hostFileByPath[cachePath] = node;
             file = opened;
+            file.AcquireRead();
             return true;
         }
     }
