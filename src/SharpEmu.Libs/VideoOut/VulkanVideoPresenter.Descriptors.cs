@@ -426,6 +426,18 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private BufferView NullStorageBuffer() => new(_bufferCache.GetBuffer(GuestBufferCache.NullBufferId).Handle, 0, NullStorageBufferBytes);
 
+        private static readonly ulong TraceBufferWriterPage = ReadTraceBufferWriterPage();
+        private readonly HashSet<(ulong Hash, ulong Address, int Slot)> _tracedBufferWriters = new();
+
+        private static ulong ReadTraceBufferWriterPage()
+        {
+            var value = Environment.GetEnvironmentVariable("SHARPEMU_TRACE_BUFFER_WRITER_ADDRESS");
+            if (value?.StartsWith("0x", StringComparison.OrdinalIgnoreCase) == true) value = value[2..];
+            return ulong.TryParse(value, System.Globalization.NumberStyles.HexNumber,
+                System.Globalization.CultureInfo.InvariantCulture, out var address)
+                ? address & ~(GuestBufferCache.CachingPageSize - 1) : 0;
+        }
+
         // A storage buffer view on the cache buffer, aligned down with the adjustment carried in the memory offsets.
         private BufferView BindStorageBuffer(
             in BufferDescriptorWords descriptor,
@@ -444,6 +456,13 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             var size = ClampMappedSize(address, requested);
+            // LOCAL ONLY: identify a page's shader producers without enabling
+            // the much broader memory trace or logging every frame's bindings.
+            var tracePage = TraceBufferWriterPage;
+            if (tracePage != 0 && resource.Written &&
+                (address <= tracePage ? tracePage - address < size : address - tracePage < GuestBufferCache.CachingPageSize) &&
+                _tracedBufferWriters.Count < 128 && _tracedBufferWriters.Add((program.Hash, address, slot)))
+                Console.Error.WriteLine($"[PERF][BUFFER_WRITER] stage={program.Stage} hash=0x{program.Hash:X16} slot={slot} address=0x{address:X} size=0x{size:X} tick={_scheduler.CurrentTick}");
             var alignment = _minStorageBufferOffsetAlignment;
             var maxRange = _deviceInfo.MaxStorageBufferRange;
             if (alignment == 0 || size > maxRange)
