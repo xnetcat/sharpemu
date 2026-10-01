@@ -46,6 +46,7 @@ internal static partial class Program
     private static int Main(string[] args)
     {
         RosettaGcBudget.ReexecIfNeeded(args);
+        MacApplicationPolicy.ReexecIfNeeded(args);
         using var macUserActivity = MacUserActivity.Begin();
         ConfigureManagedPluginResolution();
 
