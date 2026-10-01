@@ -213,6 +213,8 @@ internal sealed class HostMovieYuv420Decoder : IMediaFrameDecoder
 
     public uint FramesPerSecondDenominator => _inner.FramesPerSecondDenominator;
 
+    public int FrameByteCount => HostMovieYuv420.FrameLength(Width, Height);
+
     public bool TryDecodeNextFrame(Span<byte> destination)
     {
         if (OperatingSystem.IsMacOS() && ProfileDecode && _decodedFrames == 0)

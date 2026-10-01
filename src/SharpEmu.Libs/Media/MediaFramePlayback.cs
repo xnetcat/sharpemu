@@ -16,6 +16,9 @@ internal interface IMediaFrameDecoder : IDisposable
 
     uint FramesPerSecondDenominator { get; }
 
+    // BGRA is the default; planar decoders report their actual output layout.
+    int FrameByteCount => checked((int)((ulong)Width * Height * 4));
+
     bool TryDecodeNextFrame(Span<byte> destination);
 }
 
@@ -58,7 +61,8 @@ internal sealed class MediaFramePlayback : IDisposable
         FramesPerSecondNumerator = decoder.FramesPerSecondNumerator;
         FramesPerSecondDenominator = decoder.FramesPerSecondDenominator;
 
-        var frameBytes = checked((int)((ulong)Width * Height * 4));
+        var frameBytes = decoder.FrameByteCount;
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(frameBytes);
         for (var index = 0; index < BufferCount; index++)
         {
             _freeBuffers.Enqueue(GC.AllocateUninitializedArray<byte>(frameBytes));

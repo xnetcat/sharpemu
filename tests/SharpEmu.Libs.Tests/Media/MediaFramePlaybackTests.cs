@@ -8,6 +8,29 @@ namespace SharpEmu.Libs.Tests.Media;
 
 public sealed class MediaFramePlaybackTests
 {
+    [Theory]
+    [InlineData(2u, 2u, 6)]
+    [InlineData(3u, 3u, 17)]
+    public void PlanarDecoderGetsExactFrameBuffersIncludingOddEdges(uint width, uint height, int bytes)
+    {
+        using var decoder = new HostMovieYuv420Decoder(new SizedDecoder(width, height));
+        using var playback = new MediaFramePlayback(decoder);
+        var frame = WaitForFrame(playback, advanceClock: false);
+        Assert.Equal(bytes, frame.Length);
+        Assert.All(frame.AsSpan(0, checked((int)(width * height))).ToArray(), value => Assert.Equal(0, value));
+        Assert.All(frame.AsSpan(checked((int)(width * height))).ToArray(), value => Assert.Equal(128, value));
+    }
+
+    private sealed class SizedDecoder(uint width, uint height) : IMediaFrameDecoder
+    {
+        public uint Width => width;
+        public uint Height => height;
+        public uint FramesPerSecondNumerator => 30;
+        public uint FramesPerSecondDenominator => 1;
+        public bool TryDecodeNextFrame(Span<byte> destination) { destination.Clear(); return true; }
+        public void Dispose() { }
+    }
+
     [Fact]
     public void FramesAdvanceAccordingToMovieClock()
     {
