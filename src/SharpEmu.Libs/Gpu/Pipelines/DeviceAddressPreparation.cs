@@ -27,7 +27,10 @@ internal static class DeviceAddressPreparation
             if (memory.Opcode is "ImageBvhIntersectRay" or "ImageBvh64IntersectRay") return -1;
             if (memory.PlanningOnly)
             {
-                if (!plan.FlattenedSlotByMemoryIndex.ContainsKey(index)) return -1;
+                // Scalar descriptor reads suppressed by the indirect-image
+                // planner emit no device load, even without a flattened slot.
+                if (memory.Kind is not (MemoryResourceKind.ScalarAddress or MemoryResourceKind.ScalarBuffer) &&
+                    !plan.FlattenedSlotByMemoryIndex.ContainsKey(index)) return -1;
                 continue;
             }
             if (memory.DeviceDescriptor) return -1;

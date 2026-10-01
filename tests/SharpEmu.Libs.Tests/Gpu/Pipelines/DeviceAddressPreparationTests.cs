@@ -47,6 +47,16 @@ public sealed class DeviceAddressPreparationTests
     }
 
     [Fact]
+    public void SuppressedImageDescriptorLoadsNeedNoDeviceRange()
+    {
+        var program = ResourceTrackerTests.IndirectImageProgram(false);
+        var plan = Extract(program, flattenStandaloneScalarReads: false);
+        Assert.Contains(plan.Memory.Entries.Select((memory, index) => (memory, index)), entry =>
+            entry.memory.PlanningOnly && !plan.FlattenedSlotByMemoryIndex.ContainsKey(entry.index));
+        Assert.Equal(0, DeviceAddressPreparation.BoundedRangeCount(program, plan));
+    }
+
+    [Fact]
     public void MissingOrFailedRuntimeRangeKeepsGlobalSweep()
     {
         var program = new ShaderProgramInfo { UsesDeviceAddresses = true, BoundedDeviceAddressRangeCount = 1 };
