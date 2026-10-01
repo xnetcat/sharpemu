@@ -1585,7 +1585,11 @@ public static partial class VideoOutExports
             $"[LOADER][PERF] videoout submitted_fps={submitted / elapsedSeconds:F1} " +
             $"presented_fps={presentedCount / elapsedSeconds:F1} " +
             $"draws={draws} draw_ms={drawMs:F0} pipelines={pipelines} spirv={spirvCompiles} " +
-            $"pool_leases={poolLeases} pool_cached_mb={poolCachedBytes / 1024.0 / 1024.0:F1}");
+            $"pool_leases={poolLeases} pool_cached_mb={poolCachedBytes / 1024.0 / 1024.0:F1} " +
+            $"window_s={elapsedSeconds:F3} " +
+            $"allocated_total_mb={GC.GetTotalAllocatedBytes(precise: false) / 1048576.0:F1} " +
+            $"gc_counts={GC.CollectionCount(0)}/{GC.CollectionCount(1)}/{GC.CollectionCount(2)} " +
+            $"gc_pause_total_ms={GC.GetTotalPauseDuration().TotalMilliseconds:F1}");
     }
 
     private static readonly bool _flipPacingDisabled = string.Equals(
