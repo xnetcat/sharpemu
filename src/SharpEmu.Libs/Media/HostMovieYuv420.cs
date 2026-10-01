@@ -178,6 +178,17 @@ internal sealed class HostMovieYuv420Decoder : IMediaFrameDecoder
             GetScheduling(PthreadSelf(), out var policy, out var scheduling);
             Console.Error.WriteLine($"[PERF][MOVIE_QOS] managed priority={Thread.CurrentThread.Priority} frames={_decodedFrames} policy={policy} native_priority={scheduling.Priority}");
         }
+        if (OperatingSystem.IsMacOS() && ProfileDecode && _decodedFrames == 90 &&
+            int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_MOVIE_NATIVE_PRIORITY"), out var requestedPriority) &&
+            requestedPriority is > 0 and < 64)
+        {
+            var thread = PthreadSelf();
+            if (GetScheduling(thread, out var policy, out var scheduling) == 0 && policy == 1)
+            {
+                scheduling.Priority = requestedPriority;
+                Console.Error.WriteLine($"[PERF][MOVIE_QOS] native priority={requestedPriority} result={SetScheduling(thread, policy, ref scheduling)} frames={_decodedFrames}");
+            }
+        }
         var started = ProfileDecode ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         var cpuStarted = ProfileDecode ? CpuNanoseconds() : 0;
         if (!_inner.TryDecodeNextFrame(_bgra))
@@ -240,6 +251,8 @@ internal sealed class HostMovieYuv420Decoder : IMediaFrameDecoder
     private struct SchedulingParameters { public int Priority; }
     [System.Runtime.InteropServices.DllImport("libSystem.dylib", EntryPoint = "pthread_getschedparam")]
     private static extern int GetScheduling(nint thread, out int policy, out SchedulingParameters parameters);
+    [System.Runtime.InteropServices.DllImport("libSystem.dylib", EntryPoint = "pthread_setschedparam")]
+    private static extern int SetScheduling(nint thread, int policy, ref SchedulingParameters parameters);
     [System.Runtime.InteropServices.DllImport("libSystem.dylib", EntryPoint = "thread_info")]
     private static extern int ThreadInfo(uint thread, int flavor, out ThreadBasicInfo value, ref uint count);
     [System.Runtime.InteropServices.DllImport("libSystem.dylib", EntryPoint = "pthread_mach_thread_np")]
