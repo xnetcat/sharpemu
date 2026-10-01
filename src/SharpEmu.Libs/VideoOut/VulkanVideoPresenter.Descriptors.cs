@@ -27,7 +27,7 @@ internal static unsafe partial class VulkanVideoPresenter
         private const uint TransientDataAlignment = 256;
         private const int MaxImageOccurrences = 64;
 
-        private readonly record struct BufferView(VkBuffer Buffer, ulong Offset, ulong Range);
+        private readonly record struct BufferView(VkBuffer Buffer, ulong Offset, ulong Range, GpuBuffer? Writer = null);
 
         private sealed class DescriptorScratch
         {
@@ -35,6 +35,7 @@ internal static unsafe partial class VulkanVideoPresenter
             public readonly RenderScratchPool<Sampler> Samplers = new();
             public readonly RenderScratchPool<uint> ShaderData = new();
             public readonly RenderScratchPool<BufferView> Buffers = new();
+            public readonly RenderScratchPool<GpuBuffer> DeviceAddressWrites = new();
             public readonly RenderScratchPool<(BufferDescriptorWords Descriptor, ResourceSlotIdentifier Buffer)> Sources = new();
         }
 
@@ -67,6 +68,8 @@ internal static unsafe partial class VulkanVideoPresenter
             public (BufferDescriptorWords Descriptor, ResourceSlotIdentifier Buffer)[] BufferSources { get; set; } = [];
 
             public uint[] ShaderData { get; set; } = [];
+
+            public GpuBuffer[] DeviceAddressWrites { get; set; } = [];
 
             public TextureResource[] Textures => Descriptors.Images;
         }
@@ -499,7 +502,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 _imageCache.InvalidateMemoryFromGpu(address, size);
             }
 
-            return new BufferView(buffer.Handle, alignedOffset, size + adjustment);
+            return new BufferView(buffer.Handle, alignedOffset, size + adjustment, resource.Written ? buffer : null);
         }
 
         private BufferView UploadDwords(uint[] data, string label, ShaderProgramInfo program)
@@ -560,8 +563,16 @@ internal static unsafe partial class VulkanVideoPresenter
         private void ObtainDeviceAddressRanges(PreparedStageBindings prepared)
         {
             var program = prepared.Program;
-            foreach (var range in prepared.Stage.Resources.DeviceAddressRanges)
+            var ranges = prepared.Stage.Resources.DeviceAddressRanges;
+            if (prepared.DeviceAddressWrites.Length != ranges.Length)
             {
+                Scratch.DeviceAddressWrites.Return(prepared.DeviceAddressWrites);
+                prepared.DeviceAddressWrites = Scratch.DeviceAddressWrites.Rent(ranges.Length);
+            }
+            Array.Clear(prepared.DeviceAddressWrites);
+            for (var rangeIndex = 0; rangeIndex < ranges.Length; rangeIndex++)
+            {
+                var range = ranges[rangeIndex];
                 if (!range.Planned)
                 {
                     if (!range.Written) continue;
@@ -587,7 +598,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 var size = ClampMappedSize(range.Base, range.Size);
                 if (range.Written)
                 {
-                    _ = _bufferCache.ObtainBuffer(range.Base, size, isWritten: true);
+                    prepared.DeviceAddressWrites[rangeIndex] = _bufferCache.ObtainBuffer(range.Base, size, isWritten: true).Buffer;
                 }
                 else
                 {
@@ -698,11 +709,13 @@ internal static unsafe partial class VulkanVideoPresenter
             Scratch.Buffers.Return(stage.Descriptors.Buffers);
             Scratch.Sources.Return(stage.BufferSources);
             Scratch.ShaderData.Return(stage.ShaderData);
+            Scratch.DeviceAddressWrites.Return(stage.DeviceAddressWrites);
             stage.Descriptors.Images = [];
             stage.Descriptors.Samplers = [];
             stage.Descriptors.Buffers = [];
             stage.BufferSources = [];
             stage.ShaderData = [];
+            stage.DeviceAddressWrites = [];
         }
 
         private static DescriptorImageInfo ImageInfo(TextureResource texture, uint element, ShaderProgramInfo program, int index)

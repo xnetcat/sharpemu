@@ -893,7 +893,16 @@ internal static unsafe partial class VulkanVideoPresenter
         private void CountDraw()
         {
             if (_preparation is { } preparation)
+            {
                 preparation.CommandsRecorded = true;
+                // Preparation can roll the command buffer while uploading other
+                // resources. Track the tick that actually records the shader.
+                foreach (var stage in preparation.Stages)
+                {
+                    foreach (var buffer in stage.Descriptors.Buffers) buffer.Writer?.NoteGpuWrite();
+                    foreach (var buffer in stage.DeviceAddressWrites) buffer?.NoteGpuWrite();
+                }
+            }
             Interlocked.Increment(ref _perfDrawCount);
             PerfOverlay.RecordDraw();
             _batchDrawCount++;

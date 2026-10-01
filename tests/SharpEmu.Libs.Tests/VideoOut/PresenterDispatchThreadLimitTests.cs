@@ -23,9 +23,11 @@ public sealed class PresenterDispatchThreadLimitTests(HeadlessVulkanFixture fixt
     : IClassFixture<HeadlessVulkanFixture>
 {
     [Theory]
-    [InlineData(0u)]
-    [InlineData(32u)]
-    public void BufferBindingPreservesThreadLimitsForQueuedDispatches(uint pushDataStart)
+    [InlineData(0u, false)]
+    [InlineData(32u, false)]
+    [InlineData(0u, true)]
+    [InlineData(32u, true)]
+    public void BufferBindingPreservesThreadLimitsForQueuedDispatches(uint pushDataStart, bool rollAfterBinding)
     {
         var vulkan = fixture.Vulkan;
         if (!GatePrerequisites.Ready(vulkan, shaderInt64: true)) return;
@@ -77,17 +79,26 @@ public sealed class PresenterDispatchThreadLimitTests(HeadlessVulkanFixture fixt
                 using var preparation = presenter.RenderHost.BeginPreparation();
                 var prepared = presenter.RenderHost.PrepareBindings(stage);
                 presenter.RenderHost.BindResources(prepared);
+                if (rollAfterBinding) harness.Scheduler.Flush();
                 presenter.RenderHost.CommitBindings(PipelineBindPoint.Compute, in pipeline, [prepared]);
                 presenter.RenderHost.ShaderWriteHazardBarrier();
                 presenter.RenderHost.BindPipeline(PipelineBindPoint.Compute, in pipeline);
                 presenter.RenderHost.Dispatch(2, 2, 2);
+                var writtenBuffer = harness.Cache.GetBuffer(harness.Cache.FindBuffer(address, sizeof(uint)));
+                Assert.Equal(harness.Scheduler.CurrentTick, writtenBuffer.LastGpuWriteTick);
                 presenter.RenderHost.ShaderAccessBarrier();
             }
             presenter.RenderHost.ResetBindings();
             return harness.Cache.GetBuffer(harness.Cache.FindBuffer(address, sizeof(uint)));
         });
 
-        var result = harness.ReadBack(buffer, buffer.Offset(allocation), 2 * sizeof(uint));
+        byte[] result;
+        if (rollAfterBinding)
+        {
+            harness.Cache.ReadMemory(address, sizeof(uint));
+            result = harness.Read(allocation, 2 * sizeof(uint));
+        }
+        else result = harness.ReadBack(buffer, buffer.Offset(allocation), 2 * sizeof(uint));
         Assert.Equal(0xABCD1234u, BitConverter.ToUInt32(result, 0));
         Assert.Equal(limits.Sum(limit => (long)limit.X * limit.Y * limit.Z),
             (long)BitConverter.ToUInt32(result, sizeof(uint)));
