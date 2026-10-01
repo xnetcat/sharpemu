@@ -9,6 +9,17 @@ namespace SharpEmu.ShaderCompiler.Tests.Resources;
 
 public sealed class LaneReadDescriptorTests
 {
+    [Fact]
+    public void DynamicLaneReadsRetainInstructionIdentityAndAreNotCpuValues()
+    {
+        var graph = ScalarValueGraph.Build(Program(EndProgram(0)), 0, 2);
+        var first = graph.LaneRead(graph.UserData(0), graph.UserData(1), 4);
+        var second = graph.LaneRead(graph.UserData(0), graph.UserData(1), 8);
+        Assert.Same(first, graph.LaneRead(graph.UserData(0), graph.UserData(1), 4));
+        Assert.False(graph.Equivalent(first, second));
+        Assert.False(new RuntimeValueValidator(graph, 0, 2, 0).Validate(first));
+    }
+
     private static Gen5ShaderProgram CreateProgram() => Shift(Program(
         ScalarLoad(0, 46, 16, immediateOffset: 0x80),
         Sop1(8, "SFF1I32B32", 18, Gen5Operand.Scalar(16)),

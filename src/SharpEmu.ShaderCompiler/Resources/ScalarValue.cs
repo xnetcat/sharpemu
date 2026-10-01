@@ -283,7 +283,7 @@ public static class ScalarValueEquivalence
         }
 
         visited.Add((left, right));
-        if (left.Kind == ScalarValueKind.FirstLane && left.Payload != right.Payload)
+        if (left.Kind is (ScalarValueKind.FirstLane or ScalarValueKind.LaneRead) && left.Payload != right.Payload)
         {
             return false;
         }
