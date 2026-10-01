@@ -117,6 +117,26 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
             // SPI_PS_INPUT_CNTL can map an input to any parameter export, beyond the input count;
             // the vertex program must declare every location the pixel program reads.
             attributeCount = Math.Max(attributeCount, ReadVertexOutputCount(pixelProgram, pixelInfo));
+            if (!_host.PerVertexPixelInputsSupported && pixelProgram.ReplayedParameterAttributeMask != 0)
+            {
+                var parameters = Enumerable.Range(0, 32)
+                    .Where(attribute => (pixelProgram.ReplayedParameterAttributeMask & (1u << attribute)) != 0)
+                    .Select(attribute => pixelInfo.InterpolatorSettings[attribute] & 0x1Fu)
+                    .Distinct().Order().ToArray();
+                if (parameters.Length != 0)
+                {
+                    var vertexDecoded = _programs.Decode(vertexSource);
+                    var first = Math.Max(attributeCount, vertexDecoded.ParameterExportMask == 0 ? 0u :
+                        32u - (uint)System.Numerics.BitOperations.LeadingZeroCount(vertexDecoded.ParameterExportMask));
+                    if (first + parameters.Length * 3 > MaxPixelInputs)
+                        throw SubmissionScheduler.Fatal("Per-vertex replay exceeds the available shader output locations.");
+                    if (vertexInfo.Attributes.Length != 0 || vertexInfo.Buffers.Length != 0)
+                        throw SubmissionScheduler.Fatal("Per-vertex replay requires shader-based vertex fetching.");
+                    var replay = parameters.Select((parameter, index) => new VertexReplayParameter(parameter, first + (uint)index * 3)).ToArray();
+                    vertexInfo.ReplayParameters = replay;
+                    pixelInfo.ReplayParameters = replay;
+                }
+            }
         }
 
         ShaderProgram vertexProgram;

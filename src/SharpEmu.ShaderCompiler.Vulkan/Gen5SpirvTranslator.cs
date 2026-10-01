@@ -508,6 +508,9 @@ public static partial class Gen5SpirvTranslator
                 _module.AddStatement(SpirvOp.Return);
                 _module.EndFunction();
 
+                if (_stage == Gen5SpirvStage.Vertex && _request.VertexReplayParameters.Count != 0)
+                    main = EmitVertexReplayEntry(main, functionType);
+
                 var model = _stage switch
                 {
                     Gen5SpirvStage.Vertex => SpirvExecutionModel.Vertex,
@@ -902,6 +905,7 @@ public static partial class Gen5SpirvTranslator
             if (_stage == Gen5SpirvStage.Vertex)
             {
                 DeclareVertexInputs();
+                DeclareVertexReplay();
 
                 var inputPointer =
                     _module.TypePointer(SpirvStorageClass.Input, _uintType);
@@ -1049,13 +1053,15 @@ public static partial class Gen5SpirvTranslator
                     var cntl = attribute < (uint)_pixelInputCntl.Length
                         ? _pixelInputCntl[attribute]
                         : attribute;
-                    _module.AddDecoration(
-                        variable,
-                        SpirvDecoration.Location,
-                        locations[index]);
+                    var replayed = _perVertexAttributes.Contains(attribute) &&
+                        _request.VertexReplayParameters.Any(value => value.Parameter == (cntl & 0x1Fu));
+                    var location = replayed
+                        ? _request.VertexReplayParameters.First(value => value.Parameter == (cntl & 0x1Fu)).Location
+                        : locations[index];
+                    _module.AddDecoration(variable, SpirvDecoration.Location, location);
                     if (_perVertexAttributes.Contains(attribute))
                     {
-                        _module.AddDecoration(variable, SpirvDecoration.PerVertexKhr);
+                        _module.AddDecoration(variable, replayed ? SpirvDecoration.Flat : SpirvDecoration.PerVertexKhr);
                     }
                     else if ((cntl & 0x400u) != 0 || _flatParameterAttributes.Contains(attribute))
                     {
@@ -1244,7 +1250,7 @@ public static partial class Gen5SpirvTranslator
 
             if (_stage == Gen5SpirvStage.Vertex)
             {
-                StoreV(5, Load(_uintType, _vertexIndexInput), guardWithExec: false);
+                StoreV(5, Load(_uintType, _vertexReplayIndex != 0 ? _vertexReplayIndex : _vertexIndexInput), guardWithExec: false);
                 StoreV(8, Load(_uintType, _instanceIndexInput), guardWithExec: false);
 
                 // Give every declared param output a defined starting value.

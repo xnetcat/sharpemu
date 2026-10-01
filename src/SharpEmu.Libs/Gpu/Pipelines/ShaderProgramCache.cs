@@ -560,6 +560,7 @@ internal sealed class ShaderProgramCache
                     EnableGraphicsSubgroupOperations = enableGraphicsSubgroups,
                     SupportsSharedInt64Atomics = sharedInt64Atomics,
                     RequiredVertexOutputCount = options.RequiredVertexOutputCount,
+                    VertexReplayParameters = info.ReplayParameters,
                     VertexInputs = entry.VertexInputs,
                     PositionExportControl = info.PositionExportControl,
                     ClipSpace = new ShaderClipSpaceTransform(
@@ -589,6 +590,7 @@ internal sealed class ShaderProgramCache
                     PixelInputEnable = options.PixelInputEnable,
                     PixelCustomInterpolationMask = info.CustomInterpolationMask,
                     SupportsPerVertexPixelInputs = _host.PerVertexPixelInputsSupported,
+                    VertexReplayParameters = info.ReplayParameters,
                     PixelInputAddress = options.PixelInputAddress,
                     PixelInputCntl = interpolators,
                 };

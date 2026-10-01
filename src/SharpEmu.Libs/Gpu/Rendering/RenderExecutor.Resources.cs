@@ -225,8 +225,18 @@ public sealed partial class RenderExecutor
             _host.BindResources(pixelBindings);
         }
 
-        var vertexBuffers = AcquireVertexBuffers(vertexInput);
-        var indexBuffer = AcquireIndexBuffer(in indexSource);
+        var replay = vertexInput.ReplayParameters.Count != 0;
+        var replayCount = 0u;
+        BufferBinding[] vertexBuffers;
+        if (replay)
+        {
+            vertexBuffers = [PrepareVertexReplay(vertexInput, in draw, in emission, in indexSource,
+                topology, primitiveRestart, out vertexInput, out replayCount)];
+            topology = PrimitiveTopology.TriangleList;
+            primitiveRestart = false;
+        }
+        else vertexBuffers = AcquireVertexBuffers(vertexInput);
+        var indexBuffer = replay ? default : AcquireIndexBuffer(in indexSource);
         var indirectArguments = emission.IndirectArgumentsAddress != 0
             ? _host.ObtainBuffer(emission.IndirectArgumentsAddress, IndexedIndirectArgumentsSize, isWritten: false)
             : default;
@@ -287,7 +297,11 @@ public sealed partial class RenderExecutor
             SetDrawDebugPhase(submitId, in draw, 0x500);
         }
 
-        if (emission.IndirectArgumentsAddress != 0)
+        if (replay)
+        {
+            _host.Draw(replayCount, draw.InstanceCount, 0, emission.FirstInstance);
+        }
+        else if (emission.IndirectArgumentsAddress != 0)
         {
             // Uploads and shader writes end with barriers to all commands, so the
             // indirect read sees them.

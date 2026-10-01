@@ -36,6 +36,7 @@ public static class StageStaticKey
         }
 
         key.Add((uint)requiredOutputCount);
+        AddReplay(info.ReplayParameters, key);
         foreach (var attribute in info.Attributes)
         {
             var descriptor = attribute.Descriptor;
@@ -58,6 +59,7 @@ public static class StageStaticKey
     public static void Build(PixelInputInfo info, List<uint> key)
     {
         key.Clear();
+        AddReplay(info.ReplayParameters, key);
         key.Add(info.ScratchDwords);
         key.Add(info.InputCount);
         key.Add(info.SystemInputBase);
@@ -93,6 +95,12 @@ public static class StageStaticKey
         {
             key.Add(info.InterpolatorSettings[index]);
         }
+    }
+
+    private static void AddReplay(IReadOnlyList<SharpEmu.ShaderCompiler.VertexReplayParameter> parameters, List<uint> key)
+    {
+        key.Add((uint)parameters.Count);
+        foreach (var parameter in parameters) { key.Add(parameter.Parameter); key.Add(parameter.Location); }
     }
 
     // The dispatch mode is static; exact thread limits arrive with each dispatch.

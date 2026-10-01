@@ -12,6 +12,49 @@ namespace SharpEmu.ShaderCompiler.Tests;
 public sealed class Gen5InterpolationParameterTests
 {
     [Theory]
+    [InlineData("GlobalStoreDword")]
+    [InlineData("GlobalAtomicAdd")]
+    public void ReplayRejectsVertexMemorySideEffects(string opcode)
+    {
+        var program = ResourceTestProgram.Program(
+            ResourceTestProgram.GlobalAccess(0, opcode, 0, vectorAddress: 5),
+            ResourceTestProgram.EndProgram(8));
+        var (plan, resources, layout) = ResourceTestProgram.Prepare(program, ShaderStage.Vertex, userDataCount: 0);
+        var request = new ShaderCompileRequest(plan, resources, layout)
+        {
+            VertexReplayParameters = [new(0, 1)],
+        };
+        Assert.False(Gen5SpirvTranslator.TryCompileProgram(request, out _, out var error));
+        Assert.Contains("read-only shader", error);
+    }
+
+    [Fact]
+    public void ReplayVertexEntryAndFlatPixelArrayValidate()
+    {
+        var program = ResourceTestProgram.Program(ResourceTestProgram.EndProgram(0));
+        var (plan, resources, layout) = ResourceTestProgram.Prepare(program, ShaderStage.Vertex, userDataCount: 0);
+        var request = new ShaderCompileRequest(plan, resources, layout)
+        {
+            RequiredVertexOutputCount = 1,
+            VertexReplayParameters = [new(0, 1)],
+        };
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var vertex, out var error), error);
+        Assert.Equal(3, Instructions(vertex.Spirv).Count(instruction => instruction.Opcode == SpirvOp.FunctionCall));
+        ValidateWhenAvailable(vertex.Spirv);
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(Request(0, true, supportsPerVertex: false, replay: true), out var pixel, out error), error);
+        Assert.DoesNotContain(Instructions(pixel.Spirv), instruction => instruction.Opcode == SpirvOp.Decorate &&
+            instruction.Operands[1] == (uint)SpirvDecoration.PerVertexKhr);
+        ValidateWhenAvailable(pixel.Spirv);
+        var directory = Environment.GetEnvironmentVariable("SHARPEMU_TEST_REPLAY_DUMP_DIR");
+        if (directory is not null)
+        {
+            Directory.CreateDirectory(directory);
+            File.WriteAllBytes(Path.Combine(directory, "replay-vertex.spv"), vertex.Spirv);
+            File.WriteAllBytes(Path.Combine(directory, "replay-pixel.spv"), pixel.Spirv);
+        }
+    }
+
+    [Theory]
     [InlineData(0u, false, 1u, true)]
     [InlineData(1u, false, 2u, true)]
     [InlineData(2u, false, 0u, false)]
@@ -22,6 +65,7 @@ public sealed class Gen5InterpolationParameterTests
         uint selector, bool custom, uint vertex, bool subtractOrigin)
     {
         var request = Request(selector, custom);
+        Assert.Equal(selector == 2 ? 0u : 2u, request.Program.ReplayedParameterAttributeMask);
         Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
         var instructions = Instructions(shader.Spirv);
         Assert.Contains(instructions, instruction => instruction.Opcode == SpirvOp.Capability &&
@@ -189,7 +233,7 @@ public sealed class Gen5InterpolationParameterTests
 
     private static ShaderCompileRequest Request(
         uint selector, bool custom, uint inputs = 2, string opcode = "VInterpMovF32",
-        uint inputCntl = 0x401, bool supportsPerVertex = true)
+        uint inputCntl = 0x401, bool supportsPerVertex = true, bool replay = false)
     {
         var interpolation = new Gen5ShaderInstruction(0, Gen5ShaderEncoding.Vintrp, opcode,
             [selector], [Gen5Operand.Vector(selector)], [Gen5Operand.Vector(4)], new Gen5InterpolationControl(1, 2));
@@ -202,6 +246,7 @@ public sealed class Gen5InterpolationParameterTests
             PixelInputCntl = [0, inputCntl],
             PixelCustomInterpolationMask = custom ? 2u : 0u,
             SupportsPerVertexPixelInputs = supportsPerVertex,
+            VertexReplayParameters = replay ? [new(1, 2)] : [],
         };
     }
 

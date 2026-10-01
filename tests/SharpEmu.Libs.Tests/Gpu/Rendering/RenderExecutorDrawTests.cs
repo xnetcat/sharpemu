@@ -118,6 +118,21 @@ public sealed class RenderExecutorDrawTests : IDisposable
     }
 
     [Fact]
+    public void IndirectVertexReplay_UsesResolvedIndicesOffsetsAndInstances()
+    {
+        _pipelines.Graphics = Programs();
+        _pipelines.Graphics.VertexInput.ReplayParameters = [new(0, 1)];
+        WriteIndirectArguments(3, 2, 1, unchecked((uint)-2), 7);
+        _host.WriteGuest(IndexBase, new byte[] { 99, 0, 4, 0, 5, 0, 6, 0 });
+        var arguments = Indexed(4, source: DrawOffsetSource.IndirectArguments) with { IndirectArgumentsAddress = IndirectArguments };
+        _executor.DrawIndexed(7, Banks(), arguments);
+
+        Assert.Contains("draw 3 2 0 7", _host.Calls);
+        Assert.DoesNotContain(_host.Calls, call => call.StartsWith("draw_indexed", StringComparison.Ordinal));
+        Assert.Equal(VertexReplayIndices.Build([4, 5, 6], PrimitiveTopology.TriangleList, null, -2), _host.LastTransient);
+    }
+
+    [Fact]
     public void IndirectIndexedStrip_ReadsTheArgumentsOnTheCpu()
     {
         WriteIndirectArguments(6, 2, 4, 3, 1);

@@ -346,10 +346,28 @@ public sealed record Gen5ShaderProgram(
     private const int PixelColorMaskBits = 4;
     private readonly uint _pixelColorExportMasks = ComputePixelColorExportMasks(Instructions);
     private readonly uint _parameterExportMask = ComputeParameterExportMask(Instructions);
+    private readonly uint _replayedParameterAttributeMask = ComputeReplayedParameterAttributeMask(Instructions);
 
     public uint PixelColorExportMasks => _pixelColorExportMasks;
 
     public uint ParameterExportMask => _parameterExportMask;
+
+    // Inputs needing vertices beyond the provoking vertex on hosts without
+    // native per-vertex fragment inputs. Compute once per decoded program.
+    public uint ReplayedParameterAttributeMask => _replayedParameterAttributeMask;
+
+    private static uint ComputeReplayedParameterAttributeMask(IReadOnlyList<Gen5ShaderInstruction> instructions)
+    {
+        uint moved = 0, nonFlat = 0;
+        foreach (var instruction in instructions)
+        {
+            if (instruction.Control is not Gen5InterpolationControl { Attribute: < 32 } control) continue;
+            var bit = 1u << (int)control.Attribute;
+            if (instruction.Opcode == "VInterpMovF32") moved |= bit;
+            if (instruction.Opcode != "VInterpMovF32" || (instruction.Words[0] & 0xFFu) != 2) nonFlat |= bit;
+        }
+        return moved & nonFlat;
+    }
 
     private static uint ComputePixelColorExportMasks(
         IReadOnlyList<Gen5ShaderInstruction> instructions)

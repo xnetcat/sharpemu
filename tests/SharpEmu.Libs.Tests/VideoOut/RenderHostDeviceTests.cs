@@ -117,11 +117,11 @@ public sealed unsafe partial class RenderHostDeviceTests : IClassFixture<Headles
 
     // One float2 position program and one solid red pixel program over empty resource plans.
     private sealed class FixedProgramProvider(IShaderPipelineHost host, ulong vertexAddress, bool pushData = false,
-        byte[]? interpolationShader = null) : IShaderPipelineProvider
+        byte[]? interpolationShader = null, byte[]? replayVertexShader = null) : IShaderPipelineProvider
     {
         private const uint Float2Format = 64;
         private static readonly uint[] UserRegisters = [0, 1];
-        private readonly ShaderProgramInfo _vertex = EmptyProgram(ShaderStageKind.Vertex, 1, fetchComponents: 2, userDataRegisters: pushData ? UserRegisters : null, pushDataStart: 2);
+        private readonly ShaderProgramInfo _vertex = EmptyProgram(ShaderStageKind.Vertex, 1, fetchComponents: replayVertexShader is null ? 2u : 4u, userDataRegisters: pushData ? UserRegisters : null, pushDataStart: 2);
         private readonly ShaderProgramInfo _pixel = EmptyProgram(ShaderStageKind.Pixel, 2, userDataRegisters: pushData ? UserRegisters : null);
         private readonly ResourceSnapshot _snapshot = new() { UserData = pushData ? [0x11, 0x22] : [] };
         private ShaderProgram _vertexProgram;
@@ -153,7 +153,7 @@ public sealed unsafe partial class RenderHostDeviceTests : IClassFixture<Headles
             }
 
             _vertexProgram = new ShaderProgram(1, host.CreateShaderModule(new VulkanCompiledGuestShader(
-                CreatePositionVertexShader(interpolationShader is not null)), ShaderStage.Vertex, 1, 1));
+                replayVertexShader ?? CreatePositionVertexShader(interpolationShader is not null)), ShaderStage.Vertex, 1, 1));
             _pixelProgram = new ShaderProgram(2, host.CreateShaderModule(new VulkanCompiledGuestShader(
                 interpolationShader ?? SpirvFixedShaders.CreateSolidFragment(1f, 0f, 0f, 1f)), ShaderStage.Pixel, 2, 2));
         }
@@ -174,8 +174,9 @@ public sealed unsafe partial class RenderHostDeviceTests : IClassFixture<Headles
                 Pixel = _pixelProgram,
                 VertexInput = new VertexInputInfo
                 {
-                    Buffers = [new VertexInputBuffer(vertexAddress, VertexStride, VertexCount)],
-                    Attributes = [new VertexAttributeResource(new BufferDescriptorWords((uint)vertexAddress, (uint)(vertexAddress >> 32) | (VertexStride << 16), VertexCount, Float2Format << 12), 0, 2, 0, 0, 0, 0)],
+                    Buffers = replayVertexShader is not null ? [] : [new VertexInputBuffer(vertexAddress, VertexStride, VertexCount)],
+                    Attributes = replayVertexShader is not null ? [] : [new VertexAttributeResource(new BufferDescriptorWords((uint)vertexAddress, (uint)(vertexAddress >> 32) | (VertexStride << 16), VertexCount, Float2Format << 12), 0, 2, 0, 0, 0, 0)],
+                    ReplayParameters = replayVertexShader is not null ? [new(0, 1)] : [],
                     Stage = new ShaderStageResources(_vertex, _snapshot),
                 },
                 PixelInput = new PixelInputInfo { InputCount = 0, Stage = new ShaderStageResources(_pixel, _snapshot) },

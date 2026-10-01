@@ -287,6 +287,13 @@ public sealed partial class RenderExecutor
         }
 
         ResolveShaderPrograms(banks, ref state);
+        if (arguments.IndirectArgumentsAddress != 0 && state.Programs.VertexInput.ReplayParameters.Count != 0)
+        {
+            // Triangle replay expands indices on the CPU, so it needs the actual
+            // count, first index, base vertex and instance range from this draw.
+            DrawIndexedWithCpuArguments(submitId, banks, in arguments);
+            return;
+        }
         if (!ApplyProgramAdaptations(banks, in draw, ref state, new TargetlessDrawArguments(submitId, true, arguments, default)))
         {
             _host.ResetBindings();

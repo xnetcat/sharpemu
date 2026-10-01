@@ -127,6 +127,7 @@ public readonly record struct ClipSpaceTransform(
 
 public sealed class VertexInputInfo
 {
+    public IReadOnlyList<SharpEmu.ShaderCompiler.VertexReplayParameter> ReplayParameters { get; set; } = [];
     public const int MaxBuffers = 32;
 
     public VertexInputBuffer[] Buffers { get; init; } = [];
@@ -142,6 +143,7 @@ public sealed class VertexInputInfo
 
 public sealed class PixelInputInfo
 {
+    public IReadOnlyList<SharpEmu.ShaderCompiler.VertexReplayParameter> ReplayParameters { get; set; } = [];
     public const int InterpolatorCount = 32;
     public const int TargetCount = 8;
     public const uint NoPerspectiveCenterRegister = uint.MaxValue;
