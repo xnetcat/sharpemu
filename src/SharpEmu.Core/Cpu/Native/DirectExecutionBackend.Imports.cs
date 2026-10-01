@@ -33,6 +33,10 @@ public sealed partial class DirectExecutionBackend
 	private const int ImportVectorRegisterCount = 8;
 	private const ulong StackCheckGuardValue = 0xC0DEC0DECAFEBA00UL;
 	private static long _canaryReturnRecoveries;
+	// Preserve the full dispatcher by default until matched runs establish a
+	// benefit. Contention and shutdown always use the existing blocking path.
+	private static readonly bool _uncontendedMutexFastPath =
+		Environment.GetEnvironmentVariable("SHARPEMU_UNCONTENDED_MUTEX_FAST_PATH") == "1";
 
 	private readonly object _importResultLogSampleGate = new();
 	private readonly Dictionary<string, int> _importResultLogSamples = new(StringComparer.Ordinal);
@@ -179,7 +183,8 @@ public sealed partial class DirectExecutionBackend
 			Console.Error.WriteLine($"[LOADER][TRACE] Raw sentinel recoveries: {num2} (last import index={importIndex})");
 			_lastReportedRawSentinelRecoveries = num2;
 		}
-		if (importStubEntry.Nid is "9UK1vLZQft4" or "7H0iTOciTLo" &&
+		if (_uncontendedMutexFastPath && !_forcedGuestExit &&
+			importStubEntry.Nid is "9UK1vLZQft4" or "7H0iTOciTLo" &&
 			importStubEntry.Export is { } mutexExport &&
 			(mutexExport.Target & cpuContext.TargetGeneration) != 0 &&
 			Volatile.Read(ref _pendingGuestExceptionCount) == 0 &&
