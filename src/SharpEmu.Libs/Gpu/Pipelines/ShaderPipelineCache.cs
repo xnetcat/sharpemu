@@ -327,6 +327,8 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         var input = ComputeStageInputResolver.Resolve(compute, source.Registered, dispatchInitiator, !_host.ComputeWave64Supported, dimensionX, dimensionY, dimensionZ);
         var systemRegisters = DecodeComputeSystemRegisters(compute);
         var program = _programs.Decode(source);
+        if (TrySubmitRepeatingDwordCopyKernel(program, source, systemRegisters, input))
+            return new ComputeProgram { Consumed = true };
         if (TrySubmitMaskedDwordCopyKernel(program, source, systemRegisters, input, out var description))
         {
             if (RenderTrace.Enabled)
