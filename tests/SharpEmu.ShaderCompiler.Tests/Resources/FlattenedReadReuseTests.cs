@@ -113,4 +113,19 @@ public sealed class FlattenedReadReuseTests
         Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out _, out var error), error);
         Assert.True(Gen5MslTranslator.TryCompileProgram(request, out _, out error), error);
     }
+    [Fact]
+    public void MixedScalarLoadKeepsOnlyDescriptorDwordsOnTheHost()
+    {
+        var program = Program(ScalarLoad(0, 0, 4, 16), BufferStore(8, 4), EndProgram(16));
+        var (plan, resources, layout) = Prepare(program, userDataCount: 2, flattenStandaloneScalarReads: false);
+        Assert.Equal(4, plan.TableReads.Count);
+        for (uint component = 0; component < 16; component++)
+            Assert.Equal(component < 4, plan.Memory.Find(0, component)!.PlanningOnly);
+        Assert.Single(resources.Info.Buffers);
+        Assert.True(resources.Info.UsesDeviceAddresses);
+        var request = new ShaderCompileRequest(plan, resources, layout);
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out _, out var error), error);
+        Assert.True(Gen5MslTranslator.TryCompileProgram(request, out _, out error), error);
+    }
+
 }
