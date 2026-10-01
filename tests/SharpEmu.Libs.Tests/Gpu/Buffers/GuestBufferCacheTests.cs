@@ -23,6 +23,41 @@ public sealed class GuestBufferCacheTests : IClassFixture<HeadlessVulkanFixture>
 {
     private const ulong Page = GuestBufferCache.CachingPageSize;
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void CpuReadWaitsForWriterAndPreservesUnrelatedRecording(bool submitWriter)
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(4 * Page, ReadWrite);
+        harness.Write(address, Enumerable.Repeat((byte)0x37, (int)Page).ToArray());
+        harness.Worker.Run(() =>
+        {
+            var (buffer, offset) = harness.Cache.ObtainBuffer(address, Page, true);
+            buffer.Fill(offset + 8, 16, 0xA5A5A5A5);
+            if (submitWriter) harness.Scheduler.Flush();
+
+            // Keep unrelated writes pending in the next recording. Reading the
+            // first buffer must neither require nor expose that second write.
+            var (other, otherOffset) = harness.Cache.ObtainBuffer(address + 2 * Page, Page, true);
+            other.Fill(otherOffset, 4, 0x12345678);
+            var currentTick = harness.Scheduler.CurrentTick;
+            harness.Cache.ReadMemory(address + 9, 11);
+            var bytes = harness.Read(address, 32);
+            Assert.All(bytes[..8], value => Assert.Equal(0x37, value));
+            Assert.All(bytes[8..24], value => Assert.Equal(0xA5, value));
+            Assert.All(bytes[24..], value => Assert.Equal(0x37, value));
+            if (MappedBufferReadback.Enabled)
+            {
+                Assert.True(buffer.IsMapped && buffer.IsCoherent);
+                Assert.Equal(currentTick + (submitWriter ? 0UL : 1UL), harness.Scheduler.CurrentTick);
+            }
+            harness.Cache.ReadMemory(address + 2 * Page, 4);
+            Assert.Equal(new byte[] { 0x78, 0x56, 0x34, 0x12 }, harness.Read(address + 2 * Page, 4));
+        });
+    }
+
     [Fact]
     public void ImageUploadFailureIdentifiesAHoleBetweenBackedEndpoints()
     {

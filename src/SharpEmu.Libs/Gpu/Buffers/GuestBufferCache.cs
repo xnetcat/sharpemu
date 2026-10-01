@@ -939,7 +939,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     // Packs pieces into the download ring, waits for the copy, then writes each through the backing alias.
     private void DownloadBufferMemory(List<DownloadPiece> copies)
     {
-        if (TryDownloadAsync(copies))
+        if (TryDownloadMapped(copies) || TryDownloadAsync(copies))
         {
             foreach (var copy in copies)
             {
@@ -981,6 +981,31 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         {
             _gpuModifiedRanges.Remove(copy.Address, copy.Size);
         }
+    }
+
+    private bool TryDownloadMapped(List<DownloadPiece> copies)
+    {
+        if (!MappedBufferReadback.Enabled || copies.Count == 0) return false;
+        var waitTick = 0UL;
+        foreach (var copy in copies)
+        {
+            // Noncoherent slab atoms may be shared with host writers. Preserve
+            // the staging path for those allocations and for unknown writers.
+            if (!copy.Buffer.IsMapped || !copy.Buffer.IsCoherent || copy.Buffer.LastGpuWriteTick == 0 ||
+                copy.Buffer.Size > int.MaxValue) return false;
+            waitTick = Math.Max(waitTick, copy.Buffer.LastGpuWriteTick);
+        }
+
+        // EndBuffer publishes writes to host access. Submitted writers need no
+        // new command buffer or transfer; unsubmitted writers are flushed here.
+        _scheduler.Wait(waitTick);
+        _scheduler.WaitForPriorityOperations(waitTick);
+        foreach (var copy in copies)
+        {
+            if (!_backing.TryWriteBacking(copy.Address, copy.Buffer.Mapped.Slice(checked((int)copy.SourceOffset), checked((int)copy.Size))))
+                throw SubmissionScheduler.Fatal($"Could not write the required direct backing: addr=0x{copy.Address:X16} size=0x{copy.Size:X16}");
+        }
+        return true;
     }
 
     // Copies the pieces on the readback queue after only the tick that last wrote their
@@ -1123,7 +1148,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
 
         var bufferIdentifier = _registry.AllocateBuffer(new GpuBuffer(
-            _device, _scheduler, GpuBufferUsage.DeviceLocal, overlap.Begin,
+            _device, _scheduler, MappedBufferReadback.Enabled ? GpuBufferUsage.SharedDeviceLocal : GpuBufferUsage.DeviceLocal, overlap.Begin,
             GpuBuffer.AllFlags | BufferUsageFlags.ShaderDeviceAddressBit, overlap.End - overlap.Begin, allowSlab: true), overlap.Begin, overlap.End - overlap.Begin);
         foreach (var oldId in overlapping)
         {

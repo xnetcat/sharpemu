@@ -147,6 +147,8 @@ public unsafe class GpuBuffer : IDisposable
 
     public Span<byte> Mapped => _mapped == null ? Span<byte>.Empty : new Span<byte>(_mapped, checked((int)Size));
 
+    public bool IsMapped => _mapped != null;
+
     public bool IsCoherent { get; }
 
     public GpuBufferUsage Usage { get; }
@@ -317,6 +319,7 @@ public unsafe class GpuBuffer : IDisposable
         var (required, preferred, avoided) = usage switch
         {
             GpuBufferUsage.DeviceLocal => (MemoryPropertyFlags.None, MemoryPropertyFlags.DeviceLocalBit, MemoryPropertyFlags.None),
+            GpuBufferUsage.SharedDeviceLocal => (MemoryPropertyFlags.HostVisibleBit, MemoryPropertyFlags.DeviceLocalBit | MemoryPropertyFlags.HostCoherentBit | MemoryPropertyFlags.HostCachedBit, MemoryPropertyFlags.None),
             GpuBufferUsage.Upload => (MemoryPropertyFlags.HostVisibleBit, MemoryPropertyFlags.HostCoherentBit, MemoryPropertyFlags.DeviceLocalBit),
             GpuBufferUsage.Download => (MemoryPropertyFlags.HostVisibleBit, MemoryPropertyFlags.HostCoherentBit | MemoryPropertyFlags.HostCachedBit, MemoryPropertyFlags.DeviceLocalBit),
             _ => (MemoryPropertyFlags.HostVisibleBit, MemoryPropertyFlags.HostCoherentBit | MemoryPropertyFlags.DeviceLocalBit, MemoryPropertyFlags.None),

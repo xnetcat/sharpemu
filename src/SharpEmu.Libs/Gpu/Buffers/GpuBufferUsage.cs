@@ -9,4 +9,5 @@ public enum GpuBufferUsage : byte
     Upload,
     Download,
     Stream,
+    SharedDeviceLocal,
 }

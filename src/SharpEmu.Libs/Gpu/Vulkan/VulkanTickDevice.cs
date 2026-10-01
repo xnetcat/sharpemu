@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using SharpEmu.Libs.Gpu.Scheduling;
+using SharpEmu.Libs.Gpu.Buffers;
 using SharpEmu.Libs.VideoOut;
 using Silk.NET.Vulkan;
 using VkSemaphore = Silk.NET.Vulkan.Semaphore;
@@ -286,6 +287,27 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
 
     public void EndBuffer(nint buffer)
     {
+        if (MappedBufferReadback.Enabled)
+        {
+            // Publish GPU writes before this submission's timeline signal. A host
+            // read still waits for the last writer tick; coherence alone is not
+            // a substitute for the device-to-host memory dependency.
+            var barrier = new MemoryBarrier2
+            {
+                SType = StructureType.MemoryBarrier2,
+                SrcStageMask = PipelineStageFlags2.AllCommandsBit,
+                SrcAccessMask = AccessFlags2.MemoryWriteBit,
+                DstStageMask = PipelineStageFlags2.HostBit,
+                DstAccessMask = AccessFlags2.HostReadBit,
+            };
+            var dependency = new DependencyInfo
+            {
+                SType = StructureType.DependencyInfo,
+                MemoryBarrierCount = 1,
+                PMemoryBarriers = &barrier,
+            };
+            _vk.CmdPipelineBarrier2(new CommandBuffer(buffer), &dependency);
+        }
         CommandProfile?.WriteMarker(new CommandBuffer(buffer), VulkanCommandProfile.IntervalKind.Tail);
         RequireSuccess(_vk.EndCommandBuffer(new CommandBuffer(buffer)), "vkEndCommandBuffer(scheduler)");
     }
