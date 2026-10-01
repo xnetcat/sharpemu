@@ -179,6 +179,14 @@ public sealed partial class DirectExecutionBackend
 			Console.Error.WriteLine($"[LOADER][TRACE] Raw sentinel recoveries: {num2} (last import index={importIndex})");
 			_lastReportedRawSentinelRecoveries = num2;
 		}
+		if (importStubEntry.Nid is "9UK1vLZQft4" or "7H0iTOciTLo" &&
+			importStubEntry.Export is { } mutexExport &&
+			(mutexExport.Target & cpuContext.TargetGeneration) != 0 &&
+			Volatile.Read(ref _pendingGuestExceptionCount) == 0 &&
+			KernelPthreadCompatExports.TryLockInitializedMutexUncontended(cpuContext, *(ulong*)argPackPtr))
+		{
+			return 0;
+		}
 		if (importStubEntry.IsLeaf &&
 			TryDispatchHotMemoryLeaf(cpuContext, importStubEntry, argPackPtr, out var hotMemoryResult))
 		{

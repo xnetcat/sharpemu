@@ -891,6 +891,27 @@ public static class KernelPthreadCompatExports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
+    // Only an already initialized, unowned mutex can finish without the
+    // dispatcher's blocking-call frame. Keep pointer-slot revalidation and the
+    // same queued-waiter check as the full lock implementation.
+    internal static bool TryLockInitializedMutexUncontended(CpuContext ctx, ulong mutexAddress)
+    {
+        if (mutexAddress == 0 || !_mutexStates.ContainsKey(mutexAddress) ||
+            !TryResolveMutexState(ctx, mutexAddress, createIfZero: false, out var resolvedAddress, out var state))
+        {
+            return false;
+        }
+
+        var threadId = KernelPthreadState.GetCurrentThreadHandle();
+        if (!state.TryAcquireUncontended(threadId, allowWaiterBarge: false))
+        {
+            return false;
+        }
+
+        TracePthreadMutex(ctx, "lock", mutexAddress, resolvedAddress, state, threadId, 0);
+        return true;
+    }
+
     private static int PthreadMutexLockCore(CpuContext ctx, ulong mutexAddress, bool tryOnly)
     {
         if (mutexAddress == 0)
