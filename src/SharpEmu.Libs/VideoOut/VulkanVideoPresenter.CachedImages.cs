@@ -106,7 +106,6 @@ internal static unsafe partial class VulkanVideoPresenter
         public ulong Address;
         public ResourceSlotIdentifier ImageIdentifier;
         public ImageRequest Request;
-        public TextureRequestResolution Resolution;
         public CachedImage? CachedImage;
         public uint MipLevel;
         public Image Image;
@@ -521,7 +520,6 @@ internal static unsafe partial class VulkanVideoPresenter
                 Address = texture.Address,
                 ImageIdentifier = imageIdentifier,
                 Request = request,
-                Resolution = resolution,
                 MipLevel = texture.MipLevel,
                 IsStorage = texture.IsStorage,
                 SamplerState = texture.Sampler,
