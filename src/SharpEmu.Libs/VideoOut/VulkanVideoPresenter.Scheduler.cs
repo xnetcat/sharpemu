@@ -63,8 +63,11 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private void CreateScheduler()
         {
+            // Per-command timestamp queries can change driver scheduling and
+            // encoder boundaries. Keep them opt-in independently of CPU phase
+            // timing so a CPU audit does not silently perturb every GPU command.
             var tickDevice = new VulkanTickDevice(_vk, _device, _queue, _queueFamilyIndex, _queueGate,
-                RenderPhaseProfile.Enabled ? _physicalDevice : default);
+                Environment.GetEnvironmentVariable("SHARPEMU_PROFILE_GPU_COMMANDS") == "1" ? _physicalDevice : default);
             _gpuCommandProfile = tickDevice.CommandProfile;
             _scheduler = new SubmissionScheduler(
                 tickDevice,
