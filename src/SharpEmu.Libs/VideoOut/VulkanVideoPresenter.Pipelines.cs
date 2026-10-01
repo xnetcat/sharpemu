@@ -56,6 +56,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private readonly Dictionary<ulong, ShaderModule> _shaderModules = new();
         private readonly Dictionary<ulong, int> _shaderModuleSpirvBytes = new();
+        private readonly Dictionary<ulong, string> _shaderModuleCacheIdentities = new();
         private long _pipelineCreationMilliseconds;
         private KhrPushDescriptor _pushDescriptorApi = null!;
         private uint _maxPushDescriptors;
@@ -199,6 +200,7 @@ internal static unsafe partial class VulkanVideoPresenter
             SetDebugName(ObjectType.ShaderModule, module.Handle, $"SharpEmu {stage} 0x{hash:X16}");
             _shaderModules.Add(programId, module);
             _shaderModuleSpirvBytes[module.Handle] = shader.Payload.Length;
+            _shaderModuleCacheIdentities[module.Handle] = VulkanPipelineCacheStorage.CompiledShaderIdentity(shader.Payload);
             return module.Handle;
         }
 
@@ -814,7 +816,8 @@ internal static unsafe partial class VulkanVideoPresenter
                         Layout = layout,
                     };
                     var graphicsStart = Stopwatch.GetTimestamp();
-                    var cache = GetGuestPipelineCache($"g-{description.VertexStage.Hash:X16}-{description.PixelStage?.Hash ?? 0:X16}");
+                    var cache = GetGuestPipelineCache(GraphicsCacheKey(description.VertexStage.Hash,
+                        description.PixelStage?.Hash ?? 0, vertexModule.Handle, pixelModule.Handle));
                     Check(_vk.CreateGraphicsPipelines(_device, cache, 1, &pipelineInfo, null, out var pipeline),
                         $"vkCreateGraphicsPipelines(rendering vs=0x{description.VertexStage.Hash:X16} ps=0x{description.PixelStage?.Hash ?? 0:X16})");
                     ReportPipelineCreation(
@@ -878,7 +881,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     Layout = layout,
                 };
                 var computeStart = Stopwatch.GetTimestamp();
-                var cache = GetGuestPipelineCache($"c-{description.Stage.Hash:X16}");
+                var cache = GetGuestPipelineCache(ComputeCacheKey(description.Stage.Hash, computeModule.Handle));
                 Check(_vk.CreateComputePipelines(_device, cache, 1, &pipelineInfo, null, out pipeline), $"vkCreateComputePipelines(rendering) hash=0x{description.Stage.Hash:X16}");
                 ReportPipelineCreation(
                     (long)Stopwatch.GetElapsedTime(computeStart).TotalMilliseconds,
@@ -988,7 +991,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             var device = _device;
-            var cacheSource = GetGuestPipelineCacheSource($"c-{description.Stage.Hash:X16}");
+            var cacheSource = GetGuestPipelineCacheSource(ComputeCacheKey(description.Stage.Hash, computeModule.Handle));
             var vk = _vk;
             var started = new PendingComputePipeline
             {

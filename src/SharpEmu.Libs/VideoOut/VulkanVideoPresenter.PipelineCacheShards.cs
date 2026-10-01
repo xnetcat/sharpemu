@@ -20,12 +20,26 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private string? _pipelineCacheShardDirectory;
         private readonly Dictionary<string, DriverCacheShard> _pipelineCacheShards = new();
+        private static readonly bool LegacyShaderGroups =
+            Environment.GetEnvironmentVariable("SHARPEMU_VK_PIPELINE_CACHE_LEGACY_SHARDS") == "1";
+
+        private string ComputeCacheKey(ulong guestHash, ulong module) =>
+            !LegacyShaderGroups && _shaderModuleCacheIdentities.TryGetValue(module, out var identity)
+                ? $"c2-{identity}" : $"c-{guestHash:X16}";
+
+        private string GraphicsCacheKey(ulong vertexHash, ulong pixelHash, ulong vertexModule, ulong pixelModule)
+        {
+            if (!LegacyShaderGroups && _shaderModuleCacheIdentities.TryGetValue(vertexModule, out var vertex) &&
+                (pixelModule == 0 || _shaderModuleCacheIdentities.ContainsKey(pixelModule)))
+                return $"g2-{vertex}-{(pixelModule == 0 ? "none" : _shaderModuleCacheIdentities[pixelModule])}";
+            return $"g-{vertexHash:X16}-{pixelHash:X16}";
+        }
 
         // MoltenVK recompiles cached MSL libraries during vkCreatePipelineCache.
-        // Loading only a requested shader group prevents a mature cache from
+        // Loading only requested translated modules prevents a mature cache from
         // compiling every previously visited scene before the first frame.
         // Vulkan still validates the complete shader/layout key inside each blob;
-        // stage hashes only select a storage bucket, never a pipeline to reuse.
+        // content hashes only select a storage bucket, never a pipeline to reuse.
         private PipelineCache GetGuestPipelineCache(string key)
             => ResolveGuestPipelineCache(GetGuestPipelineCacheSource(key));
 
