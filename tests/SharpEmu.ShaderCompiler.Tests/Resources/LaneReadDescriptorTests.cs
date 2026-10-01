@@ -96,6 +96,31 @@ public sealed class LaneReadDescriptorTests
     }
 
     [Theory]
+    [InlineData(13u, false)] // High half of the remaining lane mask.
+    [InlineData(15u, false)] // High half of the matching lane mask.
+    [InlineData(21u, false)] // High half of saved EXEC.
+    [InlineData(127u, false)] // High half of EXEC itself.
+    [InlineData(100u, true)] // Unrelated body writes remain supported.
+    public void BodyWritesMustPreserveBothHalvesOfProtectedMasks(uint register, bool allowed)
+    {
+        var original = CreateProgram();
+        var instructions = original.Instructions.Select(instruction => instruction.Pc switch
+        {
+            88 => Branch(88, "SCbranchExecz", 9),
+            132 => Branch(136, "SCbranchScc1", -19),
+            >= 124 => instruction with { Pc = instruction.Pc + 4 },
+            _ => instruction,
+        }).ToList();
+        instructions.Insert(instructions.FindIndex(instruction => instruction.Pc == 128),
+            MoveScalar(124, register, 0));
+        var changed = Program(instructions.ToArray());
+        if (allowed)
+            Assert.Contains(Extract(changed, userDataCount: 2).DescriptorSources, source => source.IndirectImage is not null);
+        else
+            AssertStrictRejection(changed);
+    }
+
+    [Theory]
     [InlineData(32u)] // A different bit is not the mask's selected bit.
     [InlineData(52u)] // The remaining mask must start with EXEC.
     [InlineData(56u)] // The lane must be the first remaining lane.
@@ -107,6 +132,11 @@ public sealed class LaneReadDescriptorTests
         var original = CreateProgram();
         var changed = new Gen5ShaderProgram(original.Address, original.Instructions.Select(instruction =>
             instruction.Pc == changedPc + 8 ? Nop(changedPc + 8) with { Words = instruction.Words } : instruction).ToArray());
+        AssertStrictRejection(changed);
+    }
+
+    private static void AssertStrictRejection(Gen5ShaderProgram changed)
+    {
         try
         {
             var plan = Extract(changed, userDataCount: 2);

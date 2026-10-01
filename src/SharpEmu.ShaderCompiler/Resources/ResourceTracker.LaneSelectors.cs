@@ -41,13 +41,43 @@ public sealed partial class ResourceTracker
             repeat.Opcode != "SCbranchScc1" || Target(repeat) != scan.Pc) return false;
         // No body write may replace the remaining mask or its saved EXEC value.
         for (var i = index + 4; i < tail; i++)
-            if (code[i].Destinations.Contains(remaining) || code[i].Destinations.Contains(save.Destinations[0]) ||
-                code[i].Destinations.Contains(equal.Destinations[0]) || code[i].Destinations.Contains(read.Sources[0]))
+            if (WritesMask(code[i], remaining) || WritesMask(code[i], save.Destinations[0]) ||
+                WritesMask(code[i], equal.Destinations[0]) || WritesMask(code[i], Gen5Operand.Scalar(126)) ||
+                WritesLaneRegister(code[i], read.Sources[0]))
                 return false;
         return true;
 
         static uint Target(Gen5ShaderInstruction branch) =>
             unchecked((uint)(branch.Pc + 4 + (short)(branch.Words[0] & 0xFFFF) * 4));
+    }
+
+    private static bool WritesMask(Gen5ShaderInstruction instruction, Gen5Operand low) =>
+        WritesLaneRegister(instruction, low) ||
+        WritesLaneRegister(instruction, Gen5Operand.Scalar(low.Value + 1));
+
+    private static bool WritesLaneRegister(Gen5ShaderInstruction instruction, Gen5Operand register)
+    {
+        if (register.Kind == Gen5OperandKind.ScalarRegister)
+        {
+            if (register.Value is 126 or 127 &&
+                (instruction.Opcode.Contains("Saveexec", StringComparison.Ordinal) ||
+                 instruction.Opcode.Contains("Wrexec", StringComparison.Ordinal) ||
+                 instruction.Opcode.StartsWith("VCmpx", StringComparison.Ordinal))) return true;
+            var scalarDestination = instruction.Control switch
+            {
+                Gen5Vop3Control control => control.ScalarDestination,
+                Gen5SdwaControl control => control.ScalarDestination,
+                _ => null,
+            };
+            if (scalarDestination is { } scalar && register.Value >= scalar && register.Value - scalar < 2)
+                return true;
+        }
+        // Memory instructions enumerate every destination dword in the IR.
+        // Scalar ALU pairs may instead name only the low register.
+        var width = instruction.Destinations.Count == 1 &&
+            instruction.Opcode.Contains("64", StringComparison.Ordinal) ? 2u : 1u;
+        return instruction.Destinations.Any(destination => destination.Kind == register.Kind &&
+            register.Value >= destination.Value && register.Value - destination.Value < width);
     }
 
     private static bool HasMaskBitClear(IReadOnlyList<Gen5ShaderInstruction> code, Gen5Operand mask, Gen5Operand bit)
