@@ -540,6 +540,7 @@ public static class FiberExports
         string reason,
         bool isSwitch)
     {
+        using var profile = SharpEmu.Libs.Diagnostics.FiberSwitchProfile.Begin();
         if (!TryValidateFiber(ctx, fiber, out var error))
         {
             return SetReturn(ctx, error);
@@ -577,99 +578,105 @@ public static class FiberExports
 
         GuestCpuContinuation transferTarget;
         var resumed = false;
+        profile?.GateWaiting();
         lock (_fiberGate)
         {
-            var threadKey = GetThreadKey(ctx);
-            if (!TryReadFiberFields(ctx, fiber, out fields))
+            profile?.GateEntered();
+            try
             {
-                return SetReturn(ctx, FiberErrorInvalid);
-            }
-            if (fields.State != FiberStateIdle)
-            {
-                if (TraceEnabled)
-                    TraceFiber($"run-state-error reason={reason} fiber=0x{fiber:X16} state=0x{fields.State:X8}");
-                return SetReturn(ctx, FiberErrorState);
-            }
-
-            FiberContinuation targetContinuation = default;
-            if (_continuations.TryGetValue(fiber, out var savedContinuation))
-            {
-                targetContinuation = savedContinuation;
-                resumed = true;
-            }
-            var callerContinuation = new FiberContinuation(
-                CaptureContinuation(ctx, frame.ReturnRip, frame.ResumeRsp, frame.ReturnSlotAddress),
-                outArgumentAddress);
-
-            if (!resumed)
-            {
-                var rootStackTop = _threadStates.TryGetValue(threadKey, out var existingThreadState)
-                    ? existingThreadState.RootContinuation.Context.Rsp
-                    : callerContinuation.Context.Rsp;
-                if (!TryCreateInitialContinuation(
-                        ctx,
-                        fields,
-                        argOnRun,
-                        rootStackTop,
-                        out targetContinuation))
+                var threadKey = GetThreadKey(ctx);
+                if (!TryReadFiberFields(ctx, fiber, out fields))
                 {
                     return SetReturn(ctx, FiberErrorInvalid);
                 }
-            }
-            else if (!TryWriteResumeArgument(ctx, targetContinuation, argOnRun))
-            {
-                return SetReturn(ctx, FiberErrorInvalid);
-            }
-
-            if (previousFiber != 0)
-            {
-                if (!TryReadUInt32(ctx, previousFiber + FiberStateOffset, out var previousState) ||
-                    previousState != FiberStateRun ||
-                    !TryWriteUInt32(ctx, previousFiber + FiberStateOffset, FiberStateIdle))
+                if (fields.State != FiberStateIdle)
                 {
+                    if (TraceEnabled)
+                        TraceFiber($"run-state-error reason={reason} fiber=0x{fiber:X16} state=0x{fields.State:X8}");
                     return SetReturn(ctx, FiberErrorState);
                 }
 
-                _continuations[previousFiber] = callerContinuation;
-            }
-            else
-            {
-                if (_threadStates.ContainsKey(threadKey))
+                FiberContinuation targetContinuation = default;
+                if (_continuations.TryGetValue(fiber, out var savedContinuation))
                 {
-                    return SetReturn(ctx, FiberErrorPermission);
+                    targetContinuation = savedContinuation;
+                    resumed = true;
+                }
+                var callerContinuation = new FiberContinuation(
+                    CaptureContinuation(ctx, frame.ReturnRip, frame.ResumeRsp, frame.ReturnSlotAddress),
+                    outArgumentAddress);
+
+                if (!resumed)
+                {
+                    var rootStackTop = _threadStates.TryGetValue(threadKey, out var existingThreadState)
+                        ? existingThreadState.RootContinuation.Context.Rsp
+                        : callerContinuation.Context.Rsp;
+                    if (!TryCreateInitialContinuation(
+                            ctx,
+                            fields,
+                            argOnRun,
+                            rootStackTop,
+                            out targetContinuation))
+                    {
+                        return SetReturn(ctx, FiberErrorInvalid);
+                    }
+                }
+                else if (!TryWriteResumeArgument(ctx, targetContinuation, argOnRun))
+                {
+                    return SetReturn(ctx, FiberErrorInvalid);
                 }
 
-                _threadStates[threadKey] = new FiberThreadState(callerContinuation, fiber, previousFiber);
-            }
-
-            if (!TryWriteUInt32(ctx, fiber + FiberStateOffset, FiberStateRun))
-            {
                 if (previousFiber != 0)
                 {
-                    _continuations.TryRemove(previousFiber, out _);
-                    _ = TryWriteUInt32(ctx, previousFiber + FiberStateOffset, FiberStateRun);
+                    if (!TryReadUInt32(ctx, previousFiber + FiberStateOffset, out var previousState) ||
+                        previousState != FiberStateRun ||
+                        !TryWriteUInt32(ctx, previousFiber + FiberStateOffset, FiberStateIdle))
+                    {
+                        return SetReturn(ctx, FiberErrorState);
+                    }
+
+                    _continuations[previousFiber] = callerContinuation;
                 }
                 else
                 {
-                    _threadStates.TryRemove(threadKey, out _);
+                    if (_threadStates.ContainsKey(threadKey))
+                    {
+                        return SetReturn(ctx, FiberErrorPermission);
+                    }
+
+                    _threadStates[threadKey] = new FiberThreadState(callerContinuation, fiber, previousFiber);
                 }
-                return SetReturn(ctx, FiberErrorInvalid);
-            }
 
-            if (resumed)
-            {
-                _continuations.TryRemove(fiber, out _);
-            }
-
-            transferTarget = targetContinuation.Context with { Rax = 0 };
-            if (_threadStates.TryGetValue(threadKey, out var activeState))
-            {
-                _threadStates[threadKey] = activeState with
+                if (!TryWriteUInt32(ctx, fiber + FiberStateOffset, FiberStateRun))
                 {
-                    CurrentFiber = fiber,
-                    PreviousFiber = previousFiber,
-                };
+                    if (previousFiber != 0)
+                    {
+                        _continuations.TryRemove(previousFiber, out _);
+                        _ = TryWriteUInt32(ctx, previousFiber + FiberStateOffset, FiberStateRun);
+                    }
+                    else
+                    {
+                        _threadStates.TryRemove(threadKey, out _);
+                    }
+                    return SetReturn(ctx, FiberErrorInvalid);
+                }
+
+                if (resumed)
+                {
+                    _continuations.TryRemove(fiber, out _);
+                }
+
+                transferTarget = targetContinuation.Context with { Rax = 0 };
+                if (_threadStates.TryGetValue(threadKey, out var activeState))
+                {
+                    _threadStates[threadKey] = activeState with
+                    {
+                        CurrentFiber = fiber,
+                        PreviousFiber = previousFiber,
+                    };
+                }
             }
+            finally { profile?.GateExited(); }
         }
 
         _ = GuestThreadExecution.EnterFiber(fiber);
