@@ -100,7 +100,7 @@ internal sealed class ShaderProgramCache
     private readonly CpuContext _context;
     private readonly IGuestGpuBackend _compiler;
     private readonly IShaderPipelineHost _host;
-    private readonly Dictionary<ProgramKey, ProgramSourceEntry> _programs = new();
+    private readonly Dictionary<ProgramKey, ProgramSourceEntry> _programs = new(ProgramKeyComparer.Instance);
     private readonly Dictionary<(ulong Hash, uint CodeSize), Gen5ShaderProgram> _decoded = new();
     private readonly List<uint> _staticState = new(StageStaticKey.MaxWords);
     // Draws that re-bind unchanged resources reuse the last materialization.
@@ -189,8 +189,10 @@ internal sealed class ShaderProgramCache
         using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramCacheLookup))
         {
             BuildStaticState(source.Stage, options);
-            key = new ProgramKey(source.Stage, source.Hash, (uint)source.UserData.Length, source.CodeSize, _staticState.ToArray());
-            _programs.TryGetValue(key, out entry);
+            var lookup = new ProgramKeyLookup(source.Stage, source.Hash, (uint)source.UserData.Length, source.CodeSize,
+                System.Runtime.InteropServices.CollectionsMarshal.AsSpan(_staticState));
+            if (!_programs.GetAlternateLookup<ProgramKeyLookup>().TryGetValue(lookup, out key!, out entry))
+                key = ProgramKeyComparer.Instance.Create(lookup);
         }
         var sourceWasCached = entry is not null;
         if (RenderTrace.Enabled && RenderTrace.Pipeline())
