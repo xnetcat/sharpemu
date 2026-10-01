@@ -14,6 +14,38 @@ namespace SharpEmu.Libs.Tests.Gpu.Images;
 // Readback publication: scheduled readbacks, garbage collection under pressure, depth planes.
 public sealed partial class GuestImageCacheTests
 {
+    [Theory]
+    [InlineData(false, 9)]
+    [InlineData(true, 5)]
+    public void GarbageCollector_PressureRetiresUnusedImagesEarlierButKeepsCurrentImages(bool critical, int age)
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x400000, ReadWrite);
+        var oldRequest = Color32(address + 0x330000);
+        var currentRequest = Color32(address + 0x332000);
+        var oldImage = harness.Find(ref oldRequest);
+        var currentImage = harness.Find(ref currentRequest);
+        harness.Worker.Run(() =>
+        {
+            // Normal retention keeps both. Raising pressure may shorten the
+            // grace period for the unused image, never for this frame's image.
+            harness.Images.SetCollectionThresholds(0, ulong.MaxValue, ulong.MaxValue, (ulong)age);
+            harness.Images.ResetRecency([oldImage], (ulong)age);
+            harness.Images.RunGarbageCollector(endsFrame: false);
+        });
+        Assert.True(harness.Images.Contains(oldImage));
+        Assert.True(harness.Images.Contains(currentImage));
+        harness.Worker.Run(() =>
+        {
+            harness.Images.SetCollectionThresholds(0, 0, critical ? 0UL : ulong.MaxValue, (ulong)age);
+            harness.Images.RunGarbageCollector(endsFrame: false);
+        });
+        Assert.False(harness.Images.Contains(oldImage));
+        Assert.True(harness.Images.Contains(currentImage));
+        harness.Shutdown();
+    }
+
     [Fact]
     public void GarbageCollector_RetiresUnderPressureAndPublishesInOneTick()
     {
