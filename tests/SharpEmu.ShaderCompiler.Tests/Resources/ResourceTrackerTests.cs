@@ -430,8 +430,10 @@ public sealed class ResourceTrackerTests
         Assert.Equal([first, second], snapshot.Images);
     }
 
-    [Fact]
-    public void ResourceTableFlatteningAndRuntimeMemoization()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void ResourceTableFlatteningAndRuntimeMemoization(bool flattenStandaloneScalarReads)
     {
         var program = Program(
             ScalarLoad(4, 0, destination: 8, immediateOffset: 4),
@@ -445,7 +447,7 @@ public sealed class ResourceTrackerTests
             MoveScalar(40, 15, 0),
             BufferLoad(44, 12),
             EndProgram(48));
-        var plan = Extract(program);
+        var plan = Extract(program, flattenStandaloneScalarReads: flattenStandaloneScalarReads);
 
         Assert.Single(plan.TableReads);
         Assert.Single(plan.Info.Buffers);

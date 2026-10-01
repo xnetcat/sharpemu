@@ -168,8 +168,9 @@ internal static class ResourceTestProgram
     public static Gen5ShaderProgram Program(params Gen5ShaderInstruction[] instructions) => new(0, instructions);
 
     public static ShaderResourcePlan Extract(Gen5ShaderProgram program, uint userDataBase = 0, uint userDataCount = 64, ShaderStage stage = ShaderStage.Compute,
-        uint waveSize = 64) =>
-        ShaderResourcePlan.Extract(program, stage, Hash, userDataBase, userDataCount, waveSize: waveSize);
+        uint waveSize = 64, bool flattenStandaloneScalarReads = true) =>
+        ShaderResourcePlan.Extract(program, stage, Hash, userDataBase, userDataCount, waveSize: waveSize,
+            flattenStandaloneScalarReads: flattenStandaloneScalarReads);
 
     // The plan, its default specialization applied, and the layout of one program.
     public static (ShaderResourcePlan Plan, SpecializedResourceInfo Resources, BindingLayout Layout) Prepare(
