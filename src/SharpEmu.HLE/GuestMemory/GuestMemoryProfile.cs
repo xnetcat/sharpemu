@@ -48,6 +48,7 @@ public static class GuestMemoryProfile
         ShaderResourceRead,
         StoreDownload,
         CpuWriteInvalidation,
+        ReadbackPrefetch,
     }
 
     internal readonly record struct ReadbackRange(ulong Address, ulong Size, bool CpuWrite,

@@ -107,6 +107,9 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     internal bool DirtyImageRangeUploads { get; set; } =
         Environment.GetEnvironmentVariable("SHARPEMU_IMAGE_DIRTY_RANGE_UPLOADS") != "0";
 
+    internal bool ReadbackPrefetch { get; set; } =
+        Environment.GetEnvironmentVariable("SHARPEMU_READBACK_PREFETCH") == "1";
+
     public void ForEachBuffer(Action<GpuBuffer> visit)
     {
         for (var index = 0; index < _registry.RegisteredCount; index++)
@@ -798,10 +801,22 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
 
         var copies = CollectReadbackWindow(guestAddress, size, out var windowBegin, out var windowEnd);
+        var requestedCopies = copies.Count;
         if (copies.Count != 0)
         {
+            var prefetched = ReadbackPrefetch ? CollectReadbackNeighbors(copies, guestAddress) : null;
             DownloadBufferMemory(copies);
             _tracker.ClearGpuDirtyPages(windowBegin, windowEnd - windowBegin);
+            if (prefetched != null)
+            {
+                foreach (var (range, bytes) in prefetched)
+                {
+                    _tracker.ClearGpuDirtyPages(range.Address, range.Size);
+                    // The demand read owns the batch's wait time. Count speculative bytes separately.
+                    GuestMemoryProfile.RecordBufferReadback(range.Address, range.Size, false, bytes, 0,
+                        GuestMemoryProfile.ReadbackSource.ReadbackPrefetch);
+                }
+            }
         }
 
         if (isWrite)
@@ -811,11 +826,71 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         if (GuestMemoryProfile.ReadbackDetailsEnabled)
         {
             var downloadedBytes = 0UL;
-            foreach (var copy in copies)
-                downloadedBytes += copy.Size;
+            for (var index = 0; index < requestedCopies; index++)
+                downloadedBytes += copies[index].Size;
             GuestMemoryProfile.RecordBufferReadback(windowBegin, windowEnd - windowBegin, isWrite, downloadedBytes,
                 System.Diagnostics.Stopwatch.GetTimestamp() - readbackStarted, source);
         }
+    }
+
+    // Small neighboring allocations often contain CPU-consumed GPU results. Share the
+    // demand read's drain without merging allocations or waiting on a newer writer.
+    // Whole page-aligned windows are collected so clearing their ownership cannot hide
+    // GPU-written bytes that were omitted from the copy. Only registered buffers qualify.
+    private List<(GuestSpan Range, ulong Bytes)> CollectReadbackNeighbors(List<DownloadPiece> copies, ulong address)
+    {
+        const ulong windowSize = 512 * 1024;
+        const ulong byteLimit = 64 * 1024;
+        const int bufferLimit = 16;
+        var owner = copies[0].Buffer;
+        var writerTick = owner.LastGpuWriteTick;
+        var result = new List<(GuestSpan, ulong)>();
+        if (writerTick == 0) return result;
+        var begin = address & ~(windowSize - 1);
+        var end = begin + windowSize;
+        var requiredPackedBytes = 0UL;
+        foreach (var copy in copies) requiredPackedBytes += PackedReadbackBytes(copy);
+        // Read-ahead must fit this batch; it must not introduce another drain.
+        if (requiredPackedBytes >= _download.Size) return result;
+        var remaining = Math.Min(byteLimit, _download.Size - requiredPackedBytes);
+        var pieces = new List<DownloadPiece>();
+        for (var index = _registry.FindFirstOverlappingIndex(begin);
+             index < _registry.RegisteredCount && _registry.GetRegisteredAddress(index) < end && result.Count < bufferLimit;
+             index++)
+        {
+            var buffer = _registry.GetBuffer(_registry.GetRegisteredIdentifier(index));
+            if (buffer == owner || buffer.LastGpuWriteTick == 0 || buffer.LastGpuWriteTick > writerTick) continue;
+            var start = Math.Max(begin, buffer.CpuAddress);
+            var stop = Math.Min(end, buffer.CpuAddress + buffer.Size);
+            if (!_gpuModifiedRanges.Overlaps(start, stop - start)) continue;
+            pieces.Clear();
+            _tracker.ForEachDownloadRange(start, stop - start, clear: false,
+                (dirtyAddress, bytes) => _tracker.ValidateGpuDirtyPages(_gpuModifiedRanges, dirtyAddress, bytes, "readback prefetch"),
+                (dirtyAddress, bytes) =>
+                {
+                    foreach (var range in _gpuModifiedRanges.GetOverlappingRanges(dirtyAddress, bytes))
+                        pieces.Add(new DownloadPiece(buffer, buffer.Offset(range.Address), range.Address, range.Size));
+                });
+            var total = 0UL;
+            var packed = 0UL;
+            foreach (var piece in pieces)
+            {
+                total += piece.Size;
+                packed += PackedReadbackBytes(piece);
+            }
+            if (total == 0 || packed > remaining) continue;
+            copies.AddRange(pieces);
+            result.Add((new GuestSpan(start, stop - start), total));
+            remaining -= packed;
+            if (remaining == 0) break;
+        }
+        return result;
+    }
+
+    private static ulong PackedReadbackBytes(DownloadPiece copy)
+    {
+        var transfer = (copy.Size + (copy.SourceOffset & 3) + 3) & ~3UL;
+        return (transfer + BufferDownloadBatchPlanner.Alignment - 1) & ~(BufferDownloadBatchPlanner.Alignment - 1);
     }
 
     // The GPU-modified ranges to download for a read of the range, widened to a window so
