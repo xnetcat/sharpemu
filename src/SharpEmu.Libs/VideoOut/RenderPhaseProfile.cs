@@ -164,6 +164,9 @@ internal static class RenderPhaseProfile
 
     private static readonly long[] _ticks = new long[(int)Phase.Count];
     private static readonly long[] _entries = new long[(int)Phase.Count];
+    private static readonly bool AllocationEnabled = Enabled &&
+        Environment.GetEnvironmentVariable("SHARPEMU_PROFILE_RENDER_ALLOCATIONS") == "1";
+    private static readonly long[] _allocatedBytes = new long[(int)Phase.Count];
     private static long _frames;
     private const int FrameTraceCapacity = 4096;
     private static long[] _framePhaseTicks => FrameTraceStorage.PhaseTicks;
@@ -316,6 +319,7 @@ internal static class RenderPhaseProfile
     // the per-scope cost to two timestamp reads.
     [ThreadStatic] private static Phase _current;
     [ThreadStatic] private static long _lastTimestamp;
+    [ThreadStatic] private static long _lastAllocatedBytes;
     [ThreadStatic] private static int _scopeDepth;
 
     internal readonly ref struct Scope
@@ -381,6 +385,12 @@ internal static class RenderPhaseProfile
     {
         var now = Stopwatch.GetTimestamp();
         var previous = _current;
+        if (AllocationEnabled)
+        {
+            var allocated = GC.GetAllocatedBytesForCurrentThread();
+            if (_lastTimestamp != 0) _allocatedBytes[(int)previous] += allocated - _lastAllocatedBytes;
+            _lastAllocatedBytes = allocated;
+        }
         if (_lastTimestamp != 0)
         {
             _ticks[(int)previous] += now - _lastTimestamp;
@@ -461,6 +471,16 @@ internal static class RenderPhaseProfile
         Console.Error.WriteLine(
             $"[PERF][RENDER_MS] window_s={seconds:F1} frames={frames} " +
             string.Join(" ", parts.Select(part => $"{part.Phase}={part.Milliseconds:F2}ms/n{part.Entries}")));
+
+        if (AllocationEnabled)
+        {
+            var allocations = _allocatedBytes.Select((bytes, index) => (Bytes: bytes, Phase: (Phase)index))
+                .Where(part => part.Bytes > 0).OrderByDescending(part => part.Bytes).ToArray();
+            Array.Clear(_allocatedBytes);
+            Console.Error.WriteLine($"[PERF][RENDER_ALLOC] window_s={seconds:F1} frames={frames} " +
+                $"total_bytes={allocations.Sum(part => part.Bytes)} " +
+                string.Join(" ", allocations.Take(12).Select(part => $"{part.Phase}={part.Bytes}")));
+        }
 
         ReportImageUploads();
         BufferUploadProfile.Report();
