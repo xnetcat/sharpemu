@@ -70,6 +70,7 @@ internal static class AmprFileRegistry
 
     public static uint RegisterAprResolvedPath(string guestPath, string hostPath)
     {
+        using var ioProfile = AprIoProfile.Measure(AprIoProfile.Phase.RegisterPath);
         // APR file ids are part of the guest ABI: ResolveFilepathsToIds returns
         // the 31-bit FNV-1a hash of the guest path. Keep the collision-safe
         // process-local handles used by Register() separate from this path so a

@@ -1252,17 +1252,22 @@ public static class AmprExports
                 }
 
                 var request = (int)Math.Min((ulong)buffer.Length, size - bytesRead);
-                var read = RandomAccess.Read(
-                    cachedFile.Handle,
-                    buffer.AsSpan(0, request),
-                    unchecked((long)absoluteOffset));
+                int read;
+                using (AprIoProfile.Measure(AprIoProfile.Phase.HostRead))
+                    read = RandomAccess.Read(
+                        cachedFile.Handle,
+                        buffer.AsSpan(0, request),
+                        unchecked((long)absoluteOffset));
 
                 if (read <= 0)
                 {
                     break;
                 }
 
-                if (!ctx.Memory.TryWrite(destination + bytesRead, buffer.AsSpan(0, read)))
+                bool written;
+                using (AprIoProfile.Measure(AprIoProfile.Phase.GuestWrite))
+                    written = ctx.Memory.TryWrite(destination + bytesRead, buffer.AsSpan(0, read));
+                if (!written)
                 {
                     return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
                 }
@@ -1288,6 +1293,7 @@ public static class AmprExports
 
     private static bool TryGetCachedHostFile(string hostPath, out CachedHostFile file, out int result)
     {
+        using var ioProfile = AprIoProfile.Measure(AprIoProfile.Phase.HostOpen);
         file = null!;
         result = (int)OrbisGen2Result.ORBIS_GEN2_OK;
 

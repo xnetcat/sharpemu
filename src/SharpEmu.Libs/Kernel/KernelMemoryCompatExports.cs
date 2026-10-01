@@ -5716,6 +5716,7 @@ public static partial class KernelMemoryCompatExports
 
     private static bool TryResolveAprFilepath(CpuContext ctx, ulong pathListAddress, ulong index, out string guestPath)
     {
+        using var ioProfile = AprIoProfile.Measure(AprIoProfile.Phase.PathText);
         guestPath = string.Empty;
         if (TryReadAprPathPointer(ctx, pathListAddress + (index * sizeof(ulong)), out guestPath))
         {
@@ -6961,6 +6962,7 @@ public static partial class KernelMemoryCompatExports
 
     private static bool TryGetAprFileSize(string hostPath, out ulong size)
     {
+        using var ioProfile = AprIoProfile.Measure(AprIoProfile.Phase.FileSize);
         size = 0;
 
         string cachePath;
