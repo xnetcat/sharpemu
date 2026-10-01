@@ -11,6 +11,43 @@ namespace SharpEmu.Libs.Tests.Memory.HostViews;
 public sealed unsafe class HostViewQueryTests
 {
     [Fact]
+    public void QueriesFindFragmentedViewsAfterMappingAndUnmappingOutOfOrder()
+    {
+        if (!Supported) return;
+        var views = HostViewMemory.Create();
+        var segment = Math.Max(Segment, views.Granularity);
+        const int count = 64;
+        var size = 2 * count * segment;
+        var address = ReserveFreeHole(views, size);
+        try
+        {
+            using var backing = CreateBacking(views);
+            for (var i = count - 1; i >= 0; i--)
+            {
+                var start = address + (ulong)(2 * i) * segment;
+                Assert.True(views.SplitHole(start, segment));
+                Assert.True(views.TryMapView(backing, start, 0, segment, HostPageProtection.ReadWrite, out _));
+            }
+
+            for (var i = 0; i < count; i += 3)
+                Assert.True(views.UnmapView(address + (ulong)(2 * i) * segment, segment));
+
+            for (var i = 0; i < 2 * count; i++)
+            {
+                var committed = i % 2 == 0 && (i / 2) % 3 != 0;
+                var state = committed ? HostMemory.MEM_COMMIT : HostMemory.MEM_RESERVE;
+                var protection = committed ? HostMemory.PAGE_READWRITE : HostMemory.PAGE_NOACCESS;
+                Check(address + (ulong)i * segment, state, protection);
+                Check(address + (ulong)(i + 1) * segment - 1, state, protection);
+            }
+        }
+        finally
+        {
+            Assert.True(views.FreeOwnedRange(address, size));
+        }
+    }
+
+    [Fact]
     public void PageQueriesPreserveProtectionWithoutExtendingIntoAdjacentPages()
     {
         if (!Supported) return;

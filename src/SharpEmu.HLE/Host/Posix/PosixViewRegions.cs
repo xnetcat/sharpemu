@@ -68,10 +68,25 @@ internal static class PosixViewRegions
     {
         lock (Gate)
         {
-            foreach (var region in Regions)
+            // Replace keeps non-overlapping regions sorted by start address.
+            // Querying guest stack arguments is a hot path; do not walk every
+            // earlier mapping for each small host read.
+            var low = 0;
+            var high = Regions.Count - 1;
+            while (low <= high)
             {
-                if (region.Start > address) break;
-                if (address >= region.End) continue;
+                var middle = low + (high - low) / 2;
+                var region = Regions[middle];
+                if (address < region.Start)
+                {
+                    high = middle - 1;
+                    continue;
+                }
+                if (address >= region.End)
+                {
+                    low = middle + 1;
+                    continue;
+                }
                 var start = address - address % (ulong)Environment.SystemPageSize;
                 var end = region.End;
                 var protection = region.Protection;
