@@ -9,8 +9,9 @@ public static partial class GuestProducerProfile
 {
     // Cooperative sampling never suspends Rosetta or asks it to unwind a guest
     // stack. A sample spans one chosen HLE return to the next HLE entry. CPU time
-    // includes the native ABI gateways and intervening guest code. These are
-    // selected intervals, not a statistical instruction profile or CPU share.
+    // includes ABI gateways, host continuation work and intervening guest code.
+    // These are selected intervals outside DispatchImport, not a statistical
+    // instruction profile, pure guest CPU measurement or CPU share.
     private static readonly bool NativeEnabled = Enabled &&
         Environment.GetEnvironmentVariable("SHARPEMU_PROFILE_GUEST_NATIVE_GAPS") == "1";
     private readonly record struct NativeSample(long Timestamp, int Thread, ulong Guest,
