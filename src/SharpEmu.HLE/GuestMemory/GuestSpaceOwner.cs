@@ -65,6 +65,8 @@ public sealed class GuestSpaceOwner : IDisposable
 
     public bool TryWriteBacking(ulong address, ReadOnlySpan<byte> data) => _views.TryWriteBacking(address, data);
 
+    public bool TryWriteSingleView(ulong address, ReadOnlySpan<byte> data) => _views.TryWriteSingleView(address, data);
+
     public bool TryReadBacking(ulong address, Span<byte> data) => _views.TryReadBacking(address, data);
 
     // Reads through a view that covers the whole range without any lock; false otherwise.

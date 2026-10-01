@@ -77,6 +77,24 @@ public sealed unsafe class SharedBackingTransferTests
     }
 
     [Fact]
+    public void SingleViewWriteRefusesCrossingWithoutChangingEitherView()
+    {
+        if (!Supported) return;
+        using var mapping = new TransferMappings();
+        var address = mapping.Address + Segment - 4;
+        byte[] original = [1, 2, 3, 4, 5, 6, 7, 8];
+        Assert.True(mapping.Store.TryWriteBacking(address, original));
+        Assert.False(mapping.Store.TryWriteSingleView(address, new byte[8]));
+        var actual = new byte[8];
+        Assert.True(mapping.Store.TryReadBacking(address, actual));
+        Assert.Equal(original, actual);
+
+        Assert.True(mapping.Store.TryWriteSingleView(address, new byte[4]));
+        Assert.True(mapping.Store.TryReadBacking(address, actual));
+        Assert.Equal(new byte[] { 0, 0, 0, 0, 5, 6, 7, 8 }, actual);
+    }
+
+    [Fact]
     public void InvalidTransfersLeaveBackingBytesUnchanged()
     {
         if (!Supported) return;

@@ -56,19 +56,29 @@ public sealed unsafe class SharedBackingViews : IDisposable
         }
     }
 
+    // False without writing when the span needs multiple views or is not backed.
+    public bool TryWriteSingleView(ulong address, ReadOnlySpan<byte> data)
+    {
+        if (!TryAccessSingleView(address, (ulong)data.Length, out var target))
+        {
+            return false;
+        }
+        try
+        {
+            data.CopyTo(new Span<byte>((void*)target, data.Length));
+            return true;
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _activeAccesses);
+        }
+    }
+
     public bool TryWriteBacking(ulong address, ReadOnlySpan<byte> data)
     {
-        if (TryAccessSingleView(address, (ulong)data.Length, out var target))
+        if (TryWriteSingleView(address, data))
         {
-            try
-            {
-                data.CopyTo(new Span<byte>((void*)target, data.Length));
-                return true;
-            }
-            finally
-            {
-                Interlocked.Decrement(ref _activeAccesses);
-            }
+            return true;
         }
 
         lock (_lock)
