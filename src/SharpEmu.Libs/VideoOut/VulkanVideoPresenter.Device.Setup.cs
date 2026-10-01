@@ -1225,6 +1225,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     $"[LOADER][WARN] Vulkan pipeline cache read failed: {exception.Message}");
             }
 
+            var cacheStarted = System.Diagnostics.Stopwatch.GetTimestamp();
             var result = TryCreatePipelineCache(initialData, out _pipelineCache);
             if (result != Result.Success && initialData.Length != 0)
             {
@@ -1258,7 +1259,7 @@ internal static unsafe partial class VulkanVideoPresenter
             else
             {
                 Console.Error.WriteLine(
-                    $"[LOADER][INFO] Vulkan pipeline cache ready: path={_pipelineCachePath} initial={initialData.Length} bytes");
+                    $"[LOADER][INFO] Vulkan pipeline cache ready: path={_pipelineCachePath} initial={initialData.Length} bytes elapsed_ms={System.Diagnostics.Stopwatch.GetElapsedTime(cacheStarted).TotalMilliseconds:F1}");
             }
         }
 

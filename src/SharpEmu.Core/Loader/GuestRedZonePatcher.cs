@@ -55,6 +55,7 @@ internal static class GuestRedZonePatcher
         }
 
         var hostName = OperatingSystem.IsWindows() ? "Windows" : "macOS";
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
 
         if (!TryDecodeFunctionStarts(memory, programHeaders, imageBase, out var functionStarts))
         {
@@ -68,7 +69,7 @@ internal static class GuestRedZonePatcher
         {
             Console.Error.WriteLine(
                 $"[LOADER] {hostName} red-zone scan: functions={scan.Functions} red_zone={scan.RedZoneFunctions} " +
-                $"sites=0 unrelocatable={scan.UnrelocatableSites}.");
+                $"sites=0 unrelocatable={scan.UnrelocatableSites} elapsed_ms={System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds:F1}.");
             return scan;
         }
 
@@ -137,7 +138,7 @@ internal static class GuestRedZonePatcher
             $"(control_flow={result.ControlFlowRefusals} branch_target_after={result.BranchTargetRefusals} " +
             $"stack_after={result.StackRefusals} too_short={result.TooShortRefusals}) " +
             $"rosetta_vector_stores={result.VectorStoreCount} sha_rewrites={result.ShaInstructionCount} " +
-            $"trampolines=0x{trampolineBase:X16}+0x{result.TrampolineBytes:X}.");
+            $"trampolines=0x{trampolineBase:X16}+0x{result.TrampolineBytes:X} elapsed_ms={System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds:F1}.");
         return result;
     }
 

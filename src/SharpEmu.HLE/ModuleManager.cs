@@ -62,6 +62,7 @@ public sealed class ModuleManager : IModuleManager
     // Run every HLE type's initializer and JIT its methods here first, on a host thread.
     private void WarmHleTypeInitializers()
     {
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
         Assembly[] assemblies;
         lock (_registrationGate)
         {
@@ -143,7 +144,7 @@ public sealed class ModuleManager : IModuleManager
         }
 
         Console.Error.WriteLine(
-            $"[HLE] Warmed {warmed} type initializers ({failed} threw) + JIT-compiled {jitted} methods ({jitFailed} skipped) across {assemblies.Length} HLE assemblies, plus {bclWarmed} framework type initializers.");
+            $"[HLE] Warmed {warmed} type initializers ({failed} threw) + JIT-compiled {jitted} methods ({jitFailed} skipped) across {assemblies.Length} HLE assemblies, plus {bclWarmed} framework type initializers in {System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds:F1} ms.");
     }
 
     // Framework .cctors too (but not JIT — the BCL is too large).
