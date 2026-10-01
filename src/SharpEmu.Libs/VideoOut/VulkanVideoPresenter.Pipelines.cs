@@ -786,7 +786,8 @@ internal static unsafe partial class VulkanVideoPresenter
                         Layout = layout,
                     };
                     var graphicsStart = Stopwatch.GetTimestamp();
-                    Check(_vk.CreateGraphicsPipelines(_device, _pipelineCache, 1, &pipelineInfo, null, out var pipeline),
+                    var cache = GetGuestPipelineCache($"g-{description.VertexStage.Hash:X16}-{description.PixelStage?.Hash ?? 0:X16}");
+                    Check(_vk.CreateGraphicsPipelines(_device, cache, 1, &pipelineInfo, null, out var pipeline),
                         $"vkCreateGraphicsPipelines(rendering vs=0x{description.VertexStage.Hash:X16} ps=0x{description.PixelStage?.Hash ?? 0:X16})");
                     ReportPipelineCreation(
                         (long)Stopwatch.GetElapsedTime(graphicsStart).TotalMilliseconds,
@@ -849,7 +850,8 @@ internal static unsafe partial class VulkanVideoPresenter
                     Layout = layout,
                 };
                 var computeStart = Stopwatch.GetTimestamp();
-                Check(_vk.CreateComputePipelines(_device, _pipelineCache, 1, &pipelineInfo, null, out pipeline), $"vkCreateComputePipelines(rendering) hash=0x{description.Stage.Hash:X16}");
+                var cache = GetGuestPipelineCache($"c-{description.Stage.Hash:X16}");
+                Check(_vk.CreateComputePipelines(_device, cache, 1, &pipelineInfo, null, out pipeline), $"vkCreateComputePipelines(rendering) hash=0x{description.Stage.Hash:X16}");
                 ReportPipelineCreation(
                     (long)Stopwatch.GetElapsedTime(computeStart).TotalMilliseconds,
                     "compute",
@@ -958,7 +960,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             var device = _device;
-            var cache = _pipelineCache;
+            var cache = GetGuestPipelineCache($"c-{description.Stage.Hash:X16}");
             var vk = _vk;
             var started = new PendingComputePipeline
             {
@@ -1034,6 +1036,25 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 SilkMarshal.Free((nint)entryPoint);
             }
+        }
+
+        private void DrainPendingComputePipelines()
+        {
+            foreach (var pending in _pendingComputePipelines.Values)
+            {
+                try
+                {
+                    var pipeline = pending.Compile.GetAwaiter().GetResult();
+                    if (pipeline.Handle != 0) _vk.DestroyPipeline(_device, pipeline, null);
+                }
+                catch (Exception exception)
+                {
+                    Console.Error.WriteLine($"[LOADER][WARN] Pending compute pipeline failed during shutdown: {exception.Message}");
+                }
+                _vk.DestroyPipelineLayout(_device, pending.Layout, null);
+                _vk.DestroyDescriptorSetLayout(_device, pending.SetLayout, null);
+            }
+            _pendingComputePipelines.Clear();
         }
 
         private void DestroyRenderPipelines()
