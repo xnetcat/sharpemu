@@ -17,12 +17,17 @@ public sealed class WaveShuffleDeviceTests(HeadlessVulkanFixture fixture, ITestO
     : IClassFixture<HeadlessVulkanFixture>
 {
     [Theory]
-    [InlineData("Dpp8")]
-    [InlineData("Dpp16")]
-    [InlineData("Permlane16")]
-    [InlineData("Permlanex16")]
-    [InlineData("Reduction")]
-    public void Wave64Shuffle_PreservesUpperHalf(string operation)
+    [InlineData("Dpp8", false)]
+    [InlineData("Dpp8", true)]
+    [InlineData("Dpp16", false)]
+    [InlineData("Dpp16", true)]
+    [InlineData("Permlane16", false)]
+    [InlineData("Permlane16", true)]
+    [InlineData("Permlanex16", false)]
+    [InlineData("Permlanex16", true)]
+    [InlineData("Reduction", false)]
+    [InlineData("Reduction", true)]
+    public void Wave64Shuffle_PreservesUpperHalf(string operation, bool splitBlocks)
     {
         var vulkan = fixture.Vulkan;
         if (!GatePrerequisites.Ready(vulkan, shaderInt64: true)) return;
@@ -32,6 +37,13 @@ public sealed class WaveShuffleDeviceTests(HeadlessVulkanFixture fixture, ITestO
         {
             instructions.Add(instruction with { Pc = pc });
             pc += 8;
+            if (splitBlocks && instruction.Opcode != "SEndpgm")
+            {
+                // Empty branch blocks must not be needed to synchronize the
+                // two host subgroups; each cross-lane operation owns its scratch.
+                instructions.Add(new(pc, Gen5ShaderEncoding.Sopp, "SBranch", [0xBF820001u], [], [], null));
+                pc += 8;
+            }
         }
 
         Add(Vop2(0, "VLshlrevB32", 2, Operand(3), Gen5Operand.Vector(1)));

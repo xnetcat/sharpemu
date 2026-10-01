@@ -7893,10 +7893,22 @@ public static partial class Gen5SpirvTranslator
             return _module.AddInstruction(SpirvOp.Select, _floatType, passed, Float(1f), Float(0f));
         }
 
-        private uint ShuffleLane(uint value, uint lane) =>
-            _subgroupInvocationIdInput == 0
-                ? value
-                : _module.AddInstruction(SpirvOp.GroupNonUniformShuffle, _uintType, UInt(3), value, lane);
+        private uint ShuffleLane(uint value, uint lane)
+        {
+            if (_subgroupInvocationIdInput == 0)
+                return value;
+
+            // DPP and permlane selectors stay within a 32-lane half of a guest
+            // wave. On subgroup32, guest lanes 32..63 name lanes 0..31 of the
+            // second subgroup, not out-of-range native shuffle indices. Keep
+            // all six bits on native subgroup64. Operations crossing halves
+            // use the explicit wave64 broadcast scratch instead of this helper.
+            if (_emulateWave64)
+                lane = BitwiseAnd(lane, _module.AddInstruction(SpirvOp.ISub, _uintType,
+                    Load(_uintType, _subgroupSizeInput), UInt(1)));
+
+            return _module.AddInstruction(SpirvOp.GroupNonUniformShuffle, _uintType, UInt(3), value, lane);
+        }
 
         private uint CurrentLaneBit()
         {
