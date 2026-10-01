@@ -669,6 +669,10 @@ public static class PadExports
             : ctx.SetReturn(OrbisPadErrorInvalidHandle);
     }
 
+    private static readonly bool TracePadButtons =
+        Environment.GetEnvironmentVariable("SHARPEMU_LOG_PAD_BUTTONS") == "1";
+    private static int _lastTracedButtons = -1;
+
     private static bool WriteNeutralPadData(CpuContext ctx, ulong dataAddress)
     {
         Span<byte> data = stackalloc byte[PadDataSize];
@@ -712,7 +716,11 @@ public static class PadExports
             timestampMicroseconds);
         data[0x68] = 1;
 
-        return ctx.Memory.TryWrite(dataAddress, data);
+        var written = ctx.Memory.TryWrite(dataAddress, data);
+        if (written && TracePadButtons &&
+            Interlocked.Exchange(ref _lastTracedButtons, unchecked((int)buttons)) != unchecked((int)buttons))
+            Console.Error.WriteLine($"[PERF][PAD] address=0x{dataAddress:X} buttons=0x{buttons:X8} timestamp_us={timestampMicroseconds}");
+        return written;
     }
 
     private static PadState ReadHostInputState()
