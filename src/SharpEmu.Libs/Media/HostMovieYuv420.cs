@@ -197,7 +197,7 @@ internal sealed class HostMovieYuv420Decoder : IMediaFrameDecoder
             if (++_decodedFrames % 30 == 0)
             {
                 var scale = 1000.0 / System.Diagnostics.Stopwatch.Frequency;
-                Console.Error.WriteLine($"[PERF][MOVIE_DECODE] frames={_decodedFrames} decode_ms={_decodeTicks * scale:F1} convert_ms={_convertTicks * scale:F1} decode_cpu_ms={_decodeCpuNanoseconds / 1_000_000.0:F1} convert_cpu_ms={_convertCpuNanoseconds / 1_000_000.0:F1}");
+                Console.Error.WriteLine($"[PERF][MOVIE_DECODE] frames={_decodedFrames} decode_ms={_decodeTicks * scale:F1} convert_ms={_convertTicks * scale:F1} decode_cpu_ms={_decodeCpuNanoseconds / 1_000_000.0:F1} convert_cpu_ms={_convertCpuNanoseconds / 1_000_000.0:F1} task_role={TaskRole()}");
             }
         }
         return true;
@@ -216,6 +216,19 @@ internal sealed class HostMovieYuv420Decoder : IMediaFrameDecoder
             ? ((long)value.UserSeconds + value.SystemSeconds) * 1_000_000_000 +
               ((long)value.UserMicroseconds + value.SystemMicroseconds) * 1_000 : 0;
     }
+
+    private static int TaskRole()
+    {
+        if (!OperatingSystem.IsMacOS()) return -100;
+        uint count = 1;
+        int getDefault = 0;
+        return GetTaskPolicy(MachTaskSelf(), 1, out var role, ref count, ref getDefault) == 0 ? role : -101;
+    }
+
+    [System.Runtime.InteropServices.DllImport("libSystem.dylib", EntryPoint = "mach_task_self")]
+    private static extern uint MachTaskSelf();
+    [System.Runtime.InteropServices.DllImport("libSystem.dylib", EntryPoint = "task_policy_get")]
+    private static extern int GetTaskPolicy(uint task, int flavor, out int role, ref uint count, ref int getDefault);
 
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     private struct ThreadBasicInfo
