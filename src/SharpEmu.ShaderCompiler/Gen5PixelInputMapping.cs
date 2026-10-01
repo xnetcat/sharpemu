@@ -9,8 +9,20 @@ public static class Gen5PixelInputMapping
         ReadOnlySpan<uint> controls,
         ReadOnlySpan<uint> activeInputs)
     {
-        Span<bool> usedLocations = stackalloc bool[32];
         var locations = new uint[activeInputs.Length];
+        ResolveLocations(controls, activeInputs, locations);
+        return locations;
+    }
+
+    public static void ResolveLocations(
+        ReadOnlySpan<uint> controls,
+        ReadOnlySpan<uint> activeInputs,
+        Span<uint> locations)
+    {
+        if (locations.Length < activeInputs.Length)
+            throw new ArgumentException("The output cannot hold every active input.", nameof(locations));
+        Span<bool> usedLocations = stackalloc bool[32];
+        usedLocations.Clear();
 
         for (var index = 0; index < activeInputs.Length; index++)
         {
@@ -39,7 +51,5 @@ public static class Gen5PixelInputMapping
                 usedLocations[(int)location] = true;
             }
         }
-
-        return locations;
     }
 }

@@ -347,10 +347,22 @@ public sealed record Gen5ShaderProgram(
     private readonly uint _pixelColorExportMasks = ComputePixelColorExportMasks(Instructions);
     private readonly uint _parameterExportMask = ComputeParameterExportMask(Instructions);
     private readonly uint _replayedParameterAttributeMask = ComputeReplayedParameterAttributeMask(Instructions);
+    private readonly uint[] _interpolatedAttributes = Instructions
+        .Select(static instruction => instruction.Control)
+        .OfType<Gen5InterpolationControl>()
+        .Select(static control => control.Attribute)
+        .Distinct().Order().ToArray();
 
     public uint PixelColorExportMasks => _pixelColorExportMasks;
 
     public uint ParameterExportMask => _parameterExportMask;
+
+    // The instruction list is immutable after decoding; draw preparation only
+    // needs this small interface, not another walk through the shader body.
+    public ReadOnlySpan<uint> InterpolatedAttributes => _interpolatedAttributes;
+
+    public uint InterpolatedAttributeCount => _interpolatedAttributes.Length == 0
+        ? 0 : _interpolatedAttributes[^1] + 1;
 
     // Inputs needing vertices beyond the provoking vertex on hosts without
     // native per-vertex fragment inputs. Compute once per decoded program.

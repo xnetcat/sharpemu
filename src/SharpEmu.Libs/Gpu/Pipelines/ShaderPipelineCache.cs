@@ -99,7 +99,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
                     $"user_data=[{string.Join(",", pixelSource.UserData.Select(word => $"{word:X8}"))}]");
             using var pixelProfile = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.PixelInputResolution);
             var pixelProgram = _programs.Decode(pixelSource);
-            attributeCount = InterpolatedAttributeCount(pixelProgram);
+            attributeCount = pixelProgram.InterpolatedAttributeCount;
             var inputCount = shaderInterface.PixelInputControl & 0x3Fu;
             if (inputCount == 0)
             {
@@ -233,41 +233,25 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
     // One past the highest parameter location the pixel program reads, resolved as its translator does.
     private static uint ReadVertexOutputCount(Gen5ShaderProgram pixelProgram, PixelInputInfo info)
     {
-        var attributes = pixelProgram.Instructions
-            .Select(static instruction => instruction.Control)
-            .OfType<Gen5InterpolationControl>()
-            .Select(static control => control.Attribute)
-            .Distinct()
-            .Order()
-            .ToArray();
+        var attributes = pixelProgram.InterpolatedAttributes;
         if (attributes.Length == 0)
         {
             return 0;
         }
 
-        var controls = new uint[32];
+        Span<uint> controls = stackalloc uint[32];
         for (var index = 0u; index < (uint)controls.Length; index++)
         {
-            controls[index] = index < info.InputCount && index < (uint)info.InterpolatorSettings.Length
+            controls[(int)index] = index < info.InputCount && index < (uint)info.InterpolatorSettings.Length
                 ? info.InterpolatorSettings[index]
                 : index;
         }
 
-        return Gen5PixelInputMapping.ResolveLocations(controls, attributes).Max() + 1;
-    }
-
-    private static uint InterpolatedAttributeCount(Gen5ShaderProgram program)
-    {
-        var maxAttribute = -1;
-        foreach (var instruction in program.Instructions)
-        {
-            if (instruction.Control is Gen5InterpolationControl interpolation)
-            {
-                maxAttribute = Math.Max(maxAttribute, (int)interpolation.Attribute);
-            }
-        }
-
-        return (uint)(maxAttribute + 1);
+        Span<uint> locations = attributes.Length <= 64 ? stackalloc uint[attributes.Length] : new uint[attributes.Length];
+        Gen5PixelInputMapping.ResolveLocations(controls, attributes, locations);
+        uint maxLocation = 0;
+        foreach (var location in locations) maxLocation = Math.Max(maxLocation, location);
+        return maxLocation + 1;
     }
 
     // The bound colour slots in order; each output mode names the kind the pixel program exports.
