@@ -182,7 +182,9 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
         }
 
         var fence = waited.Fence;
-        var result = _vk.WaitForFences(_device, 1, &fence, true, ulong.MaxValue);
+        Result result;
+        using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.GpuRetirementWait))
+            result = _vk.WaitForFences(_device, 1, &fence, true, ulong.MaxValue);
         lock (_fenceGate)
         {
             waited.Waiters--;
@@ -219,10 +221,11 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
         {
             result = _vk.WaitSemaphores(_device, &waitInfo, ulong.MaxValue);
         }
+        failure = result.ToString();
+        var completed = result == Result.Success && WaitRetired(tick);
         if (_waitSites)
             RecordWaitSite(System.Diagnostics.Stopwatch.GetTimestamp() - waitStarted);
-        failure = result.ToString();
-        return result == Result.Success && WaitRetired(tick);
+        return completed;
     }
 
     // LOCAL ONLY (SHARPEMU_PROFILE_GPU_WAIT_SITES=1): who waits for the GPU timeline, by count and wait time.

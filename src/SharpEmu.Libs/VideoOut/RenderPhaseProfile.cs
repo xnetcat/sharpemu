@@ -134,6 +134,7 @@ internal static class RenderPhaseProfile
         QueueContext,
         PresentationPreparation,
         GpuCompletionWait,
+        GpuRetirementWait,
         SubmissionCapacity,
         CompletedSubmissionCleanup,
         MovieFramePolling,
