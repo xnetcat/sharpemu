@@ -1516,7 +1516,11 @@ public static partial class Gen5SpirvTranslator
                 CapturePixelExec(instruction);
             }
 
-            if (synchronizeSharedMemory && sharedMemoryPhase != SharedMemoryPhase.None) EmitWave64Barrier();
+            // Unknown is the incoming phase, not evidence of an LDS access in
+            // this block. Cross-lane helpers synchronize their own scratch;
+            // explicit SBarrier already resets the phase.
+            if (synchronizeSharedMemory && sharedMemoryPhase is SharedMemoryPhase.Read or SharedMemoryPhase.Write)
+                EmitWave64Barrier();
             return true;
         }
 

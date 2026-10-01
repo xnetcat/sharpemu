@@ -11,6 +11,32 @@ namespace SharpEmu.ShaderCompiler.Tests;
 public sealed class Gen5SharedMemoryBarrierTests
 {
     [Theory]
+    [InlineData(false, 0)]
+    [InlineData(true, 2)]
+    public void BranchOnlyBlocksDoNotAddSharedMemoryBarriers(bool sharedWrite, int expectedBarriers)
+    {
+        var instructions = new List<Gen5ShaderInstruction>
+        {
+            new(0, Gen5ShaderEncoding.Sopp, "SBranch", [0xBF820000u], [], [], null),
+        };
+        if (sharedWrite)
+            instructions.Add(new(4, Gen5ShaderEncoding.Ds, "DsWriteB32", [0u, 0u],
+                [Gen5Operand.Vector(0), Gen5Operand.Vector(1)], [], new Gen5DataShareControl(0, 0, false)));
+        instructions.Add(new(sharedWrite ? 12u : 4u, Gen5ShaderEncoding.Sopp, "SEndpgm", [0u], [], [], null));
+        var (plan, resources, layout) = ResourceTestProgram.Prepare(new Gen5ShaderProgram(0, instructions), userDataCount: 0);
+        var request = new ShaderCompileRequest(plan, resources, layout) { WaveSize = 64, LocalSizeX = 64 };
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+        var barriers = 0;
+        for (var offset = 20; offset < shader.Spirv.Length;)
+        {
+            var instruction = BinaryPrimitives.ReadUInt32LittleEndian(shader.Spirv.AsSpan(offset));
+            if ((instruction & 0xFFFF) == (uint)SpirvOp.ControlBarrier) barriers++;
+            offset += checked((int)(instruction >> 16) * 4);
+        }
+        Assert.Equal(expectedBarriers, barriers);
+    }
+
+    [Theory]
     [InlineData(64u, 64u, false, 2)]
     [InlineData(64u, 64u, true, 2)]
     [InlineData(32u, 64u, false, 0)]
