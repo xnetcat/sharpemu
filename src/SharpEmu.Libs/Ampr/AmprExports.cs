@@ -1284,6 +1284,7 @@ public static class AmprExports
                         cachedFile.Handle,
                         buffer.AsSpan(0, request),
                         unchecked((long)absoluteOffset));
+                AprIoProfile.RecordReadBytes(read);
 
                 if (read <= 0)
                 {

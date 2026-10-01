@@ -14,6 +14,12 @@ internal static class AprIoProfile
     private static readonly long[] Ticks = new long[(int)Phase.Count];
     private static readonly long[] Calls = new long[(int)Phase.Count];
     private static long _nextReport;
+    private static long _readBytes;
+
+    internal static void RecordReadBytes(int bytes)
+    {
+        if (Enabled && bytes > 0) Interlocked.Add(ref _readBytes, bytes);
+    }
 
     internal static Scope Measure(Phase phase) => Enabled ? new(phase) : default;
 
@@ -32,7 +38,8 @@ internal static class AprIoProfile
             if (now < next || Interlocked.CompareExchange(ref _nextReport, now + Stopwatch.Frequency * 10, next) != next)
                 return;
             for (var i = 0; i < (int)Phase.Count; i++)
-                Console.Error.WriteLine($"[PERF][APR_IO] phase={(Phase)i} calls={Volatile.Read(ref Calls[i])} elapsed_total_ms={Volatile.Read(ref Ticks[i]) * 1000.0 / Stopwatch.Frequency:F1}");
+                Console.Error.WriteLine($"[PERF][APR_IO] phase={(Phase)i} calls={Volatile.Read(ref Calls[i])} elapsed_total_ms={Volatile.Read(ref Ticks[i]) * 1000.0 / Stopwatch.Frequency:F1}" +
+                    ((Phase)i == Phase.HostRead ? $" bytes_total={Volatile.Read(ref _readBytes)}" : string.Empty));
         }
     }
 }
