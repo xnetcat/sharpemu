@@ -8,6 +8,13 @@ namespace SharpEmu.Libs.VideoOut;
 // The render thread owns these bounded counters. Reports use the existing profile interval.
 internal static class BufferUploadProfile
 {
+    internal enum ImageSourcePath { Resident, DirtyRanges, FullStaging }
+    internal struct ImageSourceStatistics
+    {
+        public long Calls;
+        public ulong RequestedBytes;
+        public ulong StagedBytes;
+    }
     internal readonly record struct Source(bool Sweep, ulong VertexProgramHash, ulong PixelProgramHash, ulong ComputeProgramHash);
     internal readonly record struct UploadKey(Source Source, ulong Address, ulong Size);
     internal readonly record struct SlowSample(UploadKey Key, int Copies, ulong Bytes, ulong HotBytes, long Ticks,
@@ -55,6 +62,15 @@ internal static class BufferUploadProfile
         internal const int SlowSampleCapacity = 8;
         internal readonly SlowSample[] SlowSamples = new SlowSample[SlowSampleCapacity];
         internal int SlowSampleCount;
+        internal readonly ImageSourceStatistics[] ImageSources = new ImageSourceStatistics[3];
+
+        internal void RecordImageSource(ImageSourcePath path, ulong requestedBytes, ulong stagedBytes)
+        {
+            ref var value = ref ImageSources[(int)path];
+            value.Calls++;
+            value.RequestedBytes += requestedBytes;
+            value.StagedBytes += stagedBytes;
+        }
 
         internal Statistics FindSource(Source source)
         {
@@ -136,6 +152,12 @@ internal static class BufferUploadProfile
             recordSlowSample: true);
     }
 
+    internal static void RecordImageSource(ImageSourcePath path, ulong requestedBytes, ulong stagedBytes)
+    {
+        if (!Enabled) return;
+        (_counters ??= new Counters()).RecordImageSource(path, requestedBytes, stagedBytes);
+    }
+
     private static string FormatSource(Source source) =>
         $"source={(source.Sweep ? "device-address" : "other")} vertex=0x{source.VertexProgramHash:X16} pixel=0x{source.PixelProgramHash:X16} compute=0x{source.ComputeProgramHash:X16}";
 
@@ -147,6 +169,12 @@ internal static class BufferUploadProfile
     internal static void Report(TextWriter writer)
     {
         if (!Enabled || _counters is null) return;
+        for (var index = 0; index < _counters.ImageSources.Length; index++)
+        {
+            var source = _counters.ImageSources[index];
+            if (source.Calls != 0)
+                writer.WriteLine($"[PERF][IMAGE_SOURCE] path={(ImageSourcePath)index} calls={source.Calls} requested_bytes={source.RequestedBytes} cpu_staged_bytes={source.StagedBytes}");
+        }
         for (var index = 0; index < _counters.SlowSampleCount; index++)
         {
             var sample = _counters.SlowSamples[index];

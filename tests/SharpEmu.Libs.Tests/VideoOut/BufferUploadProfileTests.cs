@@ -11,6 +11,22 @@ namespace SharpEmu.Libs.Tests.VideoOut;
 public sealed class BufferUploadProfileTests
 {
     [Fact]
+    public void ImageSourceCountersSeparateLogicalImageSizeFromCpuStaging()
+    {
+        var counters = new BufferUploadProfile.Counters();
+        counters.RecordImageSource(BufferUploadProfile.ImageSourcePath.Resident, 1024 * 1024, 0);
+        counters.RecordImageSource(BufferUploadProfile.ImageSourcePath.DirtyRanges, 1024 * 1024, 4096);
+        counters.RecordImageSource(BufferUploadProfile.ImageSourcePath.DirtyRanges, 1024 * 1024, 8192);
+        counters.RecordImageSource(BufferUploadProfile.ImageSourcePath.FullStaging, 1024 * 1024, 1024 * 1024);
+        var dirty = counters.ImageSources[(int)BufferUploadProfile.ImageSourcePath.DirtyRanges];
+        Assert.Equal(2, dirty.Calls);
+        Assert.Equal(2ul * 1024 * 1024, dirty.RequestedBytes);
+        Assert.Equal(12288ul, dirty.StagedBytes);
+        Assert.Equal(0ul, counters.ImageSources[(int)BufferUploadProfile.ImageSourcePath.Resident].StagedBytes);
+        Assert.Equal(1024ul * 1024, counters.ImageSources[(int)BufferUploadProfile.ImageSourcePath.FullStaging].StagedBytes);
+    }
+
+    [Fact]
     public void CollectionRequiresBothProfileSwitchesAndReportsOnlyOnce()
     {
         BufferUploadProfile.Report(TextWriter.Null);

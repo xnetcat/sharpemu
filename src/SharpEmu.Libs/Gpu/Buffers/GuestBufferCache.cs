@@ -104,6 +104,9 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     // The stream fast path aligns to this; the presenter raises it to its descriptor alignment.
     public ulong StreamOffsetAlignment { get; set; }
 
+    internal bool DirtyImageRangeUploads { get; set; } =
+        Environment.GetEnvironmentVariable("SHARPEMU_IMAGE_DIRTY_RANGE_UPLOADS") != "0";
+
     public void ForEachBuffer(Action<GpuBuffer> visit)
     {
         for (var index = 0; index < _registry.RegisteredCount; index++)
@@ -272,12 +275,25 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         if (owner != null && !cpuModified && (!gpuModified || hasDirtyBufferSource))
         {
             TouchBuffer(owner);
+            BufferUploadProfile.RecordImageSource(BufferUploadProfile.ImageSourcePath.Resident, size, 0);
             return (owner, owner.Offset(guestAddress));
         }
 
         if (hasDirtyBufferSource && owner == null)
         {
             throw SubmissionScheduler.Fatal("Cannot find the device buffer that owns the GPU-dirty image source.");
+        }
+
+        // The existing buffer already contains clean and GPU-owned pages. Copy
+        // only CPU-dirty pages into it, instead of staging the entire image first.
+        // Sparse/PRT backing keeps its zero-fill-aware source path below.
+        if (DirtyImageRangeUploads && owner != null && (!gpuModified || hasDirtyBufferSource) &&
+            _backing.IsBackedRange(guestAddress, size))
+        {
+            TouchBuffer(owner);
+            _ = SynchronizeBuffer(owner, guestAddress, size, false, false,
+                preserveCpuWriteHotPages: false, imageSource: true);
+            return (owner, owner.Offset(guestAddress));
         }
 
         if (!_staging.TryMap(size, out var stageOffset, 16))
@@ -294,6 +310,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
 
         _staging.Commit();
+        BufferUploadProfile.RecordImageSource(BufferUploadProfile.ImageSourcePath.FullStaging, size, size);
         hasDirtyBufferSource = _gpuModifiedRanges.Overlaps(guestAddress, size);
         owner = FindOwner(guestAddress, size);
         if (hasDirtyBufferSource && owner == null)
@@ -1162,13 +1179,15 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     }
 
     private bool SynchronizeBuffer(GpuBuffer buffer, ulong guestAddress, ulong size, bool isWritten, bool isTexelBuffer,
-        bool preserveCpuWriteHotPages = true)
+        bool preserveCpuWriteHotPages = true, bool imageSource = false)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BufferDirtySynchronization);
         var startedAt = BufferUploadProfile.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         // The locked query observes completed writes; a later write remains dirty for the next obtain.
         if (!preserveCpuWriteHotPages && !isWritten && !isTexelBuffer && !_tracker.HasCpuDirtyPages(guestAddress, size))
         {
+            if (imageSource)
+                BufferUploadProfile.RecordImageSource(BufferUploadProfile.ImageSourcePath.DirtyRanges, size, 0);
             if (BufferUploadProfile.Enabled)
                 BufferUploadProfile.Record(guestAddress, size, 0, 0, 0, System.Diagnostics.Stopwatch.GetTimestamp() - startedAt);
             return false;
@@ -1187,6 +1206,8 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             },
             () => source = _uploader.PrepareSource(buffer.CpuAddress, CollectionsMarshal.AsSpan(copies), totalSize, guestAddress, size),
             preserveCpuWriteHotPages);
+        if (imageSource)
+            BufferUploadProfile.RecordImageSource(BufferUploadProfile.ImageSourcePath.DirtyRanges, size, totalSize);
         if (source != null)
         {
             buffer.NoteGpuWrite();
