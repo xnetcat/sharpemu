@@ -623,13 +623,37 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 		public GuestExecutionRunner(ulong guestThreadHandle, string name, ThreadPriority priority)
 		{
-			_thread = new Thread(() => ThreadMain(guestThreadHandle), GuestExecutionStackBytes)
+			_thread = new Thread(() => { ApplyHostQosForGuestThread(name); ThreadMain(guestThreadHandle); }, GuestExecutionStackBytes)
 			{
 				IsBackground = true,
 				Name = $"SharpEmu-{name}",
 				Priority = priority,
 			};
 			_thread.Start();
+		}
+
+		// EXPERIMENT (SHARPEMU_UTILITY_QOS_THREADS=substr[,substr]): run matching guest threads at the macOS
+		// utility QoS so spinning worker pools lean on efficiency cores and yield to the threads that produce frames.
+		private static readonly string[] UtilityQosThreadNames =
+			(Environment.GetEnvironmentVariable("SHARPEMU_UTILITY_QOS_THREADS") ?? string.Empty)
+				.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+		[System.Runtime.InteropServices.DllImport("libSystem.dylib", EntryPoint = "pthread_set_qos_class_self_np")]
+		private static extern int PthreadSetQosClassSelf(uint qosClass, int relativePriority);
+
+		private static void ApplyHostQosForGuestThread(string name)
+		{
+			if (!OperatingSystem.IsMacOS() || UtilityQosThreadNames.Length == 0)
+				return;
+			foreach (var pattern in UtilityQosThreadNames)
+			{
+				if (name.Contains(pattern, StringComparison.Ordinal))
+				{
+					var result = PthreadSetQosClassSelf(0x11, 0);
+					Console.Error.WriteLine($"[LOADER][INFO] utility QoS for guest thread '{name}': result={result}");
+					return;
+				}
+			}
 		}
 
 		public void Schedule(Action work)

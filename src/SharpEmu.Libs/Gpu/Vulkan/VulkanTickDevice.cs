@@ -213,12 +213,40 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
             PValues = &tick,
         };
         Result result;
+        var waitStarted = _waitSites ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.GpuCompletionWait))
         {
             result = _vk.WaitSemaphores(_device, &waitInfo, ulong.MaxValue);
         }
+        if (_waitSites)
+            RecordWaitSite(System.Diagnostics.Stopwatch.GetTimestamp() - waitStarted);
         failure = result.ToString();
         return result == Result.Success && WaitRetired(tick);
+    }
+
+    // LOCAL ONLY (SHARPEMU_PROFILE_GPU_WAIT_SITES=1): who waits for the GPU timeline, by count and wait time.
+    private static readonly bool _waitSites = Environment.GetEnvironmentVariable("SHARPEMU_PROFILE_GPU_WAIT_SITES") == "1";
+    private static readonly Dictionary<string, (long Count, long Ticks)> _waitSiteTotals = new();
+    private static long _waitSiteReportAt;
+
+    private static void RecordWaitSite(long ticks)
+    {
+        var frames = new System.Diagnostics.StackTrace(2, false).GetFrames();
+        var site = string.Join(" < ", frames.Take(6).Select(frame => frame.GetMethod() is { } method ? $"{method.DeclaringType?.Name}.{method.Name}" : "?"));
+        lock (_waitSiteTotals)
+        {
+            var total = _waitSiteTotals.TryGetValue(site, out var existing) ? existing : default;
+            _waitSiteTotals[site] = (total.Count + 1, total.Ticks + ticks);
+            var now = System.Diagnostics.Stopwatch.GetTimestamp();
+            if (_waitSiteReportAt == 0)
+                _waitSiteReportAt = now + System.Diagnostics.Stopwatch.Frequency * 30;
+            if (now < _waitSiteReportAt)
+                return;
+            _waitSiteReportAt = now + System.Diagnostics.Stopwatch.Frequency * 30;
+            foreach (var pair in _waitSiteTotals.OrderByDescending(static p => p.Value.Ticks).Take(8))
+                Console.Error.WriteLine($"[PERF][GPU_WAIT_SITE] n={pair.Value.Count} ms={pair.Value.Ticks * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F0} {pair.Key}");
+            _waitSiteTotals.Clear();
+        }
     }
 
     public nint[] AllocateBuffers(int count)
