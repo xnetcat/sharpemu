@@ -137,8 +137,27 @@ public sealed partial class DirectExecutionBackend
 				.Take(20)
 				.Select(kvp => $"{kvp.Key}={kvp.Value}");
 			System.Console.Error.WriteLine($"[PERF][HLE] total={total} top: {string.Join(", ", top)}");
+
+			// LOCAL ONLY: every export's calls since the previous report, so a poll loop shows up next to the hot calls.
+			lock (_perfHleWindowGate)
+			{
+				var deltas = new System.Collections.Generic.List<string>();
+				foreach (var kvp in snapshot)
+				{
+					var previous = _perfHleWindowCounts.TryGetValue(kvp.Key, out var before) ? before : 0;
+					if (kvp.Value > previous)
+					{
+						deltas.Add($"{kvp.Key}={kvp.Value - previous}");
+					}
+					_perfHleWindowCounts[kvp.Key] = kvp.Value;
+				}
+				System.Console.Error.WriteLine($"[PERF][HLE_WINDOW] {string.Join(", ", deltas)}");
+			}
 		}
 	}
+
+	private static readonly object _perfHleWindowGate = new();
+	private static readonly System.Collections.Generic.Dictionary<string, long> _perfHleWindowCounts = new();
 
 	private void RecordRecentImportTrace(
 		long dispatchIndex,
