@@ -52,7 +52,7 @@ public sealed class ShaderResourcePlan
         using var totalProfile = new ShaderPlanningProfile(stage, hash, "total");
         ScalarValueGraph graph;
         using (new ShaderPlanningProfile(stage, hash, "value_graph"))
-            graph = ScalarValueGraph.Build(program, userDataBase, userDataCount, fixedFunctionVertexLoads, waveSize);
+            graph = ScalarGraphDiskCache.Build(program, userDataBase, userDataCount, fixedFunctionVertexLoads, waveSize);
         var plan = new ShaderResourcePlan(graph, stage, hash);
         ResourceTableReadPlanner.Result reads;
         using (new ShaderPlanningProfile(stage, hash, "table_reads"))
