@@ -25,6 +25,9 @@ public static class GuestMemoryProfile
         ReservationHost,
         ReservationPublish,
         BufferReadback,
+        ProtectionRequest,
+        ProtectionNative,
+        ProtectionMetadata,
         Count,
     }
 

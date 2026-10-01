@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using System.Runtime.InteropServices;
+using SharpEmu.HLE.GuestMemory;
 
 namespace SharpEmu.HLE.Host.Posix;
 
@@ -229,10 +230,15 @@ internal sealed unsafe partial class PosixHostViews : IHostViewMemory
 
     public bool ChangeAccess(ulong address, ulong size, HostPageProtection protection)
     {
+        using var requestProfile = GuestMemoryProfile.Measure(GuestMemoryProfile.Operation.ProtectionRequest);
         lock (PosixViewRegions.Gate)
         {
-            if (mprotect((nint)address, (nuint)size, GetNativeProtection(protection)) != 0) return false;
-            PosixViewRegions.ChangeProtection(address, size, PosixViewRegions.RawProtection(protection));
+            int result;
+            using (GuestMemoryProfile.Measure(GuestMemoryProfile.Operation.ProtectionNative))
+                result = mprotect((nint)address, (nuint)size, GetNativeProtection(protection));
+            if (result != 0) return false;
+            using (GuestMemoryProfile.Measure(GuestMemoryProfile.Operation.ProtectionMetadata))
+                PosixViewRegions.ChangeProtection(address, size, PosixViewRegions.RawProtection(protection));
             return true;
         }
     }

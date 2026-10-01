@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using System.Runtime.InteropServices;
+using SharpEmu.HLE.GuestMemory;
 
 namespace SharpEmu.HLE.Host.Posix;
 
@@ -53,6 +54,7 @@ internal static partial class PosixViewRegions
     // Null means this address belongs to the legacy anonymous allocator.
     internal static bool? Protect(ulong address, ulong size, uint protection, int nativeProtection, out uint oldProtection)
     {
+        using var requestProfile = GuestMemoryProfile.Measure(GuestMemoryProfile.Operation.ProtectionRequest);
         lock (Gate)
         {
             oldProtection = HostMemory.PAGE_NOACCESS;
@@ -65,8 +67,12 @@ internal static partial class PosixViewRegions
                     return false;
                 cursor = Math.Min(end, view.BaseAddress + view.RegionSize);
             }
-            if (mprotect((nint)address, (nuint)size, nativeProtection) != 0) return false;
-            ChangeProtection(address, size, protection);
+            int result;
+            using (GuestMemoryProfile.Measure(GuestMemoryProfile.Operation.ProtectionNative))
+                result = mprotect((nint)address, (nuint)size, nativeProtection);
+            if (result != 0) return false;
+            using (GuestMemoryProfile.Measure(GuestMemoryProfile.Operation.ProtectionMetadata))
+                ChangeProtection(address, size, protection);
             return true;
         }
     }
