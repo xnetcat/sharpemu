@@ -50,6 +50,37 @@ public sealed class DeviceAddressShaderTests(HeadlessVulkanFixture fixture, ITes
         run.Finish(output, nameof(StandaloneScalarReadsPreserveRepeatedLoadDestinations));
     }
 
+    [Theory]
+    [InlineData(true, true)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(false, false)]
+    public void StandaloneScalarReadsCrossPagesAndPreserveFaults(bool mapFirst, bool mapSecond)
+    {
+        var vulkan = fixture.Vulkan;
+        if (!GatePrerequisites.Ready(vulkan, shaderInt64: true)) return;
+        const uint components = 16;
+        var run = new Run(vulkan, FlattenedReadReuseTests.RepeatedReadProgram(components),
+            flattenStandaloneScalarReads: false);
+        var first = Pattern((int)PageSize);
+        var second = Pattern(64, seed: 7);
+        if (mapFirst) run.MapPage(GuestBase, first);
+        if (mapSecond) run.MapPage(GuestBase + PageSize, second);
+        run.Dispatch(GuestBase + PageSize - 16);
+        for (uint repetition = 0; repetition < 2; repetition++)
+        {
+            for (uint component = 0; component < components; component++)
+            {
+                var expected = component < 4
+                    ? mapFirst ? ReadWord(first, (int)PageSize - 16 + (int)component * 4) : 0u
+                    : mapSecond ? ReadWord(second, ((int)component - 4) * 4) : 0u;
+                Assert.Equal(expected, run.ResultWord((repetition * components + component) * 4));
+            }
+        }
+        Assert.Equal((mapFirst ? 0u : 1u) | (mapSecond ? 0u : 2u), run.FaultWord(GuestBase));
+        run.Finish(output, nameof(StandaloneScalarReadsCrossPagesAndPreserveFaults));
+    }
+
     [Fact]
     public void GlobalLoadThroughThePageTable_ReturnsTheGuestBytes()
     {

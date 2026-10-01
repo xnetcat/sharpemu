@@ -557,9 +557,26 @@ public static partial class Gen5SpirvTranslator
         private uint LoadDeviceDword(uint address64)
         {
             var (pointer, valid) = ResolveDeviceAddress(address64);
+            return LoadResolvedDeviceDword(pointer, valid);
+        }
+
+        private uint LoadResolvedDeviceDword(uint pointer, uint valid)
+        {
             Store(_deviceWordScratch, UInt(0));
             EmitConditional(valid, () =>
                 Store(_deviceWordScratch, _module.AddInstruction(SpirvOp.Load, _uintType, DeviceWordPointer(pointer), 2u, 4u)));
+            return Load(_uintType, _deviceWordScratch);
+        }
+
+        private uint LoadDeviceDwordOnCachedPage(uint address, uint firstAddress, uint firstPointer, uint firstValid)
+        {
+            var pageMask = ULong(DeviceAddressMask & ~(DeviceAddressPageSize - 1));
+            var samePage = _module.AddInstruction(SpirvOp.IEqual, _boolType,
+                And64(address, pageMask), And64(firstAddress, pageMask));
+            EmitConditional(samePage,
+                () => LoadResolvedDeviceDword(IAdd64(firstPointer,
+                    _module.AddInstruction(SpirvOp.ISub, _ulongType, address, firstAddress)), firstValid),
+                () => LoadDeviceDword(address));
             return Load(_uintType, _deviceWordScratch);
         }
 
@@ -748,6 +765,7 @@ public static partial class Gen5SpirvTranslator
             var request = _request;
             var dynamicOffset = control.DynamicOffsetRegister is { } register ? LoadS(register) : UInt(0);
             uint? deviceAddress = null;
+            (uint Address, uint Pointer, uint Valid)? firstDevicePage = null;
             for (var component = 0; component < instruction.Destinations.Count; component++)
             {
                 var destination = instruction.Destinations[component];
@@ -847,7 +865,19 @@ public static partial class Gen5SpirvTranslator
                         deviceAddress = And64(address, ULong(DeviceAddressMask & ~3ul));
                     }
 
-                    value = LoadDeviceDword(component == 0 ? deviceAddress.Value : IAdd64(deviceAddress.Value, ULong((ulong)component * sizeof(uint))));
+                    var componentAddress = component == 0 ? deviceAddress.Value : IAdd64(deviceAddress.Value, ULong((ulong)component * sizeof(uint)));
+                    if (firstDevicePage is { } first)
+                    {
+                        // SMEM components are contiguous. Reuse the first page's translation,
+                        // but resolve crossing components independently, including their faults.
+                        value = LoadDeviceDwordOnCachedPage(componentAddress, first.Address, first.Pointer, first.Valid);
+                    }
+                    else
+                    {
+                        var (pointer, valid) = ResolveDeviceAddress(componentAddress);
+                        firstDevicePage = (componentAddress, pointer, valid);
+                        value = LoadResolvedDeviceDword(pointer, valid);
+                    }
                 }
 
                 if (!request.IndirectOffsetKeyMemoryIndices.Contains(memoryIndex) &&
