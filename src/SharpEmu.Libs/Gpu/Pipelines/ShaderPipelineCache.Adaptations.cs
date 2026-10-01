@@ -1,7 +1,9 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using System.Buffers;
 using System.Buffers.Binary;
+using SharpEmu.HLE;
 using SharpEmu.Libs.Gpu.GpuCommands.Registers;
 using SharpEmu.Libs.Gpu.Rendering;
 using SharpEmu.ShaderCompiler;
@@ -137,6 +139,12 @@ internal sealed partial class ShaderPipelineCache
         return true;
     }
 
+    private static readonly string[] MaskedCopyOpcodes =
+    [
+        "SMovB32", "STtraceData", "SInstPrefetch", "VLshlAddU32", "SBufferLoadDword", "SWaitcnt", "VCmpxGtU32", "SCbranchExecz",
+        "SBufferLoadDword", "SWaitcnt", "VAndB32", "BufferLoadFormatX", "SWaitcnt", "BufferStoreFormatX", "SEndpgm",
+    ];
+
     // Replaces only the exact masked-copy kernel shape; its writes land in command order over the guest range.
     private bool TrySubmitMaskedDwordCopyKernel(
         Gen5ShaderProgram program,
@@ -147,16 +155,11 @@ internal sealed partial class ShaderPipelineCache
     {
         description = string.Empty;
         var instructions = program.Instructions;
-        string[] expectedOpcodes =
-        [
-            "SMovB32", "STtraceData", "SInstPrefetch", "VLshlAddU32", "SBufferLoadDword", "SWaitcnt", "VCmpxGtU32", "SCbranchExecz",
-            "SBufferLoadDword", "SWaitcnt", "VAndB32", "BufferLoadFormatX", "SWaitcnt", "BufferStoreFormatX", "SEndpgm",
-        ];
         var groupsX = input.DispatchThreadDimensions ? RenderExecutor.GroupsFromThreads(input.DispatchThreadsX, input.ThreadsX) : input.DispatchThreadsX;
         var groupsY = input.DispatchThreadDimensions ? RenderExecutor.GroupsFromThreads(input.DispatchThreadsY, input.ThreadsY) : input.DispatchThreadsY;
         var groupsZ = input.DispatchThreadDimensions ? RenderExecutor.GroupsFromThreads(input.DispatchThreadsZ, input.ThreadsZ) : input.DispatchThreadsZ;
-        if (instructions.Count != expectedOpcodes.Length ||
-            !instructions.Select(static instruction => instruction.Opcode).SequenceEqual(expectedOpcodes) ||
+        if (instructions.Count != MaskedCopyOpcodes.Length ||
+            !instructions.Select(static instruction => instruction.Opcode).SequenceEqual(MaskedCopyOpcodes) ||
             !IsExactMaskedDwordCopyInstructionShape(instructions) ||
             groupsY != 1 || groupsZ != 1 ||
             input.ThreadsX != 64 || input.ThreadsY != 1 || input.ThreadsZ != 1 ||
@@ -204,37 +207,47 @@ internal sealed partial class ShaderPipelineCache
 
         var neededSourceDwords = sourceMask == 0 ? 1UL : Math.Min((ulong)sourceMask + 1, outputDwords);
         var readableSourceBytes = Math.Min(Math.Min(sourceBytes, MaxCopyKernelSourceBytes), neededSourceDwords * sizeof(uint));
-        var sourceData = new byte[readableSourceBytes - readableSourceBytes % sizeof(uint)];
-        if (sourceData.Length < sizeof(uint) || !_context.Memory.TryRead(sourceAddress, sourceData))
-        {
+        var sourceByteCount = checked((int)(readableSourceBytes - readableSourceBytes % sizeof(uint)));
+        if (!TryCopyMaskedDwords(_context.Memory, sourceAddress, sourceByteCount, destinationAddress, outputDwords, sourceMask))
             return false;
-        }
 
-        var output = new byte[checked((int)outputDwords * sizeof(uint))];
-        var outputWords = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, uint>(output.AsSpan());
-        var sourceWordsSpan = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, uint>(sourceData.AsSpan());
-        if (sourceMask == 0)
-        {
-            outputWords.Fill(sourceWordsSpan[0]);
-        }
-        else
-        {
-            for (uint index = 0; index < outputDwords; index++)
-            {
-                var sourceIndex = index & sourceMask;
-                outputWords[(int)index] = sourceIndex < (uint)sourceWordsSpan.Length ? sourceWordsSpan[(int)sourceIndex] : 0;
-            }
-        }
-
-        // The dispatch runs in stream order on the worker, so the replacement writes at once.
-        if (!_context.Memory.TryWrite(destinationAddress, output))
-        {
-            Console.Error.WriteLine($"[LOADER][ERROR] AGC masked-copy fast path failed dst=0x{destinationAddress:X16} bytes={output.Length}");
-            return false;
-        }
-
-        description = $"dst=0x{destinationAddress:X16} bytes={output.Length} elements={elementCount} mask=0x{sourceMask:X8} dispatch={groupsX}x{input.ThreadsX}";
+        if (RenderTrace.Enabled)
+            description = $"dst=0x{destinationAddress:X16} bytes={(ulong)outputDwords * sizeof(uint)} elements={elementCount} mask=0x{sourceMask:X8} dispatch={groupsX}x{input.ThreadsX}";
         return true;
+    }
+
+    // Snapshot the source before writing: the guest ranges can overlap.
+    internal static bool TryCopyMaskedDwords(ICpuMemory memory, ulong sourceAddress, int sourceBytes,
+        ulong destinationAddress, uint outputDwords, uint sourceMask)
+    {
+        if (sourceBytes < sizeof(uint) || sourceBytes % sizeof(uint) != 0 || outputDwords == 0)
+            return false;
+        var outputBytes = checked((int)outputDwords * sizeof(uint));
+        var sourceBuffer = ArrayPool<byte>.Shared.Rent(sourceBytes);
+        byte[]? outputBuffer = null;
+        try
+        {
+            var source = sourceBuffer.AsSpan(0, sourceBytes);
+            if (!memory.TryRead(sourceAddress, source)) return false;
+            outputBuffer = ArrayPool<byte>.Shared.Rent(outputBytes);
+            var output = outputBuffer.AsSpan(0, outputBytes);
+            var outputWords = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, uint>(output);
+            var sourceWords = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, uint>(source);
+            if (sourceMask == 0)
+                outputWords.Fill(sourceWords[0]);
+            else
+                for (uint index = 0; index < outputDwords; index++)
+                {
+                    var sourceIndex = index & sourceMask;
+                    outputWords[(int)index] = sourceIndex < (uint)sourceWords.Length ? sourceWords[(int)sourceIndex] : 0;
+                }
+            return memory.TryWrite(destinationAddress, output);
+        }
+        finally
+        {
+            if (outputBuffer is not null) ArrayPool<byte>.Shared.Return(outputBuffer);
+            ArrayPool<byte>.Shared.Return(sourceBuffer);
+        }
     }
 
     private static bool IsExactMaskedDwordCopyInstructionShape(IReadOnlyList<Gen5ShaderInstruction> instructions)
