@@ -1359,7 +1359,7 @@ public sealed partial class DirectExecutionBackend
 			RestoreFullFpuState: false);
 
 	/// <summary>
-	/// Ultra-thin path for hot memcpy/memmove leaf imports: skip
+	/// Ultra-thin path for hot memory leaf imports: skip
 	/// CpuContext register marshalling, import-call frames, and vector return
 	/// stores when guest memory can satisfy the copy directly.
 	/// </summary>
@@ -1371,6 +1371,17 @@ public sealed partial class DirectExecutionBackend
 	{
 		result = 0;
 		var nid = importStubEntry.Nid;
+		if (nid == "8zTFvBIAIN8")
+		{
+			var fillDestination = *(ulong*)argPackPtr;
+			if (!TryWriteSmallMemset(cpuContext.Memory, fillDestination,
+				*(ulong*)(argPackPtr + 8), *(ulong*)(argPackPtr + 16)))
+			{
+				return false;
+			}
+			result = fillDestination;
+			return true;
+		}
 		if (nid is not ("Q3VBxCXhUHs" or "+P6FRGH4LfA"))
 		{
 			return false;
@@ -1391,6 +1402,19 @@ public sealed partial class DirectExecutionBackend
 
 		result = destination;
 		return true;
+	}
+
+	internal static bool TryWriteSmallMemset(ICpuMemory memory, ulong destination, ulong value, ulong count)
+	{
+		if (count == 0) return true;
+		// Leave compatibility recovery and large clears to the existing export.
+		// TryWrite retains managed-write tracking and GPU invalidation; never
+		// write directly through the host pointer here.
+		if (count > 256 || destination < 0x1000 || destination >= 0x0000800000000000UL)
+			return false;
+		Span<byte> bytes = stackalloc byte[(int)count];
+		bytes.Fill(unchecked((byte)value));
+		return memory.TryWrite(destination, bytes);
 	}
 
 	private unsafe bool TryDispatchLeafImport(
@@ -1853,6 +1877,7 @@ public sealed partial class DirectExecutionBackend
 			"Q3VBxCXhUHs" or // memcpy
 			"+P6FRGH4LfA" or // memmove
 			"DfivPArhucg" or // memcmp
+			"8zTFvBIAIN8" or // memset
 			"ytQULN-nhL4" or // pthread_rwlock_init
 			"6ULAa0fq4jA" or // scePthreadRwlockInit
 			"1471ajPzxh0" or // pthread_rwlock_destroy

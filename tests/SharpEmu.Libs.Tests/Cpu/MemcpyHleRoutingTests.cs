@@ -13,7 +13,7 @@ namespace SharpEmu.Libs.Tests.Cpu;
 public sealed class MemcpyHleRoutingTests
 {
     private const string MemcpyNid = "Q3VBxCXhUHs";
-    private const string MemsetNid = "QrZZdJ8XsX0";
+    private const string MemsetNid = "8zTFvBIAIN8";
     private const string StrcasecmpNid = "AV6ipCNa4Rw";
     private const string RdtscNid = "-2IRUCO--PM";
 
