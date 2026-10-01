@@ -287,7 +287,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var periodicDumpInterval = SwapchainDumpInterval();
             var traceDestination =
                 ShouldTracePresentedGuestImageContentsForDiagnostics() &&
-                (!_tracedPresentedSwapchain ||
+                (ConsumeSwapchainDumpRequest() || !_tracedPresentedSwapchain ||
                  periodicDumpInterval > 0 && presentedCount % periodicDumpInterval == 0);
             _tracedPresentedSwapchain |= traceDestination;
             BeginDebugLabel(
@@ -768,6 +768,22 @@ internal static unsafe partial class VulkanVideoPresenter
         }
 
         private static readonly long _swapchainDumpInterval = ParseSwapchainDumpInterval();
+        private static readonly string? _swapchainDumpTrigger =
+            Environment.GetEnvironmentVariable("SHARPEMU_SWAPCHAIN_DUMP_TRIGGER");
+
+        // An on-demand capture avoids periodic GPU waits during a long boot.
+        private static bool ConsumeSwapchainDumpRequest()
+        {
+            if (string.IsNullOrWhiteSpace(_swapchainDumpTrigger) || !File.Exists(_swapchainDumpTrigger))
+                return false;
+            try
+            {
+                File.Delete(_swapchainDumpTrigger);
+                return true;
+            }
+            catch (IOException) { return false; }
+            catch (UnauthorizedAccessException) { return false; }
+        }
 
         private static long SwapchainDumpInterval() => _swapchainDumpInterval;
 
