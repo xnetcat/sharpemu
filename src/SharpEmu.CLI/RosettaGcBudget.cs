@@ -7,33 +7,41 @@ using System.Runtime.InteropServices;
 namespace SharpEmu.CLI;
 
 /// <summary>
-/// Under Rosetta 2 every garbage collection suspends the runtime with
-/// FlushProcessWriteBuffers, which reads each thread's registers through a Mach call that
-/// Rosetta services by parking the thread in its runtime. A signal that reaches a parked
-/// thread (guest memory tracking raises thousands per second) trips Rosetta's "expected saved
-/// LR to be in translated code" assertion and wedges the process. With the default gen0 budget
-/// the emulator collects about once a second; a larger budget makes that rare.
+/// Rosetta can assert while a GC suspension reads translated thread registers
+/// through FlushProcessWriteBuffers. Reducing collection frequency mitigates
+/// that failure; it does not repair Rosetta's register-state handling.
+/// The gen0 budget alone is insufficient when the heap segment size constrains
+/// it. Configure both, and keep medium-sized streaming buffers off the LOH.
 /// </summary>
 /// <remarks>
-/// The GC reads its gen0 budget only from the environment when the runtime starts, so the
-/// process re-executes itself once with the variable set. execve keeps the process id.
+/// The GC reads these settings when the runtime starts, so the process
+/// re-executes itself once with missing settings filled in. execve keeps the process id.
 /// </remarks>
 internal static class RosettaGcBudget
 {
-    private const string BudgetVariable = "DOTNET_GCgen0size";
-    private const string Budget = "0x20000000"; // 512 MiB
+    private static readonly (string Name, string Value)[] Defaults =
+    [
+        ("DOTNET_GCgen0size", "0x40000000"), // 1 GiB
+        ("DOTNET_GCSegmentSize", "0x80000000"), // 2 GiB
+        ("DOTNET_GCGen0MaxBudget", "0x40000000"),
+        ("DOTNET_GCLOHThreshold", "0x400000"), // 4 MiB
+    ];
     private const string OptOutVariable = "SHARPEMU_ROSETTA_GC_BUDGET";
 
     public static void ReexecIfNeeded(string[] args)
     {
         if (!OperatingSystem.IsMacOS() ||
             RuntimeInformation.ProcessArchitecture != Architecture.X64 ||
-            Environment.GetEnvironmentVariable(BudgetVariable) is not null ||
             Environment.GetEnvironmentVariable(OptOutVariable) == "0" ||
             !IsTranslated())
         {
             return;
         }
+
+        // Preserve each user override, and stop re-executing once all settings
+        // are present. The opt-out disables the entire policy.
+        var missing = Defaults.Where(setting => Environment.GetEnvironmentVariable(setting.Name) is null).ToArray();
+        if (missing.Length == 0) return;
 
         var path = Environment.ProcessPath;
         if (string.IsNullOrEmpty(path))
@@ -46,7 +54,8 @@ internal static class RosettaGcBudget
         {
             environment.Add($"{entry.Key}={entry.Value}");
         }
-        environment.Add($"{BudgetVariable}={Budget}");
+        foreach (var setting in missing)
+            environment.Add($"{setting.Name}={setting.Value}");
 
         var argv = new string[args.Length + 1];
         argv[0] = path;
