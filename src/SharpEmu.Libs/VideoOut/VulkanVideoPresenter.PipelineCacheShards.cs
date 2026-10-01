@@ -13,7 +13,7 @@ internal static unsafe partial class VulkanVideoPresenter
     {
         private sealed class DriverCacheShard
         {
-            public required PipelineCache Cache;
+            public required Lazy<PipelineCache> Cache;
             public required string Path;
             public bool Dirty;
         }
@@ -27,8 +27,13 @@ internal static unsafe partial class VulkanVideoPresenter
         // Vulkan still validates the complete shader/layout key inside each blob;
         // stage hashes only select a storage bucket, never a pipeline to reuse.
         private PipelineCache GetGuestPipelineCache(string key)
+            => ResolveGuestPipelineCache(GetGuestPipelineCacheSource(key));
+
+        // The dictionary belongs to the render thread. Only the lazy native
+        // creation runs on compiler workers; variants share one initialization.
+        private Lazy<PipelineCache>? GetGuestPipelineCacheSource(string key)
         {
-            if (_pipelineCacheShardDirectory is null) return _pipelineCache;
+            if (_pipelineCacheShardDirectory is null) return null;
             if (_pipelineCacheShards.TryGetValue(key, out var existing))
             {
                 existing.Dirty = true;
@@ -36,6 +41,19 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             var path = Path.Combine(_pipelineCacheShardDirectory, key + ".bin");
+            var source = new Lazy<PipelineCache>(() => LoadGuestPipelineCache(key, path));
+            _pipelineCacheShards.Add(key, new DriverCacheShard { Cache = source, Path = path, Dirty = true });
+            return source;
+        }
+
+        private PipelineCache ResolveGuestPipelineCache(Lazy<PipelineCache>? source)
+        {
+            var cache = source?.Value ?? default;
+            return cache.Handle != 0 ? cache : _pipelineCache;
+        }
+
+        private PipelineCache LoadGuestPipelineCache(string key, string path)
+        {
             byte[] data = [];
             try
             {
@@ -55,10 +73,9 @@ internal static unsafe partial class VulkanVideoPresenter
             if (result != Result.Success)
             {
                 Console.Error.WriteLine($"[LOADER][WARN] Vulkan cache shard unavailable: key={key} result={result}");
-                return _pipelineCache;
+                return default;
             }
 
-            _pipelineCacheShards.Add(key, new DriverCacheShard { Cache = cache, Path = path, Dirty = true });
             if (data.Length != 0)
                 Console.Error.WriteLine($"[LOADER][INFO] Vulkan cache shard loaded: key={key} bytes={data.Length} ms={Stopwatch.GetElapsedTime(started).TotalMilliseconds:F1}");
             return cache;
@@ -68,7 +85,8 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             foreach (var shard in _pipelineCacheShards.Values)
             {
-                if (shard.Dirty && SaveDriverPipelineCache(shard.Cache, shard.Path))
+                if (shard.Dirty && shard.Cache.IsValueCreated && shard.Cache.Value.Handle != 0 &&
+                    SaveDriverPipelineCache(shard.Cache.Value, shard.Path))
                     shard.Dirty = false;
             }
         }
@@ -76,7 +94,10 @@ internal static unsafe partial class VulkanVideoPresenter
         private void DestroyGuestPipelineCaches()
         {
             foreach (var shard in _pipelineCacheShards.Values)
-                _vk.DestroyPipelineCache(_device, shard.Cache, null);
+            {
+                if (shard.Cache.IsValueCreated && shard.Cache.Value.Handle != 0)
+                    _vk.DestroyPipelineCache(_device, shard.Cache.Value, null);
+            }
             _pipelineCacheShards.Clear();
         }
     }

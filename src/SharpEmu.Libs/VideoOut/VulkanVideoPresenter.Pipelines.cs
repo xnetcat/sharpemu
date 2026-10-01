@@ -880,8 +880,8 @@ internal static unsafe partial class VulkanVideoPresenter
 
         // One compute pipeline whose vkCreateComputePipelines call runs on a worker
         // thread. Everything the command stream owns (descriptor and pipeline layout,
-        // the module handle) is prepared before the task starts, so the task touches
-        // nothing but the Vulkan pipeline creation itself.
+        // the module handle) is prepared before the task starts. The worker loads
+        // its optional driver-cache shard and creates the native pipeline.
         private sealed class PendingComputePipeline
         {
             public required DescriptorSetLayout SetLayout;
@@ -960,7 +960,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             var device = _device;
-            var cache = GetGuestPipelineCache($"c-{description.Stage.Hash:X16}");
+            var cacheSource = GetGuestPipelineCacheSource($"c-{description.Stage.Hash:X16}");
             var vk = _vk;
             var started = new PendingComputePipeline
             {
@@ -982,6 +982,9 @@ internal static unsafe partial class VulkanVideoPresenter
                     var compileStart = Stopwatch.GetTimestamp();
                     try
                     {
+                        // Importing a MoltenVK cache compiles its MSL libraries.
+                        // Keep that work inside the same bounded compiler slot.
+                        var cache = ResolveGuestPipelineCache(cacheSource);
                         return CompileComputePipeline(vk, device, cache, computeModule, layout);
                     }
                     finally
