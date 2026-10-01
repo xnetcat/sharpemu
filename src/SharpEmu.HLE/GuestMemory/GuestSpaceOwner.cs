@@ -19,7 +19,10 @@ public sealed class GuestSpaceOwner : IDisposable
     internal static Action<string> OnFatal = message => Environment.FailFast(message);
 
     public const ulong GuestPage = 0x4000;
-    private const ulong UserAddressStart = 0x10_0000_0000;
+    // Include the PS5 executable range, below the general-purpose guest arena.
+    // Otherwise host allocations during HLE warmup can occupy the mandatory
+    // 0x8_0000_0000 main-image base before SelfLoader requests it.
+    private const ulong UserAddressStart = 0x8_0000_0000;
     private const ulong UserAddressEnd = 0xFC_0000_0000;
     private const ulong MinimumPreReservedRange = 0x0100_0000;
 

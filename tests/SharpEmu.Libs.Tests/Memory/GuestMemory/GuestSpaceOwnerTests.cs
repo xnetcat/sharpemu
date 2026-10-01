@@ -444,4 +444,21 @@ public sealed unsafe partial class GuestSpaceOwnerTests
         Assert.NotEqual(0UL, address);
         Assert.True(owner.ContainsFreeRange(address, size));
     }
+
+    [Fact]
+    public void PreReservationProtectsMainImageRangeAcrossReloads()
+    {
+        if (!Supported) return;
+
+        const ulong imageBase = 0x8_0000_0000;
+        using var owner = new GuestSpaceOwner(HostViewMemory.Create(), BackingSize, preReserveGuestAddressSpace: true);
+        Assert.True(owner.ContainsFreeRange(imageBase, Page));
+        Assert.True(owner.AllocatePrivate(imageBase, Page, HostPageProtection.ReadWrite));
+        Assert.False(owner.ContainsFreeRange(imageBase, Page));
+
+        owner.ReleaseAddressRanges();
+
+        Assert.True(owner.ContainsFreeRange(imageBase, Page));
+        Assert.True(owner.AllocatePrivate(imageBase, Page, HostPageProtection.ReadWrite));
+    }
 }

@@ -317,13 +317,17 @@ public static unsafe class HostMemory
         public static bool Protect(void* address, nuint size, uint newProtect, out uint oldProtect)
         {
             oldProtect = PAGE_NOACCESS;
-            if (size == 0)
+            if (size == 0 || (ulong)size > ulong.MaxValue - (ulong)address ||
+                (ulong)address + (ulong)size > ulong.MaxValue - (PageSize - 1))
             {
                 return false;
             }
 
             var start = AlignDown((ulong)address, PageSize);
             var end = AlignUp((ulong)address + size, PageSize);
+
+            if (Host.Posix.PosixViewRegions.Protect(start, end - start, newProtect, ToPosixProtect(newProtect), out oldProtect) is { } changed)
+                return changed;
 
             lock (Gate)
             {

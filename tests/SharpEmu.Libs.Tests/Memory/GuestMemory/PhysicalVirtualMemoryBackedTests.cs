@@ -13,6 +13,39 @@ namespace SharpEmu.Libs.Tests.Memory.GuestMemory;
 [Collection(GuestMemoryStateCollection.Name)]
 public sealed unsafe class PhysicalVirtualMemoryBackedTests
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ExactImageAllocationCommitsOwnedReservationAndSurvivesReload(bool platformAdapter)
+    {
+        if (!Supported) return;
+        const ulong imageBase = 0x8_0000_0000;
+        using var memory = new PhysicalVirtualMemory(hostMemory: platformAdapter ? PlatformMemory : null, viewHost: HostViewMemory.Create(),
+            backingBytes: BackingSize, preReserveGuestAddressSpace: true);
+        Assert.True(memory.TryAllocateAtExact(imageBase, 0x5100, executable: true, out var address));
+        Assert.Equal(imageBase, address);
+        memory.Map(address, 0x4000, 0, new byte[] { 0xB8, 41, 0, 0, 0, 0xC3 },
+            ProgramHeaderFlags.Read | ProgramHeaderFlags.Execute);
+        memory.Map(address + 0x4000, 0x1100, 0, new byte[] { 0xAB },
+            ProgramHeaderFlags.Read | ProgramHeaderFlags.Write);
+        Assert.True(PlatformMemory.Query(address, out var code));
+        Assert.Equal(HostPageProtection.ReadExecute, code.Protection);
+        Assert.True(memory.TryWrite(address + 1, new byte[] { 42 }));
+        Assert.True(PlatformMemory.Query(address, out code));
+        Assert.Equal(HostPageProtection.ReadExecute, code.Protection);
+        Assert.Equal(0xB8, *(byte*)address);
+        if (System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture ==
+            System.Runtime.InteropServices.Architecture.X64)
+            Assert.Equal(42, ((delegate* unmanaged[Cdecl]<int>)address)());
+
+        memory.Clear();
+
+        Assert.Equal(imageBase, memory.AllocateAt(imageBase, 0x5100, executable: true, allowAlternative: false));
+        Assert.Equal(0, *(byte*)imageBase);
+        Assert.True(memory.TryWrite(imageBase + 0x50FF, new byte[] { 0xAB }));
+        Assert.Equal(0xAB, *(byte*)(imageBase + 0x50FF));
+    }
+
     private sealed class QueryCountingHostMemory(IHostMemory inner) : IHostMemory
     {
         public int QueryCount { get; set; }

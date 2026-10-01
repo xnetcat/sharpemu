@@ -1,10 +1,12 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using System.Runtime.InteropServices;
+
 namespace SharpEmu.HLE.Host.Posix;
 
 // View mappings bypass the anonymous-allocation tables. Keep their query state together.
-internal static class PosixViewRegions
+internal static partial class PosixViewRegions
 {
     internal static readonly object Gate = new();
     private readonly record struct Region(ulong Start, ulong End, uint State, uint Protection,
@@ -47,6 +49,30 @@ internal static class PosixViewRegions
                 Regions.Add(region);
         }
     }
+
+    // Null means this address belongs to the legacy anonymous allocator.
+    internal static bool? Protect(ulong address, ulong size, uint protection, int nativeProtection, out uint oldProtection)
+    {
+        lock (Gate)
+        {
+            oldProtection = HostMemory.PAGE_NOACCESS;
+            if (!TryQuery(address, out var view)) return null;
+            oldProtection = view.Protect;
+            var end = address + size;
+            for (var cursor = address; cursor < end;)
+            {
+                if (!TryQuery(cursor, out view) || view.State != HostMemory.MEM_COMMIT)
+                    return false;
+                cursor = Math.Min(end, view.BaseAddress + view.RegionSize);
+            }
+            if (mprotect((nint)address, (nuint)size, nativeProtection) != 0) return false;
+            ChangeProtection(address, size, protection);
+            return true;
+        }
+    }
+
+    [LibraryImport("libc", SetLastError = true)]
+    private static partial int mprotect(nint address, nuint length, int protection);
 
     // Mapping creates the storage. Fault-time protection updates must not allocate.
     internal static void ChangeProtection(ulong address, ulong size, uint protection)
