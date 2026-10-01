@@ -43,6 +43,8 @@ internal static class PakDirectoryTracker
 
     private static readonly ConcurrentDictionary<uint, FileState> _state = new();
 
+    internal static object GetReadGate(uint fileId) => _state.GetOrAdd(fileId, static _ => new FileState());
+
     /// <summary>
     /// Resolves what "read the next sequential chunk of size <paramref name="requestedSize"/>"
     /// really means for this fileId: an unconsumed directory entry whose length matches, if the
@@ -51,63 +53,65 @@ internal static class PakDirectoryTracker
     public static ulong ResolveSequentialOffset(uint fileId, ulong requestedSize)
     {
         var state = _state.GetOrAdd(fileId, static _ => new FileState());
-
-        if (state.Directory is { } entries)
+        lock (state)
         {
-            // Several unrelated archived files can share a byte count (e.g. a head model and a bot
-            // navigation file both 0x3A34 bytes). Directory order alone then picks whichever comes
-            // first, which is wrong when the game reads them out of order. id archives cluster
-            // related assets, and the guest streams them with locality, so disambiguate collisions
-            // by choosing the unconsumed match nearest the running read cursor.
-            DirectoryEntry? best = null;
-            DirectoryEntry? uniqueMatch = null;
-            var matchCount = 0;
-            var bestDistance = ulong.MaxValue;
-            foreach (var entry in entries)
+            if (state.Directory is { } entries)
             {
-                if (entry.FileLen != requestedSize)
+                // Several unrelated archived files can share a byte count (e.g. a head model and a bot
+                // navigation file both 0x3A34 bytes). Directory order alone then picks whichever comes
+                // first, which is wrong when the game reads them out of order. id archives cluster
+                // related assets, and the guest streams them with locality, so disambiguate collisions
+                // by choosing the unconsumed match nearest the running read cursor.
+                DirectoryEntry? best = null;
+                DirectoryEntry? uniqueMatch = null;
+                var matchCount = 0;
+                var bestDistance = ulong.MaxValue;
+                foreach (var entry in entries)
                 {
-                    continue;
+                    if (entry.FileLen != requestedSize)
+                    {
+                        continue;
+                    }
+
+                    uniqueMatch = entry;
+                    matchCount++;
+                    if (entry.Consumed)
+                    {
+                        continue;
+                    }
+
+                    var distance = entry.FilePos >= state.NextOffset
+                        ? entry.FilePos - state.NextOffset
+                        : state.NextOffset - entry.FilePos;
+                    if (distance < bestDistance)
+                    {
+                        bestDistance = distance;
+                        best = entry;
+                    }
                 }
 
-                uniqueMatch = entry;
-                matchCount++;
-                if (entry.Consumed)
+                if (best is not null)
                 {
-                    continue;
+                    best.Consumed = true;
+                    if (_trace)
+                    {
+                        Console.Error.WriteLine(
+                            $"[LOADER][TRACE] pak.directory_match: id=0x{fileId:X8} name='{best.Name}' " +
+                            $"filepos=0x{best.FilePos:X8} filelen=0x{best.FileLen:X8}");
+                    }
+
+                    return best.FilePos;
                 }
 
-                var distance = entry.FilePos >= state.NextOffset
-                    ? entry.FilePos - state.NextOffset
-                    : state.NextOffset - entry.FilePos;
-                if (distance < bestDistance)
+                // A unique archive member may be opened again after its first read.
+                if (matchCount == 1)
                 {
-                    bestDistance = distance;
-                    best = entry;
+                    return uniqueMatch!.FilePos;
                 }
             }
 
-            if (best is not null)
-            {
-                best.Consumed = true;
-                if (_trace)
-                {
-                    Console.Error.WriteLine(
-                        $"[LOADER][TRACE] pak.directory_match: id=0x{fileId:X8} name='{best.Name}' " +
-                        $"filepos=0x{best.FilePos:X8} filelen=0x{best.FileLen:X8}");
-                }
-
-                return best.FilePos;
-            }
-
-            // A unique archive member may be opened again after its first read.
-            if (matchCount == 1)
-            {
-                return uniqueMatch!.FilePos;
-            }
+            return state.NextOffset;
         }
-
-        return state.NextOffset;
     }
 
     /// <summary>
@@ -123,29 +127,31 @@ internal static class PakDirectoryTracker
         }
 
         var state = _state.GetOrAdd(fileId, static _ => new FileState());
-
-        if (state.ExpectingDirectory && fileOffset == state.NextOffset)
+        lock (state)
         {
-            state.Directory = TryParseDirectory(ctx, destination, bytesRead);
-            state.ExpectingDirectory = false;
-            state.NextOffset = fileOffset + bytesRead;
-            if (_trace)
+            if (state.ExpectingDirectory && fileOffset == state.NextOffset)
             {
-                Console.Error.WriteLine(
-                    $"[LOADER][TRACE] pak.directory_parsed: id=0x{fileId:X8} entries={state.Directory?.Count ?? 0}");
+                state.Directory = TryParseDirectory(ctx, destination, bytesRead);
+                state.ExpectingDirectory = false;
+                state.NextOffset = fileOffset + bytesRead;
+                if (_trace)
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] pak.directory_parsed: id=0x{fileId:X8} entries={state.Directory?.Count ?? 0}");
+                }
+
+                return;
             }
 
-            return;
-        }
+            if (fileOffset == 0 && bytesRead >= 12 && TryReadPackHeader(ctx, destination, out var dirOffset))
+            {
+                state.NextOffset = dirOffset;
+                state.ExpectingDirectory = true;
+                return;
+            }
 
-        if (fileOffset == 0 && bytesRead >= 12 && TryReadPackHeader(ctx, destination, out var dirOffset))
-        {
-            state.NextOffset = dirOffset;
-            state.ExpectingDirectory = true;
-            return;
+            state.NextOffset = fileOffset + bytesRead;
         }
-
-        state.NextOffset = fileOffset + bytesRead;
     }
 
     private static bool TryReadPackHeader(CpuContext ctx, ulong destination, out ulong dirOffset)

@@ -130,6 +130,10 @@ internal static class AmprFileRegistry
     /// <summary>Test hook: wipe registry state between cases.</summary>
     internal static void ClearForTests()
     {
+        SharpEmu.Libs.Kernel.KernelAprCompatExports.BeginShutdown();
+        if (!SharpEmu.Libs.Kernel.KernelAprCompatExports.Drain(TimeSpan.FromSeconds(5)))
+            throw new TimeoutException("APR test workers did not drain.");
+        SharpEmu.Libs.Kernel.KernelAprCompatExports.BeginSession();
         lock (_indexGate)
         {
             _hostPathsById.Clear();

@@ -67,6 +67,7 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
         GuestGpuMemory? gpuMemory = null,
         int systemLanguage = 1)
     {
+        KernelAprCompatExports.BeginSession();
         _gpuMemory = gpuMemory;
         _selfLoader = selfLoader ?? throw new ArgumentNullException(nameof(selfLoader));
         _virtualMemory = virtualMemory ?? throw new ArgumentNullException(nameof(virtualMemory));
@@ -1377,6 +1378,7 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
         }
 
         _disposed = true;
+        KernelAprCompatExports.BeginShutdown();
         KernelModuleRegistry.ConfigureModuleLoader(null);
 
         if (_cpuDispatcher is IDisposable disposableDispatcher)
@@ -1391,6 +1393,12 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
             // hosts the GUI launcher in embedded sessions.
             Console.Error.WriteLine(
                 "[RUNTIME] Guest workers were still active at teardown; keeping the guest address space mapped.");
+            return;
+        }
+
+        if (!KernelAprCompatExports.Drain(TimeSpan.FromSeconds(5)))
+        {
+            Console.Error.WriteLine("[RUNTIME] APR workers were still active at teardown; keeping guest memory mapped.");
             return;
         }
 
