@@ -750,7 +750,6 @@ internal sealed class ShaderProgramCache
             VertexOffsetScalarRegister = entry.EmbeddedFetch?.VertexOffsetScalarRegister ?? ShaderProgramInfo.NoScalarRegister,
             InstanceOffsetScalarRegister = entry.EmbeddedFetch?.InstanceOffsetScalarRegister ?? ShaderProgramInfo.NoScalarRegister,
             UsesDeviceAddresses = info.UsesDeviceAddresses,
-            DeviceAddressesAreReadOnly = entry.Plan.DeviceAddressesAreReadOnly && !request.TraceDeviceAddressFaults,
             BoundedDeviceAddressRangeCount = DeviceAddressPreparation.BoundedRangeCount(entry.Program, entry.Plan),
             ConstantStoreValue = FindConstantStoreValue(entry.Program),
             HasBitwiseExclusiveOr = entry.HasBitwiseExclusiveOr,

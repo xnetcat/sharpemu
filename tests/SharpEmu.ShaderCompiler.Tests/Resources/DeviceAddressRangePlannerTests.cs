@@ -10,31 +10,6 @@ namespace SharpEmu.ShaderCompiler.Tests.Resources;
 
 public sealed class DeviceAddressRangePlannerTests
 {
-    [Theory]
-    [InlineData("GlobalLoadDword", true)]
-    [InlineData("GlobalStoreDword", false)]
-    [InlineData("GlobalAtomicAdd", false)]
-    public void ReadOnlyProofIncludesUnboundedDeviceAccesses(string opcode, bool readOnly)
-    {
-        var plan = Extract(Program(
-            GlobalAccess(0, opcode, 0, vectorAddress: 5),
-            EndProgram(8)));
-        Assert.True(plan.Info.UsesDeviceAddresses);
-        Assert.False(Assert.Single(plan.DeviceAddressRanges).Bounded);
-        Assert.Equal(readOnly, plan.DeviceAddressesAreReadOnly);
-    }
-
-    [Fact]
-    public void ReadOnlyAddressLoadDoesNotHideABufferAtomic()
-    {
-        var plan = Extract(Program(
-            GlobalAccess(0, "GlobalLoadDword", 0),
-            BufferAtomicAdd(8, 4),
-            EndProgram(16)), userDataCount: 8);
-        Assert.True(plan.Info.UsesDeviceAddresses);
-        Assert.False(plan.DeviceAddressesAreReadOnly);
-    }
-
     // flat_store through (aperture_hi << 32) | offset: the high dword comes from an
     // aperture operand, so the store targets LDS or scratch and owns no device range.
     [Theory]

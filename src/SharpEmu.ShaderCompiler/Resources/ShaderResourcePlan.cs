@@ -42,12 +42,6 @@ public sealed class ShaderResourcePlan
     public bool RequiresSpecializationMemory { get; private set; }
     public ShaderResourceInfo Info { get; private set; } = new();
 
-    // Prove the absence of writes from the complete memory instruction table, not
-    // just bounded address ranges (runtime descriptors and unknown addresses may
-    // have no range). Keep unknown access kinds conservative.
-    public bool DeviceAddressesAreReadOnly => Info.UsesDeviceAddresses &&
-        Memory.Entries.All(memory => memory.PlanningOnly || memory.Access == MemoryAccess.Read);
-
     // The handles each memory access reads, after flattened reads were replaced.
     public MemoryAccessBinding?[] Accesses { get; private set; } = [];
 

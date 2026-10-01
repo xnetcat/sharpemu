@@ -129,12 +129,11 @@ public sealed partial class RenderExecutor
     }
 
     // A written buffer resource with an address and a footprint needs a barrier after the stage.
-    // A proven read-only device-address stage does not turn the render scope into
-    // a memory-writing scope. Unknown stages still take the conservative path.
+    // Even read-only device addresses may alias attachment writes in the current
+    // scope. Keep guest barriers conservative until those aliases are ruled out.
     private bool DrawWritesMemory(ShaderStageResources stage) =>
         stage.Program is { } program &&
-        ((program.UsesDeviceAddresses && !program.DeviceAddressesAreReadOnly) ||
-         WritesStorageImage(program) || HasBufferWrites(stage));
+        (program.UsesDeviceAddresses || WritesStorageImage(program) || HasBufferWrites(stage));
 
     private bool HasBufferWrites(ShaderStageResources stage)
     {

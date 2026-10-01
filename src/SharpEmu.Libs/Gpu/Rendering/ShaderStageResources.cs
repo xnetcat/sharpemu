@@ -51,8 +51,6 @@ public class ShaderProgramInfo
     public int VertexOffsetScalarRegister { get; init; } = NoScalarRegister;
     public int InstanceOffsetScalarRegister { get; init; } = NoScalarRegister;
     public bool UsesDeviceAddresses { get; init; }
-    // False by default so callers without complete resource analysis retain barriers.
-    public bool DeviceAddressesAreReadOnly { get; init; }
     // -1 requires the global sweep; otherwise all accesses have proven bounds.
     public int BoundedDeviceAddressRangeCount { get; init; } = -1;
 
