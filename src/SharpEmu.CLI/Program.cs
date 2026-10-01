@@ -46,6 +46,7 @@ internal static partial class Program
     private static int Main(string[] args)
     {
         RosettaGcBudget.ReexecIfNeeded(args);
+        using var macUserActivity = MacUserActivity.Begin();
         ConfigureManagedPluginResolution();
 
         if (args.Length > 0 && args[0] == SharpEmu.Core.Diagnostics.WindowsCrashCapture.HelperArgument)
