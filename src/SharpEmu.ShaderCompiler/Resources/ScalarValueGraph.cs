@@ -144,6 +144,9 @@ public sealed partial class ScalarValueGraph
     internal ScalarValue FirstLane(ScalarValue value, ScalarValue activeMask, uint instructionAddress) =>
         Intern(ScalarValueKind.FirstLane, ScalarValueType.U32, instructionAddress, operands: [value, activeMask]);
 
+    internal ScalarValue LaneRead(ScalarValue value, ScalarValue lane, uint instructionAddress) =>
+        Intern(ScalarValueKind.LaneRead, ScalarValueType.U32, instructionAddress, operands: [value, lane]);
+
     internal ScalarValue Phi(int block, ScalarValueType type) => Track(ScalarValue.Phi(block, type));
 
     internal ScalarValue Select(ScalarValue condition, ScalarValue whenTrue, ScalarValue whenFalse)
@@ -343,6 +346,7 @@ public sealed partial class ScalarValueGraph
             ScalarValueKind.Operation => Operation(value.Operation, value.Type, operands),
             ScalarValueKind.Select => Select(operands[0], operands[1], operands[2]),
             ScalarValueKind.FirstLane => FirstLane(operands[0], operands[1], (uint)value.Payload),
+            ScalarValueKind.LaneRead => LaneRead(operands[0], operands[1], (uint)value.Payload),
             ScalarValueKind.ScalarAddressWord or ScalarValueKind.ScalarBufferWord => MemoryRead(value.Kind, operands[0], operands[1], value.MemoryIndex),
             _ => Handle(value.Kind, operands),
         };

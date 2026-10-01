@@ -1587,6 +1587,12 @@ public sealed partial class ScalarValueGraph
             }
 
             var lane = instruction.Sources.Count > 1 ? Read(instruction.Sources[1], state) : _graph.Undefined(ScalarValueType.U32);
+            if (instruction.Sources.Count >= 2 &&
+                instruction.Sources[0] is { Kind: Gen5OperandKind.VectorRegister } laneSource && !lane.IsConstant)
+            {
+                state.WriteScalar(destination.Value, _graph.LaneRead(state.ReadVector(laneSource.Value), lane, instruction.Pc));
+                return;
+            }
             if (instruction.Sources.Count < 2 ||
                 instruction.Sources[0] is not { Kind: Gen5OperandKind.VectorRegister } source ||
                 !lane.IsConstant ||

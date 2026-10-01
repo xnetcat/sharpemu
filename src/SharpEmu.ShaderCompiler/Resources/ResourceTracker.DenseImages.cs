@@ -188,19 +188,23 @@ public sealed partial class ResourceTracker
         ScalarValue key,
         IReadOnlyList<ScalarValue> reads)
     {
-        if (key.Kind != ScalarValueKind.FirstLane || key.Operands.Length != 2 || reads.Count == 0)
+        if (key.Kind is not (ScalarValueKind.FirstLane or ScalarValueKind.LaneRead) || key.Operands.Length != 2 || reads.Count == 0)
         {
             return null;
         }
 
         var instructions = _graph.Program.Instructions;
         var firstLaneIndex = FindInstructionIndex(instructions, (uint)key.Payload);
-        if (firstLaneIndex < 0 || instructions[firstLaneIndex] is not { Opcode: "VReadfirstlaneB32", Sources.Count: 1, Destinations.Count: 1 } firstLane ||
+        if (firstLaneIndex < 0 || instructions[firstLaneIndex] is not { Sources.Count: >= 1, Destinations.Count: 1 } firstLane ||
             firstLane.Sources[0] is not { Kind: Gen5OperandKind.VectorRegister } vectorSource ||
             firstLane.Destinations[0] is not { Kind: Gen5OperandKind.ScalarRegister } scalarDestination)
         {
             return null;
         }
+
+        if (key.Kind == ScalarValueKind.LaneRead
+            ? !IsRemainingLaneSelector(instructions, firstLaneIndex)
+            : firstLane.Opcode != "VReadfirstlaneB32") return null;
 
         var globalIndex = FindLastDefinition(instructions, firstLaneIndex, vectorSource);
         if (globalIndex < 0 || instructions[globalIndex].Control is not Gen5GlobalMemoryControl
@@ -224,7 +228,7 @@ public sealed partial class ResourceTracker
             {
                 Control: Gen5ScalarMemoryControl
             {
-                DestinationCount: >= 8,
+                DestinationCount: >= 4,
                 DynamicOffsetRegister: { } dynamicOffsetRegister,
             },
             } descriptorLoad || dynamicOffsetRegister != scalarDestination.Value ||
@@ -244,8 +248,7 @@ public sealed partial class ResourceTracker
         if (TryGetSelfAddedConstant(instructions[addressDefinitionIndex], address, out _) &&
             TryGetWaveIndexedStride(instructions, addressDefinitionIndex, address, heapAddress,
                 out var maskRegister, out var bitRegister, out var maskOffset, out var indexStride) &&
-            indexDataOffset != 0 && indexStride != 0 && instructions.Any(instruction => instruction.Opcode == "SBitset0B32" &&
-                instruction.Destinations.Contains(maskRegister) && instruction.Sources.Contains(bitRegister)))
+            indexDataOffset != 0 && indexStride != 0 && HasMaskBitClear(instructions, maskRegister, bitRegister))
         {
             return new(maskOffset, indexDataOffset, indexStride);
         }

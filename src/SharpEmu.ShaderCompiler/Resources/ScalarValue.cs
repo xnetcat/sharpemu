@@ -34,6 +34,9 @@ public enum ScalarValueKind : byte
     ResourceTableWord,
     // The high dword of a GFX10 LDS/scratch aperture (payload: the inline operand).
     MemoryAperture,
+    // A GPU lane read whose lane is not statically known. Keep its identity for
+    // bounded descriptor-table analysis; it is not a CPU-evaluable uniform value.
+    LaneRead,
 }
 
 // Operations a value node can apply to its operands. The validator accepts only the
