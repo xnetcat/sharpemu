@@ -49,9 +49,14 @@ public sealed class ShaderResourcePlan
         IReadOnlySet<uint>? fixedFunctionVertexLoads = null, Action<ShaderResourcePlan>? beforeResourceTracking = null, uint waveSize = 64,
         bool flattenStandaloneScalarReads = true)
     {
-        var graph = ScalarValueGraph.Build(program, userDataBase, userDataCount, fixedFunctionVertexLoads, waveSize);
+        using var totalProfile = new ShaderPlanningProfile(stage, hash, "total");
+        ScalarValueGraph graph;
+        using (new ShaderPlanningProfile(stage, hash, "value_graph"))
+            graph = ScalarValueGraph.Build(program, userDataBase, userDataCount, fixedFunctionVertexLoads, waveSize);
         var plan = new ShaderResourcePlan(graph, stage, hash);
-        var reads = ResourceTableReadPlanner.Plan(graph, stage, hash, flattenStandaloneScalarReads);
+        ResourceTableReadPlanner.Result reads;
+        using (new ShaderPlanningProfile(stage, hash, "table_reads"))
+            reads = ResourceTableReadPlanner.Plan(graph, stage, hash, flattenStandaloneScalarReads);
         var memo = new Dictionary<ScalarValue, ScalarValue>();
         ScalarValue Rewrite(ScalarValue value) => graph.Substitute(value, reads.Replacements, memo);
         ScalarValue RewriteRead(ScalarValue read)
@@ -85,7 +90,9 @@ public sealed class ShaderResourcePlan
 
         // Diagnostics observe rewritten values before descriptor validation.
         beforeResourceTracking?.Invoke(plan);
-        var tracked = ResourceTracker.Track(plan);
+        ResourceTracker.Result tracked;
+        using (new ShaderPlanningProfile(stage, hash, "resource_tracking"))
+            tracked = ResourceTracker.Track(plan);
         plan.DescriptorSources = tracked.Sources;
         plan.Info = tracked.Info;
         plan.IndirectImages = tracked.IndirectImages;

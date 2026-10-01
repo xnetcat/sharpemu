@@ -77,6 +77,8 @@ internal static class RenderPhaseProfile
         DrawVertexEvaluation,
         DrawBindingAssembly,
         ProgramPreparation,
+        ProgramDecode,
+        ProgramResourcePlanning,
         ProgramSourceRead,
         VertexInputResolution,
         PixelInputResolution,

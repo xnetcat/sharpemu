@@ -299,7 +299,9 @@ internal sealed class ShaderProgramCache
 
     private ProgramSourceEntry CreateEntry(ShaderSource source, StageCompileOptions options)
     {
-        var program = Decode(source);
+        Gen5ShaderProgram program;
+        using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramDecode))
+            program = Decode(source);
         var dumpPlanning = CompiledShaderDump.ShouldWrite(source.Address, source.Hash);
         if (dumpPlanning) ShaderPlanningDump.WriteInput(source, program);
         EmbeddedVertexFetchPlan? fetch = null;
@@ -320,6 +322,7 @@ internal sealed class ShaderProgramCache
         ShaderResourcePlan plan;
         try
         {
+            using var planningScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramResourcePlanning);
             plan = ShaderResourcePlan.Extract(program, source.Stage, source.Hash, source.UserDataBase, (uint)source.UserData.Length,
                 fetch?.Loads.Select(load => load.Pc).ToHashSet(),
                 beforeResourceTracking: dumpPlanning ? resourcePlan => ShaderPlanningDump.WriteGraph(source, resourcePlan) : null,
