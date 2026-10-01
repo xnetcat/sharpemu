@@ -147,6 +147,33 @@ public sealed class ShaderProgramCacheTests : IDisposable
         Assert.NotEqual(first.Id, second.Id);
         Assert.Equal(2, _guest.Programs.ProgramCount);
         Assert.All(_guest.Programs.Entries, entry => Assert.Single(entry.Permutations));
+        var entries = _guest.Programs.Entries.ToArray();
+        Assert.Same(entries[0].Plan, entries[1].Plan);
+    }
+
+    [Fact]
+    public void ResourceAnalysisKeepsWaveSizeAndUserDataLayoutDistinct()
+    {
+        _guest.RegisterProgram(CodeA, HeaderA, PipelineTestGuest.EndProgram);
+        foreach (var (wave, count) in new[] { (32u, 0), (64u, 0), (32u, 4) })
+        {
+            var options = new StageCompileOptions
+            {
+                ComputeInfo = new ComputeInputInfo
+                {
+                    ThreadsX = 64, ThreadsY = 1, ThreadsZ = 1,
+                    WaveSize = wave, GroupIdX = true, ThreadIdCount = 1,
+                },
+            };
+            var cursor = 0u;
+            _guest.Programs.GetOrCompile(_guest.Source(CodeA, ShaderStage.Compute, new uint[count]),
+                options, ref cursor, out _);
+        }
+        var plans = _guest.Programs.Entries.Select(entry => entry.Plan).ToArray();
+        Assert.Equal(3, plans.Length);
+        Assert.NotSame(plans[0], plans[1]);
+        Assert.NotSame(plans[0], plans[2]);
+        Assert.NotSame(plans[1], plans[2]);
     }
 
     [Fact]

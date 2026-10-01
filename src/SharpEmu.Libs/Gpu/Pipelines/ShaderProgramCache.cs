@@ -104,6 +104,11 @@ internal sealed class ShaderProgramCache
     private readonly ResidentGuestBytesReader _readResidentGuestBytes;
     private readonly Dictionary<ProgramKey, ProgramSourceEntry> _programs = new(ProgramKeyComparer.Instance);
     private readonly Dictionary<(ulong Hash, uint CodeSize), Gen5ShaderProgram> _decoded = new();
+    // Raster/interpolator/workgroup state creates pipeline variants, but does not
+    // change resource analysis. Keep one immutable plan for its actual inputs.
+    private readonly record struct ResourcePlanKey(Gen5ShaderProgram Program, ShaderStage Stage, ulong Hash,
+        uint UserDataBase, uint UserDataCount, uint WaveSize, bool FlattenScalarData);
+    private readonly Dictionary<ResourcePlanKey, ShaderResourcePlan> _resourcePlans = new();
     private readonly List<uint> _staticState = new(StageStaticKey.MaxWords);
     // Draws that re-bind unchanged resources reuse the last materialization.
     // SHARPEMU_RESOURCE_CACHE=0 materializes every draw, for A/B comparisons.
@@ -332,15 +337,26 @@ internal sealed class ShaderProgramCache
         try
         {
             using var planningScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramResourcePlanning);
-            plan = ShaderResourcePlan.Extract(program, source.Stage, source.Hash, source.UserDataBase, (uint)source.UserData.Length,
-                fetch?.Loads.Select(load => load.Pc).ToHashSet(),
-                beforeResourceTracking: dumpPlanning ? resourcePlan => ShaderPlanningDump.WriteGraph(source, resourcePlan) : null,
-                // Graphics stages compile as wave32 (see the compile request); compute follows the dispatch.
-                waveSize: source.Stage == ShaderStage.Compute ? options.ComputeInfo?.WaveSize ?? 64u : 32u,
-                // Only descriptor/address dependencies need CPU interpretation.
-                // Ordinary scalar payloads stay in GPU memory, even when their
-                // address is simple enough for the CPU to evaluate eagerly.
-                flattenStandaloneScalarReads: Environment.GetEnvironmentVariable("SHARPEMU_FLATTEN_SCALAR_DATA") == "1");
+            var waveSize = source.Stage == ShaderStage.Compute ? options.ComputeInfo?.WaveSize ?? 64u : 32u;
+            var flattenScalarData = Environment.GetEnvironmentVariable("SHARPEMU_FLATTEN_SCALAR_DATA") == "1";
+            var planKey = new ResourcePlanKey(program, source.Stage, source.Hash, source.UserDataBase,
+                (uint)source.UserData.Length, waveSize, flattenScalarData);
+            // Embedded fetch replaces code and has its own fixed-function load
+            // exclusions. Diagnostic extraction must also observe the full walk.
+            var reusable = fetch is null && !dumpPlanning;
+            if (!reusable || !_resourcePlans.TryGetValue(planKey, out plan!))
+            {
+                plan = ShaderResourcePlan.Extract(program, source.Stage, source.Hash, source.UserDataBase, (uint)source.UserData.Length,
+                    fetch?.Loads.Select(load => load.Pc).ToHashSet(),
+                    beforeResourceTracking: dumpPlanning ? resourcePlan => ShaderPlanningDump.WriteGraph(source, resourcePlan) : null,
+                    // Graphics stages compile as wave32 (see the compile request); compute follows the dispatch.
+                    waveSize: waveSize,
+                    // Only descriptor/address dependencies need CPU interpretation.
+                    // Ordinary scalar payloads stay in GPU memory, even when their
+                    // address is simple enough for the CPU to evaluate eagerly.
+                    flattenStandaloneScalarReads: flattenScalarData);
+                if (reusable) _resourcePlans.Add(planKey, plan);
+            }
         }
         catch (ResourcePlanException exception)
         {
