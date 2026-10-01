@@ -42,7 +42,32 @@ public sealed unsafe partial class RenderHostDeviceTests
         _vulkan.AssertNoValidationMessages();
     }
 
-    private static byte[] CompileReplayProbe(ShaderStage stage, uint pattern)
+    [Fact]
+    public void VertexReplayLoadsCenterBarycentricsOnDevice()
+    {
+        if (!Ready()) return;
+        using var presenter = new PresenterUnderTest(_vulkan);
+        presenter.LoadRenderingCommands();
+        var harness = presenter.Harness;
+        var target = harness.MapBacked(0x10000, ReadWrite);
+        var words = RegisterWords.Color(target, Size, Size);
+        var provider = new FixedProgramProvider((IShaderPipelineHost)presenter.Instance, 0,
+            interpolationShader: CompileReplayProbe(ShaderStage.Pixel, 0, centerWeights: true),
+            replayVertexShader: CompileReplayProbe(ShaderStage.Vertex, 0));
+        var executor = new RenderExecutor(presenter.RenderHost, provider);
+        presenter.Run(() => executor.DrawAuto(1, Banks(words), Draw()));
+        presenter.Run(() => presenter.InvokeMethod("FlushBatchedGuestCommands"));
+        harness.Finish();
+        var pixels = harness.ReadImageBytes(TargetImage(presenter, words));
+        var center = Pixel(pixels, Size / 2, Size / 2);
+        Assert.InRange(center & 255, 62u, 66u);
+        Assert.InRange((center >> 8) & 255, 62u, 66u);
+        Assert.NotEqual(center, Pixel(pixels, 1, 1));
+        harness.Shutdown();
+        _vulkan.AssertNoValidationMessages();
+    }
+
+    private static byte[] CompileReplayProbe(ShaderStage stage, uint pattern, bool centerWeights = false)
     {
         var instructions = new List<Gen5ShaderInstruction>();
         uint Pc() => (uint)instructions.Count * 4;
@@ -79,7 +104,8 @@ public sealed unsafe partial class RenderHostDeviceTests
                 Binary("VMulF32", 4 + vertex, Operand(BitConverter.SingleToUInt32Bits(1f / 255)), Gen5Operand.Vector(4 + vertex));
             }
             Unary("VMovB32", 7, Operand(0x3F800000));
-            Export(0, 4, 5, 6, 7);
+            if (centerWeights) Export(0, 0, 1, 6, 7);
+            else Export(0, 4, 5, 6, 7);
         }
         instructions.Add(EndProgram(Pc()));
         var (plan, resources, layout) = Prepare(Program([.. instructions]), stage, userDataCount: 0);
@@ -88,6 +114,8 @@ public sealed unsafe partial class RenderHostDeviceTests
             VertexReplayParameters = [new(0, 1)],
             SupportsPerVertexPixelInputs = false,
             PixelInputCntl = [0],
+            PixelInputEnable = centerWeights ? 2u : 0u,
+            PixelInputAddress = centerWeights ? 2u : 0u,
             PixelCustomInterpolationMask = 1,
             PixelOutputs = [new Gen5PixelOutputBinding(0, 0, Gen5PixelOutputKind.Float)],
             EnableGraphicsSubgroupOperations = false,

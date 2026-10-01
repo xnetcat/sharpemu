@@ -21,7 +21,6 @@ public static partial class Gen5SpirvTranslator
         private uint _sampleMaskInput;
         private const uint InterpolateAtCentroid = 76;
         private const uint InterpolateAtSample = 77;
-        private const uint InterpolateAtOffset = 78;
 
         private void DeclareInterpolationParameters()
         {
@@ -228,8 +227,10 @@ public static partial class Gen5SpirvTranslator
             0 or 4 => _module.AddInstruction(SpirvOp.ExtInst, _vec3Type, _glsl, InterpolateAtSample,
                 variable, Load(_intType, _interpolationSampleId)),
             2 or 6 => _module.AddInstruction(SpirvOp.ExtInst, _vec3Type, _glsl, InterpolateAtCentroid, variable),
-            _ => _module.AddInstruction(SpirvOp.ExtInst, _vec3Type, _glsl, InterpolateAtOffset,
-                variable, _module.ConstantNull(_vec2Type)),
+            // The undecorated built-in already contains pixel-center weights. Explicit
+            // interpolation requires shaderSampleRateInterpolationFunctions and is not
+            // supported for these built-ins by the Metal translation path.
+            _ => Load(_vec3Type, variable),
         };
 
         private bool TryEmitInterpolationParameter(

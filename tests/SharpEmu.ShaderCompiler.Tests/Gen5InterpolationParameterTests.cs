@@ -91,6 +91,18 @@ public sealed class Gen5InterpolationParameterTests
         Assert.Contains("reserved interpolation parameter selector", error);
     }
 
+    [Theory]
+    [InlineData(2u)]
+    [InlineData(32u)]
+    public void CenterBarycentrics_LoadBuiltInWithoutExplicitInterpolation(uint inputs)
+    {
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(Request(0, true, inputs, supportsPerVertex: false, replay: true),
+            out var shader, out var error), error);
+        Assert.DoesNotContain(Instructions(shader.Spirv), instruction => instruction.Opcode == SpirvOp.ExtInst &&
+            instruction.Operands[3] is 76 or 77 or 78);
+        ValidateWhenAvailable(shader.Spirv);
+    }
+
     [Fact]
     public void MixedBarycentricLocations_ShareBuiltIns()
     {
