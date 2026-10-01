@@ -134,8 +134,13 @@ internal static unsafe class HostMovieYuv420
 /// </summary>
 internal sealed class HostMovieYuv420Decoder : IMediaFrameDecoder
 {
+    private static readonly bool ProfileDecode =
+        Environment.GetEnvironmentVariable("SHARPEMU_PROFILE_MOVIE_DECODE") == "1";
     private readonly IMediaFrameDecoder _inner;
     private readonly byte[] _bgra;
+    private long _decodeTicks;
+    private long _convertTicks;
+    private int _decodedFrames;
 
     internal HostMovieYuv420Decoder(IMediaFrameDecoder inner)
     {
@@ -154,12 +159,24 @@ internal sealed class HostMovieYuv420Decoder : IMediaFrameDecoder
 
     public bool TryDecodeNextFrame(Span<byte> destination)
     {
+        var started = ProfileDecode ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         if (!_inner.TryDecodeNextFrame(_bgra))
         {
             return false;
         }
 
+        var converted = ProfileDecode ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         HostMovieYuv420.ConvertFromBgra(_bgra, Width, Height, destination);
+        if (ProfileDecode)
+        {
+            _decodeTicks += converted - started;
+            _convertTicks += System.Diagnostics.Stopwatch.GetTimestamp() - converted;
+            if (++_decodedFrames % 30 == 0)
+            {
+                var scale = 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+                Console.Error.WriteLine($"[PERF][MOVIE_DECODE] frames={_decodedFrames} decode_ms={_decodeTicks * scale:F1} convert_ms={_convertTicks * scale:F1}");
+            }
+        }
         return true;
     }
 
