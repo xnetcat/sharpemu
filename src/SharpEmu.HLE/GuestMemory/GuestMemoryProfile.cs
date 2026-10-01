@@ -28,6 +28,7 @@ public static class GuestMemoryProfile
         ProtectionRequest,
         ProtectionNative,
         ProtectionMetadata,
+        ShaderBackingRead,
         Count,
     }
 

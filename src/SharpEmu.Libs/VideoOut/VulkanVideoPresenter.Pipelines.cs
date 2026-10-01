@@ -93,6 +93,26 @@ internal static unsafe partial class VulkanVideoPresenter
 
         SampleCountFlags IShaderPipelineHost.NoAttachmentSampleCounts => _noAttachmentSampleCounts;
 
+        private static readonly bool ExactShaderBackingReads =
+            Environment.GetEnvironmentVariable("SHARPEMU_EXACT_SHADER_BACKING_READS") == "1";
+
+        // LOCAL ONLY: compare page-level synchronization with exact GPU ownership.
+        // These readers execute on the GPU queue thread, which owns the buffer
+        // modified-range set. Use the unprotected backing alias, never the guest
+        // view: unrelated GPU-owned bytes can still keep that whole page guarded.
+        private bool TryReadUnownedShaderBacking(ulong address, Span<byte> destination)
+        {
+            var size = (ulong)destination.Length;
+            if (!ExactShaderBackingReads || !Relay.IsGpuQueueThread ||
+                !_bufferCache.MayHaveGpuDirtyPages(address, size) ||
+                _bufferCache.HasGpuDirtyBytes(address, size) ||
+                _imageCache.HasGpuModifiedImageBytes(address, size))
+                return false;
+            using var profile = SharpEmu.HLE.GuestMemory.GuestMemoryProfile.Measure(
+                SharpEmu.HLE.GuestMemory.GuestMemoryProfile.Operation.ShaderBackingRead);
+            return _guestBacking.TryReadBacking(address, destination);
+        }
+
         // A range the GPU wrote is downloaded first, so the word is what the guest CPU would read.
         public bool TryReadGuestWord(ulong address, out uint word)
         {
@@ -108,13 +128,19 @@ internal static unsafe partial class VulkanVideoPresenter
                 return false;
             }
 
+            Span<byte> bytes = stackalloc byte[sizeof(uint)];
+            if (TryReadUnownedShaderBacking(address, bytes))
+            {
+                word = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(bytes);
+                return true;
+            }
+
             if (!_bufferCache.TrySynchronizeCpuRead(address, sizeof(uint),
                 SharpEmu.HLE.GuestMemory.GuestMemoryProfile.ReadbackSource.ShaderResourceRead))
             {
                 return false;
             }
 
-            Span<byte> bytes = stackalloc byte[sizeof(uint)];
             if (!_guestMemory.TryRead(address, bytes))
             {
                 return false;
@@ -154,6 +180,8 @@ internal static unsafe partial class VulkanVideoPresenter
         // The same ownership rules as the two word readers, checked once for a whole range.
         public bool TryReadResidentGuestBytes(ulong address, Span<byte> destination, bool clean)
         {
+            if (TryReadUnownedShaderBacking(address, destination))
+                return true;
             var size = (ulong)destination.Length;
             if (_bufferCache.HasGpuDirtyPages(address, size) ||
                 (clean && (_bufferCache.HasGpuDirtyBytes(address, size) || _imageCache.HasGpuModifiedImageBytes(address, size))))
