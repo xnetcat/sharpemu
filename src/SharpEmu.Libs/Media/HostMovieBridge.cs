@@ -229,8 +229,12 @@ internal static class HostMovieBridge
 
     private static void AttachNativeMovieLocked(string hostPath)
     {
+        // The guest still decodes and submits the movie's audio. This bridge
+        // substitutes video textures only; a second audio stream would duplicate
+        // sound and feed host decoder progress back into the guest audio clock.
         if (!FfmpegVideoDecoder.TryOpen(
-                hostPath, _presentationWidth, _presentationHeight, out var source) ||
+                hostPath, _presentationWidth, _presentationHeight, out var source,
+                enableAudio: false) ||
             source is null)
         {
             Console.Error.WriteLine(

@@ -112,6 +112,7 @@ internal sealed unsafe class SdlHostAudio : IHostPcmAudioOutput
         private SDL_AudioStream* _stream;
         private bool _disposed;
         private long _totalSubmittedBytes;
+        private GuestAudioTimeline.Source? _clockSource;
 
         // Queue diagnostics for the current report window.
         private long _windowStart = Stopwatch.GetTimestamp();
@@ -238,7 +239,10 @@ internal sealed unsafe class SdlHostAudio : IHostPcmAudioOutput
                     var bytesPerSecond = (double)_bytesPerFrame * _sampleRate;
                     if (bytesPerSecond > 0)
                     {
-                        GuestAudioClock.Report(
+                        // Establish the epoch when this stream first submits audio,
+                        // rather than comparing its zero-based position with older streams.
+                        _clockSource ??= GuestAudioClock.CreateSource();
+                        _clockSource.Report(
                             Math.Max(0, _totalSubmittedBytes - queued - pcm.Length) / bytesPerSecond);
                     }
                 }

@@ -14,17 +14,31 @@ namespace SharpEmu.HLE.Host;
 /// that has to stay in step with the guest's audio — host-decoded video being
 /// the case that matters — has to follow this rather than <see cref="Stopwatch"/>.
 ///
-/// Reported per stream and kept as the furthest-along value: the guest's ports
-/// all carry one mix, and the leading port is the one whose position the
-/// listener perceives.
+/// Stream sample positions are aligned to their starting point on this timeline.
+/// The leading active stream drives playback; a newly started movie does not
+/// have to catch up with an older ambient stream's lifetime sample count.
 /// </summary>
 public static class GuestAudioClock
 {
-    private static long _playedMicroseconds;
-    private static long _lastAdvanceTimestamp;
+    private static readonly GuestAudioTimeline Timeline = new();
+
+    public static double PlayedSeconds => Timeline.PlayedSeconds;
+    public static bool IsRunning => Timeline.IsRunning;
+    internal static GuestAudioTimeline.Source CreateSource() => Timeline.CreateSource();
+}
+
+/// <summary>
+/// Aligns stream-relative sample positions to one playback timeline. A stream
+/// opened after another has played must not spend that earlier duration catching
+/// up before its progress can drive synchronized video.
+/// </summary>
+internal sealed class GuestAudioTimeline
+{
+    private long _playedMicroseconds;
+    private long _lastAdvanceTimestamp;
 
     /// <summary>Seconds of guest audio the device has played. Monotonic.</summary>
-    public static double PlayedSeconds =>
+    public double PlayedSeconds =>
         Interlocked.Read(ref _playedMicroseconds) / 1_000_000.0;
 
     /// <summary>
@@ -32,7 +46,7 @@ public static class GuestAudioClock
     /// audio is playing, and callers must fall back to wall clock rather than
     /// stalling on a clock that will never advance.
     /// </summary>
-    public static bool IsRunning
+    public bool IsRunning
     {
         get
         {
@@ -42,9 +56,9 @@ public static class GuestAudioClock
         }
     }
 
-    public static void Report(double playedSeconds)
+    private void Report(double playedSeconds)
     {
-        if (double.IsNaN(playedSeconds) || playedSeconds < 0)
+        if (!double.IsFinite(playedSeconds) || playedSeconds < 0)
         {
             return;
         }
@@ -64,6 +78,21 @@ public static class GuestAudioClock
             }
 
             current = seen;
+        }
+    }
+
+    internal Source CreateSource() => new(this, PlayedSeconds);
+
+    internal sealed class Source(GuestAudioTimeline timeline, double originSeconds)
+    {
+        internal void Report(double playedSeconds)
+        {
+            if (!double.IsFinite(playedSeconds) || playedSeconds < 0)
+            {
+                return;
+            }
+
+            timeline.Report(originSeconds + playedSeconds);
         }
     }
 }
