@@ -276,11 +276,11 @@ internal static unsafe partial class VulkanVideoPresenter
                         $"requested={Volatile.Read(ref _presenterCloseRequested)} " +
                         $"deviceLost={_deviceLost}");
                     VideoOutExports.NotifyPresentationWindowClosed();
+                    SharpEmu.Libs.Diagnostics.FiberSwitchProfile.WriteTrace();
                     DisposeVulkan();
                     RenderPhaseProfile.WriteFrameTrace();
                     SubmissionFlowProfile.WriteTrace();
                     SharpEmu.HLE.GuestProducerProfile.WriteNativeTrace();
-                    SharpEmu.Libs.Diagnostics.FiberSwitchProfile.WriteTrace();
                 },
                 WaitForRenderWork);
         }

@@ -14,9 +14,12 @@ internal static class FiberSwitchProfile
     [ThreadStatic] private static int _calls;
     private readonly record struct Sample(long Timestamp, int Thread, ulong Guest,
         long Wall, long Cpu, long GateWait, long GateWaitCpu, long GateHeld);
-    private static readonly object Gate = new();
-    private static readonly Sample[] Samples = new Sample[8192];
-    private static long _count;
+    private static class Storage
+    {
+        internal static readonly object Gate = new();
+        internal static readonly Sample[] Samples = new Sample[8192];
+        internal static long Count;
+    }
 
     internal static Scope? Begin() => Enabled && (++_calls & 15) == 0 ? new Scope() : null;
 
@@ -61,25 +64,25 @@ internal static class FiberSwitchProfile
             var sample = new Sample(now, Environment.CurrentManagedThreadId,
                 GuestThreadExecution.CurrentGuestThreadHandle, now - _started,
                 cpu >= _cpu && _cpu >= 0 ? cpu - _cpu : -1, _gateWait, _gateWaitCpu, _gateHeld);
-            lock (Gate) Samples[_count++ % Samples.Length] = sample;
+            lock (Storage.Gate) Storage.Samples[Storage.Count++ % Storage.Samples.Length] = sample;
         }
     }
 
     internal static void WriteTrace()
     {
         if (!Enabled) return;
-        lock (Gate)
+        lock (Storage.Gate)
         {
-            var first = Math.Max(0, _count - Samples.Length);
-            Console.Error.WriteLine($"[PERF][FIBER_SWITCH_TRACE] retained={_count - first} overwritten={first} sample_every=16");
-            for (var index = first; index < _count; index++)
+            var first = Math.Max(0, Storage.Count - Storage.Samples.Length);
+            Console.Error.WriteLine($"[PERF][FIBER_SWITCH_TRACE] retained={Storage.Count - first} overwritten={first} sample_every=16");
+            for (var index = first; index < Storage.Count; index++)
             {
-                var sample = Samples[index % Samples.Length];
+                var sample = Storage.Samples[index % Storage.Samples.Length];
                 Console.Error.WriteLine(FormattableString.Invariant(
                     $"[PERF][FIBER_SWITCH] timestamp={sample.Timestamp} thread={sample.Thread} guest=0x{sample.Guest:X} wall_ms={sample.Wall * 1000.0 / Stopwatch.Frequency:F3} cpu_ms={sample.Cpu / 1_000_000.0:F3} gate_wait_ms={sample.GateWait * 1000.0 / Stopwatch.Frequency:F3} gate_wait_cpu_ms={sample.GateWaitCpu / 1_000_000.0:F3} gate_held_ms={sample.GateHeld * 1000.0 / Stopwatch.Frequency:F3}"));
             }
-            _count = 0;
-            Array.Clear(Samples);
+            Storage.Count = 0;
+            Array.Clear(Storage.Samples);
         }
     }
 }
