@@ -10,7 +10,7 @@ namespace SharpEmu.HLE;
 // thread separate actual CPU consumption from elapsed producer gaps. HLE fields
 // are wall time in HLE (including guest callbacks), not CPU or inferred off-CPU
 // time. Nested imports partition that time, and snapshots include open scopes.
-public static class GuestProducerProfile
+public static partial class GuestProducerProfile
 {
     public static readonly bool Enabled = Environment.GetEnvironmentVariable("SHARPEMU_PROFILE_GUEST_PRODUCER") == "1";
     [ThreadStatic] private static Counters? _counters;
@@ -24,6 +24,9 @@ public static class GuestProducerProfile
             if (ActiveCategory >= 0) HleTicks[ActiveCategory] += now - AccountedThrough;
             AccountedThrough = now;
         }
+        internal long NextNativeSample, NativeStarted, NativeCpuStarted;
+        internal ulong NativeReturn;
+        internal string NativeImport = "none";
         internal long LongestTicks;
         internal string LongestImport = "none";
     }
@@ -44,18 +47,22 @@ public static class GuestProducerProfile
         return sample;
     }
 
-    public static Scope MeasureImport(string name)
+    public static int ClassifyImport(string name) =>
+        name.Contains("Mutex", StringComparison.OrdinalIgnoreCase) ? 0 :
+        name.Contains("Cond", StringComparison.OrdinalIgnoreCase) ? 1 :
+        name.Contains("Sema", StringComparison.OrdinalIgnoreCase) ? 2 :
+        name.Contains("Apr", StringComparison.OrdinalIgnoreCase) || name.Contains("Ampr", StringComparison.OrdinalIgnoreCase) ? 3 :
+        name.Contains("Equeue", StringComparison.OrdinalIgnoreCase) || name.Contains("EventFlag", StringComparison.OrdinalIgnoreCase) ? 4 :
+        name.Contains("Sleep", StringComparison.OrdinalIgnoreCase) ? 5 :
+        name.Contains("Agc", StringComparison.OrdinalIgnoreCase) || name.Contains("VideoOut", StringComparison.OrdinalIgnoreCase) ? 6 : 7;
+
+    public static Scope MeasureImport(string name, int category, ulong returnAddress)
     {
         if (!Enabled) return default;
         var counters = _counters ??= new();
-        var category = name.Contains("Mutex", StringComparison.OrdinalIgnoreCase) ? 0 :
-            name.Contains("Cond", StringComparison.OrdinalIgnoreCase) ? 1 :
-            name.Contains("Sema", StringComparison.OrdinalIgnoreCase) ? 2 :
-            name.Contains("Apr", StringComparison.OrdinalIgnoreCase) || name.Contains("Ampr", StringComparison.OrdinalIgnoreCase) ? 3 :
-            name.Contains("Equeue", StringComparison.OrdinalIgnoreCase) || name.Contains("EventFlag", StringComparison.OrdinalIgnoreCase) ? 4 :
-            name.Contains("Sleep", StringComparison.OrdinalIgnoreCase) ? 5 :
-            name.Contains("Agc", StringComparison.OrdinalIgnoreCase) || name.Contains("VideoOut", StringComparison.OrdinalIgnoreCase) ? 6 : 7;
-        return new(counters, category, Stopwatch.GetTimestamp(), name);
+        var now = Stopwatch.GetTimestamp();
+        CompleteNativeSample(counters, now, name, returnAddress);
+        return new(counters, category, now, name, returnAddress);
     }
 
     public readonly struct Scope : IDisposable
@@ -65,9 +72,10 @@ public static class GuestProducerProfile
         private readonly long _started;
         private readonly string? _name;
         private readonly int _previousCategory;
-        internal Scope(Counters counters, int category, long started, string name)
+        private readonly ulong _returnAddress;
+        internal Scope(Counters counters, int category, long started, string name, ulong returnAddress)
         {
-            (_counters, _category, _started, _name) = (counters, category, started, name);
+            (_counters, _category, _started, _name, _returnAddress) = (counters, category, started, name, returnAddress);
             counters.Advance(started);
             _previousCategory = counters.ActiveCategory;
             counters.ActiveCategory = category;
@@ -87,6 +95,7 @@ public static class GuestProducerProfile
                 }
             }
             _counters.ActiveCategory = _previousCategory;
+            StartNativeSample(_counters, _name!, _returnAddress);
         }
     }
 

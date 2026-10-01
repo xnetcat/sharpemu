@@ -279,6 +279,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     DisposeVulkan();
                     RenderPhaseProfile.WriteFrameTrace();
                     SubmissionFlowProfile.WriteTrace();
+                    SharpEmu.HLE.GuestProducerProfile.WriteNativeTrace();
                 },
                 WaitForRenderWork);
         }

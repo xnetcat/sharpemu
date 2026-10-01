@@ -63,6 +63,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 		public ulong NidHash { get; }
 
+		public int ProducerProfileCategory { get; }
+
 		public ImportStubEntry(
 			ulong address,
 			string nid,
@@ -82,6 +84,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			SuppressStrlenTrace = suppressStrlenTrace;
 			IsLoopGuardBoundary = isLoopGuardBoundary;
 			NidHash = nidHash;
+			ProducerProfileCategory = GuestProducerProfile.Enabled
+				? GuestProducerProfile.ClassifyImport(export?.Name ?? nid) : 0;
 		}
 	}
 

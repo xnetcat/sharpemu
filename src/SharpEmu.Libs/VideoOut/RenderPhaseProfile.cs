@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using System.Diagnostics;
+using SharpEmu.HLE;
 
 namespace SharpEmu.Libs.VideoOut;
 
@@ -176,10 +177,12 @@ internal static class RenderPhaseProfile
     private static class FrameTraceStorage
     {
         internal static readonly long[] PhaseTicks = new long[(int)Phase.Count];
+        internal static readonly long[] CpuNanoseconds = new long[FrameTraceCapacity];
         internal static readonly long[] Records = new long[FrameTraceCapacity * ((int)Phase.Count + 4)];
     }
     private static long _frameTraceCount;
     private static long _previousFrameTimestamp;
+    private static long _previousFrameCpuNanoseconds = -1;
     private static long _lastSubmissionTimestamp;
     private static long _submissionCount;
 
@@ -206,10 +209,11 @@ internal static class RenderPhaseProfile
                 var ticks = _frameTrace[offset + 4 + phase];
                 if (ticks != 0) parts.Add($"{(Phase)phase}={ticks * 1000.0 / Stopwatch.Frequency:F3}");
             }
-            Console.Error.WriteLine($"[PERF][FRAME] sequence={sequence} timestamp={_frameTrace[offset]} gap_ms={_frameTrace[offset + 1] * 1000.0 / Stopwatch.Frequency:F3} last_submission={_frameTrace[offset + 2]} submissions_total={_frameTrace[offset + 3]} {string.Join(" ", parts)}");
+            Console.Error.WriteLine($"[PERF][FRAME] sequence={sequence} timestamp={_frameTrace[offset]} gap_ms={_frameTrace[offset + 1] * 1000.0 / Stopwatch.Frequency:F3} cpu_ms={FrameTraceStorage.CpuNanoseconds[sequence % FrameTraceCapacity] / 1_000_000.0:F3} last_submission={_frameTrace[offset + 2]} submissions_total={_frameTrace[offset + 3]} {string.Join(" ", parts)}");
         }
         _frameTraceCount = 0;
         _previousFrameTimestamp = 0;
+        _previousFrameCpuNanoseconds = -1;
     }
     internal enum CommandReadKind { Header, Payload, RegisterTable, Operand32, Operand64, Other, Count }
     private static readonly long[] _commandReadCalls = new long[(int)CommandReadKind.Count];
@@ -420,6 +424,12 @@ internal static class RenderPhaseProfile
         var now = Stopwatch.GetTimestamp();
         if (FrameTraceEnabled)
         {
+            // One OS query per presented frame, never per draw or phase switch.
+            // This separates render CPU work from inclusive phase wall time.
+            var cpu = GuestProducerProfile.ReadCurrentCpuNanoseconds();
+            FrameTraceStorage.CpuNanoseconds[_frameTraceCount % FrameTraceCapacity] =
+                cpu >= 0 && _previousFrameCpuNanoseconds >= 0 ? cpu - _previousFrameCpuNanoseconds : -1_000_000;
+            _previousFrameCpuNanoseconds = cpu;
             var traceOffset = (int)(_frameTraceCount % FrameTraceCapacity) * ((int)Phase.Count + 4);
             _frameTrace[traceOffset] = now;
             _frameTrace[traceOffset + 1] = _previousFrameTimestamp == 0 ? 0 : now - _previousFrameTimestamp;

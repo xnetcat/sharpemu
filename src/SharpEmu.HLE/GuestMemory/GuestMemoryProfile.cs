@@ -33,7 +33,8 @@ public static class GuestMemoryProfile
     }
 
     private static readonly bool Enabled = string.Equals(
-        Environment.GetEnvironmentVariable("SHARPEMU_PROFILE_PERFORMANCE"), "1", StringComparison.Ordinal);
+        Environment.GetEnvironmentVariable("SHARPEMU_PROFILE_PERFORMANCE"), "1", StringComparison.Ordinal) ||
+        Environment.GetEnvironmentVariable("SHARPEMU_PROFILE_READBACKS") == "1";
     private static readonly Measurements Counters = new();
     public static readonly bool ReadbackDetailsEnabled = Enabled && string.Equals(
         Environment.GetEnvironmentVariable("SHARPEMU_PROFILE_PERFORMANCE_FRAME_TRACE"), "1", StringComparison.Ordinal);

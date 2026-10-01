@@ -9,7 +9,8 @@ namespace SharpEmu.Libs.Diagnostics;
 
 internal static class MutexHandoffProfile
 {
-    internal static bool Enabled => RenderPhaseProfile.FrameTraceEnabled;
+    internal static readonly bool Enabled = RenderPhaseProfile.FrameTraceEnabled &&
+        Environment.GetEnvironmentVariable("SHARPEMU_PROFILE_MUTEX_HANDOFF") != "0";
     internal readonly record struct TraceEvent(long Timestamp, int HostThread, ulong GuestThread,
         long MutexIdentity, string Stage, ulong Address, ulong Owner, ulong Waiter,
         string WakeKey, int Waiting, int Result);
