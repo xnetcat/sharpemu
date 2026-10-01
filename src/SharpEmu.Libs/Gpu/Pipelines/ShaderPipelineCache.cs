@@ -30,8 +30,9 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
     private readonly bool _strictShaders = Environment.GetEnvironmentVariable("SHARPEMU_STRICT_COMPUTE") != "0";
     private readonly HashSet<(ShaderStage Stage, ulong Hash, uint CodeSize)> _reportedShaderSkips = [];
 
-    public ShaderPipelineCache(CpuContext context, IShaderPipelineHost host, IGuestGpuBackend compiler, ShaderHeaderRegistry registry)
+    public ShaderPipelineCache(CpuContext context, IShaderPipelineHost host, IGuestGpuBackend compiler, ShaderHeaderRegistry registry, bool? repeatingCopyEnabled = null)
     {
+        _repeatingCopyEnabled = repeatingCopyEnabled ?? RepeatingCopyEnabled;
         _context = context;
         _host = host;
         _registry = registry;
@@ -327,7 +328,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         var input = ComputeStageInputResolver.Resolve(compute, source.Registered, dispatchInitiator, !_host.ComputeWave64Supported, dimensionX, dimensionY, dimensionZ);
         var systemRegisters = DecodeComputeSystemRegisters(compute);
         var program = _programs.Decode(source);
-        if (TrySubmitRepeatingDwordCopyKernel(program, source, systemRegisters, input))
+        if (TrySubmitRepeatingDwordCopyKernel(program, source, systemRegisters, input, dimensionX, dimensionY, dimensionZ))
             return new ComputeProgram { Consumed = true };
         if (TrySubmitMaskedDwordCopyKernel(program, source, systemRegisters, input, out var description))
         {

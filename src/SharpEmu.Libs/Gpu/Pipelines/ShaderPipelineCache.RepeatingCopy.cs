@@ -15,6 +15,7 @@ internal sealed partial class ShaderPipelineCache
 {
     private static readonly bool RepeatingCopyEnabled =
         Environment.GetEnvironmentVariable("SHARPEMU_REPEATING_COPY_FAST_PATH") == "1";
+    private readonly bool _repeatingCopyEnabled;
     private int _repeatingCopyCompleted;
 
     // Exact ISA shape for dst[id] = src[id % period], id < count. The compiler
@@ -48,15 +49,17 @@ internal sealed partial class ShaderPipelineCache
     }
 
     private bool TrySubmitRepeatingDwordCopyKernel(Gen5ShaderProgram program, ShaderSource source,
-        Gen5ComputeSystemRegisters systemRegisters, ComputeInputInfo input)
+        Gen5ComputeSystemRegisters systemRegisters, ComputeInputInfo input, uint dimensionX, uint dimensionY, uint dimensionZ)
     {
-        if (!RepeatingCopyEnabled || !IsRepeatingDwordCopyKernel(program) ||
+        if (!_repeatingCopyEnabled || !IsRepeatingDwordCopyKernel(program) ||
             input.ThreadsX != 64 || input.ThreadsY != 1 || input.ThreadsZ != 1 ||
             systemRegisters.WorkGroupXRegister != WorkGroupRegisterOfCopyKernel)
             return false;
-        var groupsX = input.DispatchThreadDimensions ? RenderExecutor.GroupsFromThreads(input.DispatchThreadsX, input.ThreadsX) : input.DispatchThreadsX;
-        var groupsY = input.DispatchThreadDimensions ? RenderExecutor.GroupsFromThreads(input.DispatchThreadsY, input.ThreadsY) : input.DispatchThreadsY;
-        var groupsZ = input.DispatchThreadDimensions ? RenderExecutor.GroupsFromThreads(input.DispatchThreadsZ, input.ThreadsZ) : input.DispatchThreadsZ;
+        // DispatchThreads* on ComputeInputInfo is populated only in thread-
+        // dimension mode. The command's dimensions also carry ordinary groups.
+        var groupsX = input.DispatchThreadDimensions ? RenderExecutor.GroupsFromThreads(dimensionX, input.ThreadsX) : dimensionX;
+        var groupsY = input.DispatchThreadDimensions ? RenderExecutor.GroupsFromThreads(dimensionY, input.ThreadsY) : dimensionY;
+        var groupsZ = input.DispatchThreadDimensions ? RenderExecutor.GroupsFromThreads(dimensionZ, input.ThreadsZ) : dimensionZ;
         if (groupsY != 1 || groupsZ != 1 || source.UserData.Length < 12 ||
             !IsExactMaskedDwordCopyDescriptor(source.UserData, 0, out var from) ||
             !IsExactMaskedDwordCopyDescriptor(source.UserData, 4, out var to))
@@ -72,7 +75,7 @@ internal sealed partial class ShaderPipelineCache
         if (!_host.TryReadResidentGuestBytes(control.Address, parameters, clean: true)) return false;
         var count = BinaryPrimitives.ReadUInt32LittleEndian(parameters);
         var period = BinaryPrimitives.ReadUInt32LittleEndian(parameters[4..]);
-        var dispatchedThreads = input.DispatchThreadDimensions ? input.DispatchThreadsX : (ulong)groupsX * input.ThreadsX;
+        var dispatchedThreads = input.DispatchThreadDimensions ? dimensionX : (ulong)groupsX * input.ThreadsX;
         var outputCount = (uint)Math.Min(Math.Min((ulong)count, dispatchedThreads), (to.Footprint() ?? 0) / 4);
         if (period == 0 || outputCount == 0 || outputCount > MaxCopyKernelSourceBytes / 4) return false;
         var sourceBytes = Math.Min(from.Footprint() ?? 0, Math.Min((ulong)period, outputCount) * 4);

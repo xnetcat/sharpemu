@@ -30,6 +30,11 @@ internal sealed class FakePipelineHost(ICpuMemory memory) : IShaderPipelineHost
 {
     private ulong _nextHandle = 1;
 
+    public bool ResidentReadsEnabled { get; set; }
+
+    public bool TryReadResidentGuestBytes(ulong address, Span<byte> bytes, bool clean) =>
+        ResidentReadsEnabled && memory.TryRead(address, bytes);
+
     public List<(ShaderStage Stage, ulong Hash, ulong ProgramId)> Modules { get; } = new();
 
     public List<GraphicsPipelineDescription> GraphicsPipelines { get; } = new();
