@@ -499,6 +499,8 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     private ulong _bdaTouchTick = ulong.MaxValue;
     private ulong _bdaTouchMapping;
 
+    public void PrepareBoundedDeviceAddresses() => _faultProcessPending = true;
+
     public void PrepareBda(IEnumerable<GuestSpan> mapped)
     {
         var traceAddress = GuestGpuMemoryHook.TraceAddress;

@@ -369,10 +369,20 @@ internal static unsafe partial class VulkanVideoPresenter
             prepared.BufferSources = sources;
         }
 
-        // Uploads every mapped range into the cache before a device-address draw; the fault pass follows.
+        private static readonly bool BoundedDeviceAddressPreparation =
+            Environment.GetEnvironmentVariable("SHARPEMU_BOUNDED_DEVICE_ADDRESS_PREPARATION") != "0";
+
+        // Unknown device addresses require the global sweep. Proven ranges are
+        // obtained, uploaded and retained by BindResources immediately afterward.
         public void PrepareDeviceAddresses()
         {
             var preparation = RequirePreparation();
+            if (BoundedDeviceAddressPreparation && preparation.Stages.All(stage =>
+                DeviceAddressPreparation.CanUseBoundedPreparation(stage.Program, stage.Stage.Resources)))
+            {
+                _bufferCache.PrepareBoundedDeviceAddresses();
+                return;
+            }
             ulong vertexProgramHash = 0, pixelProgramHash = 0, computeProgramHash = 0;
             if (BufferUploadProfile.Enabled)
             {

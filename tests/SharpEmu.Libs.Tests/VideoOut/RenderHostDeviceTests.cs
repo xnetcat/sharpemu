@@ -486,6 +486,52 @@ public sealed unsafe partial class RenderHostDeviceTests : IClassFixture<Headles
         presenter.Harness.Shutdown();
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void BoundedDeviceAddressPreparationLeavesUnrelatedCpuWritesDirty(bool proven)
+    {
+        if (!Ready()) return;
+        using var presenter = new PresenterUnderTest(_vulkan!);
+        presenter.LoadRenderingCommands();
+        var harness = presenter.Harness;
+        var address = harness.MapBacked(0x10000, ReadWrite) + 32;
+        var unrelated = harness.MapBacked(0x10000, ReadWrite) + 32;
+        var info = new ShaderResourceInfo { UsesDeviceAddresses = true };
+        var program = new ShaderProgramInfo
+        {
+            Stage = ShaderStageKind.Compute, Hash = 3, UsesDeviceAddresses = true,
+            BoundedDeviceAddressRangeCount = proven ? 1 : -1,
+            Resources = new SpecializedResourceInfo { Info = info },
+            Bindings = BindingLayout.Allocate(info, [], false, false, false),
+        };
+        var snapshot = new ResourceSnapshot { DeviceAddressRanges = [new(0, address, 32, true, false)] };
+        GuestGpuMemoryHook.Attach(harness.Gpu);
+        try
+        {
+            presenter.Run(() => harness.Cache.FindBuffer(unrelated, 32));
+            for (byte iteration = 1; iteration <= 2; iteration++)
+            {
+                var expected = Enumerable.Repeat(iteration, 32).ToArray();
+                Assert.True(harness.Memory.TryWrite(address, expected));
+                Assert.True(harness.Memory.TryWrite(unrelated, expected));
+                var buffer = presenter.Run(() =>
+                {
+                    using var preparation = presenter.RenderHost.BeginPreparation();
+                    var prepared = presenter.RenderHost.PrepareBindings(new ShaderStageResources(program, snapshot));
+                    presenter.RenderHost.PrepareDeviceAddresses();
+                    presenter.RenderHost.BindResources(prepared);
+                    Assert.False(harness.Cache.HasCpuDirtyPages(address, 32));
+                    Assert.Equal(proven, harness.Cache.HasCpuDirtyPages(unrelated, 32));
+                    return harness.Cache.GetBuffer(harness.Cache.FindBuffer(address, 32));
+                });
+                Assert.Equal(expected, harness.ReadBack(buffer, buffer.Offset(address), 32));
+            }
+        }
+        finally { GuestGpuMemoryHook.Attach(null); }
+        harness.Shutdown();
+    }
+
     [Fact]
     public void BindResourcesMakesReadOnlyDeviceAddressRangesResidentOnFirstUse()
     {
