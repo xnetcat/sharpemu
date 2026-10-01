@@ -166,10 +166,18 @@ internal sealed class HostMovieYuv420Decoder : IMediaFrameDecoder
         if (OperatingSystem.IsMacOS() && ProfileDecode && _decodedFrames == 0)
         {
             var result = GetQos(PthreadSelf(), out var qos, out var relative);
-            Console.Error.WriteLine($"[PERF][MOVIE_QOS] initial=0x{qos:X} relative={relative} result={result}");
+            GetScheduling(PthreadSelf(), out var policy, out var scheduling);
+            Console.Error.WriteLine($"[PERF][MOVIE_QOS] initial=0x{qos:X} relative={relative} result={result} policy={policy} priority={scheduling.Priority}");
         }
         if (OperatingSystem.IsMacOS() && ProfileDecode && _decodedFrames == RaiseQosAfterFrames)
             Console.Error.WriteLine($"[PERF][MOVIE_QOS] user_initiated result={SetQos(0x19, 0)} frames={_decodedFrames}");
+        if (ProfileDecode && _decodedFrames == 90 &&
+            Environment.GetEnvironmentVariable("SHARPEMU_MOVIE_MANAGED_PRIORITY") == "1")
+        {
+            Thread.CurrentThread.Priority = ThreadPriority.AboveNormal;
+            GetScheduling(PthreadSelf(), out var policy, out var scheduling);
+            Console.Error.WriteLine($"[PERF][MOVIE_QOS] managed priority={Thread.CurrentThread.Priority} frames={_decodedFrames} policy={policy} native_priority={scheduling.Priority}");
+        }
         var started = ProfileDecode ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         var cpuStarted = ProfileDecode ? CpuNanoseconds() : 0;
         if (!_inner.TryDecodeNextFrame(_bgra))
@@ -197,14 +205,32 @@ internal sealed class HostMovieYuv420Decoder : IMediaFrameDecoder
 
     public void Dispose() => _inner.Dispose();
 
-    private static long CpuNanoseconds() =>
-        OperatingSystem.IsMacOS() && ClockGetTime(16, out var value) == 0
-            ? value.Seconds * 1_000_000_000 + value.Nanoseconds : 0;
+    private static long CpuNanoseconds()
+    {
+        if (!OperatingSystem.IsMacOS()) return 0;
+        // clock_gettime(CLOCK_THREAD_CPUTIME_ID) under this Rosetta build
+        // reports raw 24 MHz ticks as nanoseconds; thread_info returns valid
+        // microseconds in the same one-second CPU calibration probe.
+        uint count = 10;
+        return ThreadInfo(PthreadMachThread(PthreadSelf()), 3, out var value, ref count) == 0
+            ? ((long)value.UserSeconds + value.SystemSeconds) * 1_000_000_000 +
+              ((long)value.UserMicroseconds + value.SystemMicroseconds) * 1_000 : 0;
+    }
 
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
-    private struct Timespec { public long Seconds; public long Nanoseconds; }
-    [System.Runtime.InteropServices.DllImport("libSystem.dylib", EntryPoint = "clock_gettime")]
-    private static extern int ClockGetTime(int clock, out Timespec value);
+    private struct ThreadBasicInfo
+    {
+        public int UserSeconds, UserMicroseconds, SystemSeconds, SystemMicroseconds;
+        public int CpuUsage, Policy, RunState, Flags, SuspendCount, SleepTime;
+    }
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential, Size = 64)]
+    private struct SchedulingParameters { public int Priority; }
+    [System.Runtime.InteropServices.DllImport("libSystem.dylib", EntryPoint = "pthread_getschedparam")]
+    private static extern int GetScheduling(nint thread, out int policy, out SchedulingParameters parameters);
+    [System.Runtime.InteropServices.DllImport("libSystem.dylib", EntryPoint = "thread_info")]
+    private static extern int ThreadInfo(uint thread, int flavor, out ThreadBasicInfo value, ref uint count);
+    [System.Runtime.InteropServices.DllImport("libSystem.dylib", EntryPoint = "pthread_mach_thread_np")]
+    private static extern uint PthreadMachThread(nint thread);
     [System.Runtime.InteropServices.DllImport("libSystem.dylib", EntryPoint = "pthread_self")]
     private static extern nint PthreadSelf();
     [System.Runtime.InteropServices.DllImport("libSystem.dylib", EntryPoint = "pthread_get_qos_class_np")]
