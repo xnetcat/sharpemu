@@ -140,7 +140,11 @@ internal sealed class HostMovieYuv420Decoder : IMediaFrameDecoder
     private readonly byte[] _bgra;
     private long _decodeTicks;
     private long _convertTicks;
+    private long _decodeCpuNanoseconds;
+    private long _convertCpuNanoseconds;
     private int _decodedFrames;
+    private static readonly int RaiseQosAfterFrames =
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_MOVIE_QOS_AFTER_FRAMES"), out var frames) ? frames : -1;
 
     internal HostMovieYuv420Decoder(IMediaFrameDecoder inner)
     {
@@ -159,26 +163,52 @@ internal sealed class HostMovieYuv420Decoder : IMediaFrameDecoder
 
     public bool TryDecodeNextFrame(Span<byte> destination)
     {
+        if (OperatingSystem.IsMacOS() && ProfileDecode && _decodedFrames == 0)
+        {
+            var result = GetQos(PthreadSelf(), out var qos, out var relative);
+            Console.Error.WriteLine($"[PERF][MOVIE_QOS] initial=0x{qos:X} relative={relative} result={result}");
+        }
+        if (OperatingSystem.IsMacOS() && ProfileDecode && _decodedFrames == RaiseQosAfterFrames)
+            Console.Error.WriteLine($"[PERF][MOVIE_QOS] user_initiated result={SetQos(0x19, 0)} frames={_decodedFrames}");
         var started = ProfileDecode ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        var cpuStarted = ProfileDecode ? CpuNanoseconds() : 0;
         if (!_inner.TryDecodeNextFrame(_bgra))
         {
             return false;
         }
 
         var converted = ProfileDecode ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        var cpuConverted = ProfileDecode ? CpuNanoseconds() : 0;
         HostMovieYuv420.ConvertFromBgra(_bgra, Width, Height, destination);
         if (ProfileDecode)
         {
             _decodeTicks += converted - started;
             _convertTicks += System.Diagnostics.Stopwatch.GetTimestamp() - converted;
+            _decodeCpuNanoseconds += cpuConverted - cpuStarted;
+            _convertCpuNanoseconds += CpuNanoseconds() - cpuConverted;
             if (++_decodedFrames % 30 == 0)
             {
                 var scale = 1000.0 / System.Diagnostics.Stopwatch.Frequency;
-                Console.Error.WriteLine($"[PERF][MOVIE_DECODE] frames={_decodedFrames} decode_ms={_decodeTicks * scale:F1} convert_ms={_convertTicks * scale:F1}");
+                Console.Error.WriteLine($"[PERF][MOVIE_DECODE] frames={_decodedFrames} decode_ms={_decodeTicks * scale:F1} convert_ms={_convertTicks * scale:F1} decode_cpu_ms={_decodeCpuNanoseconds / 1_000_000.0:F1} convert_cpu_ms={_convertCpuNanoseconds / 1_000_000.0:F1}");
             }
         }
         return true;
     }
 
     public void Dispose() => _inner.Dispose();
+
+    private static long CpuNanoseconds() =>
+        OperatingSystem.IsMacOS() && ClockGetTime(16, out var value) == 0
+            ? value.Seconds * 1_000_000_000 + value.Nanoseconds : 0;
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    private struct Timespec { public long Seconds; public long Nanoseconds; }
+    [System.Runtime.InteropServices.DllImport("libSystem.dylib", EntryPoint = "clock_gettime")]
+    private static extern int ClockGetTime(int clock, out Timespec value);
+    [System.Runtime.InteropServices.DllImport("libSystem.dylib", EntryPoint = "pthread_self")]
+    private static extern nint PthreadSelf();
+    [System.Runtime.InteropServices.DllImport("libSystem.dylib", EntryPoint = "pthread_get_qos_class_np")]
+    private static extern int GetQos(nint thread, out uint qos, out int relative);
+    [System.Runtime.InteropServices.DllImport("libSystem.dylib", EntryPoint = "pthread_set_qos_class_self_np")]
+    private static extern int SetQos(uint qos, int relative);
 }
