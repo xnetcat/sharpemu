@@ -97,4 +97,20 @@ public sealed class FlattenedReadReuseTests
         var kernel = metal.Source[metal.Source.IndexOf("kernel void ", StringComparison.Ordinal)..];
         Assert.Contains("sharpemu_load_device_dword", kernel);
     }
+
+    [Theory]
+    [InlineData(1u)]
+    [InlineData(4u)]
+    [InlineData(16u)]
+    public void StandaloneScalarDataCanRemainOnDevice(uint components)
+    {
+        var (plan, resources, layout) = Prepare(RepeatedReadProgram(components), userDataCount: 9,
+            flattenStandaloneScalarReads: false);
+        Assert.Empty(plan.TableReads);
+        Assert.Empty(plan.FlattenedSlotByMemoryIndex);
+        Assert.True(resources.Info.UsesDeviceAddresses);
+        var request = new ShaderCompileRequest(plan, resources, layout);
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out _, out var error), error);
+        Assert.True(Gen5MslTranslator.TryCompileProgram(request, out _, out error), error);
+    }
 }

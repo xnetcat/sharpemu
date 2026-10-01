@@ -34,10 +34,10 @@ public sealed class ResourceTableReadPlanner
         IReadOnlyDictionary<ScalarValue, ScalarValue> Replacements,
         IReadOnlyDictionary<int, uint> FlattenedSlotByMemoryIndex);
 
-    public static Result Plan(ScalarValueGraph graph, ShaderStage stage, ulong hash) =>
-        new ResourceTableReadPlanner(graph, stage, hash).Run();
+    public static Result Plan(ScalarValueGraph graph, ShaderStage stage, ulong hash, bool flattenStandaloneScalarReads = true) =>
+        new ResourceTableReadPlanner(graph, stage, hash).Run(flattenStandaloneScalarReads);
 
-    private Result Run()
+    private Result Run(bool flattenStandaloneScalarReads)
     {
         foreach (var value in _graph.Values)
         {
@@ -76,7 +76,7 @@ public sealed class ResourceTableReadPlanner
         var validatorReadCount = _reads.Count;
         foreach (var access in _graph.Accesses)
         {
-            if (access?.Read is { Kind: ScalarValueKind.ScalarAddressWord } read &&
+            if (flattenStandaloneScalarReads && access?.Read is { Kind: ScalarValueKind.ScalarAddressWord } read &&
                 IsRawRead(read) && read.Operands[1].IsConstant &&
                 new RuntimeValueValidator(_graph, _graph.UserDataBase, _graph.UserDataCount, validatorReadCount).Validate(read))
             {

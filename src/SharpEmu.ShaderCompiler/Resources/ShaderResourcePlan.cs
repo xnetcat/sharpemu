@@ -46,11 +46,12 @@ public sealed class ShaderResourcePlan
     public MemoryAccessBinding?[] Accesses { get; private set; } = [];
 
     public static ShaderResourcePlan Extract(Gen5ShaderProgram program, ShaderStage stage, ulong hash, uint userDataBase, uint userDataCount,
-        IReadOnlySet<uint>? fixedFunctionVertexLoads = null, Action<ShaderResourcePlan>? beforeResourceTracking = null, uint waveSize = 64)
+        IReadOnlySet<uint>? fixedFunctionVertexLoads = null, Action<ShaderResourcePlan>? beforeResourceTracking = null, uint waveSize = 64,
+        bool flattenStandaloneScalarReads = true)
     {
         var graph = ScalarValueGraph.Build(program, userDataBase, userDataCount, fixedFunctionVertexLoads, waveSize);
         var plan = new ShaderResourcePlan(graph, stage, hash);
-        var reads = ResourceTableReadPlanner.Plan(graph, stage, hash);
+        var reads = ResourceTableReadPlanner.Plan(graph, stage, hash, flattenStandaloneScalarReads);
         var memo = new Dictionary<ScalarValue, ScalarValue>();
         ScalarValue Rewrite(ScalarValue value) => graph.Substitute(value, reads.Replacements, memo);
         ScalarValue RewriteRead(ScalarValue read)

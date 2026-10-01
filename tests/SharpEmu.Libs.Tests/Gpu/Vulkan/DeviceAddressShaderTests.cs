@@ -31,6 +31,25 @@ public sealed class DeviceAddressShaderTests(HeadlessVulkanFixture fixture, ITes
     public void PageBits_MatchTheHostCache() =>
         Assert.Equal(GuestBufferCache.CachingPageBits, Gen5SpirvTranslator.DeviceAddressPageBits);
 
+    [Theory]
+    [InlineData(1u)]
+    [InlineData(4u)]
+    [InlineData(16u)]
+    public void StandaloneScalarReadsPreserveRepeatedLoadDestinations(uint components)
+    {
+        var vulkan = fixture.Vulkan;
+        if (!GatePrerequisites.Ready(vulkan, shaderInt64: true)) return;
+        var run = new Run(vulkan, FlattenedReadReuseTests.RepeatedReadProgram(components),
+            flattenStandaloneScalarReads: false);
+        var data = run.MapPage(GuestBase, Pattern(64));
+        run.Dispatch(GuestBase);
+        for (uint repetition = 0; repetition < 2; repetition++)
+            for (uint component = 0; component < components; component++)
+                Assert.Equal(ReadWord(data, (int)(component * 4)), run.ResultWord((repetition * components + component) * 4));
+        Assert.Equal(0u, run.FaultWord(GuestBase));
+        run.Finish(output, nameof(StandaloneScalarReadsPreserveRepeatedLoadDestinations));
+    }
+
     [Fact]
     public void GlobalLoadThroughThePageTable_ReturnsTheGuestBytes()
     {
@@ -346,9 +365,10 @@ public sealed class DeviceAddressShaderTests(HeadlessVulkanFixture fixture, ITes
         private readonly ulong _tableEntries;
         private GpuBuffer? _pageTable;
 
-        public Run(HeadlessVulkan vulkan, Gen5ShaderProgram program, uint threadCount = 1, ulong tableEntries = TableEntries)
+        public Run(HeadlessVulkan vulkan, Gen5ShaderProgram program, uint threadCount = 1, ulong tableEntries = TableEntries,
+            bool flattenStandaloneScalarReads = true)
         {
-            var (plan, resources, layout) = Prepare(program);
+            var (plan, resources, layout) = Prepare(program, flattenStandaloneScalarReads: flattenStandaloneScalarReads);
             Plan = plan;
             Request = new ShaderCompileRequest(plan, resources, layout) { LocalSizeX = threadCount, ThreadCountX = threadCount };
             Assert.True(resources.Info.UsesDeviceAddresses);
