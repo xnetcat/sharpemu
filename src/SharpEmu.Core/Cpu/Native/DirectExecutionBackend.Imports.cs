@@ -215,13 +215,7 @@ public sealed partial class DirectExecutionBackend
 		cpuContext[CpuRegister.R14] = *(ulong*)(argPackPtr + 80);
 		cpuContext[CpuRegister.R15] = *(ulong*)(argPackPtr + 88);
 		cpuContext[CpuRegister.Rsp] = (ulong)argPackPtr + 96uL;
-		cpuContext.SetImportStackArguments(
-			ReadImportStackArgument(argPackPtr, 0),
-			ReadImportStackArgument(argPackPtr, 1),
-			ReadImportStackArgument(argPackPtr, 2),
-			ReadImportStackArgument(argPackPtr, 3),
-			ReadImportStackArgument(argPackPtr, 4),
-			ReadImportStackArgument(argPackPtr, 5));
+		LoadImportStackArguments(cpuContext, argPackPtr);
 		ulong value = cpuContext[CpuRegister.Rdi];
 		ulong value2 = cpuContext[CpuRegister.Rsi];
 		ulong num3 = cpuContext[CpuRegister.Rdx];
@@ -306,12 +300,12 @@ public sealed partial class DirectExecutionBackend
 			activeGuestThreadState.LastImportRcx = num4;
 			activeGuestThreadState.LastImportR8 = num5;
 			activeGuestThreadState.LastImportR9 = num6;
-			activeGuestThreadState.LastImportStack0 = ReadImportStackArgument(argPackPtr, 0);
-			activeGuestThreadState.LastImportStack1 = ReadImportStackArgument(argPackPtr, 1);
-			activeGuestThreadState.LastImportStack2 = ReadImportStackArgument(argPackPtr, 2);
-			activeGuestThreadState.LastImportStack3 = ReadImportStackArgument(argPackPtr, 3);
-			activeGuestThreadState.LastImportStack4 = ReadImportStackArgument(argPackPtr, 4);
-			activeGuestThreadState.LastImportStack5 = ReadImportStackArgument(argPackPtr, 5);
+			cpuContext.TryGetImportStackArgument(0, out activeGuestThreadState.LastImportStack0);
+			cpuContext.TryGetImportStackArgument(1, out activeGuestThreadState.LastImportStack1);
+			cpuContext.TryGetImportStackArgument(2, out activeGuestThreadState.LastImportStack2);
+			cpuContext.TryGetImportStackArgument(3, out activeGuestThreadState.LastImportStack3);
+			cpuContext.TryGetImportStackArgument(4, out activeGuestThreadState.LastImportStack4);
+			cpuContext.TryGetImportStackArgument(5, out activeGuestThreadState.LastImportStack5);
 			Volatile.Write(ref activeGuestThreadState.LastImportResultValid, 0);
 			Volatile.Write(ref activeGuestThreadState.LastReturnRip, num7);
 			// Publish the NID last so readers cannot pair a new import name with
@@ -1276,6 +1270,58 @@ public sealed partial class DirectExecutionBackend
 		return true;
 	}
 
+    // Capture the contiguous ABI stack tail with one region lookup. Fiber stacks
+    // lie outside the thread's original allocation, and unrelated GPU protection
+    // changes invalidate the per-thread range cache many times during an import.
+    // Diagnostics reuse this snapshot instead of querying the same six words again.
+    internal static unsafe void LoadImportStackArguments(CpuContext context, nint argPackPtr)
+    {
+        const ulong bytes = 6 * sizeof(ulong);
+        var address = checked((ulong)argPackPtr + 104UL);
+        if (!OperatingSystem.IsWindows())
+        {
+            ulong end = 0;
+            if (_activeGuestThreadState is { StackSize: >= bytes } thread &&
+                address >= thread.StackBase && address - thread.StackBase <= thread.StackSize - bytes)
+            {
+                end = address + bytes;
+            }
+            else
+            {
+                var generation = HostMemory.MappingGeneration;
+                if (generation == _importReadableGeneration &&
+                    address >= _importReadableStart && address < _importReadableEnd)
+                {
+                    end = _importReadableEnd;
+                }
+                else if (TryQueryReadableRange(address, out var start, out end))
+                {
+                    _importReadableStart = start;
+                    _importReadableEnd = end;
+                    _importReadableGeneration = generation;
+                }
+            }
+
+            if (end >= bytes && address <= end - bytes)
+            {
+                var arguments = (ulong*)address;
+                context.SetImportStackArguments(arguments[0], arguments[1], arguments[2],
+                    arguments[3], arguments[4], arguments[5]);
+                return;
+            }
+        }
+
+        // Preserve per-word checks when the argument tail crosses a region or
+        // guard page. An unreadable argument has the same zero fallback as before.
+        context.SetImportStackArguments(
+            ReadImportStackArgument(argPackPtr, 0),
+            ReadImportStackArgument(argPackPtr, 1),
+            ReadImportStackArgument(argPackPtr, 2),
+            ReadImportStackArgument(argPackPtr, 3),
+            ReadImportStackArgument(argPackPtr, 4),
+            ReadImportStackArgument(argPackPtr, 5));
+    }
+
 	private static ulong ReadImportStackArgument(nint argPackPtr, int index)
 	{
 		var address = checked((ulong)argPackPtr + 104UL + (ulong)index * sizeof(ulong));
@@ -1390,13 +1436,7 @@ public sealed partial class DirectExecutionBackend
 		cpuContext[CpuRegister.R14] = *(ulong*)(argPackPtr + 80);
 		cpuContext[CpuRegister.R15] = *(ulong*)(argPackPtr + 88);
 		cpuContext[CpuRegister.Rsp] = (ulong)argPackPtr + 96uL;
-		cpuContext.SetImportStackArguments(
-			ReadImportStackArgument(argPackPtr, 0),
-			ReadImportStackArgument(argPackPtr, 1),
-			ReadImportStackArgument(argPackPtr, 2),
-			ReadImportStackArgument(argPackPtr, 3),
-			ReadImportStackArgument(argPackPtr, 4),
-			ReadImportStackArgument(argPackPtr, 5));
+		LoadImportStackArguments(cpuContext, argPackPtr);
 
 		if (_activeGuestThreadState is { } activeGuestThreadState)
 		{
@@ -1407,12 +1447,12 @@ public sealed partial class DirectExecutionBackend
 			activeGuestThreadState.LastImportRcx = *(ulong*)(argPackPtr + 24);
 			activeGuestThreadState.LastImportR8 = *(ulong*)(argPackPtr + 32);
 			activeGuestThreadState.LastImportR9 = *(ulong*)(argPackPtr + 40);
-			activeGuestThreadState.LastImportStack0 = ReadImportStackArgument(argPackPtr, 0);
-			activeGuestThreadState.LastImportStack1 = ReadImportStackArgument(argPackPtr, 1);
-			activeGuestThreadState.LastImportStack2 = ReadImportStackArgument(argPackPtr, 2);
-			activeGuestThreadState.LastImportStack3 = ReadImportStackArgument(argPackPtr, 3);
-			activeGuestThreadState.LastImportStack4 = ReadImportStackArgument(argPackPtr, 4);
-			activeGuestThreadState.LastImportStack5 = ReadImportStackArgument(argPackPtr, 5);
+			cpuContext.TryGetImportStackArgument(0, out activeGuestThreadState.LastImportStack0);
+			cpuContext.TryGetImportStackArgument(1, out activeGuestThreadState.LastImportStack1);
+			cpuContext.TryGetImportStackArgument(2, out activeGuestThreadState.LastImportStack2);
+			cpuContext.TryGetImportStackArgument(3, out activeGuestThreadState.LastImportStack3);
+			cpuContext.TryGetImportStackArgument(4, out activeGuestThreadState.LastImportStack4);
+			cpuContext.TryGetImportStackArgument(5, out activeGuestThreadState.LastImportStack5);
 			Volatile.Write(ref activeGuestThreadState.LastImportResultValid, 0);
 			Volatile.Write(ref activeGuestThreadState.LastReturnRip, returnRip);
 			Volatile.Write(ref activeGuestThreadState.LastImportNid, importStubEntry.Nid);
