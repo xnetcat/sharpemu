@@ -100,6 +100,9 @@ internal sealed class ShaderProgramCache
     private readonly CpuContext _context;
     private readonly IGuestGpuBackend _compiler;
     private readonly IShaderPipelineHost _host;
+    private readonly GuestWordReader _readGuestWord;
+    private readonly GuestWordReader _readCleanGuestWord;
+    private readonly ResidentGuestBytesReader _readResidentGuestBytes;
     private readonly Dictionary<ProgramKey, ProgramSourceEntry> _programs = new(ProgramKeyComparer.Instance);
     private readonly Dictionary<(ulong Hash, uint CodeSize), Gen5ShaderProgram> _decoded = new();
     private readonly List<uint> _staticState = new(StageStaticKey.MaxWords);
@@ -120,6 +123,9 @@ internal sealed class ShaderProgramCache
         _context = context;
         _compiler = compiler;
         _host = host;
+        _readGuestWord = host.TryReadGuestWord;
+        _readCleanGuestWord = host.TryReadCleanGuestWord;
+        _readResidentGuestBytes = host.TryReadResidentGuestBytes;
     }
 
     public int ProgramCount => _programs.Count;
@@ -204,8 +210,8 @@ internal sealed class ShaderProgramCache
         {
             UserData = source.UserData,
             ShaderBase = source.Address,
-            ReadMemory = _host.TryReadGuestWord,
-            ReadCleanMemory = _host.TryReadCleanGuestWord,
+            ReadMemory = _readGuestWord,
+            ReadCleanMemory = _readCleanGuestWord,
             ComputeState = source.Stage == ShaderStage.Compute && options.ComputeInfo is { } computeState
                 ? new ComputeSelectorState(computeState.WaveSize, Math.Max(computeState.ThreadsX, 1),
                     Math.Max(computeState.ThreadsY, 1), Math.Max(computeState.ThreadsZ, 1), computeState.DispatchThreadDimensions,
@@ -219,14 +225,16 @@ internal sealed class ShaderProgramCache
             ShaderCacheCounters.CountProgram();
         }
 
-        var snapshot = new ResourceSnapshot();
-        var specialization = new ResourceSpecialization();
+        // Both materializers replace these outputs on success; failure throws before use.
+        // Do not construct discarded empty snapshots/lists on every cache hit.
+        ResourceSnapshot snapshot = null!;
+        ResourceSpecialization specialization = null!;
         var captureIndirectImageFailure = _spirvDumpEnabled ? ShaderPermutationDump.CreateFailureCapture(source) : null;
         using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ResourceMaterialization))
         {
             // Failure capture needs the full walk, so a dump run bypasses the cache.
             var materialized = _materializations is not null && captureIndirectImageFailure is null
-                ? _materializations.Materialize(entry.Plan, inputs, _host.TryReadResidentGuestBytes, ref snapshot, ref specialization,
+                ? _materializations.Materialize(entry.Plan, inputs, _readResidentGuestBytes, ref snapshot, ref specialization,
                     out var materializationFailure)
                 : ResourceMaterializer.Materialize(entry.Plan, inputs, ref snapshot, ref specialization, out materializationFailure,
                     captureIndirectImageFailure);
