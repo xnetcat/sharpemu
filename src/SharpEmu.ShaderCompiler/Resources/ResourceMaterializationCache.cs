@@ -61,7 +61,7 @@ public sealed class ResourceMaterializationCache
         var key = KeyOf(plan, inputs);
         if (TryFind(key, plan, inputs, out var cached))
         {
-            if (Validate(cached, residentReader))
+            if (Validate(cached, residentReader, out var tableChanged))
             {
                 Hits++;
                 Interlocked.Increment(ref _totalHits);
@@ -71,7 +71,7 @@ public sealed class ResourceMaterializationCache
                 return true;
             }
 
-            if (TryRefreshTable(key, cached, plan, inputs, residentReader, out var refreshed))
+            if (tableChanged && TryRefreshTable(key, cached, plan, inputs, out var refreshed))
             {
                 TableRefreshes++;
                 snapshot = refreshed.Snapshot;
@@ -121,31 +121,13 @@ public sealed class ResourceMaterializationCache
     // specialization reads or extends the table (indirect or candidate tables), when the table
     // now reads a word the entry did not validate, or when a word moved between the two reads.
     private bool TryRefreshTable(ulong key, Entry cached, ShaderResourcePlan plan, ResourceRuntimeInputs inputs,
-        ResidentGuestBytesReader residentReader, out Entry refreshed)
+        out Entry refreshed)
     {
         refreshed = null!;
-        if (!cached.TableRefreshable)
-            return false;
-
-        var current = new byte[cached.Bytes.Length];
-        for (var index = 0; index < cached.RangeAddresses.Length; index++)
-        {
-            if (!residentReader(cached.RangeAddresses[index], current.AsSpan(cached.RangeOffsets[index], cached.RangeLengths[index]), cached.RangeClean[index]))
-                return false;
-        }
-
-        var changed = false;
-        for (var offset = 0; offset < current.Length; offset += sizeof(uint))
-        {
-            if (current.AsSpan(offset, sizeof(uint)).SequenceEqual(cached.Bytes.AsSpan(offset, sizeof(uint))))
-                continue;
-            if (!cached.WordTableOnly[offset / sizeof(uint)])
-                return false;
-            changed = true;
-        }
-
-        if (!changed)
-            return false;
+        // Validate already read every range and proved that only table words changed.
+        // Retain those bytes before evaluating the table; its reads below must still
+        // match, so a concurrent guest write cannot publish an inconsistent refresh.
+        var current = _scratch.AsSpan(0, cached.Bytes.Length).ToArray();
 
         var recorder = TakeRecorder();
         try
@@ -289,20 +271,35 @@ public sealed class ResourceMaterializationCache
         _young[key] = entry;
     }
 
-    private bool Validate(Entry entry, ResidentGuestBytesReader residentReader)
+    private bool Validate(Entry entry, ResidentGuestBytesReader residentReader, out bool tableChanged)
     {
+        tableChanged = false;
+        if (_scratch.Length < entry.Bytes.Length)
+            _scratch = new byte[Math.Max(entry.Bytes.Length, _scratch.Length * 2)];
+        var changed = false;
         for (var index = 0; index < entry.RangeAddresses.Length; index++)
         {
+            var offset = entry.RangeOffsets[index];
             var length = entry.RangeLengths[index];
-            if (_scratch.Length < length)
-                _scratch = new byte[Math.Max(length, _scratch.Length * 2)];
-            var current = _scratch.AsSpan(0, length);
-            if (!residentReader(entry.RangeAddresses[index], current, entry.RangeClean[index]) ||
-                !current.SequenceEqual(entry.Bytes.AsSpan(entry.RangeOffsets[index], length)))
+            var current = _scratch.AsSpan(offset, length);
+            if (!residentReader(entry.RangeAddresses[index], current, entry.RangeClean[index]))
                 return false;
+            var previous = entry.Bytes.AsSpan(offset, length);
+            if (current.SequenceEqual(previous))
+                continue;
+            if (!entry.TableRefreshable)
+                return false;
+            for (var word = 0; word < length; word += sizeof(uint))
+            {
+                if (!current.Slice(word, sizeof(uint)).SequenceEqual(previous.Slice(word, sizeof(uint))) &&
+                    !entry.WordTableOnly[(offset + word) / sizeof(uint)])
+                    return false;
+            }
+            changed = true;
         }
 
-        return true;
+        tableChanged = changed;
+        return !changed;
     }
 
     private sealed class Entry

@@ -188,12 +188,13 @@ public sealed class ResourceMaterializationCacheTests
 
     // Reads the four constants of FlattenedReadReuseTests.RepeatedReadProgram from a word memory.
     private static bool RunTable(ResourceMaterializationCache cache, ShaderResourcePlan plan, TestWordMemory memory,
-        out ResourceSnapshot snapshot)
+        out ResourceSnapshot snapshot, Action<int>? residentRead = null)
     {
         snapshot = new ResourceSnapshot();
         var specialization = new ResourceSpecialization();
         return cache.Materialize(plan, Inputs(TableUserData, memory.Read, memory.Read), (address, destination, _) =>
         {
+            residentRead?.Invoke(destination.Length);
             for (var offset = 0; offset < destination.Length; offset += 4)
             {
                 if (!memory.Read(address + (ulong)offset, out var word))
@@ -215,7 +216,10 @@ public sealed class ResourceMaterializationCacheTests
         Assert.Equal([11u, 22, 33, 44], first.FlattenedResourceTable);
 
         memory.Words[2] = 99;
-        Assert.True(RunTable(cache, plan, memory, out var second));
+        var residentBytes = 0;
+        Assert.True(RunTable(cache, plan, memory, out var second, bytes => residentBytes += bytes));
+        Assert.Equal(4 * sizeof(uint), residentBytes);
+        Assert.Equal([11u, 22, 33, 44], first.FlattenedResourceTable);
         Assert.Equal((0, 1, 1), (cache.Hits, cache.Misses, cache.TableRefreshes));
         Assert.Equal([11u, 22, 99, 44], second.FlattenedResourceTable);
         Assert.Same(first.Buffers, second.Buffers);
@@ -241,6 +245,55 @@ public sealed class ResourceMaterializationCacheTests
         memory.FailAddress = 0x1000 + 3 * 4;
         RunTable(cache, plan, memory, out _);
         Assert.Equal(0, cache.TableRefreshes);
+    }
+
+    [Fact]
+    public void AnUnavailableResidentTableIsReadOnlyOnceBeforeFullMaterialization()
+    {
+        var (plan, _, _) = Prepare(FlattenedReadReuseTests.RepeatedReadProgram(4), userDataCount: 9);
+        var memory = new TestWordMemory { Words = [11, 22, 33, 44] };
+        var cache = new ResourceMaterializationCache();
+        Assert.True(RunTable(cache, plan, memory, out _));
+        memory.Words[1] = 77;
+        var residentReads = 0;
+        var snapshot = new ResourceSnapshot();
+        var specialization = new ResourceSpecialization();
+        Assert.True(cache.Materialize(plan, Inputs(TableUserData, memory.Read, memory.Read), (_, _, _) =>
+        {
+            residentReads++;
+            return false;
+        }, ref snapshot, ref specialization, out _));
+        Assert.Equal(1, residentReads);
+        Assert.Equal([11u, 77, 33, 44], snapshot.FlattenedResourceTable);
+        Assert.Equal((0, 2, 0), (cache.Hits, cache.Misses, cache.TableRefreshes));
+    }
+
+    [Fact]
+    public void ATableChangedAfterValidationFallsBackWithoutPublishingStaleBytes()
+    {
+        var (plan, _, _) = Prepare(FlattenedReadReuseTests.RepeatedReadProgram(4), userDataCount: 9);
+        var memory = new TestWordMemory { Words = [11, 22, 33, 44] };
+        var cache = new ResourceMaterializationCache();
+        Assert.True(RunTable(cache, plan, memory, out var first));
+        memory.Words[1] = 77;
+        var snapshot = new ResourceSnapshot();
+        var specialization = new ResourceSpecialization();
+        Assert.True(cache.Materialize(plan, Inputs(TableUserData, memory.Read, memory.Read), (address, destination, _) =>
+        {
+            for (var offset = 0; offset < destination.Length; offset += sizeof(uint))
+            {
+                if (!memory.Read(address + (ulong)offset, out var word))
+                    return false;
+                BitConverter.TryWriteBytes(destination[offset..], word);
+            }
+            memory.Words[1] = 99;
+            return true;
+        }, ref snapshot, ref specialization, out _));
+        Assert.Equal([11u, 99, 33, 44], snapshot.FlattenedResourceTable);
+        Assert.Equal([11u, 22, 33, 44], first.FlattenedResourceTable);
+        Assert.Equal((0, 2, 0), (cache.Hits, cache.Misses, cache.TableRefreshes));
+        Assert.True(RunTable(cache, plan, memory, out var cached));
+        Assert.Same(snapshot, cached);
     }
 
     [Fact]
