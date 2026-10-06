@@ -48,6 +48,33 @@ public sealed class GuestBufferAsyncReadbackTests(HeadlessVulkanFixture fixture)
         harness.Shutdown();
     }
 
+    // Without a readback queue the main queue carries the download and the guest thread waits
+    // for that submission; the worker records the copies and moves on.
+    [Fact]
+    public void AGuestReadWithoutAReadbackQueueStillWaitsOffTheQueueThread()
+    {
+        if (_vulkan is null || !GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        using var fatal = new FatalScope();
+        Assert.Null(harness.Cache.AsyncReadback);
+        var address = harness.MapBacked(0x10000, ReadWrite);
+        GpuWrite(harness, address, 0x55667788);
+        Assert.True(harness.Cache.HasGpuDirtyBytes(address, 0x100));
+
+        Assert.True(harness.Cache.DownloadToCpu(address + 8, 4));
+
+        Assert.False(harness.Cache.HasGpuDirtyBytes(address, 0x100));
+        Assert.Equal((1L, 0L), (harness.Cache.PendingReadbacksApplied, harness.Cache.PendingReadbacksRetried));
+        Assert.Equal(0x55667788u, BitConverter.ToUInt32(harness.Read(address + 0xF0, 4)));
+
+        // A second write after the first read is picked up by the next read, not served stale.
+        GpuWrite(harness, address, 0x99AABBCCu);
+        Assert.True(harness.Cache.DownloadToCpu(address, 4));
+        Assert.Equal(0x99AABBCCu, BitConverter.ToUInt32(harness.Read(address + 0x40, 4)));
+        Assert.Equal((2L, 0L), (harness.Cache.PendingReadbacksApplied, harness.Cache.PendingReadbacksRetried));
+        harness.Shutdown();
+    }
+
     private static void GpuWrite(CacheHarness harness, ulong address, uint value) => harness.Worker.Run(() =>
     {
         var (buffer, offset) = harness.Cache.ObtainBuffer(address, 0x100, isWritten: true);

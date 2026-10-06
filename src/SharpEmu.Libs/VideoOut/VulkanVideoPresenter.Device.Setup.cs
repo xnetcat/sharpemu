@@ -684,6 +684,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             uint? compute = null;
+            uint? general = null;
             for (uint index = 0; index < count; index++)
             {
                 var flags = families[index].QueueFlags;
@@ -701,9 +702,16 @@ internal static unsafe partial class VulkanVideoPresenter
                 {
                     compute ??= index;
                 }
+
+                // MoltenVK exposes only general families, one queue each, every one its own
+                // Metal command queue: a second one still runs readbacks beside the main queue.
+                if ((flags & (QueueFlags.TransferBit | QueueFlags.GraphicsBit | QueueFlags.ComputeBit)) != 0)
+                {
+                    general ??= index;
+                }
             }
 
-            return compute;
+            return compute ?? general;
         }
 
         private bool _supportsFragmentShaderBarycentric;

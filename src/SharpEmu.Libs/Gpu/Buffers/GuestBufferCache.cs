@@ -896,24 +896,45 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                 $"unsupported buffer readback from an asynchronous GPU completion, addr=0x{guestAddress:X16} size=0x{size:X16}");
         }
 
-        if (!_relay.IsGpuQueueThread && AsyncReadback is { } readback && GuestReadsAwaitOffQueue)
+        if (!_relay.IsGpuQueueThread && GuestReadsAwaitOffQueue && (AsyncReadback is not null || MainQueuePendingReads))
         {
-            PendingDownload? pending = null;
-            if (_relay.TryRunOnGpuQueue(() => pending = BeginReadMemoryOnGpu(guestAddress, size, isWrite, source, allowPending: true)))
+            // A GPU write that lands after the copy was recorded makes the read stale. Retrying
+            // synchronously stalls the command worker until the GPU drains, so re-issue the read and
+            // wait here again; only the last attempt falls back to the synchronous read.
+            for (var attempt = 1; ; attempt++)
             {
+                PendingDownload? pending = null;
+                if (!_relay.TryRunOnGpuQueue(() => pending = BeginReadMemoryOnGpu(guestAddress, size, isWrite, source, allowPending: true)))
+                {
+                    return AwaitShutdown();
+                }
+
                 if (pending is null)
                 {
                     return true;
                 }
 
-                readback.Wait(pending.Ticket);
-                if (_relay.TryRunOnGpuQueue(() => CompleteReadMemoryOnGpu(pending, retrySynchronously: true)))
+                if (pending.Ticket is { } ticket)
+                {
+                    (AsyncReadback ?? throw SubmissionScheduler.Fatal("The pending readback lost its queue.")).Wait(ticket);
+                }
+                else
+                {
+                    _scheduler.WaitForSubmittedTick(pending.MainQueueTick);
+                }
+
+                var finalAttempt = attempt >= PendingReadAttempts;
+                var applied = false;
+                if (!_relay.TryRunOnGpuQueue(() => applied = CompleteReadMemoryOnGpu(pending, retrySynchronously: finalAttempt)))
+                {
+                    return AwaitShutdown();
+                }
+
+                if (applied || finalAttempt)
                 {
                     return true;
                 }
             }
-
-            return AwaitShutdown();
         }
 
         var onQueue = _relay.IsGpuQueueThread;
@@ -1144,9 +1165,14 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     public static string TakeAsyncReadbackReport() => FormattableString.Invariant(
         $"[PERF][ASYNC_READBACK] applied={Interlocked.Exchange(ref _reportedApplied, 0)} retried={Interlocked.Exchange(ref _reportedRetried, 0)} eager_started={Interlocked.Exchange(ref _reportedEagerStarted, 0)} eager_used={Interlocked.Exchange(ref _reportedEagerUsed, 0)} eager_stale={Interlocked.Exchange(ref _reportedEagerStale, 0)}");
 
+    // Ticket is set when the readback queue carries the download; otherwise the main queue
+    // does, into MainQueueBuffer, and MainQueueTick is the submission the guest thread waits for.
     private sealed record PendingDownload
     {
-        public required VulkanAsyncReadback.Ticket Ticket { get; init; }
+        public VulkanAsyncReadback.Ticket? Ticket { get; init; }
+        public ulong MainQueueTick { get; init; }
+        public GpuBuffer? MainQueueBuffer { get; init; }
+        public ulong[] MainQueueOffsets { get; init; } = [];
         public required List<DownloadPiece> Copies { get; init; }
         public required ulong[] WriteTicks { get; init; }
         public required ulong WindowBegin { get; init; }
@@ -1201,6 +1227,31 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             };
         }
 
+        if (copies.Count != 0 && allowPending &&
+            TryBeginDownloadOnMainQueue(copies, out var mainTick, out var mainBuffer, out var mainOffsets, out var mainWriteTicks))
+        {
+            foreach (var copy in copies)
+            {
+                copy.Buffer.RetainForeignRead();
+            }
+
+            return new PendingDownload
+            {
+                MainQueueTick = mainTick,
+                MainQueueBuffer = mainBuffer,
+                MainQueueOffsets = mainOffsets,
+                Copies = copies,
+                WriteTicks = mainWriteTicks,
+                WindowBegin = windowBegin,
+                WindowEnd = windowEnd,
+                GuestAddress = guestAddress,
+                Size = size,
+                IsWrite = isWrite,
+                Source = source,
+                Started = readbackStarted,
+            };
+        }
+
         if (copies.Count != 0)
         {
             DownloadBufferMemory(copies);
@@ -1216,9 +1267,70 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         return null;
     }
 
+    // Without a readback queue the main queue copies the pieces into a buffer of their own and
+    // submits at once; the guest thread then waits for that submission instead of the worker
+    // waiting for the whole GPU (a guest read of GPU-written memory otherwise idled the worker
+    // for tens of milliseconds, several times per frame in Silent Hill: The Short Message).
+    private bool TryBeginDownloadOnMainQueue(List<DownloadPiece> copies, out ulong tick, out GpuBuffer buffer, out ulong[] offsets, out ulong[] writeTicks)
+    {
+        tick = 0;
+        buffer = null!;
+        offsets = [];
+        writeTicks = [];
+        if (!MainQueuePendingReads || copies.Count == 0)
+        {
+            return false;
+        }
+
+        var ticks = new ulong[copies.Count];
+        var placements = new ulong[copies.Count];
+        var total = 0UL;
+        for (var index = 0; index < copies.Count; index++)
+        {
+            var written = copies[index].Buffer.LastGpuWriteTick;
+            if (written == 0)
+            {
+                return false;
+            }
+
+            ticks[index] = written;
+            placements[index] = total;
+            total += (copies[index].Size + BufferDownloadBatchPlanner.Alignment - 1) & ~(BufferDownloadBatchPlanner.Alignment - 1);
+        }
+
+        if (total > AsyncReadbackLimit)
+        {
+            return false;
+        }
+
+        buffer = new GpuBuffer(_device, _scheduler, GpuBufferUsage.Download, 0, BufferUsageFlags.TransferDstBit, total);
+        for (var index = 0; index < copies.Count; index++)
+        {
+            buffer.CopyFrom(
+                _scheduler.Current, copies[index].Buffer, copies[index].SourceOffset, placements[index], copies[index].Size,
+                AccessFlags.MemoryWriteBit, AccessFlags.None, AccessFlags.MemoryReadBit | AccessFlags.MemoryWriteBit, AccessFlags.HostReadBit);
+        }
+
+        tick = _scheduler.Flush();
+        offsets = placements;
+        writeTicks = ticks;
+        return true;
+    }
+
+    private static readonly bool MainQueuePendingReads =
+        Environment.GetEnvironmentVariable("SHARPEMU_MAIN_QUEUE_PENDING_READS") != "0";
+
+    // Pending reads a guest thread re-issues before it lets the worker read synchronously.
+    private const int PendingReadAttempts = 4;
+
     private bool CompleteReadMemoryOnGpu(PendingDownload pending, bool retrySynchronously)
     {
         using var readbackScope = GuestMemoryProfile.Measure(GuestMemoryProfile.Operation.BufferReadback);
+        if (pending.Ticket is null)
+        {
+            return CompleteMainQueueRead(pending, retrySynchronously);
+        }
+
         var readback = AsyncReadback ?? throw SubmissionScheduler.Fatal("The pending readback lost its queue.");
         try
         {
@@ -1262,6 +1374,58 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
         finally
         {
+            foreach (var copy in pending.Copies)
+            {
+                copy.Buffer.ReleaseForeignRead();
+            }
+        }
+    }
+
+    private bool CompleteMainQueueRead(PendingDownload pending, bool retrySynchronously)
+    {
+        var buffer = pending.MainQueueBuffer ?? throw SubmissionScheduler.Fatal("The pending readback lost its buffer.");
+        try
+        {
+            if (!IsPendingDownloadCurrent(pending))
+            {
+                if (retrySynchronously)
+                {
+                    PendingReadbacksRetried++;
+                    Interlocked.Increment(ref _reportedRetried);
+                    ReadMemoryOnGpu(pending.GuestAddress, pending.Size, pending.IsWrite, pending.Source);
+                }
+
+                return false;
+            }
+
+            PendingReadbacksApplied++;
+            Interlocked.Increment(ref _reportedApplied);
+            var copies = pending.Copies;
+            buffer.Invalidate(0, buffer.Size);
+            for (var index = 0; index < copies.Count; index++)
+            {
+                var bytes = buffer.Mapped.Slice((int)pending.MainQueueOffsets[index], (int)copies[index].Size);
+                if (!_backing.TryWriteBacking(copies[index].Address, bytes))
+                {
+                    throw SubmissionScheduler.Fatal($"Could not write the required direct backing: addr=0x{copies[index].Address:X16} size=0x{copies[index].Size:X16}");
+                }
+
+                _gpuModifiedRanges.Remove(copies[index].Address, copies[index].Size);
+            }
+
+            _tracker.ClearGpuDirtyPages(pending.WindowBegin, pending.WindowEnd - pending.WindowBegin);
+            if (pending.IsWrite)
+            {
+                _tracker.MarkCpuDirtyPages(pending.GuestAddress, pending.Size);
+            }
+
+            RecordReadback(pending.WindowBegin, pending.WindowEnd, pending.IsWrite, copies, pending.Started, pending.Source);
+            return true;
+        }
+        finally
+        {
+            // The guest thread waited for the submission, so the GPU is done with the buffer.
+            buffer.Dispose();
             foreach (var copy in pending.Copies)
             {
                 copy.Buffer.ReleaseForeignRead();
