@@ -340,6 +340,27 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
         // Registered buffers are ordered and disjoint: walk only the ones the write overlaps.
         var end = guestAddress + (ulong)data.Length;
+        if (DeferHostWrites)
+        {
+            // When no GPU-written byte shares the written pages, the pages can simply turn
+            // CPU-dirty: every later GPU reader synchronizes CPU-dirty pages first (bound buffers
+            // on obtain, device-address programs at the next visibility point), so the bytes
+            // arrive in command order without a staging copy that ends the rendering scope.
+            var firstPage = guestAddress & ~(TrackerLayout.PageBytes - 1);
+            var pagesEnd = (end + TrackerLayout.PageBytes - 1) & ~(TrackerLayout.PageBytes - 1);
+            if (!_gpuModifiedRanges.Overlaps(firstPage, pagesEnd - firstPage) &&
+                !_tracker.HasGpuDirtyPages(firstPage, pagesEnd - firstPage))
+            {
+                if (IsRegionRegistered(guestAddress, (ulong)data.Length))
+                {
+                    _tracker.MarkCpuDirtyPages(guestAddress, (ulong)data.Length);
+                    NoteMemoryVisibilityPoint();
+                }
+
+                return;
+            }
+        }
+
         for (var index = _registry.FindFirstOverlappingIndex(guestAddress);
              index < _registry.RegisteredCount && _registry.GetRegisteredAddress(index) < end;
              index++)
@@ -358,6 +379,9 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             TouchBuffer(bufferIdentifier);
         }
     }
+
+    private static readonly bool DeferHostWrites =
+        Environment.GetEnvironmentVariable("SHARPEMU_DEFER_HOST_WRITES") != "0";
 
     public void FillBuffer(ulong guestAddress, ulong size, uint value, bool isGds)
     {
@@ -661,13 +685,28 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                 _bdaTouchMapping = mapping;
             }
 
+            // Device-address programs may read any mapped page, so CPU writes are swept into the
+            // buffers - but only at memory visibility points (a submission slice starting, a wait
+            // packet satisfied). A CPU write after the submission began carries no ordering
+            // guarantee for its commands, and sweeping on every draw would end the render pass
+            // for every page the guest streams while the stream is being translated.
             var epoch = _tracker.CpuDirtyEpoch;
-            if (epoch != _bdaSweepEpoch || mapping != _bdaSweepMapping)
+            if (mapping != _bdaSweepMapping || (epoch != _bdaSweepEpoch && (_bdaVisibilityPending || SweepBdaOnEveryDraw)))
             {
-                foreach (var span in spans)
-                    _tracker.ForEachPossiblyCpuDirtyRange(span.Address, span.Size, _uploadDirtyBuffersInRange ??= UploadDirtyBuffersInRange);
+                BeginUploadBatch();
+                try
+                {
+                    foreach (var span in spans)
+                        _tracker.ForEachPossiblyCpuDirtyRange(span.Address, span.Size, _uploadDirtyBuffersInRange ??= UploadDirtyBuffersInRange);
+                }
+                finally
+                {
+                    EndUploadBatch();
+                }
+
                 _bdaSweepEpoch = epoch;
                 _bdaSweepMapping = mapping;
+                _bdaVisibilityPending = false;
             }
         }
 
@@ -678,6 +717,15 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     }
 
     private Action<ulong, ulong>? _uploadDirtyBuffersInRange;
+
+    private static readonly bool PreserveHotPagesInSweeps =
+        Environment.GetEnvironmentVariable("SHARPEMU_BDA_SWEEP_REPROTECT_HOT") != "1";
+    private bool _bdaVisibilityPending = true;
+
+    private static readonly bool SweepBdaOnEveryDraw =
+        Environment.GetEnvironmentVariable("SHARPEMU_BDA_SWEEP_EVERY_DRAW") == "1";
+
+    public void NoteMemoryVisibilityPoint() => _bdaVisibilityPending = true;
     private long _bdaSweepEpoch = -1;
     private ulong _bdaSweepMapping;
 
@@ -699,8 +747,10 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             var buffer = _registry.GetBuffer(_registry.GetRegisteredIdentifier(index));
             var start = Math.Max(buffer.CpuAddress, guestAddress);
             var finish = Math.Min(buffer.CpuAddress + buffer.Size, end);
+            // Hot pages stay writable and are copied again on the next sweep: a few hundred KiB of
+            // ring memory per sweep costs far less than a protection fault per page per frame.
             if (start < finish && _tracker.MayHaveCpuDirtyPages(start, finish - start))
-                _ = SynchronizeBuffer(buffer, start, finish - start, false, false, preserveCpuWriteHotPages: false);
+                _ = SynchronizeBuffer(buffer, start, finish - start, false, false, preserveCpuWriteHotPages: PreserveHotPagesInSweeps);
         }
     }
 
@@ -726,7 +776,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                 // SynchronizeBuffer takes for this read-only call), and the block summary
                 // answers that without a lock for the common all-clean case.
                 if (_tracker.HasCpuDirtyPages(start, finish - start))
-                    _ = SynchronizeBuffer(buffer, start, finish - start, false, false, preserveCpuWriteHotPages: false);
+                    _ = SynchronizeBuffer(buffer, start, finish - start, false, false, preserveCpuWriteHotPages: PreserveHotPagesInSweeps);
             }
         }
     }
@@ -1898,6 +1948,17 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             command.EndRendering();
             var native = new CommandBuffer(command.Handle);
             var vk = _device.Vk;
+            if (_uploadBatchActive)
+            {
+                OpenUploadBatch(native);
+                var batched = CollectionsMarshal.AsSpan(copies);
+                fixed (BufferCopy* pointer = batched)
+                {
+                    vk.CmdCopyBuffer(native, source.Handle, buffer.Handle, (uint)batched.Length, pointer);
+                }
+            }
+            else
+            {
             var before = new BufferMemoryBarrier2
             {
                 SType = StructureType.BufferMemoryBarrier2,
@@ -1924,6 +1985,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             VulkanSynchronization.PipelineBarrier(vk,
                 native, PipelineStageFlags.TransferBit, PipelineStageFlags.AllCommandsBit, DependencyFlags.ByRegionBit,
                 0, null, 1, &after, 0, null);
+            }
         }
 
         if (BufferUploadProfile.Enabled)
@@ -1947,6 +2009,59 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
 
         return false;
+    }
+
+    // A sweep uploads many buffers back to back: one global barrier before the first copy and one
+    // after the last replace a barrier pair per buffer, so the copies share one transfer pass.
+    private bool _uploadBatchActive;
+    private ulong _uploadBatchCommand;
+
+    private void BeginUploadBatch()
+    {
+        _uploadBatchActive = true;
+        _uploadBatchCommand = 0;
+    }
+
+    private void OpenUploadBatch(CommandBuffer native)
+    {
+        if (_uploadBatchCommand == (ulong)native.Handle)
+        {
+            return;
+        }
+
+        // A new command buffer (or the first copy) orders the copies after all earlier work.
+        var barrier = new MemoryBarrier2
+        {
+            SType = StructureType.MemoryBarrier2,
+            SrcAccessMask = AccessFlags2.MemoryReadBit | AccessFlags2.MemoryWriteBit,
+            DstAccessMask = AccessFlags2.TransferWriteBit,
+        };
+        VulkanSynchronization.PipelineBarrier(_device.Vk,
+            native, PipelineStageFlags.AllCommandsBit, PipelineStageFlags.TransferBit, 0, 1, &barrier, 0, null, 0, null);
+        _uploadBatchCommand = (ulong)native.Handle;
+    }
+
+    private void EndUploadBatch()
+    {
+        _uploadBatchActive = false;
+        if (_uploadBatchCommand == 0)
+        {
+            return;
+        }
+
+        // Recorded on the current command buffer; submission order covers copies recorded on an
+        // earlier one.
+        var command = _scheduler.Current;
+        command.EndRendering();
+        var barrier = new MemoryBarrier2
+        {
+            SType = StructureType.MemoryBarrier2,
+            SrcAccessMask = AccessFlags2.TransferWriteBit,
+            DstAccessMask = AccessFlags2.MemoryReadBit | AccessFlags2.MemoryWriteBit,
+        };
+        VulkanSynchronization.PipelineBarrier(_device.Vk,
+            new CommandBuffer(command.Handle), PipelineStageFlags.TransferBit, PipelineStageFlags.AllCommandsBit, 0, 1, &barrier, 0, null, 0, null);
+        _uploadBatchCommand = 0;
     }
 
     private GpuBuffer? FindOwner(ulong guestAddress, ulong size)
