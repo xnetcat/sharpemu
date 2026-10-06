@@ -122,6 +122,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var resolution = ImageRequestBuilders.Texture(words, ShapeOf(image));
             _ = BeginBatchedGuestCommands();
             var request = resolution.Request;
+            request.ShaderWrite = storage && (image.Written || image.Atomic);
             var imageIdentifier = _imageCache.FindImage(ref request, resolution.ExactFormat);
             resolution = resolution with { Request = request };
             imageIdentifier = ImageRequestBuilders.ValidateTextureOwner(_imageCache, imageIdentifier, resolution);
@@ -293,6 +294,22 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             stage.WriteDispatchThreadLimits(shaderData);
+            if (layout.UsesRenderScale)
+            {
+                ulong scaledImages = 0;
+                var scaledCount = Math.Min(info.Images.Count, 64);
+                for (var index = 0; index < scaledCount; index++)
+                {
+                    var identifier = descriptors.Images[index].ImageIdentifier;
+                    if (identifier.IsValid && _imageCache.GetImage(identifier).IsScaled)
+                    {
+                        scaledImages |= 1UL << index;
+                    }
+                }
+
+                stage.WriteRenderScale(shaderData, scaledImages, RenderScalePolicy.Scale);
+            }
+
             prepared.ShaderData = shaderData;
             if (layout.Find(DescriptorBindingKind.GlobalDataShare) is not null)
             {
