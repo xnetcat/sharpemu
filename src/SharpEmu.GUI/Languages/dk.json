@@ -219,6 +219,8 @@
   "Options.WindowMode.Exclusive": "Eksklusiv",
   "Options.Resolution.Label": "Opløsning",
   "Options.Resolution.Desc": "Oprindelig vinduesstørrelse eller opløsning i eksklusiv fuldskærm.",
+  "Options.GuestResolution.Label": "Spillets skærmtilstand",
+  "Options.GuestResolution.Desc": "Skærmopløsning oplyst til spillet. Standard er 1080p. Spillet vælger den interne renderopløsning; spil med fast opløsning kan ignorere denne indstilling.",
   "Options.Display.Label": "Skærm",
   "Options.Display.Desc": "Skærm, der bruges til centrering og fuldskærm.",
   "Options.RefreshRate.Label": "Opdateringshastighed",

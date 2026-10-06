@@ -856,6 +856,14 @@ SPDX-License-Identifier: GPL-2.0-or-later
                                     VerticalAlignment="Center" />
                         </local:SettingRow>
 
+                        <local:SettingRow x:Name="GameGuestResolutionRow"
+                                          Classes="optionRow"
+                                          Label="{Binding [Options.GuestResolution.Label], Source={x:Static local:Localization.Instance}}"
+                                          Description="{Binding [Options.GuestResolution.Desc], Source={x:Static local:Localization.Instance}}">
+                          <ComboBox x:Name="GameGuestResolutionBox"
+                                    Classes="optionValue"
+                                    VerticalAlignment="Center" />
+                        </local:SettingRow>
                         <local:SettingRow x:Name="GameDisplayRow"
                                           Classes="optionRow"
                                           Label="{Binding [Options.Display.Label],
@@ -1489,6 +1497,12 @@ SPDX-License-Identifier: GPL-2.0-or-later
                         <ComboBox x:Name="ResolutionBox"
                                   Classes="optionValue"
                                   VerticalAlignment="Center" />
+                      </local:SettingRow>
+                      <local:SettingRow x:Name="GuestResolutionRow"
+                                        Classes="optionRow"
+                                        Label="{Binding [Options.GuestResolution.Label], Source={x:Static local:Localization.Instance}}"
+                                        Description="{Binding [Options.GuestResolution.Desc], Source={x:Static local:Localization.Instance}}">
+                        <ComboBox x:Name="GuestResolutionBox" Classes="optionValue" VerticalAlignment="Center" />
                       </local:SettingRow>
                       <local:SettingRow x:Name="DisplayRow"
                                         Classes="optionRow"

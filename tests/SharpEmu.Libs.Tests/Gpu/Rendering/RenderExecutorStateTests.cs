@@ -323,6 +323,25 @@ public sealed class RenderExecutorStateTests : IDisposable
     }
 
     [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Attachments_DisabledColorBufferIgnoresStaleTargetsAndPreservesDepthEffects(bool exportsDepth)
+    {
+        var banks = Banks(withDepth: true);
+        banks.Context.ColorControl = ColorControlRegisters.Decode(0);
+        banks.Context.ColorTargets[0] = RegisterWords.Color(ColorBase, 32, 32);
+        banks.Context.ShaderInterface.DepthShaderControl = new DepthShaderControlRegisters { DepthExportEnable = exportsDepth };
+
+        _executor.DrawIndexed(1, banks, Indexed(3));
+
+        var rendering = Assert.Single(_host.BegunRenderings);
+        Assert.Equal((0u, 64u, 64u), (rendering.ColorAttachmentCount, rendering.Width, rendering.Height));
+        Assert.Equal(Format.D32Sfloat, rendering.DepthFormat);
+        Assert.Equal(exportsDepth, Assert.Single(_pipelines.PipelineRequests).PixelActive);
+        Assert.True(Assert.Single(_host.DynamicStates).DepthWriteEnabled);
+    }
+
+    [Theory]
     [InlineData(0x0u, 0u, 64u)]
     [InlineData(0xFu, 1u, 32u)]
     public void Attachments_AColorTargetThePixelProgramNeverExportsDoesNotBoundTheDepthPass(uint exportMasks, uint expectedColors, uint expectedExtent)

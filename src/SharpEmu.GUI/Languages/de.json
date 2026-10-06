@@ -219,6 +219,8 @@
   "Options.WindowMode.Exclusive": "Exklusiv",
   "Options.Resolution.Label": "Auflösung",
   "Options.Resolution.Desc": "Anfängliche Fenstergröße oder exklusive Vollbildauflösung.",
+  "Options.GuestResolution.Label": "Anzeigemodus des Spiels",
+  "Options.GuestResolution.Desc": "Dem Spiel gemeldete Bildschirmauflösung. Standard ist 1080p. Spiele wählen ihre interne Renderauflösung selbst; Spiele mit fester Auflösung können diese Einstellung ignorieren.",
   "Options.Display.Label": "Anzeige",
   "Options.Display.Desc": "Monitor für Zentrierung und Vollbilddarstellung.",
   "Options.RefreshRate.Label": "Bildwiederholrate",

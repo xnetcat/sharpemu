@@ -1778,8 +1778,11 @@ public static partial class Gen5SpirvTranslator
         }
 
         // Reads one V_FMA_MIX source as an f32. op_sel_hi selects whether a
-        // register operand is taken as an f16 (the half picked by op_sel, widened
-        // exactly to f32) or as a full f32; inline constants are always f32. The
+        // register or literal operand is taken as an f16 (the half picked by op_sel,
+        // widened exactly to f32) or as a full f32; inline constants keep their value
+        // either way. A literal is an f16 bit pattern then: reading 0x34CD as an f32
+        // made Silent Hill's luminance weights denormal zeros, and the lighting that
+        // divides by that luminance came out thousands of times too bright. The
         // per-operand neg_hi bit takes the absolute value and neg negates, in that
         // order (abs-then-neg), reusing the VOP3P modifier fields the way the mix
         // ops define them rather than the packed low/high-lane meaning.
@@ -1791,7 +1794,7 @@ public static partial class Gen5SpirvTranslator
             var source = instruction.Sources[index];
             var readAsHalf =
                 ((control.OpSelHiMask >> index) & 1) != 0 &&
-                source.Kind is Gen5OperandKind.VectorRegister or Gen5OperandKind.ScalarRegister;
+                source.Kind is Gen5OperandKind.VectorRegister or Gen5OperandKind.ScalarRegister or Gen5OperandKind.LiteralConstant;
 
             uint value;
             if (readAsHalf)
@@ -3924,7 +3927,7 @@ public static partial class Gen5SpirvTranslator
             {
                 targetLane = BitwiseAnd(targetLane, UInt(31));
             }
-            var shuffled = ShuffleLane(value, targetLane);
+            var shuffled = ShuffleHalfWaveLane(value, targetLane);
             if (control.FetchInactive)
             {
                 return shuffled;
@@ -3937,7 +3940,7 @@ public static partial class Gen5SpirvTranslator
                 UInt(1),
                 UInt(0));
             var sourceActive = IsNotZero(
-                ShuffleLane(activeWord, targetLane));
+                ShuffleHalfWaveLane(activeWord, targetLane));
             return _module.AddInstruction(
                 SpirvOp.Select,
                 _uintType,
@@ -3960,7 +3963,7 @@ public static partial class Gen5SpirvTranslator
             // operations are limited to a single half-wave for some encodings, so we 
             // must not clamp wave64 lanes to 31; use the full lane mask instead.
             safeTarget = BitwiseAnd(safeTarget, UInt(_waveLaneCount == 64 ? 63u : 31u));
-            var shuffled = ShuffleLane(value, safeTarget);
+            var shuffled = ShuffleHalfWaveLane(value, safeTarget);
 
             var sourceAvailable = inRange;
             if (!control.FetchInactive)
@@ -3971,7 +3974,7 @@ public static partial class Gen5SpirvTranslator
                     Load(_boolType, _exec),
                     UInt(1),
                     UInt(0));
-                var shuffledActive = ShuffleLane(activeWord, safeTarget);
+                var shuffledActive = ShuffleHalfWaveLane(activeWord, safeTarget);
                 sourceAvailable = _module.AddInstruction(
                     SpirvOp.LogicalAnd,
                     _boolType,
@@ -5086,11 +5089,9 @@ public static partial class Gen5SpirvTranslator
             }
 
             var targetLane = IAdd(rowBase, selector);
-            // Mask to guest wave size — on Radeon hardware DPP is limited to a 
-            // single half-wave for some encodings, but we must not clamp wave64 
-            // lanes to 31; use the full lane mask instead.
+            // Select a guest lane first; ShuffleHalfWaveLane maps it to the host subgroup.
             targetLane = BitwiseAnd(targetLane, UInt(_waveLaneCount == 64 ? 63u : 31u));
-            var shuffled = ShuffleLane(value, targetLane);
+            var shuffled = ShuffleHalfWaveLane(value, targetLane);
             var fetchInactive = (control.OperandSelect & 1) != 0;
             if (fetchInactive)
             {
@@ -5104,7 +5105,7 @@ public static partial class Gen5SpirvTranslator
                 UInt(1),
                 UInt(0));
             var sourceActive = IsNotZero(
-                ShuffleLane(activeWord, targetLane));
+                ShuffleHalfWaveLane(activeWord, targetLane));
             return _module.AddInstruction(
                 SpirvOp.Select,
                 _uintType,
@@ -5199,12 +5200,33 @@ public static partial class Gen5SpirvTranslator
             return Bitcast(_uintType, value);
         }
 
+        // Rounds an f32 toward zero onto an f16 value, so packHalf2x16 then encodes it exactly
+        // (V_CVT_PKRTZ_F16_F32). Toward zero, a finite value beyond the f16 range becomes
+        // +-65504, never infinity: Silent Hill's deferred lighting packs values past 65504 and
+        // its fog pass then scales them down, while an infinity stays infinite, turns into NaN
+        // and blacks out the whole title-menu scene. Subnormal results keep whole 2^-24 steps.
         private uint TruncateFloat32ForPack(uint value)
         {
-            var raw = BitwiseAnd(
-                Bitcast(_uintType, value),
-                UInt(0xFFFF_E000));
-            return Bitcast(_floatType, raw);
+            var normal = Bitcast(
+                _floatType,
+                BitwiseAnd(Bitcast(_uintType, Ext(43, _floatType, value, Float(-65504f), Float(65504f))), UInt(0xFFFF_E000)));
+            var subnormal = _module.AddInstruction(
+                SpirvOp.FMul,
+                _floatType,
+                Ext(3, _floatType, _module.AddInstruction(SpirvOp.FMul, _floatType, value, Float(16777216f))),
+                Float(1f / 16777216f));
+            var isSubnormal = _module.AddInstruction(
+                SpirvOp.FOrdLessThan,
+                _boolType,
+                Ext(4, _floatType, value),
+                Float(6.10351562e-05f));
+            var finite = _module.AddInstruction(SpirvOp.Select, _floatType, isSubnormal, subnormal, normal);
+            var special = _module.AddInstruction(
+                SpirvOp.LogicalOr,
+                _boolType,
+                _module.AddInstruction(SpirvOp.IsNan, _boolType, value),
+                _module.AddInstruction(SpirvOp.IsInf, _boolType, value));
+            return _module.AddInstruction(SpirvOp.Select, _floatType, special, value, finite);
         }
 
         private uint Ext(uint operation, uint resultType, params uint[] operands)

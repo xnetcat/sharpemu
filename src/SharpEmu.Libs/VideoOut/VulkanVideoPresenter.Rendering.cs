@@ -585,8 +585,13 @@ internal static unsafe partial class VulkanVideoPresenter
                 var view = binding.Request.View;
                 for (var layer = view.BaseLayer; layer < view.BaseLayer + view.LayerCount; layer++)
                 {
-                    var tracked = _imageCache.IsMetadataCleared(metadataAddress, layer, out var metadataValue) && (byte)metadataValue == DccClearToZero;
+                    // Every fixed clear code carries its own colour; only the register code (0x20) needs
+                    // the CB clear word, which is known when the surface binds as a target. Silent Hill
+                    // fast-clears UE's separate-translucency target to (0,0,0,1) and only samples it:
+                    // skipping that clear left stale zeros that blacked out the whole title-menu scene.
                     var clearValue = default(ClearColorValue);
+                    var tracked = _imageCache.IsMetadataCleared(metadataAddress, layer, out var metadataValue) &&
+                        TryDecodeDccClear((byte)metadataValue, false, (byte)metadataValue == DccClearToZero || fixedClearSupported, default, out clearValue);
                     ulong guestSlice = 0;
                     if (!tracked &&
                         (sliceSize == 0 || !_imageCache.TryReadGuestDccClear(metadataAddress, sliceSize, layer, out guestSlice, out var code) ||
@@ -864,6 +869,7 @@ internal static unsafe partial class VulkanVideoPresenter
             _renderingScopesBegun++;
             _renderingActive = true;
             _renderingState = state;
+            BeginOcclusionSegment(command);
         }
 
         public void EndRendering()
@@ -876,6 +882,7 @@ internal static unsafe partial class VulkanVideoPresenter
             _renderingActive = false;
             _renderingState = default;
             var command = new CommandBuffer(_scheduler.Current.Handle);
+            EndOcclusionSegment(command);
             _vk.CmdEndRendering(command);
             foreach (var (sourceStages, destinationStages, barriers) in _barriersAfterRendering)
             {
@@ -888,6 +895,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             _barriersAfterRendering.Clear();
+            PublishOcclusionResults(command);
             if (_globalBarrierAfterRendering)
             {
                 _globalBarrierAfterRendering = false;

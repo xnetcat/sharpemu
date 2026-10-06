@@ -219,6 +219,8 @@
   "Options.WindowMode.Exclusive": "排他",
   "Options.Resolution.Label": "解像度",
   "Options.Resolution.Desc": "初期ウィンドウサイズまたは排他フルスクリーンの解像度。",
+  "Options.GuestResolution.Label": "ゲームの表示モード",
+  "Options.GuestResolution.Desc": "ゲームに通知する画面解像度。既定値は1080pです。内部描画解像度はゲームが決定するため、解像度が固定されたゲームではこの設定が反映されない場合があります。",
   "Options.Display.Label": "ディスプレイ",
   "Options.Display.Desc": "中央配置とフルスクリーンに使用するモニター。",
   "Options.RefreshRate.Label": "リフレッシュレート",

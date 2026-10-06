@@ -18,6 +18,7 @@ public sealed class HostVideoOptionsTests
             DisplayIndex = -2,
             RefreshRate = 5000,
             HdrMode = (HostHdrMode)99,
+            GuestResolution = (GuestDisplayResolution)99,
         }.Normalize();
 
         Assert.Equal(640, options.Width);
@@ -25,5 +26,18 @@ public sealed class HostVideoOptionsTests
         Assert.Equal(0, options.DisplayIndex);
         Assert.Equal(1000, options.RefreshRate);
         Assert.Equal(HostHdrMode.Auto, options.HdrMode);
+        Assert.Equal(GuestDisplayResolution.Hd, options.GuestResolution);
+    }
+    [Theory]
+    [InlineData(1920, 1080, GuestDisplayResolution.UltraHd)]
+    [InlineData(3840, 2160, GuestDisplayResolution.Hd)]
+    public void GuestModeIsIndependentOfWindowSize(int width, int height, GuestDisplayResolution mode)
+    {
+        var options = new HostVideoOptions { Width = width, Height = height, GuestResolution = mode }.Normalize();
+        Assert.Equal(mode, options.GuestResolution);
+        Assert.Equal(GuestDisplayResolution.Hd, HostVideoOptions.Default.GuestResolution);
+        Span<byte> status = stackalloc byte[0x30];
+        VideoOutExports.WriteOutputStatus(status, options.GuestResolution, 60, false);
+        Assert.Equal((int)mode, System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(status));
     }
 }

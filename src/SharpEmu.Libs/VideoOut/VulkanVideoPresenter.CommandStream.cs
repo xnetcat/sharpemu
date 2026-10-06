@@ -287,6 +287,7 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             using var relayScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.QueueRelay);
             _relay.RunPendingCommands();
+            DrainOcclusionWrites();
         }
 
         public void BeginSubmission(int queueId, ulong submissionId, object? geometrySnapshots)

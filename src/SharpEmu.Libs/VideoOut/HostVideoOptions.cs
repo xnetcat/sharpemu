@@ -21,6 +21,13 @@ public enum HostScalingMode
     Integer,
 }
 
+// The display mode exposed to the guest, independent of host window and guest buffer sizes.
+public enum GuestDisplayResolution
+{
+    Hd = 1,
+    UltraHd = 2,
+}
+
 public enum HostHdrMode
 {
     Auto,
@@ -55,6 +62,8 @@ public sealed record HostVideoOptions
 
     public int Height { get; init; } = 1080;
 
+    public GuestDisplayResolution GuestResolution { get; init; } = GuestDisplayResolution.Hd;
+
     public int DisplayIndex { get; init; }
 
     public int RefreshRate { get; init; }
@@ -82,6 +91,7 @@ public sealed record HostVideoOptions
     {
         Width = Math.Clamp(Width, 640, 16384),
         Height = Math.Clamp(Height, 360, 16384),
+        GuestResolution = Enum.IsDefined(GuestResolution) ? GuestResolution : GuestDisplayResolution.Hd,
         DisplayIndex = Math.Max(0, DisplayIndex),
         RefreshRate = Math.Clamp(RefreshRate, 0, 1000),
         HdrMode = Enum.IsDefined(HdrMode) ? HdrMode : HostHdrMode.Auto,

@@ -325,12 +325,30 @@ public sealed class GpuCommandInterpreterLabelTests
         Assert.Contains("event type is unknown", runner.RunExpectingFatal(StreamRunner.Packet(PacketOpcode.EventWrite, 0x3F)).Message);
 
         runner.Run(StreamRunner.Packet(PacketOpcode.EventWrite, 0x39 | (1u << 8), StreamRunner.Low(Label), StreamRunner.High(Label)));
+        // CPU-only stores leave GPU query-reduction inputs stale. Require the
+        // host transfer path for both words of every counter, including ready.
+        Assert.Equal(32, runner.Host.Calls.Count);
+        Assert.All(runner.Host.Calls, call => Assert.StartsWith("fill ", call));
         Assert.Equal(1UL << 63, runner.Host.ReadQword(Label));
         Assert.Equal(1UL << 63, runner.Host.ReadQword(Label + 15 * 16));
         Assert.Equal(0UL, runner.Host.ReadQword(Label + 8));
 
         runner.Run(StreamRunner.Packet(PacketOpcode.EventWrite, 0x39 | (1u << 8), StreamRunner.Low(Label), StreamRunner.High(Label)));
-        Assert.Equal((1UL << 63) | 1, runner.Host.ReadQword(Label));
+        Assert.Equal((1UL << 63) | 0x2FFFFFFUL, runner.Host.ReadQword(Label));
+    }
+
+    [Fact]
+    public void EventWrite_OcclusionDumpUsesHostSampleCountsWhenAvailable()
+    {
+        var runner = new StreamRunner();
+        runner.Host.OcclusionDumps = new List<ulong>();
+
+        runner.Run(StreamRunner.Packet(PacketOpcode.EventWrite, 0x39 | (1u << 8), StreamRunner.Low(Label), StreamRunner.High(Label)));
+        runner.Run(StreamRunner.Packet(PacketOpcode.EventWrite, 0x39 | (1u << 8), StreamRunner.Low(Label + 8), StreamRunner.High(Label + 8)));
+
+        Assert.Equal(new[] { Label, Label + 8 }, runner.Host.OcclusionDumps);
+        Assert.Empty(runner.Host.Calls);
+        Assert.Equal(0UL, runner.Host.ReadQword(Label));
     }
 
     [Fact]

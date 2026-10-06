@@ -70,6 +70,11 @@ public sealed class GuiSettings
 
     public string Resolution { get; set; } = "1920x1080";
 
+    public string GuestResolution { get; set; } = "1920x1080";
+
+    internal static string NormalizeGuestResolution(string? value) =>
+        string.Equals(value, "3840x2160", StringComparison.OrdinalIgnoreCase) ? "3840x2160" : "1920x1080";
+
     public int DisplayIndex { get; set; }
 
     public int RefreshRate { get; set; }
@@ -88,9 +93,6 @@ public sealed class GuiSettings
     public List<string> EnvironmentToggles { get; set; } = ["SHARPEMU_WRITABLE_APP0", "SHARPEMU_DISABLE_IMPORT_LOOP_GUARD"];
 
     public string BinkPlaybackMode { get; set; } = "Guest";
-
-    /// <summary>Internal render resolution scale (1.0 = native, 0.5 = half).</summary>
-    public double RenderResolutionScale { get; set; } = 1.0;
 
     /// <summary>
     /// Discord application ID used for Rich Presence; the default is the
@@ -184,6 +186,7 @@ public sealed class GuiSettings
             "Ukrainian");
         settings.WindowMode = NormalizeChoice(settings.WindowMode, "Windowed", "Borderless", "Exclusive");
         settings.Resolution = NormalizeResolution(settings.Resolution);
+        settings.GuestResolution = NormalizeGuestResolution(settings.GuestResolution);
         settings.ScalingMode = NormalizeChoice(settings.ScalingMode, "Fit", "Cover", "Stretch", "Integer");
         settings.HdrMode = NormalizeChoice(settings.HdrMode, "Auto", "On", "Off");
         settings.BinkPlaybackMode = NormalizeChoice(settings.BinkPlaybackMode, "Guest", "Host", "Skip");

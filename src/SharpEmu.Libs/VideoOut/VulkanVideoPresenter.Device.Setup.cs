@@ -763,7 +763,9 @@ internal static unsafe partial class VulkanVideoPresenter
                 DepthBiasClamp = supportedFeatures.DepthBiasClamp,
                 SampleRateShading = supportedFeatures.SampleRateShading,
                 SamplerAnisotropy = supportedFeatures.SamplerAnisotropy,
+                OcclusionQueryPrecise = supportedFeatures.OcclusionQueryPrecise,
             };
+            _supportsPreciseOcclusion = supportedFeatures.OcclusionQueryPrecise;
 
             if (!supportedFeatures.SampleRateShading)
             {
@@ -919,13 +921,19 @@ internal static unsafe partial class VulkanVideoPresenter
                 SType = StructureType.PhysicalDeviceShaderAtomicInt64Features,
                 PNext = &addressFeatures,
             };
+            var hostQueryResetFeatures = new PhysicalDeviceHostQueryResetFeatures
+            {
+                SType = StructureType.PhysicalDeviceHostQueryResetFeatures,
+                PNext = &atomicInt64Features,
+            };
             var featuresQuery = new PhysicalDeviceFeatures2
             {
                 SType = StructureType.PhysicalDeviceFeatures2,
-                PNext = &atomicInt64Features,
+                PNext = &hostQueryResetFeatures,
             };
             _vk.GetPhysicalDeviceFeatures2(_physicalDevice, &featuresQuery);
             var supportsTimelineSemaphore = timelineSemaphoreFeatures.TimelineSemaphore;
+            _supportsHostQueryReset = hostQueryResetFeatures.HostQueryReset;
             var supportsBufferDeviceAddress = addressFeatures.BufferDeviceAddress;
             var supportsSharedInt64Atomics = atomicInt64Features.ShaderSharedInt64Atomics;
             var supportsMaintenance8 = maintenance8Features.Maintenance8;
@@ -1072,6 +1080,16 @@ internal static unsafe partial class VulkanVideoPresenter
                     PNext = &timelineSemaphoreFeatures,
                 };
                 void* renderingChain = &addressFeatures;
+                if (_supportsHostQueryReset)
+                {
+                    hostQueryResetFeatures = new PhysicalDeviceHostQueryResetFeatures
+                    {
+                        SType = StructureType.PhysicalDeviceHostQueryResetFeatures,
+                        HostQueryReset = true,
+                        PNext = renderingChain,
+                    };
+                    renderingChain = &hostQueryResetFeatures;
+                }
                 if (supportsSharedInt64Atomics)
                 {
                     atomicInt64Features = new PhysicalDeviceShaderAtomicInt64Features

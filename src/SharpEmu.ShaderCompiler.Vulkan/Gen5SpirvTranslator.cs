@@ -1453,9 +1453,11 @@ public static partial class Gen5SpirvTranslator
             var block = blocks[blockIndex];
             var halfMaskPlan = HalfMaskPlan();
             // One guest wave can span two host subgroups. Keep its shared-memory phases ordered.
-            // The half-mask plan inserts its own barriers; other wave64 programs also
-            // need LDS phase ordering when reads and writes span basic blocks.
-            var synchronizeSharedMemory = _emulateWave64 && halfMaskPlan is null;
+            // The half-mask plan's barriers only order its own mask exchanges, not the program's
+            // LDS traffic: with phase ordering off under the plan, UE's FFT bloom (wave64, 512
+            // threads, LDS butterflies) read half-written rows and blurred Silent Hill's whole
+            // post chain into a flat haze.
+            var synchronizeSharedMemory = _emulateWave64;
             var sharedMemoryPhase = SharedMemoryPhase.None;
             for (var index = block.StartIndex; index < block.EndIndex; index++)
             {
@@ -8004,6 +8006,15 @@ public static partial class Gen5SpirvTranslator
             _subgroupInvocationIdInput == 0
                 ? value
                 : _module.AddInstruction(SpirvOp.GroupNonUniformShuffle, _uintType, UInt(3), value, lane);
+
+        // DPP row/quad operations and PERMLANE16 never cross a 32-lane half-wave.
+        // Guest lanes 32..63 belong to the second host subgroup on 32-lane devices;
+        // using those guest indices directly in OpGroupNonUniformShuffle is undefined.
+        // Preserve the current physical half on devices whose subgroup is wider than 32.
+        private uint ShuffleHalfWaveLane(uint value, uint guestLane) =>
+            _subgroupInvocationIdInput == 0 ? value : ShuffleLane(value,
+                BitwiseOr(BitwiseAnd(Load(_uintType, _subgroupInvocationIdInput), UInt(0xFFFF_FFE0)),
+                    BitwiseAnd(guestLane, UInt(31))));
 
         private uint CurrentLaneBit()
         {

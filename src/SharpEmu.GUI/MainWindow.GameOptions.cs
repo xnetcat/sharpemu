@@ -45,6 +45,7 @@ public partial class MainWindow
         GameLogLevelBox.ItemsSource = _logLevelChoices;
         GameWindowModeBox.ItemsSource = _windowModeChoices;
         GameScalingModeBox.ItemsSource = _scalingModeChoices;
+        GameGuestResolutionBox.ItemsSource = new[] { "1920x1080", "3840x2160" };
         GameHdrModeBox.ItemsSource = _hdrModeChoices;
         GameOverlayModeBox.ItemsSource = _overlayModeChoices;
         GameOverlayCornerBox.ItemsSource = _overlayCornerChoices;
@@ -115,6 +116,7 @@ public partial class MainWindow
         GameRefreshRateBox.SelectionChanged += (_, _) => PersistOpenGameSettings();
         GameScalingModeBox.SelectionChanged += (_, _) => PersistOpenGameSettings();
         GameVSyncToggle.IsCheckedChanged += (_, _) => PersistOpenGameSettings();
+        GameGuestResolutionBox.SelectionChanged += (_, _) => PersistOpenGameSettings();
         GameHdrModeBox.SelectionChanged += (_, _) => PersistOpenGameSettings();
         GameOverlayEnabledToggle.IsCheckedChanged += (_, _) => PersistOpenGameSettings();
         GameOverlayModeBox.SelectionChanged += (_, _) => PersistOpenGameSettings();
@@ -216,6 +218,7 @@ public partial class MainWindow
                 _scalingModeChoices,
                 effective.ScalingMode,
                 "Fit");
+            GameGuestResolutionBox.SelectedItem = effective.GuestResolution;
             GameVSyncToggle.IsChecked = effective.VSync;
             GameOverlayEnabledToggle.IsChecked = effective.OverlayEnabled;
             GameOverlayModeBox.SelectedItem = FindChoice(_overlayModeChoices, effective.OverlayMode, "TitleBar");
@@ -277,6 +280,7 @@ public partial class MainWindow
             LogToFile = GameLogToFileToggle.IsChecked == true,
             WindowMode = SelectedComboText(GameWindowModeBox, "Windowed"),
             Resolution = SelectedComboText(GameResolutionBox, "1920x1080"),
+            GuestResolution = SelectedComboText(GameGuestResolutionBox, "1920x1080"),
             DisplayIndex = GameDisplayBox.SelectedItem is HostDisplayOption display
                 ? display.Index
                 : 0,

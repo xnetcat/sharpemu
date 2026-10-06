@@ -26,6 +26,8 @@ public sealed class PerGameSettings
 
     public string? Resolution { get; set; }
 
+    public string? GuestResolution { get; set; }
+
     public int? DisplayIndex { get; set; }
 
     public int? RefreshRate { get; set; }
@@ -52,6 +54,7 @@ public sealed class PerGameSettings
         LogToFile is null &&
         WindowMode is null &&
         Resolution is null &&
+        GuestResolution is null &&
         DisplayIndex is null &&
         RefreshRate is null &&
         ScalingMode is null &&
@@ -143,6 +146,11 @@ public sealed class PerGameSettings
         if (string.Equals(Resolution, global.Resolution, StringComparison.OrdinalIgnoreCase))
         {
             Resolution = null;
+        }
+
+        if (string.Equals(GuestResolution, global.GuestResolution, StringComparison.OrdinalIgnoreCase))
+        {
+            GuestResolution = null;
         }
 
         if (DisplayIndex == global.DisplayIndex)
@@ -272,6 +280,7 @@ public sealed record EffectiveLaunchSettings(
     bool LogToFile,
     string WindowMode,
     string Resolution,
+    string GuestResolution,
     int DisplayIndex,
     int RefreshRate,
     string ScalingMode,
@@ -289,6 +298,7 @@ public sealed record EffectiveLaunchSettings(
         perGame?.LogToFile ?? global.LogToFile,
         perGame?.WindowMode ?? global.WindowMode,
         perGame?.Resolution ?? global.Resolution,
+        GuiSettings.NormalizeGuestResolution(perGame?.GuestResolution ?? global.GuestResolution),
         Math.Max(0, perGame?.DisplayIndex ?? global.DisplayIndex),
         Math.Clamp(perGame?.RefreshRate ?? global.RefreshRate, 0, 1000),
         perGame?.ScalingMode ?? global.ScalingMode,

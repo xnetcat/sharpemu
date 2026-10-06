@@ -100,7 +100,9 @@ public readonly record struct DispatchThreadLimits(uint X, uint Y, uint Z);
 // The vertex buffer words of one fetch slot as the vertex program declares them.
 public readonly record struct VertexInputBuffer(ulong Address, uint Stride, uint RecordCount, bool PerInstance = false)
 {
-    public ulong Size => Stride != 0 ? (ulong)Stride * RecordCount : RecordCount;
+    public uint MinimumFetchBytes { get; init; }
+
+    public ulong Size => Math.Max(Stride != 0 ? (ulong)Stride * RecordCount : RecordCount, MinimumFetchBytes);
 }
 
 // One attribute of the vertex tables: its buffer words, the registers it fills and its buffer slot.

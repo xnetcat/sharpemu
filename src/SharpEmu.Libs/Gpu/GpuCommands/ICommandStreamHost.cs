@@ -102,6 +102,10 @@ public interface ICommandStreamHost
 
     void FillBuffer(ulong address, ulong size, uint value, bool isGds);
 
+    // Records a PIXEL_PIPE_STAT_DUMP occlusion counter dump with real sample counts; false when
+    // the host cannot count samples and the interpreter must publish a conservative result.
+    bool TryRecordOcclusionCounterDump(ulong address) => false;
+
     void CopyBuffer(ulong destination, ulong source, ulong size, bool destinationIsGds, bool sourceIsGds);
 
     void ReadGds(Span<uint> destination, uint wordOffset, uint wordCount);

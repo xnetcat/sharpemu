@@ -9,6 +9,33 @@ namespace SharpEmu.Libs.Tests.GUI;
 public sealed class PerGameSettingsTests
 {
     [Fact]
+    public void GuestResolutionDefaultsToHdAndCanBeOverriddenPerGame()
+    {
+        var global = new GuiSettings { Resolution = "3840x2160" };
+        Assert.Equal("1920x1080", EffectiveLaunchSettings.Resolve(global, null).GuestResolution);
+        var game = new PerGameSettings { GuestResolution = "3840x2160" };
+        game.RemoveInheritedValues(global);
+        Assert.False(game.IsEmpty);
+        var restored = PerGameSettings.NormalizeFromJson(System.Text.Json.JsonSerializer.Serialize(game));
+        Assert.Equal("3840x2160", EffectiveLaunchSettings.Resolve(global, restored).GuestResolution);
+        global.GuestResolution = "3840x2160";
+        game.RemoveInheritedValues(global);
+        Assert.True(game.IsEmpty);
+        Assert.Equal("3840x2160", EffectiveLaunchSettings.Resolve(global, game).GuestResolution);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("invalid")]
+    [InlineData("7680x4320")]
+    public void InvalidGuestResolutionFallsBackToHd(string? value)
+    {
+        Assert.Equal("1920x1080", EffectiveLaunchSettings.Resolve(
+            new GuiSettings(), new PerGameSettings { GuestResolution = value }).GuestResolution);
+    }
+
+    [Fact]
     public void NewGameInheritsWritableApp0AndGlobalCrashCapture()
     {
         var global = new GuiSettings();

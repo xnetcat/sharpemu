@@ -74,6 +74,8 @@
   "Options.WindowMode.Exclusive": "Eksklüziv",
   "Options.Resolution.Label": "Təsvir ölçüsü",
   "Options.Resolution.Desc": "Pəncərənin başlanğıc ölçüsü və ya eksklüziv tam ekranın təsvir ölçüsü.",
+  "Options.GuestResolution.Label": "Oyunun ekran rejimi",
+  "Options.GuestResolution.Desc": "Oyuna bildirilən ekran təsvir ölçüsü. Standart 1080p-dir. Daxili render ölçüsünü oyun seçir; sabit ölçülü oyunlar bu ayarı nəzərə almaya bilər.",
   "Options.Display.Label": "Ekran",
   "Options.Display.Desc": "Pəncərənin mərkəzə yerləşdirilməsi və tam ekran üçün istifadə olunan monitor.",
   "Options.RefreshRate.Label": "Yenilənmə tezliyi",

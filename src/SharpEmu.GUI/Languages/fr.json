@@ -220,6 +220,8 @@
   "Options.WindowMode.Exclusive": "Exclusif",
   "Options.Resolution.Label": "Résolution",
   "Options.Resolution.Desc": "Taille initiale de la fenêtre ou résolution du plein écran exclusif.",
+  "Options.GuestResolution.Label": "Mode d’affichage du jeu",
+  "Options.GuestResolution.Desc": "Résolution d’écran indiquée au jeu. La valeur par défaut est 1080p. Le jeu choisit sa résolution de rendu interne ; les jeux à résolution fixe peuvent ignorer ce réglage.",
   "Options.Display.Label": "Écran",
   "Options.Display.Desc": "Moniteur utilisé pour le centrage et le plein écran.",
   "Options.RefreshRate.Label": "Fréquence de rafraîchissement",

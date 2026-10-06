@@ -556,7 +556,8 @@ public sealed partial class RenderExecutor
     {
         var context = banks.Context;
         var shaderInterface = context.ShaderInterface;
-        var hasColorOutput = (context.RenderTargetMask & shaderInterface.ColorShaderMask) != 0;
+        var hasColorOutput = context.ColorControl.Mode != 0 &&
+                             (context.RenderTargetMask & shaderInterface.ColorShaderMask) != 0;
         return banks.Shader.Pixel.Address != 0 && (hasColorOutput || PixelShaderHasDepthOrCoverageSideEffects(shaderInterface));
     }
 

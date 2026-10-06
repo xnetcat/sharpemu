@@ -322,6 +322,7 @@ public partial class MainWindow : Window
         WindowModeBox.SelectionChanged += (_, _) => _settings.WindowMode = SelectedComboText(WindowModeBox, "Windowed");
         DisplayBox.SelectionChanged += (_, _) => OnHostDisplayChanged();
         ResolutionBox.SelectionChanged += (_, _) => OnHostResolutionChanged();
+        GuestResolutionBox.SelectionChanged += (_, _) => _settings.GuestResolution = SelectedComboText(GuestResolutionBox, "1920x1080");
         RefreshRateBox.SelectionChanged += (_, _) => OnHostRefreshRateChanged();
         ScalingModeBox.SelectionChanged += (_, _) => _settings.ScalingMode = SelectedComboText(ScalingModeBox, "Fit");
         VSyncToggle.IsCheckedChanged += (_, _) => _settings.VSync = VSyncToggle.IsChecked == true;
@@ -1249,6 +1250,7 @@ public partial class MainWindow : Window
         LogLevelBox.ItemsSource = _logLevelChoices;
         WindowModeBox.ItemsSource = _windowModeChoices;
         ScalingModeBox.ItemsSource = _scalingModeChoices;
+        GuestResolutionBox.ItemsSource = new[] { "1920x1080", "3840x2160" };
         HdrModeBox.ItemsSource = _hdrModeChoices;
         BinkPlaybackBox.ItemsSource = _binkPlaybackChoices;
         OverlayModeBox.ItemsSource = _overlayModeChoices;
@@ -1324,6 +1326,7 @@ public partial class MainWindow : Window
         LoadHostDisplayOptions();
         ScalingModeBox.SelectedIndex = ChoiceIndex(_settings.ScalingMode, "Fit", "Cover", "Stretch", "Integer");
         VSyncToggle.IsChecked = _settings.VSync;
+        GuestResolutionBox.SelectedItem = GuiSettings.NormalizeGuestResolution(_settings.GuestResolution);
         HdrModeBox.SelectedIndex = ChoiceIndex(_settings.HdrMode, "Auto", "On", "Off");
         OverlayEnabledToggle.IsChecked = _settings.OverlayEnabled;
         OverlayModeBox.SelectedIndex = ChoiceIndex(_settings.OverlayMode, "Full", "Minimal", "TitleBar");
@@ -2560,13 +2563,6 @@ public partial class MainWindow : Window
             });
         _appliedEnvironmentVariables.Add(BinkModeEnvironmentName);
 
-        Environment.SetEnvironmentVariable(
-            "SHARPEMU_RENDER_SCALE",
-            _settings.RenderResolutionScale.ToString(
-                "0.###",
-                System.Globalization.CultureInfo.InvariantCulture));
-        _appliedEnvironmentVariables.Add("SHARPEMU_RENDER_SCALE");
-
         foreach (var entry in customEnvironment)
         {
             if (!CustomEnvironmentVariables.TryParseEntry(entry, out var name, out var value))
@@ -2784,6 +2780,7 @@ public partial class MainWindow : Window
 
         arguments.Add($"--window-mode={launch.Settings.WindowMode.ToLowerInvariant()}");
         arguments.Add($"--resolution={launch.Settings.Resolution}");
+        arguments.Add($"--guest-resolution={launch.Settings.GuestResolution}");
         arguments.Add($"--display={launch.Settings.DisplayIndex}");
         arguments.Add($"--refresh-rate={launch.Settings.RefreshRate}");
         arguments.Add($"--scaling={launch.Settings.ScalingMode.ToLowerInvariant()}");

@@ -220,6 +220,8 @@
   "Options.WindowMode.Exclusive": "Exclusiva",
   "Options.Resolution.Label": "Resolução",
   "Options.Resolution.Desc": "Tamanho inicial da janela ou resolução de tela cheia exclusiva.",
+  "Options.GuestResolution.Label": "Modo de exibição do jogo",
+  "Options.GuestResolution.Desc": "Resolução informada ao jogo. O padrão é 1080p. O jogo escolhe a resolução interna de renderização; jogos com resolução fixa podem ignorar esta opção.",
   "Options.Display.Label": "Tela",
   "Options.Display.Desc": "Monitor usado para centralização e tela cheia.",
   "Options.RefreshRate.Label": "Taxa de atualização",

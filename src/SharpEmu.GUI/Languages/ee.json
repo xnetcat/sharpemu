@@ -85,6 +85,8 @@
   "Options.WindowMode.Exclusive": "Eksklusiivne",
   "Options.Resolution.Label": "Eraldusvõime",
   "Options.Resolution.Desc": "Algne akna suurus või eksklusiivse täisekraani eraldusvõime.",
+  "Options.GuestResolution.Label": "Mängu kuvarežiim",
+  "Options.GuestResolution.Desc": "Mängule teatatud ekraani eraldusvõime. Vaikimisi 1080p. Mäng valib sisemise renderduse eraldusvõime; fikseeritud eraldusvõimega mängud võivad seda sätet eirata.",
   "Options.Display.Label": "Kuvar",
   "Options.Display.Desc": "Monitor, mida kasutatakse tsentreerimiseks ja täisekraanrežiimiks.",
   "Options.RefreshRate.Label": "Värskendussagedus",

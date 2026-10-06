@@ -1010,7 +1010,7 @@ internal static partial class Program
 
     private static void PrintUsage()
     {
-        Log.Info("Usage: SharpEmu.CLI [--strict] [--trace-imports[=N]] [--cpu-engine=<native>] [--console=<ps5>] [--console-language=<language>] [--log-level=<level>] [--log-file[=<path>]] [--window-mode=<windowed|borderless|exclusive>] [--resolution=<WIDTHxHEIGHT>] [--display=<N>] [--refresh-rate=<HZ>] [--scaling=<fit|cover|stretch|integer>] [--vsync=<on|off>] [--hdr=<auto|on|off>] [--overlay=<on|off>] [--overlay-mode=<full|minimal|titlebar>] [--overlay-corner=<topleft|topright|bottomright|bottomleft>] [--debug-server[=host:port]] <path-to-eboot.bin>");
+        Log.Info("Usage: SharpEmu.CLI [--strict] [--trace-imports[=N]] [--cpu-engine=<native>] [--console=<ps5>] [--console-language=<language>] [--log-level=<level>] [--log-file[=<path>]] [--window-mode=<windowed|borderless|exclusive>] [--resolution=<WIDTHxHEIGHT>] [--guest-resolution=<1920x1080|3840x2160>] [--display=<N>] [--refresh-rate=<HZ>] [--scaling=<fit|cover|stretch|integer>] [--vsync=<on|off>] [--hdr=<auto|on|off>] [--overlay=<on|off>] [--overlay-mode=<full|minimal|titlebar>] [--overlay-corner=<topleft|topright|bottomright|bottomleft>] [--debug-server[=host:port]] <path-to-eboot.bin>");
         Log.Info(@"Example: SharpEmu.CLI --cpu-engine=native --trace-imports=64 --log-level=debug --log-file ""E:\Games\...\eboot.bin""");
         Log.Info("Debug server: --debug-server starts a live debug listener (default 127.0.0.1:5714); connect with SharpEmu.DebugClient.");
     }
@@ -1075,6 +1075,7 @@ internal static partial class Program
         var systemLanguage = 1;
         HostWindowMode? windowModeOverride = null;
         HostScalingMode? scalingModeOverride = null;
+        GuestDisplayResolution? guestResolutionOverride = null;
         int? windowWidthOverride = null;
         int? windowHeightOverride = null;
         int? displayIndexOverride = null;
@@ -1132,6 +1133,18 @@ internal static partial class Program
                 }
                 windowWidthOverride = windowWidth;
                 windowHeightOverride = windowHeight;
+                continue;
+            }
+            if (TrySplitOption(argument, "--guest-resolution", out var guestResolutionText))
+            {
+                if (guestResolutionText is not ("1920x1080" or "3840x2160"))
+                {
+                    ebootPath = string.Empty;
+                    runtimeOptions = default;
+                    return false;
+                }
+                guestResolutionOverride = guestResolutionText == "3840x2160"
+                    ? GuestDisplayResolution.UltraHd : GuestDisplayResolution.Hd;
                 continue;
             }
             if (TrySplitOption(argument, "--display", out var displayText))
@@ -1391,6 +1404,7 @@ internal static partial class Program
         {
             WindowMode = windowModeOverride ?? configuredVideoOptions.WindowMode,
             ScalingMode = scalingModeOverride ?? configuredVideoOptions.ScalingMode,
+            GuestResolution = guestResolutionOverride ?? configuredVideoOptions.GuestResolution,
             Width = windowWidthOverride ?? configuredVideoOptions.Width,
             Height = windowHeightOverride ?? configuredVideoOptions.Height,
             DisplayIndex = displayIndexOverride ?? configuredVideoOptions.DisplayIndex,
@@ -1431,6 +1445,8 @@ internal static partial class Program
             {
                 WindowMode = windowMode,
                 ScalingMode = scalingMode,
+                GuestResolution = effective.GuestResolution == "3840x2160"
+                    ? GuestDisplayResolution.UltraHd : GuestDisplayResolution.Hd,
                 Width = hasResolution ? configuredWidth : defaults.Width,
                 Height = hasResolution ? configuredHeight : defaults.Height,
                 DisplayIndex = effective.DisplayIndex,
