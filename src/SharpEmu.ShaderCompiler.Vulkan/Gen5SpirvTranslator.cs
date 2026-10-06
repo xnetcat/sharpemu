@@ -70,6 +70,8 @@ public static partial class Gen5SpirvTranslator
         private readonly IReadOnlyList<Gen5PixelOutputBinding> _pixelOutputBindings;
         private readonly bool _usesPixelValidMask;
         private readonly bool _enableGraphicsSubgroupOperations;
+        private readonly bool _nativeHalfConversionExact;
+        private readonly bool _zeroOutOfBoundsBufferReads;
         private readonly uint _waveLaneCount;
         private readonly bool _emulateWave64;
 
@@ -3924,21 +3926,85 @@ public static partial class Gen5SpirvTranslator
                 ShiftRightLogical(descriptorWord3, UInt(12)),
                 UInt(0x7F));
             var (dataFormat, numberFormat) = DecodeGfx10BufferFormat(unifiedFormat);
+            var one = Gfx10FormatOne(numberFormat);
 
-            var canonical = new uint[4];
-            var componentBounds = new uint[4];
-            for (var component = 0; component < canonical.Length; component++)
-            {
-                canonical[component] = LoadGfx10BufferFormatComponent(
-                    bindingIndex,
-                    byteAddress,
-                    dataFormat,
-                    numberFormat,
-                    component,
-                    out componentBounds[component]);
-            }
+            // Dword-aligned 32-bit components whose number format keeps the raw bits (most
+            // vertex streams) load one word per component; every other format takes the
+            // generic byte-wise decode. The descriptor is uniform, so the branch never diverges.
+            var wordCount = UInt(0);
+            wordCount = SelectUInt(dataFormat, 4, UInt(1), wordCount);
+            wordCount = SelectUInt(dataFormat, 11, UInt(2), wordCount);
+            wordCount = SelectUInt(dataFormat, 13, UInt(3), wordCount);
+            wordCount = SelectUInt(dataFormat, 14, UInt(4), wordCount);
+            var rawBits = _module.AddInstruction(
+                SpirvOp.LogicalOr, _boolType,
+                _module.AddInstruction(SpirvOp.IEqual, _boolType, numberFormat, UInt(7)),
+                _module.AddInstruction(
+                    SpirvOp.LogicalOr, _boolType,
+                    _module.AddInstruction(SpirvOp.IEqual, _boolType, numberFormat, UInt(4)),
+                    _module.AddInstruction(SpirvOp.IEqual, _boolType, numberFormat, UInt(5))));
+            var wordPath = _module.AddInstruction(
+                SpirvOp.LogicalAnd, _boolType,
+                _module.AddInstruction(
+                    SpirvOp.LogicalAnd, _boolType,
+                    _module.AddInstruction(SpirvOp.INotEqual, _boolType, wordCount, UInt(0)),
+                    rawBits),
+                _module.AddInstruction(
+                    SpirvOp.IEqual, _boolType, BitwiseAnd(byteAddress, UInt(3)), UInt(0)));
 
-            // Only selected memory components contribute to the shared bounds check.
+            EmitConditional(
+                wordPath,
+                () =>
+                {
+                    var dwordAddress = ShiftRightLogical(byteAddress, UInt(2));
+                    var canonical = new uint[4];
+                    var componentBounds = new uint[4];
+                    for (uint component = 0; component < 4; component++)
+                    {
+                        var address = component == 0 ? dwordAddress : IAdd(dwordAddress, UInt(component));
+                        var present = _module.AddInstruction(
+                            SpirvOp.ULessThan, _boolType, UInt(component), wordCount);
+                        canonical[component] = _module.AddInstruction(
+                            SpirvOp.Select, _uintType, present,
+                            LoadBufferWord(bindingIndex, address),
+                            component == 3 ? one : UInt(0));
+                        componentBounds[component] = _module.AddInstruction(
+                            SpirvOp.LogicalOr, _boolType,
+                            _module.AddInstruction(SpirvOp.LogicalNot, _boolType, present),
+                            IsBufferWordInRange(bindingIndex, address));
+                    }
+
+                    StoreBufferFormatComponents(descriptorWord3, vectorData, componentCount, one, canonical, componentBounds);
+                },
+                () =>
+                {
+                    var canonical = new uint[4];
+                    var componentBounds = new uint[4];
+                    for (var component = 0; component < canonical.Length; component++)
+                    {
+                        canonical[component] = LoadGfx10BufferFormatComponent(
+                            bindingIndex,
+                            byteAddress,
+                            dataFormat,
+                            numberFormat,
+                            component,
+                            out componentBounds[component]);
+                    }
+
+                    StoreBufferFormatComponents(descriptorWord3, vectorData, componentCount, one, canonical, componentBounds);
+                });
+        }
+
+        // Applies the descriptor swizzle to the memory components; only selected memory
+        // components contribute to the shared bounds check.
+        private void StoreBufferFormatComponents(
+            uint descriptorWord3,
+            uint vectorData,
+            uint componentCount,
+            uint one,
+            uint[] canonical,
+            uint[] componentBounds)
+        {
             var selectors = new uint[componentCount];
             var inBounds = _module.ConstantBool(true);
             for (uint destination = 0; destination < componentCount; destination++)
@@ -3958,7 +4024,6 @@ public static partial class Gen5SpirvTranslator
                 inBounds = _module.AddInstruction(SpirvOp.LogicalAnd, _boolType, inBounds, selectedInBounds);
             }
 
-            var one = Gfx10FormatOne(numberFormat);
             for (uint destination = 0; destination < componentCount; destination++)
             {
                 var selector = selectors[destination];
@@ -4632,23 +4697,27 @@ public static partial class Gen5SpirvTranslator
                 whenTrue,
                 whenFalse);
 
+        // The four bytes at a byte address span at most two words, so one funnel shift of those
+        // two words is the whole value. Reading each byte from its own bounds-checked word load
+        // (four loads, four range tests and a byte assembly) costs twice as much for the same
+        // result: a word outside the buffer reads zero either way, so the bytes it would have
+        // contributed stay zero, and the formatted-load fallback does this per component.
         private uint LoadUnalignedBufferWord(int bindingIndex, uint byteAddress)
         {
-            var result = UInt(0);
-            for (uint index = 0; index < 4; index++)
-            {
-                var address = index == 0
-                    ? byteAddress
-                    : IAdd(byteAddress, UInt(index));
-                var dwordAddress = ShiftRightLogical(address, UInt(2));
-                var bitOffset = ShiftLeftLogical(BitwiseAnd(address, UInt(3)), UInt(3));
-                var value = BitwiseAnd(
-                    ShiftRightLogical(LoadBufferWord(bindingIndex, dwordAddress), bitOffset),
-                    UInt(0xFF));
-                result = BitwiseOr(result, ShiftLeftLogical(value, UInt(index * 8)));
-            }
-
-            return result;
+            var dwordAddress = ShiftRightLogical(byteAddress, UInt(2));
+            var bitOffset = ShiftLeftLogical(BitwiseAnd(byteAddress, UInt(3)), UInt(3));
+            var low = LoadBufferWord(bindingIndex, dwordAddress);
+            var high = LoadBufferWord(bindingIndex, IAdd(dwordAddress, UInt(1)));
+            // A shift by the word width is undefined, so the aligned case keeps the low word.
+            var spanning = BitwiseOr(
+                ShiftRightLogical(low, bitOffset),
+                ShiftLeftLogical(high, _module.AddInstruction(SpirvOp.ISub, _uintType, UInt(32), bitOffset)));
+            return _module.AddInstruction(
+                SpirvOp.Select,
+                _uintType,
+                IsNotZero(bitOffset),
+                spanning,
+                low);
         }
 
         private uint LoadSubdwordBufferValue(
@@ -7462,6 +7531,14 @@ public static partial class Gen5SpirvTranslator
 
         private uint LoadBufferWord(int binding, uint dwordAddress)
         {
+            // With the device measured to return zero past the end of a descriptor range, the
+            // range test, the address clamp and the zero select only reproduce what the read
+            // already does. The guest expects zero there, and so the load stands alone.
+            if (_zeroOutOfBoundsBufferReads)
+            {
+                return Load(_uintType, BufferWordPointer(binding, dwordAddress));
+            }
+
             var inRange = IsBufferWordInRange(binding, dwordAddress);
             var safeAddress = _module.AddInstruction(
                 SpirvOp.Select,
