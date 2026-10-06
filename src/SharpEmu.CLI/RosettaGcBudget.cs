@@ -12,7 +12,7 @@ namespace SharpEmu.CLI;
 /// Rosetta services by parking the thread in its runtime. A signal that reaches a parked
 /// thread (guest memory tracking raises thousands per second) trips Rosetta's "expected saved
 /// LR to be in translated code" assertion and wedges the process. With the default gen0 budget
-/// the emulator collects about once a second; a larger budget makes that rare.
+/// the emulator collects about twice a second; a 64 MiB budget makes that rare.
 /// </summary>
 /// <remarks>
 /// The GC reads its gen0 budget only from the environment when the runtime starts, so the
@@ -21,7 +21,9 @@ namespace SharpEmu.CLI;
 internal static class RosettaGcBudget
 {
     private const string BudgetVariable = "DOTNET_GCgen0size";
-    private const string Budget = "0x20000000"; // 512 MiB
+    // 64 MiB: a larger budget turns every collection into a blocking gen1/gen2 pass of
+    // about a second (512 MiB measured 8 such pauses in 150 s of Demon's Souls).
+    private const string Budget = "0x4000000";
     private const string OptOutVariable = "SHARPEMU_ROSETTA_GC_BUDGET";
 
     public static void ReexecIfNeeded(string[] args)
