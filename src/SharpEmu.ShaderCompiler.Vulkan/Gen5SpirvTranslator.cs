@@ -172,6 +172,7 @@ public static partial class Gen5SpirvTranslator
         private uint _storageBlockPointer;
         private uint _storageUintPointer;
         private uint _lds;
+        private uint _ldsWritten;
         private uint _ldsElementPointer;
         private uint _lds64ElementPointer;
         private uint _ldsDwordMask;
@@ -774,14 +775,24 @@ public static partial class Gen5SpirvTranslator
             var ldsPointer = _module.TypePointer(storageClass, ldsArrayType);
             _ldsElementPointer = _module.TypePointer(storageClass, _uintType);
             _lds64ElementPointer = _module.TypePointer(storageClass, _ulongType);
-            _lds = storageClass == SpirvStorageClass.Workgroup
-                ? _module.AddGlobalVariable(ldsPointer, storageClass)
-                : _module.AddGlobalVariable(
-                    ldsPointer,
-                    storageClass,
-                    _module.ConstantNull(ldsArrayType));
+            // A private array must read zero where this invocation has not written, but
+            // zero-initializing it costs every invocation the whole array: Metal keeps a
+            // dynamically indexed private array in stack memory, so an NGG vertex shader
+            // cleared 8 KiB per vertex. A written-dword bitmap clears 1/32 of that, and
+            // LdsPointer zeroes a slot the first time it is addressed.
+            _lds = _module.AddGlobalVariable(ldsPointer, storageClass);
             _module.AddName(_lds, "lds");
             _interfaces.Add(_lds);
+            if (storageClass == SpirvStorageClass.Private)
+            {
+                var bitmapType = _module.TypeArray(_uintType, (arrayDwordCount + 31) / 32);
+                _ldsWritten = _module.AddGlobalVariable(
+                    _module.TypePointer(SpirvStorageClass.Private, bitmapType),
+                    SpirvStorageClass.Private,
+                    _module.ConstantNull(bitmapType));
+                _module.AddName(_ldsWritten, "ldsWritten");
+                _interfaces.Add(_ldsWritten);
+            }
         }
 
         internal static SpirvImageFormat DecodeStorageImageFormat(
@@ -1461,6 +1472,8 @@ public static partial class Gen5SpirvTranslator
             // post chain into a flat haze.
             var synchronizeSharedMemory = _emulateWave64;
             var sharedMemoryPhase = SharedMemoryPhase.None;
+            // A wait in another block may or may not have run before this one.
+            _vectorMemoryWaited = null;
             for (var index = block.StartIndex; index < block.EndIndex; index++)
             {
                 var instruction = _request.Program.Instructions[index];
@@ -2138,10 +2151,15 @@ public static partial class Gen5SpirvTranslator
             {
                 return true;
             }
+            if (instruction.Opcode == "SWaitcnt")
+            {
+                NoteWaitCount(instruction);
+                return true;
+            }
+
             if (instruction.Opcode is
                 "SNop" or
                 "SSetregB32" or
-                "SWaitcnt" or
                 "SInstPrefetch" or
                 "STtraceData" or
                 // Wave scheduling priority hint; no effect on results.
@@ -2158,11 +2176,17 @@ public static partial class Gen5SpirvTranslator
             {
                 if (_stage == Gen5SpirvStage.Compute)
                 {
-                    // s_waitcnt vmcnt(0) + s_barrier also publishes buffer and image
-                    // stores to the workgroup: AcquireRelease over uniform, workgroup
-                    // and image memory.
+                    // s_barrier orders execution; what it publishes is whatever the guest
+                    // waited for first. s_waitcnt vmcnt(0) before it means buffer and image
+                    // stores are being published to the workgroup, so the barrier carries
+                    // AcquireRelease over uniform, workgroup and image memory. A barrier that
+                    // only follows lgkmcnt(0) publishes LDS, and ordering device memory there
+                    // costs a cache flush the guest never asked for: UE's FFT bloom
+                    // convolution barriers 48 times per group, every one of them lgkmcnt-only.
                     var workgroup = UInt(2);
-                    var semantics = UInt(0x8 | 0x40 | 0x100 | 0x800);
+                    var semantics = UInt(_vectorMemoryWaited == false
+                        ? 0x8u | 0x100u
+                        : 0x8u | 0x40u | 0x100u | 0x800u);
                     _module.AddStatement(
                         SpirvOp.ControlBarrier,
                         workgroup,
@@ -2687,11 +2711,30 @@ public static partial class Gen5SpirvTranslator
             var index = BitwiseAnd(
                 ShiftRightLogical(addressWithOffset, UInt(2)),
                 UInt(_ldsDwordMask));
-            return _module.AddInstruction(
+            var pointer = _module.AddInstruction(
                 SpirvOp.AccessChain,
                 _ldsElementPointer,
                 _lds,
                 index);
+            if (_ldsWritten != 0)
+            {
+                var wordPointer = _module.AddInstruction(
+                    SpirvOp.AccessChain,
+                    _privateUintPointer,
+                    _ldsWritten,
+                    ShiftRightLogical(index, UInt(5)));
+                var bit = ShiftLeftLogical(UInt(1), BitwiseAnd(index, UInt(31)));
+                var word = Load(_uintType, wordPointer);
+                var unwritten = _module.AddInstruction(
+                    SpirvOp.IEqual, _boolType, BitwiseAnd(word, bit), UInt(0));
+                EmitConditional(unwritten, () =>
+                {
+                    Store(pointer, UInt(0));
+                    Store(wordPointer, BitwiseOr(word, bit));
+                });
+            }
+
+            return pointer;
         }
 
         private void StoreLds(uint pointer, uint value)
@@ -7487,7 +7530,7 @@ public static partial class Gen5SpirvTranslator
             var slots = new List<(uint Register, uint Lane)>();
             if (_emulateWave64)
             {
-                return slots;
+                return FindPureLaneSpillSlots();
             }
 
             var ownsLaneZero = !UsesSubgroupOperations();
@@ -7504,6 +7547,70 @@ public static partial class Gen5SpirvTranslator
                     readRegisters.Contains(register) &&
                     TryGetConstantLane(instruction, out var lane) &&
                     (lane != 0 || !ownsLaneZero) &&
+                    !slots.Contains((register, lane)))
+                {
+                    slots.Add((register, lane));
+                }
+            }
+
+            return slots;
+        }
+
+        // Under wave64 emulation a lane read normally rendezvous with the other host subgroup through
+        // LDS and a workgroup barrier. A VGPR written only by constant-lane V_WRITELANE holds spilled
+        // scalars, which are wave-uniform, so every invocation can keep each written lane itself and a
+        // constant-lane V_READLANE needs no exchange. V_WRITELANE still updates the VGPR, so other
+        // reads of it are unaffected. Relative VGPR addressing could alias any register, so programs
+        // that use it keep the exchange.
+        private List<(uint Register, uint Lane)> FindPureLaneSpillSlots()
+        {
+            var slots = new List<(uint Register, uint Lane)>();
+            var instructions = _request.Program.Instructions;
+            if (instructions.Any(static instruction => instruction.Opcode.StartsWith("VMovrel", StringComparison.Ordinal)))
+            {
+                return slots;
+            }
+
+            var candidates = new HashSet<uint>();
+            var rejected = new HashSet<uint>();
+            foreach (var instruction in instructions)
+            {
+                var isWritelane = instruction.Opcode == "VWritelaneB32";
+                var isReadlane = instruction.Opcode == "VReadlaneB32";
+                for (var index = 0; index < instruction.Destinations.Count; index++)
+                {
+                    var operand = instruction.Destinations[index];
+                    if (operand.Kind != Gen5OperandKind.VectorRegister)
+                    {
+                        continue;
+                    }
+
+                    if (isWritelane && index == 0 && TryGetConstantLane(instruction, out _))
+                    {
+                        candidates.Add(operand.Value);
+                    }
+                    else
+                    {
+                        rejected.Add(operand.Value);
+                    }
+                }
+
+                // A variable lane read cannot use a slot; it keeps reading the VGPR, which V_WRITELANE
+                // still writes, so ordinary vector reads of the register stay exact as well.
+                if (isReadlane && instruction.Sources.Count > 0 &&
+                    instruction.Sources[0].Kind == Gen5OperandKind.VectorRegister &&
+                    !TryGetConstantLane(instruction, out _))
+                {
+                    rejected.Add(instruction.Sources[0].Value);
+                }
+            }
+
+            foreach (var instruction in instructions)
+            {
+                if (instruction.Opcode == "VWritelaneB32" &&
+                    TryGetVectorDestination(instruction, out var register) &&
+                    candidates.Contains(register) && !rejected.Contains(register) &&
+                    TryGetConstantLane(instruction, out var lane) &&
                     !slots.Contains((register, lane)))
                 {
                     slots.Add((register, lane));
@@ -7741,6 +7848,25 @@ public static partial class Gen5SpirvTranslator
         {
             if (_waveLaneCount != 32)
             {
+                // The lane's bit lives in one of the two mask registers, so select that register
+                // and shift inside it. Composing the 64-bit mask and masking it with a 64-bit
+                // lane bit costs several times as much on a host that emulates 64-bit integers,
+                // and VCC and EXEC refresh their lane flag on every mask write.
+                if (_subgroupInvocationIdInput != 0 && _emulateWave64)
+                {
+                    var lane = GuestWaveLane();
+                    var word = _module.AddInstruction(
+                        SpirvOp.Select,
+                        _uintType,
+                        _module.AddInstruction(SpirvOp.ULessThan, _boolType, lane, UInt(32)),
+                        LoadS(lowRegister),
+                        LoadS(lowRegister + 1));
+                    return IsNotZero(
+                        BitwiseAnd(
+                            ShiftRightLogical(word, BitwiseAnd(lane, UInt(31))),
+                            UInt(1)));
+                }
+
                 return IsWaveMaskActive(LoadS64(lowRegister));
             }
 
@@ -8250,6 +8376,35 @@ public static partial class Gen5SpirvTranslator
             }
 
             return _halfMaskPlan;
+        }
+
+        // Null until a wait is seen in the current block; then true once any wait in the block
+        // drained vector memory (vmcnt(0), or vscnt(0), which is what covers stores on GFX10),
+        // which is how the guest publishes buffer and image stores before a barrier. It stays
+        // true for the rest of the block: a later LDS-only wait does not unpublish them.
+        private bool? _vectorMemoryWaited;
+
+        private void NoteWaitCount(Gen5ShaderInstruction instruction)
+        {
+            if (instruction.Words.Count == 0)
+            {
+                return;
+            }
+
+            var word = instruction.Words[0];
+            if (instruction.Encoding == Gen5ShaderEncoding.Sopk)
+            {
+                // SOPK waits name one counter: 0x17 vscnt, 0x18 vmcnt, 0x19 expcnt, 0x1A lgkmcnt.
+                var counter = (word >> 23) & 0x1Fu;
+                var drainsVectorMemory = counter is 0x17 or 0x18 && (word & 0xFFFFu) == 0;
+                _vectorMemoryWaited = _vectorMemoryWaited == true || drainsVectorMemory;
+                return;
+            }
+
+            // SOPP S_WAITCNT packs vmcnt across bits [3:0] and [15:14].
+            var immediate = word & 0xFFFFu;
+            var vectorCount = (immediate & 0xFu) | (((immediate >> 14) & 0x3u) << 4);
+            _vectorMemoryWaited = _vectorMemoryWaited == true || vectorCount == 0;
         }
 
         private void EmitWave64Barrier()
