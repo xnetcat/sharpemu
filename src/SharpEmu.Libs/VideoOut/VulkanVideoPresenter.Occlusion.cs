@@ -174,13 +174,22 @@ internal static unsafe partial class VulkanVideoPresenter
             var queries = _pendingOcclusionResults.ToArray();
             _pendingOcclusionResults.Clear();
             var bytes = (ulong)queries.Length * OcclusionDepthBlocks * sizeof(ulong);
-            var download = _bufferCache.GetUtilityBuffer(GpuBufferUsage.Download);
-            if (!download.TryMap(bytes, out var offset, sizeof(ulong)))
+            var ring = _bufferCache.GetUtilityBuffer(GpuBufferUsage.Download);
+            GpuBuffer download = ring;
+            // This can run inside submission's EndRendering hook. A ring wrap must not
+            // recursively submit that command buffer, nor leave us recording into a
+            // submitted handle. Overflow storage survives until its completion callback.
+            var overflow = !ring.TryMap(bytes, out var offset, sizeof(ulong), allowWait: false);
+            if (overflow)
             {
-                throw SubmissionScheduler.Fatal($"The download ring cannot map occlusion results: bytes=0x{bytes:X}.");
+                download = new GpuBuffer(_deviceInfo, _scheduler, GpuBufferUsage.Download,
+                    0, BufferUsageFlags.TransferDstBit, bytes);
+                offset = 0;
             }
-
-            download.Commit();
+            else
+            {
+                ring.Commit();
+            }
             for (var index = 0; index < queries.Length; index++)
             {
                 var segments = queries[index].Segments;
@@ -211,12 +220,19 @@ internal static unsafe partial class VulkanVideoPresenter
 
             _scheduler.QueuePriorityCompletionAction(() =>
             {
-                download.Invalidate(offset, bytes);
-                var counts = MemoryMarshal.Cast<byte, ulong>(download.Mapped.Slice((int)offset, (int)bytes));
-                for (var index = 0; index < queries.Length; index++)
+                try
                 {
-                    _occlusionWrites.Enqueue((queries[index].Block, BuildOcclusionBlock(queries[index],
-                        counts.Slice(index * OcclusionDepthBlocks, OcclusionDepthBlocks))));
+                    download.Invalidate(offset, bytes);
+                    var counts = MemoryMarshal.Cast<byte, ulong>(download.Mapped.Slice((int)offset, (int)bytes));
+                    for (var index = 0; index < queries.Length; index++)
+                    {
+                        _occlusionWrites.Enqueue((queries[index].Block, BuildOcclusionBlock(queries[index],
+                            counts.Slice(index * OcclusionDepthBlocks, OcclusionDepthBlocks))));
+                    }
+                }
+                finally
+                {
+                    if (overflow) download.Dispose();
                 }
             });
         }
