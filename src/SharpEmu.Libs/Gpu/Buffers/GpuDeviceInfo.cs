@@ -36,10 +36,17 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport
         Slabs = new GpuMemorySlabs(this);
         const FormatFeatureFlags blit = FormatFeatureFlags.BlitSrcBit | FormatFeatureFlags.BlitDstBit;
         Images.RenderScalePolicy.ConfigureFormatSupport(format => (GetFormatProperties(format).OptimalTilingFeatures & blit) == blit);
+        GuestImports = new GuestBufferImportPool(this);
     }
 
     // Shared chunks the small buffers are carved from; freed at device teardown.
     internal GpuMemorySlabs Slabs { get; }
+
+    internal GuestBufferImportPool GuestImports { get; }
+
+    public Silk.NET.Vulkan.Extensions.EXT.ExtExternalMemoryHost? ExternalMemoryHost { get; set; }
+
+    public ulong ImportedHostPointerAlignment { get; set; }
 
     public Vk Vk { get; }
 
