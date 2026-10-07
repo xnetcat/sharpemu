@@ -34,8 +34,6 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport
         MaxMemoryAllocationCount = properties.Limits.MaxMemoryAllocationCount;
         MaxComputeWorkGroupCount = (properties.Limits.MaxComputeWorkGroupCount[0], properties.Limits.MaxComputeWorkGroupCount[1], properties.Limits.MaxComputeWorkGroupCount[2]);
         Slabs = new GpuMemorySlabs(this);
-        const FormatFeatureFlags blit = FormatFeatureFlags.BlitSrcBit | FormatFeatureFlags.BlitDstBit;
-        Images.RenderScalePolicy.ConfigureFormatSupport(format => (GetFormatProperties(format).OptimalTilingFeatures & blit) == blit);
         GuestImports = new GuestBufferImportPool(this);
     }
 
