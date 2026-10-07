@@ -65,11 +65,6 @@ internal sealed class RecordingCommandStreamHost : ICommandStreamHost
 
     public void NoteMemoryVisibilityPoint() => VisibilityPoints++;
 
-    // Satisfied waits and command-processor memory writes reported to the host.
-    public int VisibilityPoints { get; private set; }
-
-    public void NoteMemoryVisibilityPoint() => VisibilityPoints++;
-
     public List<ulong> GuestReads { get; } = new();
 
     public Action<ulong>? BeforeGuestRead { get; set; }
