@@ -88,4 +88,17 @@ public sealed class LauncherThemesTests
     {
         Assert.Equal(LauncherThemes.DefaultId, LauncherThemes.Find("Nope").Id);
     }
+
+    // Stop is a solid pill like Launch; every theme's red must carry its white label.
+    [Fact]
+    public void EveryThemeHasAStopRedThatCarriesWhiteText()
+    {
+        var palettes = LauncherThemes.All.Append(LauncherThemes.Derive(null, null));
+        foreach (var palette in palettes)
+        {
+            Assert.True(LauncherThemes.TryParseHex(palette.Stop, out var stop), palette.Id);
+            Assert.Equal("#FFFFFF", LauncherThemes.ForegroundOn(stop));
+            Assert.True(stop.R > stop.G + 0x40 && stop.R > stop.B + 0x30, $"{palette.Id} Stop is not red");
+        }
+    }
 }

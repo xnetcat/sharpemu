@@ -29,7 +29,8 @@ internal sealed record LauncherPalette(
     string AccentHover,
     string AccentPressed,
     string AccentTint,
-    string AccentForeground);
+    string AccentForeground,
+    string Stop = LauncherThemes.DefaultStop);
 
 /// <summary>
 /// Everything the user picks about the launcher's look: the theme, the custom theme's
@@ -56,6 +57,10 @@ internal static class LauncherThemes
     public const int DefaultGlassOpacity = 75;
     public const int MinGlassOpacity = 30;
     public const int MaxContrast = 50;
+
+    // The Stop button's fill: Radix red (the solid step, made for white labels). Themes with
+    // a published red use theirs, deepened where needed so white text stays readable.
+    public const string DefaultStop = "#E5484D";
 
     // Text, rims and focus rings are drawn light, so a custom background is kept dark.
     private const byte MaxCustomBackgroundChannel = 0x40;
@@ -113,7 +118,7 @@ internal static class LauncherThemes
             Field: "#313244", FieldHover: "#45475A", Overlay: "#2A2B3D",
             Text: "#CDD6F4", SecondaryText: "#BAC2DE", Description: "#A6ADC8", Muted: "#9399B2", Faint: "#6C7086",
             Accent: "#3A72E8", AccentHover: "#4C7FE6", AccentPressed: "#2F62CC", AccentTint: "#333A72E8",
-            AccentForeground: "#FFFFFF"),
+            AccentForeground: "#FFFFFF", Stop: "#D9475F"),
         // Nord (nordtheme.com): Polar Night surfaces, Snow Storm text, and the deepest Frost
         // blue (nord10) as the accent, so labels on it are white.
         new(
@@ -123,7 +128,7 @@ internal static class LauncherThemes
             Field: "#434C5E", FieldHover: "#4C566A", Overlay: "#3B4252",
             Text: "#ECEFF4", SecondaryText: "#E5E9F0", Description: "#D8DEE9", Muted: "#B1BACB", Faint: "#7B88A1",
             Accent: "#5E81AC", AccentHover: "#6A8DB8", AccentPressed: "#4F6F96", AccentTint: "#335E81AC",
-            AccentForeground: "#FFFFFF"),
+            AccentForeground: "#FFFFFF", Stop: "#C24E57"),
         // Tokyo Night (github.com/folke/tokyonight.nvim, night style), its blue deepened so
         // labels on the accent are white.
         new(
@@ -133,7 +138,7 @@ internal static class LauncherThemes
             Field: "#292E42", FieldHover: "#343A55", Overlay: "#24283B",
             Text: "#C0CAF5", SecondaryText: "#A9B1D6", Description: "#9AA5CE", Muted: "#828BB8", Faint: "#565F89",
             Accent: "#4F74D6", AccentHover: "#5A7FD8", AccentPressed: "#4262BC", AccentTint: "#334F74D6",
-            AccentForeground: "#FFFFFF"),
+            AccentForeground: "#FFFFFF", Stop: "#DB4B4B"),
     ];
 
     // Maps a 12-step dark scale (Radix roles: 1-2 backgrounds, 3-5 element fills,
@@ -310,7 +315,7 @@ internal static class LauncherThemes
 
     // White label text while it keeps 3:1 (large, bold button text), dark text otherwise:
     // mid-bright accents like green fell under 2.5:1 with white.
-    private static string ForegroundOn(Color accent) =>
+    internal static string ForegroundOn(Color accent) =>
         1.05 / (Luminance(accent) + 0.05) >= 3 ? "#FFFFFF" : "#111111";
 
     private static string Hex(Color color) => $"#{color.R:X2}{color.G:X2}{color.B:X2}";
@@ -405,6 +410,17 @@ internal static class LauncherThemes
             new BoxShadow { Spread = 2, Color = WithAlpha(accent, neutral ? 0.5 : 0.7) });
 
         app.Resources["SystemAccentColor"] = accent;
+
+        // Stop is as solid as Launch, in the theme's red. While the game is still closing it
+        // sits between the raised surface and that red: opaque, so key art behind the hero
+        // and the glass setting cannot wash it out, yet clearly not a live control.
+        var stop = Color.Parse(palette.Stop);
+        Paint(app, "StopBrush", stop);
+        Paint(app, "StopHoverBrush", Mix(stop, Colors.White, 0.12));
+        Paint(app, "StopPressedBrush", Mix(stop, Colors.Black, 0.15));
+        Paint(app, "StopForegroundBrush", Color.Parse(ForegroundOn(stop)));
+        Paint(app, "StopBusyBrush", Mix(Color.Parse(palette.Elevated), stop, 0.35));
+        Paint(app, "StopBusyForegroundBrush", Mix(stop, text, 0.55));
     }
 
     private static void Paint(Avalonia.Application app, string key, Color color)

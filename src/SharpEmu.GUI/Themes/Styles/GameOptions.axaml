@@ -87,15 +87,24 @@ Contextual per-game options reveal, actions, and selected-game motion.
     <Setter Property="Foreground" Value="{StaticResource FaintBrush}" />
   </Style>
 
-  <!-- While a session is running the same button stops it: tinted red, not solid. -->
-  <Style Selector="Button.playButton.danger">
-    <Setter Property="Background" Value="{StaticResource DangerHoverTintBrush}" />
-    <Setter Property="Foreground" Value="{StaticResource DangerBrush}" />
+  <!-- While a session is running the same button stops it: a solid pill in the theme's red,
+       as clearly live as Launch. Set on the presenter, where the accent rules above would win. -->
+  <Style Selector="Button.playButton.danger /template/ ContentPresenter#PART_ContentPresenter">
+    <Setter Property="Background" Value="{StaticResource StopBrush}" />
+    <Setter Property="Foreground" Value="{StaticResource StopForegroundBrush}" />
   </Style>
-
   <Style Selector="Button.playButton.danger:pointerover /template/ ContentPresenter#PART_ContentPresenter">
-    <Setter Property="Background" Value="{StaticResource DangerStrongTintBrush}" />
-    <Setter Property="Foreground" Value="{StaticResource DangerHoverBrush}" />
+    <Setter Property="Background" Value="{StaticResource StopHoverBrush}" />
+    <Setter Property="Foreground" Value="{StaticResource StopForegroundBrush}" />
+  </Style>
+  <Style Selector="Button.playButton.danger:pressed /template/ ContentPresenter#PART_ContentPresenter">
+    <Setter Property="Background" Value="{StaticResource StopPressedBrush}" />
+    <Setter Property="Foreground" Value="{StaticResource StopForegroundBrush}" />
+  </Style>
+  <!-- "Stopping…" waits for the game to exit; it reads as busy, not as a live control. -->
+  <Style Selector="Button.playButton.danger:disabled /template/ ContentPresenter#PART_ContentPresenter">
+    <Setter Property="Background" Value="{StaticResource StopBusyBrush}" />
+    <Setter Property="Foreground" Value="{StaticResource StopBusyForegroundBrush}" />
   </Style>
 
   <!-- Round selected-game actions: all 52 pt, matching the Launch pill. -->

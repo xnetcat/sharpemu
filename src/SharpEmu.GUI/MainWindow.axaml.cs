@@ -3248,7 +3248,7 @@ public partial class MainWindow : Window
     private static StackPanel IconLabel(bool stop, string label) => new()
     {
         Orientation = Avalonia.Layout.Orientation.Horizontal,
-        Spacing = 10,
+        Spacing = 8,
         Children =
         {
             new PathIcon
@@ -3285,7 +3285,10 @@ public partial class MainWindow : Window
 
         GameSettingsButton.IsEnabled =
             GameList.SelectedItem is GameEntry;
-        LaunchVariablesButton.IsEnabled = !_isRunning && GameList.SelectedItem is GameEntry;
+        // Launch variables only mean something before a launch; hidden rather than greyed
+        // while a game runs, so the row never shows a control that looks broken.
+        LaunchVariablesButton.IsVisible = !_isRunning;
+        LaunchVariablesButton.IsEnabled = GameList.SelectedItem is GameEntry;
         _libraryMenu.OpenFileButton.IsEnabled = !_isRunning;
     }
 

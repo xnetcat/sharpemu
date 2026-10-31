@@ -212,13 +212,13 @@ at least 44 pt tall.
     <Setter Property="VerticalAlignment" Value="Center" />
   </Style>
 
-  <!-- Selected-game actions: the same height as the Launch pill, an icon and a word each. -->
+  <!-- Selected-game actions: the Launch pill's height, type size and weight, an icon and a word each. -->
   <Style Selector="Button.heroAction, ToggleButton.heroAction">
     <Setter Property="Height" Value="52" />
     <Setter Property="Padding" Value="20,0" />
     <Setter Property="CornerRadius" Value="26" />
-    <Setter Property="FontSize" Value="15" />
-    <Setter Property="FontWeight" Value="SemiBold" />
+    <Setter Property="FontSize" Value="{StaticResource FontSizeBody}" />
+    <Setter Property="FontWeight" Value="Bold" />
     <Setter Property="VerticalContentAlignment" Value="Center" />
   </Style>
   <!-- The reset button of a game setting that has its own value (SettingRow). -->

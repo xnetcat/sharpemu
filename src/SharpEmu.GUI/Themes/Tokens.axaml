@@ -62,6 +62,13 @@ Shadows belong to floating layers (sheets, menus, toasts, dialogs) alone.
   <!-- Semantic colours tuned for dark surfaces. -->
   <SolidColorBrush x:Key="DangerBrush" Color="#FF7A86" />
   <SolidColorBrush x:Key="DangerHoverBrush" Color="#FF98A1" />
+  <!-- The Stop button; LauncherThemes repaints these for each theme. -->
+  <SolidColorBrush x:Key="StopBrush" Color="#E5484D" />
+  <SolidColorBrush x:Key="StopHoverBrush" Color="#E85E62" />
+  <SolidColorBrush x:Key="StopPressedBrush" Color="#C33D41" />
+  <SolidColorBrush x:Key="StopForegroundBrush" Color="#FFFFFF" />
+  <SolidColorBrush x:Key="StopBusyBrush" Color="#6B3436" />
+  <SolidColorBrush x:Key="StopBusyForegroundBrush" Color="#EEA7A9" />
   <SolidColorBrush x:Key="DangerTintBrush" Color="#1FFF7A86" />
   <SolidColorBrush x:Key="DangerHoverTintBrush" Color="#33FF7A86" />
   <SolidColorBrush x:Key="DangerStrongTintBrush" Color="#47FF7A86" />
